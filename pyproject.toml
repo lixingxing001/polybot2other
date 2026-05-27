@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polybot2other"
+version = "0.1.0"
+description = "Paper trading dashboard for real Polymarket BTC 5-minute prediction markets"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+polybot2other-dashboard = "polybot2other.web:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

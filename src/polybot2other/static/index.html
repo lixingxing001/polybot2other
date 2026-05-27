@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>polybot2other</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">Paper Trading</div>
+          <h1>Polymarket BTC 5m Paper Bot</h1>
+        </div>
+        <div class="top-actions">
+          <label class="strategy-toggle" title="开启后按 Up/Down 双边配对策略运行">
+            <input id="pair-strategy-toggle" type="checkbox">
+            <span>配对策略</span>
+          </label>
+          <span id="pair-strategy-status" class="status-text">关闭</span>
+          <span id="runtime-pill" class="pill">连接中</span>
+          <button id="tick-button" type="button" title="立即同步">同步</button>
+        </div>
+      </header>
+
+      <section class="metric-grid" aria-label="账户指标">
+        <div class="metric">
+          <span>总资产</span>
+          <strong id="total-equity">$0.00</strong>
+        </div>
+        <div class="metric">
+          <span>总盈亏</span>
+          <strong id="total-pnl">$0.00</strong>
+        </div>
+        <div class="metric">
+          <span>可用资金</span>
+          <strong id="cash-balance">$0.00</strong>
+        </div>
+        <div class="metric">
+          <span>持仓风险</span>
+          <strong id="open-risk">$0.00</strong>
+        </div>
+        <div class="metric">
+          <span>胜率</span>
+          <strong id="win-rate">0.00%</strong>
+        </div>
+        <div class="metric">
+          <span>最大回撤</span>
+          <strong id="max-drawdown">$0.00</strong>
+        </div>
+      </section>
+
+      <section class="main-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>实时市场</h2>
+            <span id="last-tick">-</span>
+          </div>
+          <div id="markets" class="market-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>资金曲线</h2>
+            <span id="paper-only">Paper Only</span>
+          </div>
+          <canvas id="equity-chart" width="680" height="260"></canvas>
+        </div>
+      </section>
+
+      <section class="table-stack">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>当前持仓</h2>
+              <span id="open-count">0</span>
+            </div>
+            <details class="field-menu">
+              <summary>字段</summary>
+              <div id="open-field-options" class="field-options"></div>
+            </details>
+          </div>
+          <div class="table-wrap">
+            <table class="trade-table">
+              <thead id="open-trades-head"></thead>
+              <tbody id="open-trades"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>最近交易</h2>
+              <span id="trade-count">0</span>
+            </div>
+            <details class="field-menu">
+              <summary>字段</summary>
+              <div id="recent-field-options" class="field-options"></div>
+            </details>
+          </div>
+          <div class="table-wrap recent-table-wrap">
+            <table class="trade-table">
+              <thead id="recent-trades-head"></thead>
+              <tbody id="recent-trades"></tbody>
+            </table>
+          </div>
+          <div class="table-footer">
+            <span id="recent-page-info">最近 0 / 0 条</span>
+            <button id="load-more-recent" type="button" hidden>查看更多</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
