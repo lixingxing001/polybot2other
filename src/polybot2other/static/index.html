@@ -34,6 +34,10 @@
           <strong id="total-pnl">$0.00</strong>
         </div>
         <div class="metric">
+          <span>未实现盈亏</span>
+          <strong id="unrealized-pnl">$0.00</strong>
+        </div>
+        <div class="metric">
           <span>可用资金</span>
           <strong id="cash-balance">$0.00</strong>
         </div>
@@ -60,12 +64,15 @@
           <div id="markets" class="market-list"></div>
         </div>
 
-        <div class="panel">
+        <div class="panel chart-panel">
           <div class="panel-head">
             <h2>资金曲线</h2>
             <span id="paper-only">Paper Only</span>
           </div>
-          <canvas id="equity-chart" width="680" height="260"></canvas>
+          <div class="chart-body">
+            <canvas id="equity-chart" width="680" height="190"></canvas>
+            <div id="equity-tooltip" class="chart-tooltip" hidden></div>
+          </div>
         </div>
       </section>
 

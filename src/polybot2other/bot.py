@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import replace
 from typing import Any
 
 from .config import Settings
@@ -16,6 +15,9 @@ from .strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
 LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
 RECENT_TRADES_DEFAULT_LIMIT = 100
 RECENT_TRADES_MAX_LIMIT = 500
+EQUITY_CURVE_DEFAULT_DAYS = 90
+EQUITY_CURVE_DEFAULT_MAX_POINTS = 1200
+EQUITY_CURVE_MAX_POINTS = 5000
 PAIR_ENTRY_COST_THRESHOLD = 0.92
 PAIR_EXIT_BID_THRESHOLD = 0.98
 PAIR_ENTRY_MIN_SECONDS_LEFT = 45
@@ -131,11 +133,17 @@ class PaperTradingBot:
         if client_market.get("slug") and client_market.get("slug") != market.round_id:
             return self.snapshot(extra={"ignored_snapshot": "stale_market"})
 
-        market = self._market_with_target_from_payload(market, payload)
         price = payload.get("price") if isinstance(payload.get("price"), dict) else {}
         price = dict(price)
         if market.target_price > 0:
             price["target_price"] = market.target_price
+            price["target_price_source"] = "market.target_price"
+            price["target_price_fallback"] = False
+        else:
+            price.pop("target_price", None)
+            price.pop("target_price_source", None)
+            price.pop("target_price_fallback", None)
+            price.pop("target_price_updated_ms", None)
         quotes = payload.get("quotes") if isinstance(payload.get("quotes"), dict) else {}
         chainlink_price = _maybe_float(price.get("chainlink"))
         binance_price = _maybe_float(price.get("binance"))
@@ -196,15 +204,6 @@ class PaperTradingBot:
             url=str(row.get("url") or ""),
         )
 
-    def _market_with_target_from_payload(self, market, payload: dict[str, Any]):
-        target = _maybe_float(payload.get("target_price"))
-        if target is None:
-            price = payload.get("price") if isinstance(payload.get("price"), dict) else {}
-            target = _maybe_float(price.get("target_price"))
-        if target is not None and target > 0 and market.target_price <= 0:
-            return replace(market, target_price=target)
-        return market
-
     def _rest_fallback_snapshot(self, market) -> None:
         quotes = self.polymarket.get_quotes(market)
         now = time.time()
@@ -214,9 +213,12 @@ class PaperTradingBot:
             "chainlink": None,
             "binance": tick.price,
             "binance_updated_ms": now_ms,
-            "target_price": market.target_price,
             "source": f"{tick.source}-rest-fallback",
         }
+        if market.target_price > 0:
+            price["target_price"] = market.target_price
+            price["target_price_source"] = "market.target_price"
+            price["target_price_fallback"] = False
         with self._lock:
             self.latest_quotes = {side: quote.to_dict() for side, quote in quotes.items()}
             self.latest_price = price
@@ -316,6 +318,8 @@ class PaperTradingBot:
 
     def _pair_entry_block_reason(self, market: MarketRound, state: dict[str, Any], now: float) -> str | None:
         time_left = market.ends_at - now
+        if market.target_price <= 0:
+            return "配对策略缺少官方目标价，停止开新仓"
         if self.store.daily_realized_pnl() <= -abs(self.settings.initial_balance * PAIR_DAILY_LOSS_PCT / 100.0):
             return "配对策略日内回撤达到 3%，停止开新仓"
         if self.pair_stop_loss_streak >= PAIR_STOP_STREAK_LIMIT:
@@ -583,6 +587,24 @@ class PaperTradingBot:
             },
         }
 
+    def equity_curve_window(
+        self,
+        days: int = EQUITY_CURVE_DEFAULT_DAYS,
+        max_points: int = EQUITY_CURVE_DEFAULT_MAX_POINTS,
+    ) -> dict[str, Any]:
+        days = max(1, min(365, int(days)))
+        max_points = max(2, min(EQUITY_CURVE_MAX_POINTS, int(max_points)))
+        rows = self.store.equity_curve_window(days, max_points)
+        return {
+            "equity_curve": rows,
+            "equity_curve_meta": {
+                "days": days,
+                "max_points": max_points,
+                "points": len(rows),
+                "initial_balance": self.settings.initial_balance,
+            },
+        }
+
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
         state = _pair_quote_state(self.latest_quotes, time.time())
         return {
@@ -662,11 +684,11 @@ class PaperTradingBot:
         enriched["unrealized_pnl"] = _round_money(unrealized_pnl) or 0.0
         cash_balance = _maybe_float(enriched.get("cash_balance")) or 0.0
         initial_balance = _maybe_float(enriched.get("initial_balance")) or self.settings.initial_balance
-        total_equity = cash_balance + open_mark_value
-        total_pnl = total_equity - initial_balance
-        enriched["total_equity"] = _round_money(total_equity) or 0.0
-        enriched["total_pnl"] = _round_money(total_pnl) or 0.0
-        enriched["total_pnl_pct"] = _round_pct(total_pnl / initial_balance * 100.0) if initial_balance else 0.0
+        estimated_total_equity = cash_balance + open_mark_value
+        estimated_total_pnl = estimated_total_equity - initial_balance
+        enriched["estimated_total_equity"] = _round_money(estimated_total_equity) or 0.0
+        enriched["estimated_total_pnl"] = _round_money(estimated_total_pnl) or 0.0
+        enriched["estimated_total_pnl_pct"] = _round_pct(estimated_total_pnl / initial_balance * 100.0) if initial_balance else 0.0
         return enriched
 
 

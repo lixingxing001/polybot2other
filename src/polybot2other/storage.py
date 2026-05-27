@@ -664,7 +664,77 @@ class TradeStore:
             """,
             (limit,),
         ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        return self._equity_rows([dict(row) for row in reversed(rows)])
+
+    @_locked
+    def equity_curve_window(
+        self,
+        days: int = 90,
+        max_points: int = 1200,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        days = max(1, min(365, int(days)))
+        max_points = max(2, min(5000, int(max_points)))
+        end_at = time.time() if now is None else float(now)
+        start_at = end_at - days * 24 * 60 * 60
+        count_row = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM equity_curve WHERE created_at >= ? AND created_at <= ?",
+            (start_at, end_at),
+        ).fetchone()
+        count = int(count_row["count"] or 0)
+        if count <= max_points:
+            rows = self.conn.execute(
+                """
+                SELECT cash_balance, open_risk, realized_pnl, total_equity, created_at
+                FROM equity_curve
+                WHERE created_at >= ? AND created_at <= ?
+                ORDER BY created_at ASC
+                """,
+                (start_at, end_at),
+            ).fetchall()
+            return self._equity_rows([dict(row) for row in rows])
+
+        stride = max(1, -(-count // max(1, max_points - 1)))
+        rows = self.conn.execute(
+            """
+            SELECT cash_balance, open_risk, realized_pnl, total_equity, created_at
+            FROM (
+                SELECT
+                    cash_balance,
+                    open_risk,
+                    realized_pnl,
+                    total_equity,
+                    created_at,
+                    ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS row_num,
+                    COUNT(*) OVER () AS total_count
+                FROM equity_curve
+                WHERE created_at >= ? AND created_at <= ?
+            )
+            WHERE row_num = 1
+               OR row_num = total_count
+               OR ((row_num - 1) % ?) = 0
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (start_at, end_at, stride, max_points),
+        ).fetchall()
+        return self._equity_rows([dict(row) for row in rows])
+
+    def _equity_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        initial_balance = float(self.account()["initial_balance"])
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            total_equity = round(float(row["total_equity"]), 6)
+            total_pnl = round(total_equity - initial_balance, 6)
+            item = dict(row)
+            item["cash_balance"] = round(float(item["cash_balance"]), 6)
+            item["open_risk"] = round(float(item["open_risk"]), 6)
+            item["realized_pnl"] = round(float(item["realized_pnl"]), 6)
+            item["total_equity"] = total_equity
+            item["total_pnl"] = total_pnl
+            item["total_pnl_pct"] = round(total_pnl / initial_balance * 100, 4) if initial_balance else 0.0
+            result.append(item)
+        return result
 
 
 def _normalize_side(side: str) -> str:

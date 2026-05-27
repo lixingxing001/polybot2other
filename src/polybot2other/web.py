@@ -41,6 +41,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             self._send_json(self.server.bot.snapshot(), include_body=False)
             return
+        if path == "/api/equity-curve":
+            self._send_json(self.server.bot.equity_curve_window(), include_body=False)
+            return
         if path.startswith("/static/"):
             self._send_static(path.removeprefix("/static/"), include_body=False)
             return
@@ -60,6 +63,11 @@ class Handler(BaseHTTPRequestHandler):
             limit = _query_int(query, "limit", 100, 1, 500)
             offset = _query_int(query, "offset", 0, 0, 100_000)
             self._send_json(self.server.bot.recent_trades_page(limit, offset))
+            return
+        if path == "/api/equity-curve":
+            days = _query_int(query, "days", 90, 1, 365)
+            max_points = _query_int(query, "max_points", 1200, 2, 5000)
+            self._send_json(self.server.bot.equity_curve_window(days, max_points))
             return
         if path == "/api/current-market":
             self.server.bot.tick()
