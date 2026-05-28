@@ -1,5 +1,169 @@
 # polybot2other-progress
 
+## 2026-05-28 v2.43
+
+### 已完成
+
+1. 修复订单流水和最近交易右侧“字段”菜单被裁切的问题。
+2. 将订单流水、最近交易的字段菜单移出带 `overflow-x: auto` 的 actions 容器，避免下拉层被父容器裁剪。
+3. 新增 `panel-head-actions` 右侧工具栏容器，保持筛选/按钮横向滚动，同时让字段菜单下拉层可正常覆盖在表格上方。
+4. 给打开状态的 `.field-menu` 增加更高层级，降低被后续表格内容遮挡的概率。
+5. 首页 CSS 版本号升级到 `/static/styles.css?v=20260528-v2-43`，避免浏览器继续使用旧样式。
+
+### 已确认决策
+
+1. 本轮只修复字段菜单展示层级和裁切问题，不改变订单/交易接口和字段选择逻辑。
+2. 保留订单流水和最近交易操作区的横向布局，不回退到竖向堆叠。
+
+### 待办和后期优化
+
+1. 当前环境没有可用浏览器自动化工具，未做真实截图验证；后续可补 Playwright/Chromium 视觉回归。
+
+### 已知坑位
+
+1. 小屏幕下操作区仍会横向滚动，字段按钮固定在滚动区域外侧，避免再次裁切下拉层。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk git diff --check -- src/polybot2other/static/index.html src/polybot2other/static/styles.css`，未发现空白错误。
+3. 已请求首页 HTML，确认 CSS 链接为 `/static/styles.css?v=20260528-v2-43`，并且订单流水、最近交易均存在 `panel-head-actions`。
+4. 已静态检查确认存在 `.field-menu[open]` 层级规则。
+
+### 回滚建议
+
+1. 如需回滚本轮字段菜单展示修复，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/styles.css` 和本进度文档中的 v2.43 改动。
+2. 本轮不涉及后端和数据库结构变更，无需服务端迁移回滚。
+
+## 2026-05-28 v2.42
+
+### 已完成
+
+1. 官方结算结果继续以 Gamma `outcomePrices` 判断 Up/Down winner，不改胜负信任链路。
+2. 结算路径新增 `eventMetadata.finalPrice` 和 `eventMetadata.priceToBeat` 读取，官方结算能写入最终价和官方目标价。
+3. `find_current_btc_5m_market` 解析市场时保留 event 级 `eventMetadata`，减少不必要的页面目标价解析。
+4. 如果 Gamma metadata 缺少最终价或目标价，才在市场结束后兜底解析一次 Polymarket 页面 payload，并按 slug 缓存。
+5. 已结算且来源为 `polymarket_official`、但 `final_price` 缺失的近 24 小时记录，会每轮最多补 3 条；已补齐的记录不会重复请求。
+6. 官方补偿核对如果拿到最终价，会同步更新 `market_rounds.final_price`；如果拿到更准确的 `priceToBeat`，会更新 `target_price`，最近交易的最终距离 bps 会随之恢复。
+7. README 更新结算价来源说明。
+
+### 已确认决策
+
+1. 页面解析不是实时行情路径，只作为结算后 metadata 缺失时的兜底。
+2. 不新增数据库字段，本轮复用 `market_rounds.final_price` 和 `market_rounds.target_price`。
+3. 不重新核对已经有最终价的官方结算记录，避免重复请求和重复扰动历史数据。
+
+### 待办和后期优化
+
+1. 如果后续需要审计价格来源，可再新增 `final_price_source` 字段；当前为了避免迁移，只在运行时保留来源说明。
+2. Polymarket 页面 payload 属于兜底路径，若页面结构变化，最多影响最终价展示，不影响官方 winner 和盈亏结算。
+
+### 已知坑位
+
+1. 历史很久以前的官方记录如果超过 24 小时窗口，本轮不会自动回填，避免大批量请求页面。
+2. 如果 Polymarket 官方 metadata 临时缺少 `finalPrice`，记录仍会保持最终价为空，并按 60 秒间隔重试近期缺失记录。
+
+### 验证记录
+
+1. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/polymarket.py src/polybot2other/storage.py src/polybot2other/bot.py tests/test_core.py`，语法检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_polymarket_resolution_reads_event_metadata_prices tests.test_core.TradingCoreTest.test_polymarket_resolution_falls_back_to_page_prices tests.test_core.TradingCoreTest.test_bot_records_official_resolution_final_and_target_prices tests.test_core.TradingCoreTest.test_bot_backfills_missing_official_final_price_once_available`，4 个结算价格定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，36 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk git diff --check`，未发现空白错误。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+7. 已请求 `/api/status`，确认 `running=True`，当前市场目标价来自 `market.target_price`。
+8. 已请求 `/api/recent-trades?limit=5&offset=0`，确认 `Polymarket官方` 记录返回 `final_price` 和 `final_distance_bps`。
+
+### 回滚建议
+
+1. 如需回滚本轮官方最终价补全，撤销 `polymarket.py`、`storage.py`、`bot.py`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.42 改动。
+2. 本轮不涉及数据库结构变更，无需 SQLite 迁移回滚。
+
+## 2026-05-28 v2.41
+
+### 已完成
+
+1. 最近交易区域新增骨架 loading，覆盖统计卡片和表格行。
+2. 页面首次加载时先展示最近交易骨架，数据返回后再淡入真实统计和表格。
+3. 点击最近交易时间范围“查询”或“重置”时展示骨架 loading，避免空白或硬切。
+4. “查看更多”不清空已有列表，不触发整表骨架，只保持按钮禁用，避免打断用户浏览。
+5. 后台自动轮询不触发骨架 loading，避免重新引入闪烁、选中中断和焦点丢失问题。
+6. 新增 `prefers-reduced-motion` 兼容，系统关闭动画时不播放 shimmer 和淡入动画。
+7. 首页脚本版本号升级到 `/static/app.js?v=20260528-v2-41`。
+
+### 已确认决策
+
+1. 骨架 loading 只用于用户明确等待的场景，不用于后台轮询。
+2. 数据展示使用短淡入过渡，避免骨架到真实表格的切换过硬。
+3. 保持最近交易表格和统计区原尺寸结构，降低布局跳动。
+
+### 待办和后期优化
+
+1. 如果用户后续希望“查看更多”也有局部 loading，可以只在按钮或底部增加轻量状态，不替换表格主体。
+2. 如果最近交易在自动刷新时也出现复制中断，可以再做和订单流水类似的 DOM 延迟刷新。
+
+### 已知坑位
+
+1. 网络异常时骨架会保持到请求失败并显示错误提示；后续可以增加“重试”状态。
+2. 骨架列宽是视觉占位，不和用户自定义字段逐项一一对应。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk git diff --check -- src/polybot2other/static/app.js src/polybot2other/static/styles.css src/polybot2other/static/index.html`，未发现空白错误。
+3. 已静态检查确认存在 `renderRecentSkeleton`、`recent-content-enter`、`skeleton-shimmer`、`prefers-reduced-motion` 和脚本版本 `v2-41`。
+
+### 回滚建议
+
+1. 如需回滚本轮最近交易 loading 动画，撤销 `static/app.js`、`static/styles.css`、`static/index.html` 和本进度文档中的 v2.41 改动。
+2. 本轮未修改后端和数据库结构，无需服务端迁移回滚。
+
+## 2026-05-28 v2.40
+
+### 已完成
+
+1. 最近交易新增时间范围查询能力，前端可选择开始时间和结束时间后查询指定范围内的交易记录。
+2. `/api/recent-trades` 支持 `start_at` / `end_at` 秒级时间戳参数，分页加载会继续沿用同一个时间范围。
+3. 后端新增范围内交易统计，统计基于完整时间范围，不受当前页 `limit` 影响。
+4. 最近交易区域新增统计展示：交易数、已结算数、总盈亏、ROI、胜率、本金、回款、结算来源数量。
+5. 默认未选择时间范围时，保持原来的最近交易列表和分页行为。
+6. README 补充 `/api/recent-trades` 时间范围查询示例。
+
+### 已确认决策
+
+1. 时间筛选口径使用 `COALESCE(settled_at, opened_at)`。
+2. 已结算交易按 `settled_at` 进入范围，OPEN 交易按 `opened_at` 进入范围。
+3. 总盈亏、ROI、胜率只按已结算交易计算，OPEN 交易单独计入交易数和 open risk，不混入已实现收益。
+4. 统计必须由后端计算，不能只统计前端当前页，避免分页后总盈亏失真。
+
+### 待办和后期优化
+
+1. 后续可以增加“仅看官方修正过”“仅看 Chainlink 兜底”“仅看提前平仓”等筛选。
+2. 如果最近交易也出现复制文本被自动刷新打断，可以复用订单流水的 DOM 延迟刷新策略。
+
+### 已知坑位
+
+1. 服务运行时数据库会继续变化，同一时间范围重复查询的结果可能因为新交易结算而变化。
+2. 前端时间控件使用浏览器本地时区生成时间戳，后端只接收 Unix 秒级时间戳。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_recent_trades_time_range_summary_uses_full_range_not_page tests.test_core.TradingCoreTest.test_recent_trades_supports_count_and_offset`，2 个最近交易分页/统计测试通过。
+2. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py src/polybot2other/web.py tests/test_core.py`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，32 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求首页 HTML，确认脚本地址为 `/static/app.js?v=20260528-v2-40`，且存在 `recent-start-time` 和 `recent-summary`。
+9. 已请求 `/api/recent-trades?limit=1&offset=0&start_at=0&end_at=4102444800`，确认返回 `recent_trades_summary.total_pnl`、`win_rate`、`roi_pct`。
+10. 已请求 `/api/status`，确认 `running=True`，且返回 `recent_trades_summary`。
+
+### 回滚建议
+
+1. 如需回滚本轮最近交易时间范围查询和统计，撤销 `storage.py`、`bot.py`、`web.py`、`static/index.html`、`static/app.js`、`static/styles.css`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.40 改动。
+2. 本轮不涉及数据库结构变更，无需 SQLite 迁移回滚。
+
 ## 2026-05-28 v2.34
 
 ### 已完成

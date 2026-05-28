@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-28">
+    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-43">
   </head>
   <body>
     <main class="app-shell">
@@ -106,17 +106,19 @@
               <h2>订单流水</h2>
               <span id="order-count">0</span>
             </div>
-            <div class="panel-actions order-actions">
-              <select id="order-status-filter" aria-label="订单状态筛选">
-                <option value="all">全部</option>
-                <option value="active">活跃</option>
-                <option value="filled">成交</option>
-                <option value="canceled">已取消</option>
-                <option value="expired">已过期</option>
-                <option value="rejected">已拒绝</option>
-              </select>
-              <button id="cancel-current-orders" type="button" disabled>取消当前市场</button>
-              <button id="cancel-all-orders" type="button" disabled>取消全部挂单</button>
+            <div class="panel-head-actions">
+              <div class="panel-actions order-actions">
+                <select id="order-status-filter" aria-label="订单状态筛选">
+                  <option value="all">全部</option>
+                  <option value="active">活跃</option>
+                  <option value="filled">成交</option>
+                  <option value="canceled">已取消</option>
+                  <option value="expired">已过期</option>
+                  <option value="rejected">已拒绝</option>
+                </select>
+                <button id="cancel-current-orders" type="button" disabled>取消当前市场</button>
+                <button id="cancel-all-orders" type="button" disabled>取消全部挂单</button>
+              </div>
               <details class="field-menu">
                 <summary>字段</summary>
                 <div id="order-field-options" class="field-options"></div>
@@ -141,11 +143,26 @@
               <h2>最近交易</h2>
               <span id="trade-count">0</span>
             </div>
-            <details class="field-menu">
-              <summary>字段</summary>
-              <div id="recent-field-options" class="field-options"></div>
-            </details>
+            <div class="panel-head-actions">
+              <div class="panel-actions recent-actions">
+                <label>
+                  开始
+                  <input id="recent-start-time" type="datetime-local">
+                </label>
+                <label>
+                  结束
+                  <input id="recent-end-time" type="datetime-local">
+                </label>
+                <button id="apply-recent-filter" type="button">查询</button>
+                <button id="reset-recent-filter" type="button">重置</button>
+              </div>
+              <details class="field-menu">
+                <summary>字段</summary>
+                <div id="recent-field-options" class="field-options"></div>
+              </details>
+            </div>
           </div>
+          <div id="recent-summary" class="recent-summary"></div>
           <div class="table-wrap recent-table-wrap">
             <table class="trade-table">
               <thead id="recent-trades-head"></thead>
@@ -160,6 +177,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260528-v2-32"></script>
+    <script src="/static/app.js?v=20260528-v2-41"></script>
   </body>
 </html>

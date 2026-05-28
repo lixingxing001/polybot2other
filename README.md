@@ -14,7 +14,7 @@ This project is intentionally paper-only:
 - Paper entries are simulated as CLOB-style orders. The default entry mode is FAK, walks visible ask levels up to the execution limit, and charges the configured taker fee per filled level.
 - Paper order attempts and per-level paper fills are stored separately from positions for execution-quality review.
 - Trades, settlements, and equity curve are stored in SQLite.
-- Recent trades include a trade-level settlement source. `polymarket_official` means the market winner came from Polymarket Gamma resolved prices; `chainlink_fallback` means the bot used the local Chainlink price against the target because the official winner was not available yet; `early_exit` means the position was closed before market settlement. The bot periodically rechecks fallback settlements and upgrades or corrects them when the official outcome appears. Official outcome settlement does not invent a final BTC price.
+- Recent trades include a trade-level settlement source. `polymarket_official` means the market winner came from Polymarket Gamma resolved prices; `chainlink_fallback` means the bot used the local Chainlink price against the target because the official winner was not available yet; `early_exit` means the position was closed before market settlement. The bot periodically rechecks fallback settlements and upgrades or corrects them when the official outcome appears. When Polymarket exposes `finalPrice` / `priceToBeat` in event metadata, the bot records those official settlement prices for final price and final distance display; if metadata is missing, it falls back to a one-time Polymarket page payload parse after settlement.
 
 ## Run
 
@@ -43,6 +43,7 @@ data/polybot2other-real-btc.sqlite3
 ## API
 
 ```text
+GET /api/recent-trades?limit=100&offset=0&start_at=1779870000&end_at=1779873600
 GET /api/orders?limit=20&offset=0&status=all
 GET /api/order-fills?order_id=1
 POST /api/cancel-order {"order_id":1}

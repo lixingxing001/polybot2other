@@ -63,9 +63,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(self.server.bot.snapshot())
             return
         if path == "/api/recent-trades":
-            limit = _query_int(query, "limit", 100, 1, 500)
-            offset = _query_int(query, "offset", 0, 0, 100_000)
-            self._send_json(self.server.bot.recent_trades_page(limit, offset))
+            try:
+                limit = _query_int(query, "limit", 100, 1, 500)
+                offset = _query_int(query, "offset", 0, 0, 100_000)
+                start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
+                end_at = _query_float_optional(query, "end_at", 0, 4_102_444_800)
+                self._send_json(self.server.bot.recent_trades_page(limit, offset, start_at, end_at))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/orders":
             try:
@@ -216,6 +221,19 @@ def _query_int(query: dict[str, list[str]], key: str, default: int, minimum: int
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+def _query_float_optional(query: dict[str, list[str]], key: str, minimum: float, maximum: float) -> float | None:
+    raw = query.get(key, [""])[0]
+    if raw in (None, ""):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
 
 
 def _query_choice(query: dict[str, list[str]], key: str, choices: set[str], default: str) -> str:

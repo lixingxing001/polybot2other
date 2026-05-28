@@ -173,6 +173,70 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
 
+    def test_bot_records_official_resolution_final_and_target_prices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-bot-official-price",
+                symbol="BTC",
+                started_at=now - 301,
+                ends_at=now - 1,
+                target_price=99.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "bot official price")
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            bot.polymarket.get_resolution = (
+                lambda slug: {"outcome": "Up", "final_price": 101.25, "target_price": 100.5}
+                if slug == market.round_id
+                else None
+            )
+
+            bot._settle_due(now)
+
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(recent[0]["final_price"], 101.25, places=6)
+            self.assertAlmostEqual(recent[0]["target_price"], 100.5, places=6)
+
+    def test_bot_backfills_missing_official_final_price_once_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-official-backfill-price",
+                symbol="BTC",
+                started_at=now - 301,
+                ends_at=now - 1,
+                target_price=99.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "official backfill")
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.settle_round_outcome(
+                market.round_id,
+                "Down",
+                now,
+                settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+            )
+            bot.polymarket.get_resolution = (
+                lambda slug: {"outcome": "Down", "final_price": 98.75, "target_price": 100.5}
+                if slug == market.round_id
+                else None
+            )
+
+            bot._backfill_official_final_prices(now + 60)
+
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(recent[0]["final_price"], 98.75, places=6)
+            self.assertAlmostEqual(recent[0]["target_price"], 100.5, places=6)
+
     def test_partial_close_keeps_account_and_open_position_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3")
@@ -234,6 +298,41 @@ class TradingCoreTest(unittest.TestCase):
             first_ids = {row["id"] for row in first_page}
             second_ids = {row["id"] for row in second_page}
             self.assertFalse(first_ids & second_ids)
+
+    def test_recent_trades_time_range_summary_uses_full_range_not_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            base = 1_800_000_000.0
+            for index, side in enumerate(("Up", "Down", "Up")):
+                market = MarketRound(
+                    round_id=f"btc-updown-5m-range-{index}",
+                    symbol="BTC",
+                    started_at=base - 60 + index,
+                    ends_at=base + index,
+                    target_price=100.0,
+                )
+                store.upsert_round(market)
+                signal = Signal("BTC", side, 0.7, 0.5, 10.0, f"test range {index}")
+                store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+                outcome = "Up" if index != 1 else "Up"
+                store.settle_round_outcome(market.round_id, outcome, base + index * 60)
+
+            start_at = base - 1
+            end_at = base + 61
+            page = store.recent_trades(limit=1, offset=0, symbol="BTC", start_at=start_at, end_at=end_at)
+            summary = store.recent_trade_summary("BTC", start_at, end_at)
+
+            self.assertEqual(len(page), 1)
+            self.assertEqual(store.recent_trade_count("BTC", start_at, end_at), 2)
+            self.assertEqual(summary["total_count"], 2)
+            self.assertEqual(summary["settled_count"], 2)
+            self.assertEqual(summary["win_count"], 1)
+            self.assertEqual(summary["loss_count"], 1)
+            self.assertAlmostEqual(summary["settled_stake"], 10.0, places=6)
+            self.assertAlmostEqual(summary["total_payout"], 10.0, places=6)
+            self.assertAlmostEqual(summary["total_pnl"], 0.0, places=6)
+            self.assertAlmostEqual(summary["roi_pct"], 0.0, places=6)
 
     def test_equity_curve_window_filters_and_downsamples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1067,6 +1166,59 @@ class TradingCoreTest(unittest.TestCase):
         self.assertEqual(market.up_token, "1")
         self.assertEqual(market.down_token, "2")
         self.assertEqual(market.symbol, "BTC")
+
+    def test_polymarket_resolution_reads_event_metadata_prices(self) -> None:
+        client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
+        slug = "btc-updown-5m-1779871200"
+        client._get_event_by_slug = lambda _slug: {
+            "eventMetadata": {"finalPrice": 101.25, "priceToBeat": 100.5},
+            "markets": [
+                {
+                    "slug": slug,
+                    "closed": True,
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["1", "0"]',
+                }
+            ],
+        }
+
+        def fail_page_fetch(_url: str) -> str:
+            raise AssertionError("page fallback should not be used when Gamma eventMetadata has prices")
+
+        client._get_text = fail_page_fetch
+
+        resolution = client.get_resolution(slug)
+
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["outcome"], "Up")
+        self.assertAlmostEqual(resolution["final_price"], 101.25, places=6)
+        self.assertAlmostEqual(resolution["target_price"], 100.5, places=6)
+        self.assertEqual(resolution["settlement_price_source"], "Gamma:eventMetadata")
+
+    def test_polymarket_resolution_falls_back_to_page_prices(self) -> None:
+        client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
+        slug = "btc-updown-5m-1779871200"
+        client._get_event_by_slug = lambda _slug: {
+            "markets": [
+                {
+                    "slug": slug,
+                    "closed": True,
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["0", "1"]',
+                }
+            ],
+        }
+        client._get_text = lambda _url: (
+            '<html><script>{"eventMetadata":{"finalPrice":98.75,"priceToBeat":100.5}}</script></html>'
+        )
+
+        resolution = client.get_resolution(slug)
+
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["outcome"], "Down")
+        self.assertAlmostEqual(resolution["final_price"], 98.75, places=6)
+        self.assertAlmostEqual(resolution["target_price"], 100.5, places=6)
+        self.assertEqual(resolution["settlement_price_source"], "PolymarketPage:eventMetadata")
 
     def test_polymarket_quote_keeps_sorted_orderbook_levels(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")

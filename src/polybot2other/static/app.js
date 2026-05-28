@@ -22,6 +22,11 @@ const ids = {
   recentTrades: document.getElementById("recent-trades"),
   recentTradesHead: document.getElementById("recent-trades-head"),
   recentFieldOptions: document.getElementById("recent-field-options"),
+  recentStartTime: document.getElementById("recent-start-time"),
+  recentEndTime: document.getElementById("recent-end-time"),
+  applyRecentFilter: document.getElementById("apply-recent-filter"),
+  resetRecentFilter: document.getElementById("reset-recent-filter"),
+  recentSummary: document.getElementById("recent-summary"),
   openCount: document.getElementById("open-count"),
   orderCount: document.getElementById("order-count"),
   tradeCount: document.getElementById("trade-count"),
@@ -52,6 +57,7 @@ const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
 const EQUITY_CURVE_REFRESH_MS = 30_000;
 const METRIC_ANIMATION_MS = 360;
+const RECENT_SKELETON_ROWS = 8;
 const SNAPSHOT_LEADER_KEY = "polybot2other:snapshot-leader";
 const SNAPSHOT_LEADER_TTL_MS = 2_500;
 const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -81,7 +87,11 @@ let lastSnapshotPostMs = 0;
 let snapshotInFlight = false;
 let latestStatus = null;
 let recentRows = [];
-let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false };
+let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
+let recentSummary = null;
+let recentFilters = { start_at: null, end_at: null };
+let recentLoading = true;
+let recentTransitionTimer = null;
 let orderRows = [];
 let orderStatusFilter = "all";
 let orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
@@ -440,21 +450,122 @@ function renderRecentOrders(rows, options = {}) {
 }
 
 function renderRecentTrades(rows) {
+  if (recentLoading) {
+    renderRecentSkeleton();
+    return;
+  }
   const total = Number(recentMeta.total || rows.length || 0);
   const loaded = rows.length;
+  const filtered = recentFilterActive();
   ids.tradeCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
-  ids.recentPageInfo.textContent = total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`;
+  ids.recentPageInfo.textContent = total > loaded
+    ? `${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
+    : `${filtered ? "范围" : "最近"} ${loaded} 条`;
   ids.loadMoreRecent.hidden = !recentMeta.has_more;
   ids.loadMoreRecent.disabled = false;
+  renderRecentSummary(recentSummary);
   const renderKey = recentRenderKey(rows);
   if (renderKey === lastRecentRenderKey) return;
   lastRecentRenderKey = renderKey;
   renderTradeTable("recent", rows, recentTradeFields, ids.recentTradesHead, ids.recentTrades);
+  applyRecentContentTransition();
+}
+
+function renderRecentSkeleton() {
+  ids.tradeCount.textContent = "加载中";
+  ids.recentPageInfo.textContent = "正在加载交易记录";
+  ids.loadMoreRecent.hidden = true;
+  renderRecentSummarySkeleton();
+  ids.recentTradesHead.innerHTML = `
+    <tr>
+      ${Array.from({ length: 8 }, (_, index) => `<th><span class="skeleton skeleton-head skeleton-w-${(index % 4) + 1}"></span></th>`).join("")}
+    </tr>
+  `;
+  ids.recentTrades.innerHTML = Array.from({ length: RECENT_SKELETON_ROWS }, (_, rowIndex) => `
+    <tr class="recent-skeleton-row">
+      ${Array.from({ length: 8 }, (_, colIndex) => `
+        <td><span class="skeleton skeleton-cell skeleton-w-${((rowIndex + colIndex) % 4) + 1}"></span></td>
+      `).join("")}
+    </tr>
+  `).join("");
+  lastRecentRenderKey = "recent-loading";
+}
+
+function renderRecentSummarySkeleton() {
+  if (!ids.recentSummary) return;
+  ids.recentSummary.innerHTML = Array.from({ length: 8 }, (_, index) => `
+    <div class="recent-summary-item skeleton-summary-item">
+      <span class="skeleton skeleton-label skeleton-w-${(index % 3) + 1}"></span>
+      <strong><span class="skeleton skeleton-value skeleton-w-${(index % 4) + 1}"></span></strong>
+    </div>
+  `).join("");
+}
+
+function setRecentLoading(loading) {
+  recentLoading = Boolean(loading);
+  if (recentLoading) {
+    if (recentTransitionTimer) {
+      window.clearTimeout(recentTransitionTimer);
+      recentTransitionTimer = null;
+    }
+    ids.recentSummary?.classList.remove("recent-content-enter");
+    ids.recentTradesHead?.classList.remove("recent-content-enter");
+    ids.recentTrades?.classList.remove("recent-content-enter");
+    renderRecentSkeleton();
+  }
+}
+
+function applyRecentContentTransition() {
+  ids.recentSummary?.classList.remove("recent-content-enter");
+  ids.recentTradesHead?.classList.remove("recent-content-enter");
+  ids.recentTrades?.classList.remove("recent-content-enter");
+  void ids.recentTrades.offsetWidth;
+  ids.recentSummary?.classList.add("recent-content-enter");
+  ids.recentTradesHead?.classList.add("recent-content-enter");
+  ids.recentTrades?.classList.add("recent-content-enter");
+  if (recentTransitionTimer) window.clearTimeout(recentTransitionTimer);
+  recentTransitionTimer = window.setTimeout(() => {
+    ids.recentSummary?.classList.remove("recent-content-enter");
+    ids.recentTradesHead?.classList.remove("recent-content-enter");
+    ids.recentTrades?.classList.remove("recent-content-enter");
+    recentTransitionTimer = null;
+  }, 260);
+}
+
+function renderRecentSummary(summary) {
+  if (!ids.recentSummary) return;
+  const data = summary || {};
+  const sourceText = `官 ${Number(data.official_count || 0)} / 兜 ${Number(data.chainlink_count || 0)} / 平 ${Number(data.early_exit_count || 0)}`;
+  const items = [
+    ["交易", `${Number(data.total_count || 0)} 笔`],
+    ["已结算", `${Number(data.settled_count || 0)} 笔`],
+    ["总盈亏", fmtSignedMoneyCell(data.total_pnl)],
+    ["ROI", fmtSignedPctCell(data.roi_pct)],
+    ["胜率", `${fmtPctCell(data.win_rate)} (${Number(data.win_count || 0)}/${Number(data.loss_count || 0)})`],
+    ["本金", fmtMoneyCell(data.settled_stake)],
+    ["回款", fmtMoneyCell(data.total_payout)],
+    ["来源", sourceText],
+  ];
+  ids.recentSummary.innerHTML = items.map(([label, value]) => `
+    <div class="recent-summary-item">
+      <span>${safe(label)}</span>
+      <strong>${value}</strong>
+    </div>
+  `).join("");
 }
 
 function recentRenderKey(rows) {
   const idsKey = rows.map((row) => `${row.id}:${row.status}:${row.settled_at || ""}:${row.pnl ?? ""}:${row.reason || ""}`).join(",");
-  return `${idsKey}|${selectedFields.recent.join(",")}|${recentMeta.loaded}|${recentMeta.total}|${recentMeta.has_more}`;
+  return [
+    idsKey,
+    selectedFields.recent.join(","),
+    recentMeta.loaded,
+    recentMeta.total,
+    recentMeta.has_more,
+    recentMeta.start_at || "",
+    recentMeta.end_at || "",
+    recentSummary?.total_pnl ?? "",
+  ].join("|");
 }
 
 function orderRenderKey(rows) {
@@ -958,7 +1069,13 @@ async function loadStatus(manual = false) {
   if (data.runtime.latest_price && !priceState.chainlink && !priceState.binance) {
     priceState = { ...priceState, ...data.runtime.latest_price };
   }
-  applyRecentPage(data.recent_trades, data.recent_trades_meta);
+  if (recentFilterActive()) {
+    data.recent_trades = recentRows;
+    data.recent_trades_meta = recentMeta;
+    data.recent_trades_summary = recentSummary;
+  } else {
+    applyRecentPage(data.recent_trades, data.recent_trades_meta, data.recent_trades_summary);
+  }
   if (orderStatusFilter === "all") {
     applyOrderPage(data.recent_orders, data.recent_orders_meta);
   } else {
@@ -992,9 +1109,11 @@ async function loadEquityCurve(force = false) {
   }
 }
 
-function applyRecentPage(rows = [], meta = {}) {
+function applyRecentPage(rows = [], meta = {}, summary = {}, options = {}) {
   const incoming = Array.isArray(rows) ? rows : [];
-  if (recentRows.length > incoming.length) {
+  if (options.replace) {
+    recentRows = incoming;
+  } else if (recentRows.length > incoming.length) {
     const seen = new Set(incoming.map((row) => row.id));
     recentRows = incoming.concat(recentRows.filter((row) => !seen.has(row.id)));
   } else {
@@ -1007,10 +1126,15 @@ function applyRecentPage(rows = [], meta = {}) {
     loaded: recentRows.length,
     total,
     has_more: Boolean(meta.has_more || recentRows.length < total),
+    start_at: meta.start_at ?? recentFilters.start_at,
+    end_at: meta.end_at ?? recentFilters.end_at,
   };
+  recentSummary = summary || recentSummary || {};
+  recentLoading = false;
   if (latestStatus) {
     latestStatus.recent_trades = recentRows;
     latestStatus.recent_trades_meta = recentMeta;
+    latestStatus.recent_trades_summary = recentSummary;
   }
 }
 
@@ -1172,32 +1296,96 @@ function bindCancelOrdersButton(button, scope) {
   });
 }
 
-async function loadMoreRecentTrades() {
-  ids.loadMoreRecent.disabled = true;
-  try {
-    const params = new URLSearchParams({
-      limit: String(RECENT_PAGE_SIZE),
-      offset: String(recentRows.length),
-    });
-    const res = await fetch(`/api/recent-trades?${params.toString()}`);
-    if (!res.ok) throw new Error(`recent trades HTTP ${res.status}`);
-    const page = await res.json();
-    const nextRows = Array.isArray(page.recent_trades) ? page.recent_trades : [];
+function recentFilterActive() {
+  return recentFilters.start_at !== null || recentFilters.end_at !== null;
+}
+
+function datetimeLocalToSeconds(value) {
+  if (!value) return null;
+  const millis = new Date(value).getTime();
+  if (!Number.isFinite(millis)) throw new Error("时间格式不正确");
+  return Math.floor(millis / 1000);
+}
+
+function recentTradeQueryParams(offset) {
+  const params = new URLSearchParams({
+    limit: String(RECENT_PAGE_SIZE),
+    offset: String(offset),
+  });
+  if (recentFilters.start_at !== null) params.set("start_at", String(recentFilters.start_at));
+  if (recentFilters.end_at !== null) params.set("end_at", String(recentFilters.end_at));
+  return params;
+}
+
+async function loadRecentTradesPage(replace = false) {
+  const offset = replace ? 0 : recentRows.length;
+  const params = recentTradeQueryParams(offset);
+  const res = await fetch(`/api/recent-trades?${params.toString()}`);
+  if (!res.ok) throw new Error(`recent trades HTTP ${res.status}`);
+  const page = await res.json();
+  const nextRows = Array.isArray(page.recent_trades) ? page.recent_trades : [];
+  const meta = page.recent_trades_meta || {};
+  if (replace) {
+    applyRecentPage(nextRows, meta, page.recent_trades_summary, { replace: true });
+  } else {
     const seen = new Set(recentRows.map((row) => row.id));
     recentRows = recentRows.concat(nextRows.filter((row) => !seen.has(row.id)));
-    const meta = page.recent_trades_meta || {};
     recentMeta = {
       limit: Number(meta.limit || RECENT_PAGE_SIZE),
       offset: 0,
       loaded: recentRows.length,
       total: Number(meta.total || recentRows.length),
       has_more: recentRows.length < Number(meta.total || recentRows.length),
+      start_at: meta.start_at ?? recentFilters.start_at,
+      end_at: meta.end_at ?? recentFilters.end_at,
     };
+    recentSummary = page.recent_trades_summary || recentSummary || {};
     if (latestStatus) {
       latestStatus.recent_trades = recentRows;
       latestStatus.recent_trades_meta = recentMeta;
+      latestStatus.recent_trades_summary = recentSummary;
     }
-    renderRecentTrades(recentRows);
+  }
+  lastRecentRenderKey = "";
+  renderRecentTrades(recentRows);
+}
+
+async function applyRecentTradeFilter() {
+  const startAt = datetimeLocalToSeconds(ids.recentStartTime.value);
+  const endAt = datetimeLocalToSeconds(ids.recentEndTime.value);
+  if (startAt !== null && endAt !== null && endAt < startAt) {
+    throw new Error("结束时间不能早于开始时间");
+  }
+  recentFilters = { start_at: startAt, end_at: endAt };
+  recentRows = [];
+  recentSummary = null;
+  recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: startAt, end_at: endAt };
+  setRecentLoading(true);
+  ids.applyRecentFilter.disabled = true;
+  ids.resetRecentFilter.disabled = true;
+  try {
+    await loadRecentTradesPage(true);
+  } finally {
+    ids.applyRecentFilter.disabled = false;
+    ids.resetRecentFilter.disabled = false;
+  }
+}
+
+async function resetRecentTradeFilter() {
+  ids.recentStartTime.value = "";
+  ids.recentEndTime.value = "";
+  recentFilters = { start_at: null, end_at: null };
+  recentRows = [];
+  recentSummary = null;
+  recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
+  setRecentLoading(true);
+  await loadRecentTradesPage(true);
+}
+
+async function loadMoreRecentTrades() {
+  ids.loadMoreRecent.disabled = true;
+  try {
+    await loadRecentTradesPage(false);
   } finally {
     ids.loadMoreRecent.disabled = false;
   }
@@ -1632,6 +1820,8 @@ ids.orderStatusFilter.addEventListener("change", handleOrderStatusFilterChange);
 bindCancelOrdersButton(ids.cancelCurrentOrders, "current_market");
 bindCancelOrdersButton(ids.cancelAllOrders, "all");
 ids.loadMoreRecent.addEventListener("click", () => loadMoreRecentTrades().catch(showError));
+ids.applyRecentFilter.addEventListener("click", () => applyRecentTradeFilter().catch(showError));
+ids.resetRecentFilter.addEventListener("click", () => resetRecentTradeFilter().catch(showError));
 ids.pairStrategyToggle.addEventListener("change", () => {
   setPairStrategyEnabled(ids.pairStrategyToggle.checked).catch((error) => {
     ids.pairStrategyToggle.checked = !ids.pairStrategyToggle.checked;
@@ -1645,6 +1835,7 @@ document.addEventListener("focusout", () => window.setTimeout(flushPendingOrderR
 document.addEventListener("mouseup", () => window.setTimeout(flushPendingOrderRender, 120));
 
 initFieldOptions();
+setRecentLoading(true);
 loadStatus(true).then(() => {
   connectPriceSocket();
 }).catch(showError);

@@ -838,6 +838,7 @@ class TradeStore:
                 self._settle_round(
                     row["round_id"],
                     final_price,
+                    None,
                     outcome,
                     now,
                     SETTLEMENT_SOURCE_CHAINLINK,
@@ -854,10 +855,18 @@ class TradeStore:
         outcome: str,
         now: float | None = None,
         final_price: float | None = None,
+        target_price: float | None = None,
         settlement_source: str = SETTLEMENT_SOURCE_POLYMARKET,
     ) -> list[dict[str, Any]]:
         now = time.time() if now is None else now
-        settled = self._settle_round(round_id, final_price, _normalize_side(outcome), now, settlement_source)
+        settled = self._settle_round(
+            round_id,
+            final_price,
+            target_price,
+            _normalize_side(outcome),
+            now,
+            settlement_source,
+        )
         if settled:
             self.record_equity()
         return settled
@@ -867,12 +876,14 @@ class TradeStore:
         self,
         round_id: str,
         final_price: float | None,
+        target_price: float | None,
         outcome: str,
         now: float,
         settlement_source: str,
     ) -> list[dict[str, Any]]:
         normalized_outcome = _normalize_side(outcome)
         normalized_source = str(settlement_source or "").strip() or SETTLEMENT_SOURCE_CHAINLINK
+        normalized_target_price = _positive_price_or_none(target_price)
         trades = self.conn.execute(
             "SELECT * FROM trades WHERE round_id = ? AND status = 'OPEN'",
             (round_id,),
@@ -882,10 +893,14 @@ class TradeStore:
             self.conn.execute(
                 """
                 UPDATE market_rounds
-                SET final_price = ?, outcome = ?, settled_at = ?, settlement_source = ?
+                SET final_price = ?,
+                    target_price = COALESCE(?, target_price),
+                    outcome = ?,
+                    settled_at = ?,
+                    settlement_source = ?
                 WHERE round_id = ?
                 """,
-                (final_price, normalized_outcome, now, normalized_source, round_id),
+                (final_price, normalized_target_price, normalized_outcome, now, normalized_source, round_id),
             )
             for trade in trades:
                 win = _normalize_side(trade["side"]) == normalized_outcome
@@ -956,17 +971,45 @@ class TradeStore:
         return [dict(row) for row in rows]
 
     @_locked
+    def official_final_price_candidates(
+        self,
+        now: float,
+        lookback_seconds: float,
+        limit: int = 5,
+        symbol: str = "BTC",
+    ) -> list[dict[str, Any]]:
+        cutoff = now - max(0.0, float(lookback_seconds))
+        safe_limit = max(1, min(50, int(limit)))
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_rounds
+            WHERE symbol = ?
+              AND settled_at IS NOT NULL
+              AND ends_at >= ?
+              AND settlement_source = ?
+              AND (final_price IS NULL OR target_price <= 0)
+            ORDER BY ends_at DESC, round_id DESC
+            LIMIT ?
+            """,
+            (symbol, cutoff, SETTLEMENT_SOURCE_POLYMARKET, safe_limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
     def reconcile_round_official_outcome(
         self,
         round_id: str,
         official_outcome: str,
         now: float | None = None,
         final_price: float | None = None,
+        target_price: float | None = None,
     ) -> dict[str, Any]:
         now = time.time() if now is None else now
         normalized_outcome = _normalize_side(official_outcome)
         if normalized_outcome not in {"Up", "Down"}:
             raise ValueError("official_outcome must be Up or Down")
+        normalized_target_price = _positive_price_or_none(target_price)
 
         round_row = self.get_round(round_id)
         if round_row is None:
@@ -1013,12 +1056,13 @@ class TradeStore:
                 """
                 UPDATE market_rounds
                 SET final_price = ?,
+                    target_price = COALESCE(?, target_price),
                     outcome = ?,
                     settled_at = COALESCE(settled_at, ?),
                     settlement_source = ?
                 WHERE round_id = ?
                 """,
-                (final_price, normalized_outcome, now, SETTLEMENT_SOURCE_POLYMARKET, round_id),
+                (final_price, normalized_target_price, normalized_outcome, now, SETTLEMENT_SOURCE_POLYMARKET, round_id),
             )
             for trade in trades:
                 win = _normalize_side(trade["side"]) == normalized_outcome
@@ -1100,9 +1144,16 @@ class TradeStore:
         return [dict(row) for row in rows]
 
     @_locked
-    def recent_trades(self, limit: int = 30, offset: int = 0, symbol: str | None = None) -> list[dict[str, Any]]:
-        where = "WHERE t.symbol = ?" if symbol else ""
-        params: tuple[Any, ...] = (symbol, limit, offset) if symbol else (limit, offset)
+    def recent_trades(
+        self,
+        limit: int = 30,
+        offset: int = 0,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> list[dict[str, Any]]:
+        where, params = self._recent_trade_where(symbol, start_at, end_at)
+        query_params: tuple[Any, ...] = (*params, limit, offset)
         rows = self.conn.execute(
             f"""
             SELECT
@@ -1141,20 +1192,132 @@ class TradeStore:
             LIMIT ?
             OFFSET ?
             """,
-            params,
+            query_params,
         ).fetchall()
         return [dict(row) for row in rows]
 
     @_locked
-    def recent_trade_count(self, symbol: str | None = None) -> int:
-        if symbol:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS count FROM trades WHERE symbol = ?",
-                (symbol,),
-            ).fetchone()
-        else:
-            row = self.conn.execute("SELECT COUNT(*) AS count FROM trades").fetchone()
+    def recent_trade_count(
+        self,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> int:
+        where, params = self._recent_trade_where(symbol, start_at, end_at)
+        row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM trades t
+            {where}
+            """,
+            params,
+        ).fetchone()
         return int(row["count"])
+
+    @_locked
+    def recent_trade_summary(
+        self,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        where, params = self._recent_trade_where(symbol, start_at, end_at)
+        row = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN 1 ELSE 0 END), 0) AS settled_count,
+                COALESCE(SUM(CASE WHEN t.status = 'OPEN' THEN 1 ELSE 0 END), 0) AS open_count,
+                COALESCE(SUM(t.stake), 0) AS total_stake,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN t.stake ELSE 0 END), 0) AS settled_stake,
+                COALESCE(SUM(CASE WHEN t.status = 'OPEN' THEN t.stake ELSE 0 END), 0) AS open_risk,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN COALESCE(t.payout, 0) ELSE 0 END), 0) AS total_payout,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN COALESCE(t.pnl, 0) ELSE 0 END), 0) AS total_pnl,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' AND t.pnl > 0 THEN 1 ELSE 0 END), 0) AS win_count,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' AND t.pnl < 0 THEN 1 ELSE 0 END), 0) AS loss_count,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' AND t.pnl = 0 THEN 1 ELSE 0 END), 0) AS breakeven_count,
+                MAX(CASE WHEN t.status = 'SETTLED' THEN t.pnl ELSE NULL END) AS max_win,
+                MIN(CASE WHEN t.status = 'SETTLED' THEN t.pnl ELSE NULL END) AS max_loss,
+                AVG(CASE WHEN t.status = 'SETTLED' THEN t.pnl ELSE NULL END) AS avg_pnl,
+                COALESCE(SUM(CASE
+                    WHEN t.status = 'SETTLED'
+                     AND COALESCE(t.settlement_source, r.settlement_source) = ?
+                    THEN 1 ELSE 0 END), 0) AS official_count,
+                COALESCE(SUM(CASE
+                    WHEN t.status = 'SETTLED'
+                     AND COALESCE(t.settlement_source, r.settlement_source) = ?
+                    THEN 1 ELSE 0 END), 0) AS chainlink_count,
+                COALESCE(SUM(CASE
+                    WHEN t.status = 'SETTLED'
+                     AND COALESCE(t.settlement_source, r.settlement_source) = ?
+                    THEN 1 ELSE 0 END), 0) AS early_exit_count,
+                COALESCE(SUM(CASE
+                    WHEN t.status = 'SETTLED'
+                     AND COALESCE(t.settlement_source, r.settlement_source) IS NULL
+                    THEN 1 ELSE 0 END), 0) AS unknown_source_count
+            FROM trades t
+            JOIN market_rounds r ON r.round_id = t.round_id
+            {where}
+            """,
+            (
+                SETTLEMENT_SOURCE_POLYMARKET,
+                SETTLEMENT_SOURCE_CHAINLINK,
+                SETTLEMENT_SOURCE_EARLY_EXIT,
+                *params,
+            ),
+        ).fetchone()
+        summary = dict(row)
+        settled_count = int(summary["settled_count"] or 0)
+        settled_stake = float(summary["settled_stake"] or 0.0)
+        win_count = int(summary["win_count"] or 0)
+        total_pnl = float(summary["total_pnl"] or 0.0)
+        summary.update(
+            {
+                "start_at": start_at,
+                "end_at": end_at,
+                "total_count": int(summary["total_count"] or 0),
+                "settled_count": settled_count,
+                "open_count": int(summary["open_count"] or 0),
+                "win_count": win_count,
+                "loss_count": int(summary["loss_count"] or 0),
+                "breakeven_count": int(summary["breakeven_count"] or 0),
+                "official_count": int(summary["official_count"] or 0),
+                "chainlink_count": int(summary["chainlink_count"] or 0),
+                "early_exit_count": int(summary["early_exit_count"] or 0),
+                "unknown_source_count": int(summary["unknown_source_count"] or 0),
+                "total_stake": round(float(summary["total_stake"] or 0.0), 6),
+                "settled_stake": round(settled_stake, 6),
+                "open_risk": round(float(summary["open_risk"] or 0.0), 6),
+                "total_payout": round(float(summary["total_payout"] or 0.0), 6),
+                "total_pnl": round(total_pnl, 6),
+                "avg_pnl": round(float(summary["avg_pnl"]), 6) if summary["avg_pnl"] is not None else None,
+                "max_win": round(float(summary["max_win"]), 6) if summary["max_win"] is not None else None,
+                "max_loss": round(float(summary["max_loss"]), 6) if summary["max_loss"] is not None else None,
+                "roi_pct": round(total_pnl / settled_stake * 100.0, 4) if settled_stake else None,
+                "win_rate": round(win_count / settled_count * 100.0, 4) if settled_count else None,
+            }
+        )
+        return summary
+
+    def _recent_trade_where(
+        self,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            clauses.append("t.symbol = ?")
+            params.append(symbol)
+        if start_at is not None:
+            clauses.append("COALESCE(t.settled_at, t.opened_at) >= ?")
+            params.append(float(start_at))
+        if end_at is not None:
+            clauses.append("COALESCE(t.settled_at, t.opened_at) <= ?")
+            params.append(float(end_at))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, tuple(params)
 
     @_locked
     def recent_paper_orders(
@@ -1700,6 +1863,13 @@ def _nullable_price(value: float | None) -> float | None:
     if value is None:
         return None
     return max(0.0, min(1.0, round(float(value), 4)))
+
+
+def _positive_price_or_none(value: float | None) -> float | None:
+    parsed = _maybe_float(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return float(parsed)
 
 
 def _maybe_float(value: Any) -> float | None:

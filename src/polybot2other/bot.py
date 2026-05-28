@@ -37,6 +37,9 @@ LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
 OFFICIAL_RECHECK_INTERVAL_SECONDS = 10.0
 OFFICIAL_RECHECK_WINDOW_SECONDS = 24 * 60 * 60
 OFFICIAL_RECHECK_LIMIT = 5
+OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS = 60.0
+OFFICIAL_PRICE_BACKFILL_WINDOW_SECONDS = 24 * 60 * 60
+OFFICIAL_PRICE_BACKFILL_LIMIT = 3
 RECENT_TRADES_DEFAULT_LIMIT = 100
 RECENT_TRADES_MAX_LIMIT = 500
 ORDERS_DEFAULT_LIMIT = 20
@@ -73,6 +76,7 @@ class PaperTradingBot:
         self.latest_quotes: dict[str, dict[str, Any]] = {}
         self._last_live_snapshot_ingest_at = 0.0
         self._official_recheck_next_at: dict[str, float] = {}
+        self._official_price_backfill_next_at: dict[str, float] = {}
         self.pair_strategy_enabled = False
         self.pair_stop_loss_streak = 0
         self.last_pair_event: dict[str, Any] | None = None
@@ -122,6 +126,7 @@ class PaperTradingBot:
                 self._rest_fallback_snapshot(market)
             self._settle_due(now)
             self._reconcile_official_settlements(now)
+            self._backfill_official_final_prices(now)
             self._run_strategy_from_state()
             self.store.record_equity()
             with self._lock:
@@ -194,6 +199,7 @@ class PaperTradingBot:
             self._last_live_snapshot_ingest_at = now
         self._settle_due(now)
         self._reconcile_official_settlements(now)
+        self._backfill_official_final_prices(now)
         self._run_strategy_from_state()
         return self.snapshot()
 
@@ -280,12 +286,19 @@ class PaperTradingBot:
         for slug in due_slugs:
             resolution = self.polymarket.get_resolution(slug)
             if resolution and resolution.get("outcome") in {"Up", "Down"}:
+                final_price = _maybe_float(resolution.get("final_price"))
+                target_price = _maybe_float(resolution.get("target_price"))
                 self.store.settle_round_outcome(
                     slug,
                     str(resolution["outcome"]),
                     now,
+                    final_price=final_price,
+                    target_price=target_price,
                     settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
                 )
+                if final_price is None:
+                    with self._lock:
+                        self._official_price_backfill_next_at[slug] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
                 continue
         with self._lock:
             price = dict(self.latest_price)
@@ -324,15 +337,69 @@ class PaperTradingBot:
                 resolution = self.polymarket.get_resolution(round_id)
                 outcome = resolution.get("outcome") if isinstance(resolution, dict) else None
                 if outcome in {"Up", "Down"}:
-                    self.store.reconcile_round_official_outcome(round_id, str(outcome), now, final_price=None)
+                    final_price = _maybe_float(resolution.get("final_price"))
+                    target_price = _maybe_float(resolution.get("target_price"))
+                    self.store.reconcile_round_official_outcome(
+                        round_id,
+                        str(outcome),
+                        now,
+                        final_price=final_price,
+                        target_price=target_price,
+                    )
                     with self._lock:
                         self._official_recheck_next_at.pop(round_id, None)
+                        if final_price is None:
+                            self._official_price_backfill_next_at[round_id] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
                 else:
                     with self._lock:
                         self._official_recheck_next_at[round_id] = now + OFFICIAL_RECHECK_INTERVAL_SECONDS
             except Exception:  # noqa: BLE001 - retry later; dashboard exposes fatal errors elsewhere.
                 with self._lock:
                     self._official_recheck_next_at[round_id] = now + OFFICIAL_RECHECK_INTERVAL_SECONDS
+
+    def _backfill_official_final_prices(self, now: float) -> None:
+        try:
+            candidates = self.store.official_final_price_candidates(
+                now,
+                OFFICIAL_PRICE_BACKFILL_WINDOW_SECONDS,
+                OFFICIAL_PRICE_BACKFILL_LIMIT,
+                "BTC",
+            )
+        except Exception:  # noqa: BLE001 - missing price backfill must not stop trading ticks.
+            return
+        for row in candidates:
+            round_id = str(row.get("round_id") or "")
+            if not round_id:
+                continue
+            with self._lock:
+                next_at = self._official_price_backfill_next_at.get(round_id, 0.0)
+            if next_at > now:
+                continue
+            try:
+                resolution = self.polymarket.get_resolution(round_id)
+                if not isinstance(resolution, dict):
+                    with self._lock:
+                        self._official_price_backfill_next_at[round_id] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
+                    continue
+                outcome = resolution.get("outcome") or row.get("outcome")
+                final_price = _maybe_float(resolution.get("final_price"))
+                target_price = _maybe_float(resolution.get("target_price"))
+                if outcome in {"Up", "Down"} and (final_price is not None or target_price is not None):
+                    self.store.reconcile_round_official_outcome(
+                        round_id,
+                        str(outcome),
+                        now,
+                        final_price=final_price,
+                        target_price=target_price,
+                    )
+                with self._lock:
+                    if final_price is not None:
+                        self._official_price_backfill_next_at.pop(round_id, None)
+                    else:
+                        self._official_price_backfill_next_at[round_id] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
+            except Exception:  # noqa: BLE001 - retry later; dashboard exposes fatal errors elsewhere.
+                with self._lock:
+                    self._official_price_backfill_next_at[round_id] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
 
     def _run_strategy_from_state(self) -> None:
         with self._lock:
@@ -908,6 +975,7 @@ class PaperTradingBot:
             "open_trades": open_trades,
             "recent_trades": recent_page["recent_trades"],
             "recent_trades_meta": recent_page["recent_trades_meta"],
+            "recent_trades_summary": recent_page["recent_trades_summary"],
             "recent_orders": recent_orders_page["recent_orders"],
             "recent_orders_meta": recent_orders_page["recent_orders_meta"],
             "equity_curve": self.store.equity_curve(120),
@@ -916,20 +984,32 @@ class PaperTradingBot:
             payload.update(extra)
         return payload
 
-    def recent_trades_page(self, limit: int = RECENT_TRADES_DEFAULT_LIMIT, offset: int = 0) -> dict[str, Any]:
+    def recent_trades_page(
+        self,
+        limit: int = RECENT_TRADES_DEFAULT_LIMIT,
+        offset: int = 0,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
         limit = max(1, min(RECENT_TRADES_MAX_LIMIT, int(limit)))
         offset = max(0, int(offset))
-        total = self.store.recent_trade_count("BTC")
-        rows = self._decorate_recent_trades(self.store.recent_trades(limit, offset, "BTC"))
+        if start_at is not None and end_at is not None and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        total = self.store.recent_trade_count("BTC", start_at, end_at)
+        rows = self._decorate_recent_trades(self.store.recent_trades(limit, offset, "BTC", start_at, end_at))
+        summary = self.store.recent_trade_summary("BTC", start_at, end_at)
         loaded = min(total, offset + len(rows))
         return {
             "recent_trades": rows,
+            "recent_trades_summary": summary,
             "recent_trades_meta": {
                 "limit": limit,
                 "offset": offset,
                 "loaded": loaded,
                 "total": total,
                 "has_more": loaded < total,
+                "start_at": start_at,
+                "end_at": end_at,
             },
         }
 
