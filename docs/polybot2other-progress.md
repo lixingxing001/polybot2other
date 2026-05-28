@@ -1,5 +1,558 @@
 # polybot2other-progress
 
+## 2026-05-28 v2.61
+
+### 已完成
+
+1. 从首页右上角移除“配对策略”开关和状态文案，避免误解为控制 8 组合策略实验。
+2. 移除前端 `pairStrategyToggle` / `pairStrategyStatus` DOM 引用、渲染逻辑和事件绑定，避免删掉控件后出现空节点访问。
+3. 保留后端 `/api/strategy-settings` 和主账户配对能力，后续如需主账户单独切换配对策略仍可恢复前端入口。
+4. 清理不再使用的 `.strategy-toggle` 和 `.status-text` 样式。
+5. 首页静态资源版本升级到 `v2-61`。
+
+### 已确认决策
+
+1. 右上角开关只影响主账户，不影响 8 个 shadow 策略实验账户。
+2. 当前阶段页面核心是 8 组合并行复盘，保留该开关会误导策略实验的控制范围。
+3. 本轮只移除前端入口，不删除后端能力，降低回滚成本。
+
+### 待办和后期优化
+
+1. 后续如仍需要主账户配对切换，可放到“主账户设置”区域，并明确标注“不影响 8 组合实验”。
+2. 后续可以在策略实验面板增加更明显的说明：8 组合始终按配置并行运行，不受主账户开关影响。
+
+### 已知坑位
+
+1. `/api/strategy-settings` 仍存在，但首页已不提供入口。
+2. 主账户 `pair_strategy_enabled` 的运行状态仍会在接口里返回，用于保留兼容。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，47 个测试通过。
+5. 已重启默认库服务 `http://127.0.0.1:8788`，新进程 PID 为 `2862360`。
+6. 已请求首页，确认静态资源版本为 `v2-61`，不再包含 `pair-strategy-toggle`、`pair-strategy-status` 和“配对策略”文案。
+7. 已请求 `/static/app.js?v=20260528-v2-61`，确认不再包含 `pairStrategyToggle`、`renderPairStrategy` 和 `strategy-settings` 前端调用。
+8. 已请求 `/static/styles.css?v=20260528-v2-61`，确认不再包含 `.strategy-toggle` 和 `.status-text` 样式。
+
+### 回滚建议
+
+1. 如需恢复顶部开关，恢复 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 中 v2.61 的前端改动即可。
+2. 本轮没有修改数据库和后端接口，不需要迁移回滚。
+
+## 2026-05-28 v2.60
+
+### 已完成
+
+1. 新增 `/api/strategy-experiments-tables`，合并返回 8 个隔离实验账户的持仓、订单流水和交易记录。
+2. 实验明细接口给每行数据补充 `combo`、`variant_id`、`strategy_family`、`experiment_order_type` 和 `account_scope`，用于页面明确标识数据归属。
+3. 首页“持仓 / 订单流水 / 交易记录”新增 `主账户 / 策略实验` 数据范围切换。
+4. 策略实验视图下的三张表第一列展示组合，例如 `SINGLE + FAK`、`PAIR + POST_ONLY`。
+5. 策略实验订单视图禁用主账户撤单按钮和逐档成交展开，避免用 shadow 订单 ID 调主账户取消接口。
+6. “最近交易”摘要中的“本金”改为“累计投入”，并增加“范围”字段，降低和初始本金、8 组合数据的混淆。
+7. 首页静态资源版本升级到 `v2-60`。
+
+### 已确认决策
+
+1. 主账户和 8 组合实验账户不直接混成一个账户，只通过数据范围切换查看。
+2. 策略实验明细只读展示，不提供取消 shadow 订单动作。
+3. 主账户顶部资产和资金曲线仍保持主账户口径，避免把 8 个 shadow 账户当成真实总资产。
+
+### 待办和后期优化
+
+1. 后续可给策略实验视图增加组合筛选器，只看某一个组合的持仓、订单和交易。
+2. 后续可把策略实验表格分页从“增大 limit 重新拉取”改为真正 offset 分页。
+3. 后续可在顶部指标增加“主账户 / 策略实验汇总”口径说明。
+
+### 已知坑位
+
+1. 策略实验视图下的订单流水是只读 shadow 数据，不能取消订单。
+2. 策略实验汇总交易记录按 8 个隔离库合并排序，和主账户最近交易不是同一账户口径。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，47 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新进程 PID 为 `2832950`。
+7. 已请求 `/api/strategy-experiments-tables?trade_limit=20&order_limit=20&status=all`，确认返回 8 个组合、20 条实验订单、20 条实验交易、交易汇总 37 条，且行内包含组合名。
+8. 已请求首页，确认静态资源版本为 `v2-60`，存在 `open-data-scope`、`order-data-scope`、`recent-data-scope`，旧 `v2-58` 不再出现在 HTML 中。
+9. 已请求 `/static/app.js?v=20260528-v2-60`，确认包含 `strategy-experiments-tables`、`comboField` 和 `handleDataScopeChange`。
+
+### 回滚建议
+
+1. 如需回滚本轮数据范围切换，撤销 `src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.60 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.59
+
+### 已完成
+
+1. 新增本地复盘快照命令 `python3 -m polybot2other.report_snapshot`，可把当前 8 组合复盘结果导出为静态 HTML。
+2. 默认快照路径为 `docs/strategy-experiments-retrospective-<timestamp>.html`，也支持 `--output` 指定文件。
+3. 快照命令支持 `--start-at` 和 `--end-at`，用于保存指定时间窗口的复盘证据。
+4. 快照生成只读取现有 Paper 主库和 shadow 实验库，不启动交易循环，也不通过 Web 页面暴露写文件能力。
+5. README 新增复盘快照生成命令。
+
+### 已确认决策
+
+1. 静态留档走本地 CLI，不走无鉴权 Web 写文件接口，降低误触和安全风险。
+2. HTML 快照复用动态报告的展示口径，保证“实时查看”和“留档复盘”的字段一致。
+
+### 待办和后期优化
+
+1. 后续可以增加定时快照，例如每小时或每天收盘后自动保存一份。
+2. 后续可以在快照里加入 Git 版本、配置摘要和环境变量摘要，增强可追溯性。
+3. 后续可以增加 CSV 导出，便于表格软件继续分析。
+
+### 已知坑位
+
+1. 快照保存的是生成时刻的数据，后续实验库继续变化不会自动更新旧快照。
+2. 如果当前样本不足，快照仍不会输出正式盈利胜出，只会记录当前盈利领先和待补样本。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiment_report_snapshot_writes_docs_html tests.test_core.TradingCoreTest.test_strategy_experiment_html_report_escapes_and_summarizes_variants`，2 个定向测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，47 个测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src python3 -m polybot2other.report_snapshot --output docs/strategy-experiments-retrospective-latest.html`，生成静态快照。
+7. 已验证 `docs/strategy-experiments-retrospective-latest.html` 包含“策略实验复盘报告”、“8 组合盈利排名”、`profitable_winner_ready`、`SINGLE + FAK` 和 `PAIR + POST_ONLY`。
+
+### 回滚建议
+
+1. 如需回滚本轮静态快照能力，撤销 `src/polybot2other/report_snapshot.py`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.59 改动。
+2. 删除本轮生成的 `docs/strategy-experiments-retrospective-latest.html` 即可清理快照产物。
+
+## 2026-05-28 v2.58
+
+### 已完成
+
+1. 新增动态 HTML 复盘报告 `/strategy-experiments-retrospective.html`，直接读取当前 8 个隔离实验库的复盘数据。
+2. HTML 报告展示盈利状态、正式盈利胜出、当前盈利领先、样本可比数量、执行淘汰数量、8 组合盈利排名、待补样本和淘汰组合。
+3. HTML 报告支持 `start_at/end_at` 查询参数，和 JSON 复盘接口使用同一时间窗口口径。
+4. 首页策略实验面板新增“复盘报告”入口，点击后新窗口打开当前 HTML 复盘报告。
+5. HTML 报告对策略原因、组合名和文本字段做转义，避免报告中展示的原因文本造成 HTML 注入。
+6. 首页静态资源版本升级到 `v2-58`。
+
+### 已确认决策
+
+1. 报告采用动态生成，不写死到 docs，避免后续用过期静态报告做决策。
+2. HTML 报告是留档和人工复盘入口，正式决胜仍以 `profit_summary.profitable_winner_ready` 和 `winner_*` 字段为准。
+
+### 待办和后期优化
+
+1. 后续可以增加一键导出到 `docs/` 的快照功能，用于保存某个具体时间点的复盘证据。
+2. 后续可以增加报告时间窗口选择器和 CSV 下载。
+3. 后续可以把最大回撤、连续亏损、按小时段表现加入报告。
+
+### 已知坑位
+
+1. 当前 HTML 报告是动态视图；浏览器另存为才是静态留档。
+2. 如果样本不足，报告只展示当前盈利领先，不会输出正式盈利胜出。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiment_html_report_escapes_and_summarizes_variants tests.test_core.TradingCoreTest.test_strategy_experiment_profit_summary_separates_leader_from_final_winner tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，3 个定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，46 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新进程 PID 为 `2801245`。
+7. 已请求 `/strategy-experiments-retrospective.html`，确认包含“策略实验复盘报告”、“8 组合盈利排名”、`profitable_winner_ready` 和核心组合内容。
+8. 已请求首页，确认静态资源版本为 `v2-58`，存在 `strategy-experiments-retrospective.html` 入口，旧 `v2-57` 不再出现在 HTML 中。
+9. 已请求 `/static/styles.css?v=20260528-v2-58`，确认包含 `.report-link` 和 `.experiment-head-actions` 样式。
+
+### 回滚建议
+
+1. 如需回滚本轮 HTML 报告入口，撤销 `src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/styles.css`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.58 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.57
+
+### 已完成
+
+1. 策略实验新增 `profit_summary`，把“综合评分推荐”和“盈利最高决胜”拆开，避免短期高收益样本被误读为最终主策略。
+2. `/api/status` 和 `/api/strategy-experiments` 的实验数据中新增盈利复盘摘要：当前盈利领先、正式盈利胜出、盈利排名、样本状态和淘汰数量。
+3. 新增 `/api/strategy-experiments-retrospective?start_at=&end_at=`，支持按时间窗口复盘 8 个隔离实验库。
+4. 订单统计 `paper_order_summary` 支持 `start_at/end_at`，时间窗口复盘时订单质量和交易盈亏使用同一窗口口径。
+5. 如果样本已可比较但最高净盈亏不大于 0，`profit_summary` 会返回 `NO_PROFIT`，不把亏损最少的组合误标为盈利胜出。
+6. 首页策略实验摘要新增“盈利”字段，展示正式盈利胜出组合；样本不足时只展示当前盈利领先作为观察信号。
+7. 首页静态资源版本升级到 `v2-57`。
+
+### 已确认决策
+
+1. “盈利最高”必须分成当前观察领先和正式胜出两种状态；正式胜出必须等未淘汰组合都达到样本阈值。
+2. 复盘接口使用隔离 shadow 库数据，不污染主 Paper 账户。
+3. 时间窗口复盘先覆盖交易汇总和订单质量，账户总资产类指标仍作为当前状态参考。
+4. 正式盈利胜出的净盈亏必须大于 0；否则只能记录 `best_eligible_*`，不能输出 `winner_*`。
+
+### 待办和后期优化
+
+1. 后续可以把复盘接口生成 HTML/CSV 报告，保存每次决胜依据。
+2. 后续可以给首页增加时间窗口选择器，直接在页面对比不同时间段的 8 组合表现。
+3. 后续可以把正式胜出规则配置化，例如按净盈亏、ROI、最大回撤或综合评分切换。
+
+### 已知坑位
+
+1. `current_profit_leader_*` 只是当前盈利观察领先，不等于最终胜出。
+2. `winner_*` 只有在样本可比较且未被淘汰后才会出现。
+3. Paper 复盘仍不等于实盘收益，尤其 maker 排队成交概率需要后续实盘前专项验证。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiment_profit_summary_separates_leader_from_final_winner tests.test_core.TradingCoreTest.test_paper_order_summary_supports_time_window tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，3 个定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，45 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新进程 PID 为 `2794506`。
+7. 已请求 `/api/status`，确认返回 8 个实验组合、`profit_summary`、8 条盈利排名，当前盈利复盘状态为 `WAITING_FOR_SAMPLE`，`profitable_winner_ready=false`。
+8. 已请求 `/api/strategy-experiments-retrospective`，确认返回 8 个组合、`profit_summary.rankings`、`profitable_winner_ready` 和空时间窗口。
+9. 已请求首页，确认静态资源版本为 `v2-57`，旧 `v2-56` 不再出现在 HTML 中。
+10. 已请求 `/static/app.js?v=20260528-v2-57`，确认包含 `profit_summary`、“盈利”和 `current_profit_leader_variant_id`。
+
+### 回滚建议
+
+1. 如需回滚本轮盈利复盘摘要，撤销 `src/polybot2other/bot.py`、`src/polybot2other/storage.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.57 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.56
+
+### 已完成
+
+1. 策略实验评分新增“执行淘汰”口径：订单样本足够但长期没有成交的组合，不再永久阻塞 8 组组合进入决胜比较。
+2. `decision_summary` 新增并使用 `pending_count`、`disqualified_count` 和 `disqualified_variants`，正式推荐只从可比较且未淘汰的组合中产生。
+3. 首页策略实验摘要新增“淘汰”数量，便于区分“还在等待样本”和“执行质量已不适合继续决胜”的组合。
+4. 修复首页策略实验渲染 key 中 `decision` 未传入导致的前端运行时错误。
+5. 首页静态资源版本升级到 `v2-56`。
+
+### 已确认决策
+
+1. 90%+ 报告契合度只能作为目标，不应强行让所有组合都达到 90%；单边组合主要保留为对照组。
+2. 低成交淘汰是保守条件，只处理订单样本足够但几乎无法成交的执行组合，避免误淘汰仍在积累样本的策略。
+3. 正式推荐必须同时满足“样本可比较”和“未被执行淘汰”，不能按短期 PnL 直接切主策略。
+
+### 待办和后期优化
+
+1. 后续可把淘汰阈值配置化，例如订单阈值、最低成交率、最低结算数。
+2. 后续复盘报告应展示被淘汰组合的订单样本和成交率证据，避免只看结果标签。
+
+### 已知坑位
+
+1. `DISQUALIFIED` 代表当前 Paper 执行质量不可用于决胜，不代表该组合在所有市场环境下永久无效。
+2. 如果 Polymarket 流动性变化，POST_ONLY/GTC/GTD 的成交率需要继续滚动观察。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiment_low_fill_variant_is_disqualified tests.test_core.TradingCoreTest.test_strategy_experiment_decision_can_finish_with_disqualified_variants tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，3 个定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，43 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新进程 PID 为 `2785664`。
+7. 已请求 `/api/status`，确认返回 8 个实验组合、`decision_summary.pending_count`、`decision_summary.disqualified_count`，当前仍为样本等待态。
+8. 已请求首页，确认静态资源版本为 `v2-56`，旧 `v2-55` 不再出现在 HTML 中。
+9. 已请求 `/static/app.js?v=20260528-v2-56`，确认包含 `experimentRenderKey(experiments, variants, decision)`、“淘汰”和 `pending_count`。
+
+### 回滚建议
+
+1. 如需回滚本轮执行淘汰口径，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档中的 v2.56 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.55
+
+### 已完成
+
+1. 策略实验汇总新增 `decision_summary`，明确区分“当前观察领先”和“正式决胜推荐”。
+2. 只有全部组合达到样本阈值后，`decision_summary.comparison_ready` 才会为 `true`，并输出 `recommended_variant_id`。
+3. 样本不足时返回 `WAITING_FOR_SAMPLE`，同时保留 `current_leader_variant_id` 作为观察对象，避免短期高分被误认为最终推荐。
+4. 首页策略实验摘要从“领先”改为“推荐/状态/可比”，直接展示当前是否具备决胜条件。
+5. 首页静态资源版本升级到 `v2-55`。
+
+### 已确认决策
+
+1. 决胜条件必须看全部 8 个组合是否达到可比较样本，不能只看单个组合短期领先。
+2. 当前样本不足时只给观察信号，不给正式推荐。
+
+### 待办和后期优化
+
+1. 后续可把样本阈值配置化，并在页面提示每个组合距离阈值还差多少。
+2. 后续复盘报告应优先读取 `decision_summary`，避免报告和首页使用不同决策口径。
+
+### 已知坑位
+
+1. `current_leader_variant_id` 只是当前评分领先，不等同于可切换主策略。
+2. 如果某些组合长期没有成交，会阻止整体进入正式决胜状态；这符合保守复盘要求，但需要结合执行质量判断是否淘汰该组合。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py tests/test_core.py`，Python 语法检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，41 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，并请求 `/api/status`，确认返回 `decision_summary`、状态为 `WAITING_FOR_SAMPLE`、正式推荐为空。
+8. 已请求 `/static/index.html`，确认包含 `v2-55`。
+9. 已请求 `/static/app.js?v=20260528-v2-55`，确认包含“推荐”“可比”和 `decision_summary`。
+
+### 回滚建议
+
+1. 如需回滚本轮决胜摘要，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档中的 v2.55 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.54
+
+### 已完成
+
+1. 每个策略实验组合新增后端复盘评分 `review_score`，包含总分、决策建议、样本状态、官方结算占比、异常订单占比、分项得分和扣分原因。
+2. 复盘评分综合 ROI、净盈亏、胜率、成交率、官方结算占比、样本量、取消/过期/拒绝比例和运行异常，不再只按短期 PnL 排名。
+3. 首页策略实验表新增“评分”和“样本”列，排名优先按后端评分排序。
+4. 组合详情区新增评分、决策和扣分原因，方便解释为什么某个组合暂时不能作为主策略候选。
+5. 首页静态资源版本升级到 `v2-54`。
+
+### 已确认决策
+
+1. 评分不是盈利承诺，只是复盘排序辅助；样本不足时即使短期盈利也显示“继续观察”。
+2. 评分阈值先采用保守默认：至少 30 笔结算和 60 笔订单才进入“可比较”。
+
+### 待办和后期优化
+
+1. 后续可以把评分公式参数配置化，例如最低样本数、成交率权重、官方结算权重。
+2. 后续复盘报告应记录评分分项，避免只给一个总分导致无法解释。
+
+### 已知坑位
+
+1. 当前评分是 Paper 复盘辅助，不代表实盘收益；POST_ONLY/GTC/GTD 的真实 maker 排队概率仍需要实盘前单独评估。
+2. 样本不足阶段的排序只能用于观察，不适合直接切换主策略。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py tests/test_core.py`，Python 语法检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，41 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，并请求 `/api/status`，确认返回 8 个组合和 `review_score` 字段。
+8. 已请求首页，确认包含 `v2-54`、“评分”和“样本”列。
+
+### 回滚建议
+
+1. 如需回滚本轮复盘评分，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档中的 v2.54 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.53
+
+### 已完成
+
+1. 策略实验表新增“详情”列，每个组合可直接在首页展开。
+2. 点击组合详情会请求 `/api/strategy-experiments?variant_id=<组合>&trade_limit=6&order_limit=6`，展示该组合自己的最近交易和订单流水摘要。
+3. 详情区展示该组合净盈亏、ROI、官方/兜底结算数、成交率、订单数、最近交易和订单状态，方便从排名进入复盘证据。
+4. 详情每次展开都会重新请求接口，避免长期使用旧缓存误判当前组合表现。
+5. 首页静态资源版本升级到 `v2-53`。
+
+### 已确认决策
+
+1. 本轮只增加前端详情展开，不改变交易逻辑、结算逻辑和数据库结构。
+2. 详情先展示最近 6 条交易和最近 6 条订单，避免在首页一次性渲染过多历史数据。
+
+### 待办和后期优化
+
+1. 后续可以把详情区升级为可分页详情面板，支持查看更多该组合订单和交易。
+2. 后续复盘报告应直接读取单组合详情接口，生成每个组合的证据链。
+
+### 已知坑位
+
+1. 详情区展示的是最近样本摘要，不是完整历史；完整决策仍要结合后续复盘报告。
+2. 如果组合近期没有交易或订单，详情区会显示空状态，这是正常现象。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，41 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已请求首页，确认包含 `v2-53` 和“详情”列。
+6. 已请求 `/static/app.js?v=20260528-v2-53`，确认包含 `data-experiment-id` 和 `toggleExperimentDetail`。
+
+### 回滚建议
+
+1. 如需回滚本轮前端详情展开，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档中的 v2.53 改动。
+2. 本轮不涉及后端、数据库和实验库结构变更。
+
+## 2026-05-28 v2.52
+
+### 已完成
+
+1. 主 bot 官方结算结果会广播到 8 个 shadow 实验库，覆盖首次官方结算、fallback 后官方修正、官方 final_price / target_price 回填三条路径。
+2. shadow 实验库收到官方结果后，会先修正已按 Chainlink fallback 结算的交易，再结算仍未完成的 open trades，避免实验复盘长期停留在本地价格结果。
+3. 策略实验运行状态增加 `official_broadcast_count`、`last_official_broadcast_at` 和单组合 `official_broadcast_error`。
+4. 首页策略实验摘要增加“官方”计数，组合行出现官方广播异常时会在最后信号列标红展示。
+5. 首页静态资源版本升级到 `v2-52`。
+
+### 已确认决策
+
+1. 官方结果只由主 bot 请求上游一次，再广播给 8 个实验库；shadow bot 不再各自重复请求 Polymarket 官方接口。
+2. shadow 实验仍保留本地价格临时结算能力，但只作为官方结果出来前的临时状态。
+
+### 待办和后期优化
+
+1. 后续复盘报告需要按 `official_count`、`chainlink_count`、`unknown_source_count` 拆分每个组合的结算可信度。
+2. 如果某个实验库广播失败，需要在前端加更明显的告警入口和一键重放官方广播。
+
+### 已知坑位
+
+1. 官方广播只会作用于 shadow 库里已经存在的 round；如果某个组合从未见过该市场，不会反向补整段历史。
+2. 早退 `early_exit` 交易不会被官方结果重新改写，这是有意保留的风控行为。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_bot_broadcasts_official_resolution_to_strategy_experiments tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，2 个定向测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py src/polybot2other/web.py src/polybot2other/storage.py tests/test_core.py`，Python 语法检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，41 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，并请求 `/api/status`，确认 `running=True`、实验启用、返回 8 个组合、存在 `official_broadcast_count` 和单组合 `official_broadcast_error` 字段。
+8. 已请求首页，确认包含 `v2-52` 和“策略实验”面板。
+
+### 回滚建议
+
+1. 如需回滚本轮官方广播，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py` 和本进度文档中的 v2.52 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.51
+
+### 已完成
+
+1. 每个策略实验组合新增订单执行质量统计：总订单、活跃挂单、完全成交、部分成交、取消、过期、拒绝、POST_ONLY 数量、成交率、成交份额、花费和手续费。
+2. `/api/strategy-experiments` 的每个组合返回 `order_summary`，方便复盘时同时看 PnL 和执行质量。
+3. 新增单组合详情能力：`/api/strategy-experiments?variant_id=PAIR_GTD&trade_limit=50&order_limit=50` 返回该组合的概览、最近交易和订单流水。
+4. 策略实验面板新增“成交率”和“订单质量”列，避免只按短期 ROI 判断组合优劣。
+5. shadow runner 不再在同一把锁里跑完整 8 组合，也不再让 8 个 shadow bot 重复请求官方结算；shadow 组合先用本地价格结算，后续再做主 bot 官方结果广播。
+6. 首页静态资源版本升级到 `v2-51`，避免浏览器继续使用旧实验面板脚本。
+
+### 已确认决策
+
+1. 复盘决胜不能只看净盈亏，还要看成交率、拒绝率、过期率和取消率。
+2. 官方结算核对不应由 8 个 shadow bot 分别请求上游，后续推荐由主 bot 获取一次官方结果后广播给所有实验库。
+
+### 待办和后期优化
+
+1. 将主 bot 官方结算结果广播到 8 个 shadow 实验库，替代当前 shadow 的本地价格结算。
+2. 增加单组合前端详情展开，展示该组合自己的最近交易和订单流水。
+3. 在复盘报告中加入执行质量评分，避免高 ROI 但成交率极低的组合误导决策。
+
+### 已知坑位
+
+1. v2.51 后 shadow 实验接口响应会更轻，但官方结算广播还没完成；短期 shadow 结果仍可能先显示本地价格结算，后续需要官方修正链路。
+2. 成交率是 Paper 订单生命周期统计，不代表真实 maker 排队成交概率。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，定向测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，40 个测试通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，并请求 `/api/strategy-experiments`，确认返回 8 个组合和 `order_summary`。
+7. 已请求 `/api/strategy-experiments?variant_id=PAIR_GTD&trade_limit=5&order_limit=5`，确认返回 `PAIR_GTD` 详情、最近订单分页和最近交易分页。
+8. 已请求首页，确认包含 `v2-51`、`成交率` 和 `订单质量`。
+
+### 回滚建议
+
+1. 如需回滚本轮执行质量统计和详情接口，撤销 `src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档中的 v2.51 改动。
+2. 本轮没有新增数据库字段，不需要迁移回滚。
+
+## 2026-05-28 v2.50
+
+### 已完成
+
+1. 首页新增“策略实验”面板，展示 8 个组合的排名、定位、净盈亏、ROI、胜率、结算数、当前持仓/挂单、目标契合度和最后信号。
+2. 策略实验面板直接读取 `/api/status` 中的 `runtime.strategy_experiments`，不额外增加轮询接口压力。
+3. 实验表格不会因为单纯 tick 计数变化而整表重绘，降低选中文字、查看行内容时被实时刷新打断的概率。
+4. 首页静态资源版本升级到 `v2-50`，避免浏览器继续使用旧 JS/CSS。
+
+### 已确认决策
+
+1. 本轮只做 8 组合可视化排名入口，不改变交易策略和 shadow 数据库结构。
+2. 暂时按已结算组合的净盈亏/ROI 排名；没有任何组合结算前保留原始 8 组合顺序。
+
+### 待办和后期优化
+
+1. 后续增加更完整的实验复盘：最大回撤、成交率、撤单率、过期率、官方修正次数和按时间窗口筛选。
+2. 后续可以给每个组合加独立详情页，展示该组合自己的订单流水和最近交易。
+
+### 已知坑位
+
+1. 当前排名只代表 shadow Paper 数据，不代表实盘可成交性；`POST_ONLY/GTC/GTD` 的 maker 排队位置仍是模拟。
+2. 样本量不足时不要按短期 ROI 直接切主策略，需要至少跨多个市场周期观察。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，40 个测试通过。
+4. 已请求首页，确认包含 `v2-50`、`strategy-experiments` 和 `strategy-experiment-summary`。
+5. 已请求 `/api/status`，确认 `running=True`、实验启用、`run_count=56`、返回 8 个组合。
+6. 已请求 `/static/app.js?v=20260528-v2-50`，确认 HTTP 200。
+
+### 回滚建议
+
+1. 如需回滚本轮可视化入口，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档中的 v2.50 改动。
+2. 本轮不涉及后端、数据库和实验库结构变更。
+
+## 2026-05-28 v2.49
+
+### 已完成
+
+1. 新增 8 个策略实验组合定义：`SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY`。
+2. 新增隔离式 shadow Paper 实验 runner；每个组合使用独立 SQLite 库、独立账户、独立订单和独立盈亏，避免 8 个组合共用主账户导致数据污染。
+3. `PAIR + GTC/GTD/POST_ONLY` 不再只是名义配置：配对策略现在能生成双边 resting orders，并按组合记录独立挂单。
+4. 配对策略增加当前市场活跃挂单拦截，避免 resting pair 未成交时重复堆挂同一 round。
+5. resting order 的订单流水 reason 追加原始策略 reason，避免挂单记录丢失 `PAIR_OPEN_RESTING` 等策略归因。
+6. `/api/status` 和新增 `/api/strategy-experiments` 返回 8 组合实验状态、目标完成度、目标报告契合度、隔离库路径、指标和最近交易汇总。
+7. README 增加 strategy experiments 说明、接口和环境变量。
+
+### 已确认决策
+
+1. 主 Paper 账户不直接 8 倍下注；8 个组合先用 shadow Paper 隔离运行，用数据复盘决胜。
+2. 隔离库默认目录为 `data/strategy-experiments`，每个组合一个 SQLite 文件。
+3. `Settings(...)` 直接构造时默认不启用实验，避免单元测试和脚本意外创建 8 个子 bot；`load_settings()` 运行服务时默认启用，可用 `POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED=false` 关闭。
+
+### 待办和后期优化
+
+1. 前端还没有新增专门的 8 组合排名面板；当前可先通过 `/api/strategy-experiments` 查看数据。
+2. shadow 实验的官方结算核对目前复用每个隔离 bot 自己的逻辑，后续可优化为主 bot 获取一次官方结果后广播给 8 个实验库，减少重复请求。
+3. 后续复盘报告应按 `variant_id` 汇总 ROI、胜率、最大回撤、挂单成交率、早退收益和官方结算修正影响。
+
+### 已知坑位
+
+1. `PAIR + GTC/GTD/POST_ONLY` 已能双边挂单，但真实 maker 订单的排队位置、撮合优先级和撤改单延迟仍是 Paper 近似模拟，不等于实盘成交保证。
+2. 如果单边先成交、另一边长期未成交，残余库存管理会接管，但仍需要后续继续强化“成交残缺后撤单/补单/止损”的完整闭环。
+3. 8 个 shadow bot 会增加本地 SQLite 写入和少量官方结算查询压力，长期运行需要观察接口延迟。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_variants_cover_all_eight_target_combinations tests.test_core.TradingCoreTest.test_pair_strategy_gtd_places_two_resting_pair_orders tests.test_core.TradingCoreTest.test_pair_strategy_post_only_places_two_maker_pair_orders tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，4 个新增定向测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，40 个测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已重启默认库服务 `http://127.0.0.1:8788`，并请求 `/api/status` 和 `/api/strategy-experiments`，确认 `running=True`、实验启用、返回 8 个组合。
+6. 已确认 `data/strategy-experiments` 下生成 8 个隔离 SQLite 文件。
+
+### 回滚建议
+
+1. 如需回滚本轮 8 组合实验基础，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/bot.py`、`src/polybot2other/config.py`、`src/polybot2other/storage.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md` 和本进度文档中的 v2.49 改动。
+2. 本轮没有修改主库 schema；回滚代码后，可直接保留或删除 `data/strategy-experiments` 下的 shadow 实验 SQLite 文件。
+
 ## 2026-05-28 v2.43
 
 ### 已完成

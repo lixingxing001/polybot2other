@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-43">
+    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-61">
   </head>
   <body>
     <main class="app-shell">
@@ -14,11 +14,6 @@
           <h1>Polymarket BTC 5m Paper Bot</h1>
         </div>
         <div class="top-actions">
-          <label class="strategy-toggle" title="开启后按 Up/Down 双边配对策略运行">
-            <input id="pair-strategy-toggle" type="checkbox">
-            <span>配对策略</span>
-          </label>
-          <span id="pair-strategy-status" class="status-text">关闭</span>
           <span id="runtime-pill" class="pill">连接中</span>
           <button id="tick-button" type="button" title="立即同步">同步</button>
         </div>
@@ -80,17 +75,63 @@
         </div>
       </section>
 
+      <section class="panel experiment-panel">
+        <div class="panel-head">
+          <div>
+            <h2>策略实验</h2>
+            <span id="strategy-experiment-meta">0 组</span>
+          </div>
+          <div class="experiment-head-actions">
+            <a class="report-link" href="/strategy-experiments-retrospective.html" target="_blank" rel="noopener">复盘报告</a>
+            <div id="strategy-experiment-summary" class="experiment-summary"></div>
+          </div>
+        </div>
+        <div class="table-wrap experiment-table-wrap">
+          <table class="trade-table experiment-table">
+            <thead>
+              <tr>
+                <th>排名</th>
+                <th>评分</th>
+                <th>样本</th>
+                <th>组合</th>
+                <th>定位</th>
+                <th>净盈亏</th>
+                <th>ROI</th>
+                <th>胜率</th>
+                <th>成交率</th>
+                <th>订单质量</th>
+                <th>结算</th>
+                <th>当前</th>
+                <th>目标契合</th>
+                <th>最后信号</th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="strategy-experiments"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="table-stack">
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>当前持仓</h2>
+              <h2>持仓</h2>
               <span id="open-count">0</span>
             </div>
-            <details class="field-menu">
-              <summary>字段</summary>
-              <div id="open-field-options" class="field-options"></div>
-            </details>
+            <div class="panel-head-actions">
+              <label class="scope-switch">
+                数据范围
+                <select id="open-data-scope" aria-label="持仓数据范围">
+                  <option value="main">主账户</option>
+                  <option value="experiment">策略实验</option>
+                </select>
+              </label>
+              <details class="field-menu">
+                <summary>字段</summary>
+                <div id="open-field-options" class="field-options"></div>
+              </details>
+            </div>
           </div>
           <div class="table-wrap">
             <table class="trade-table">
@@ -107,6 +148,13 @@
               <span id="order-count">0</span>
             </div>
             <div class="panel-head-actions">
+              <label class="scope-switch">
+                数据范围
+                <select id="order-data-scope" aria-label="订单数据范围">
+                  <option value="main">主账户</option>
+                  <option value="experiment">策略实验</option>
+                </select>
+              </label>
               <div class="panel-actions order-actions">
                 <select id="order-status-filter" aria-label="订单状态筛选">
                   <option value="all">全部</option>
@@ -140,10 +188,17 @@
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>最近交易</h2>
+              <h2>交易记录</h2>
               <span id="trade-count">0</span>
             </div>
             <div class="panel-head-actions">
+              <label class="scope-switch">
+                数据范围
+                <select id="recent-data-scope" aria-label="交易数据范围">
+                  <option value="main">主账户</option>
+                  <option value="experiment">策略实验</option>
+                </select>
+              </label>
               <div class="panel-actions recent-actions">
                 <label>
                   开始
@@ -177,6 +232,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260528-v2-41"></script>
+    <script src="/static/app.js?v=20260528-v2-61"></script>
   </body>
 </html>

@@ -101,37 +101,23 @@ button:hover {
   color: var(--red);
 }
 
-.strategy-toggle {
-  min-height: 36px;
+.scope-switch {
+  min-height: 30px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 10px;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scope-switch select {
+  min-height: 30px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--panel-2);
   color: var(--text);
-  font-size: 13px;
-  font-weight: 700;
-  cursor: pointer;
-}
-
-.strategy-toggle input {
-  width: 17px;
-  height: 17px;
-  margin: 0;
-  accent-color: var(--green);
-}
-
-.strategy-toggle:has(input:disabled) {
-  opacity: 0.6;
-  cursor: wait;
-}
-
-.status-text {
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 700;
+  padding: 0 8px;
 }
 
 .metric-grid {
@@ -185,6 +171,172 @@ button:hover {
   grid-template-columns: 1fr 1.35fr;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.experiment-panel {
+  margin-bottom: 12px;
+}
+
+.experiment-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.experiment-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.report-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.report-link:hover {
+  border-color: var(--blue);
+}
+
+.experiment-summary span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.experiment-summary b {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.experiment-table-wrap {
+  max-height: 390px;
+  overflow: auto;
+}
+
+.experiment-table {
+  min-width: 1620px;
+}
+
+.experiment-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+}
+
+.experiment-table td strong {
+  display: block;
+  font-size: 13px;
+}
+
+.experiment-detail-row td {
+  background: #151a1f;
+  white-space: normal;
+}
+
+.experiment-detail {
+  display: grid;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.experiment-detail-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.experiment-detail-metrics span {
+  display: inline-grid;
+  gap: 3px;
+  min-width: 116px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101418;
+  font-size: 12px;
+}
+
+.experiment-detail-metrics b {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.experiment-score-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.experiment-score-reasons span {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #101418;
+  font-size: 12px;
+}
+
+.experiment-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.experiment-detail-section {
+  min-width: 0;
+}
+
+.experiment-detail-section h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.experiment-mini-table {
+  min-width: 540px;
+  border: 1px solid var(--line);
+}
+
+.experiment-mini-table th,
+.experiment-mini-table td {
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.experiment-detail-empty {
+  color: var(--muted);
+  padding: 8px 2px;
+}
+
+.subtle {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .main-grid .panel-head {
@@ -897,6 +1049,20 @@ tbody tr:hover {
 
   .recent-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .experiment-summary {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .experiment-head-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .experiment-detail-grid {
+    grid-template-columns: 1fr;
   }
 }
 

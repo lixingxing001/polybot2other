@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import mimetypes
 import signal
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 from http import HTTPStatus
@@ -46,6 +48,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/orders":
             self._send_json(self.server.bot.orders_page(), include_body=False)
+            return
+        if path == "/api/strategy-experiments":
+            self._send_json(self.server.bot.strategy_experiments_snapshot(), include_body=False)
+            return
+        if path == "/api/strategy-experiments-retrospective":
+            self._send_json(self.server.bot.strategy_experiments_retrospective(), include_body=False)
+            return
+        if path == "/api/strategy-experiments-tables":
+            self._send_json(self.server.bot.strategy_experiments_tables(), include_body=False)
+            return
+        if path == "/strategy-experiments-retrospective.html":
+            self._send_html(
+                _strategy_experiments_retrospective_report_html(
+                    self.server.bot.strategy_experiments_retrospective(),
+                    generated_at=time.time(),
+                ),
+                include_body=False,
+            )
             return
         if path.startswith("/static/"):
             self._send_static(path.removeprefix("/static/"), include_body=False)
@@ -89,6 +109,54 @@ class Handler(BaseHTTPRequestHandler):
             days = _query_int(query, "days", 90, 1, 365)
             max_points = _query_int(query, "max_points", 1200, 2, 5000)
             self._send_json(self.server.bot.equity_curve_window(days, max_points))
+            return
+        if path == "/api/strategy-experiments":
+            try:
+                variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                if variant_id:
+                    trade_limit = _query_int(query, "trade_limit", 50, 1, 200)
+                    order_limit = _query_int(query, "order_limit", 50, 1, 200)
+                    self._send_json(self.server.bot.strategy_experiment_detail(variant_id, trade_limit, order_limit))
+                else:
+                    self._send_json(self.server.bot.strategy_experiments_snapshot())
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/strategy-experiments-retrospective":
+            try:
+                start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
+                end_at = _query_float_optional(query, "end_at", 0, 4_102_444_800)
+                self._send_json(self.server.bot.strategy_experiments_retrospective(start_at, end_at))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/strategy-experiments-tables":
+            try:
+                trade_limit = _query_int(query, "trade_limit", 100, 1, 500)
+                order_limit = _query_int(query, "order_limit", 20, 1, 200)
+                status_filter = _query_choice(query, "status", set(PAPER_ORDER_STATUS_FILTERS), "all")
+                start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
+                end_at = _query_float_optional(query, "end_at", 0, 4_102_444_800)
+                self._send_json(
+                    self.server.bot.strategy_experiments_tables(
+                        trade_limit=trade_limit,
+                        order_limit=order_limit,
+                        order_status_filter=status_filter,
+                        start_at=start_at,
+                        end_at=end_at,
+                    )
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/strategy-experiments-retrospective.html":
+            try:
+                start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
+                end_at = _query_float_optional(query, "end_at", 0, 4_102_444_800)
+                report = self.server.bot.strategy_experiments_retrospective(start_at, end_at)
+                self._send_html(_strategy_experiments_retrospective_report_html(report, generated_at=time.time()))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/current-market":
             self.server.bot.tick()
@@ -176,6 +244,19 @@ class Handler(BaseHTTPRequestHandler):
             except BrokenPipeError:
                 return
 
+    def _send_html(self, payload: str, include_body: bool = True) -> None:
+        data = payload.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if include_body:
+            try:
+                self.wfile.write(data)
+            except BrokenPipeError:
+                return
+
     def _send_static(self, relative: str, include_body: bool = True) -> None:
         path = (STATIC_DIR / relative).resolve()
         if not str(path).startswith(str(STATIC_DIR.resolve())) or not path.is_file():
@@ -197,6 +278,265 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             except BrokenPipeError:
                 return
+
+
+def _strategy_experiments_retrospective_report_html(report: dict[str, Any], generated_at: float | None = None) -> str:
+    generated_at = time.time() if generated_at is None else float(generated_at)
+    profit = report.get("profit_summary") or {}
+    decision = report.get("decision_summary") or {}
+    window = report.get("window") or {}
+    variants = report.get("variants") if isinstance(report.get("variants"), list) else []
+    title = "策略实验复盘报告"
+    rows = "\n".join(_strategy_report_row(row, index + 1) for index, row in enumerate(variants))
+    if not rows:
+        rows = '<tr><td colspan="17" class="empty">暂无策略实验数据</td></tr>'
+    missing_rows = "\n".join(_strategy_report_pending_row(row) for row in decision.get("missing_sample_variants") or [])
+    if not missing_rows:
+        missing_rows = '<tr><td colspan="5" class="empty">暂无待补样本组合</td></tr>'
+    disqualified_rows = "\n".join(_strategy_report_disqualified_row(row) for row in decision.get("disqualified_variants") or [])
+    if not disqualified_rows:
+        disqualified_rows = '<tr><td colspan="5" class="empty">暂无执行淘汰组合</td></tr>'
+    return f"""<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{_html(title)}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --text: #17202a;
+        --muted: #657080;
+        --line: #d9e0e8;
+        --bg: #f5f7fa;
+        --panel: #ffffff;
+        --good: #0f7a4f;
+        --bad: #b42318;
+        --warn: #9a5b00;
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        margin: 0;
+        font-family: Arial, "Microsoft YaHei", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+      }}
+      main {{ max-width: 1280px; margin: 0 auto; padding: 24px; }}
+      header {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 18px; }}
+      h1 {{ margin: 0 0 8px; font-size: 28px; }}
+      h2 {{ margin: 0 0 12px; font-size: 18px; }}
+      p {{ margin: 4px 0; color: var(--muted); }}
+      .stamp {{ text-align: right; font-size: 13px; color: var(--muted); }}
+      .cards {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }}
+      .card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 78px; }}
+      .card span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }}
+      .card strong {{ display: block; font-size: 17px; line-height: 1.25; word-break: break-word; }}
+      .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-top: 14px; }}
+      table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+      th, td {{ border-bottom: 1px solid var(--line); padding: 8px 7px; text-align: left; vertical-align: top; }}
+      th {{ color: var(--muted); font-weight: 600; background: #f8fafc; position: sticky; top: 0; }}
+      .table-wrap {{ overflow-x: auto; }}
+      .mono {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }}
+      .muted {{ color: var(--muted); }}
+      .good {{ color: var(--good); font-weight: 700; }}
+      .bad {{ color: var(--bad); font-weight: 700; }}
+      .warn {{ color: var(--warn); font-weight: 700; }}
+      .empty {{ color: var(--muted); text-align: center; padding: 20px; }}
+      .reason {{ max-width: 280px; line-height: 1.45; }}
+      @media (max-width: 900px) {{
+        main {{ padding: 14px; }}
+        header {{ display: block; }}
+        .stamp {{ text-align: left; margin-top: 8px; }}
+        .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>{_html(title)}</h1>
+          <p>8 组 SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY 隔离 Paper 实验复盘。</p>
+          <p>窗口：{_html(_format_report_window(window))}</p>
+        </div>
+        <div class="stamp">
+          <div>生成时间：{_html(_format_report_time(generated_at))}</div>
+          <div>数据源：{_html(str(report.get("db_dir") or "-"))}</div>
+        </div>
+      </header>
+      <section class="cards">
+        {_strategy_report_card("盈利状态", profit.get("status_label") or "-")}
+        {_strategy_report_card("正式盈利胜出", profit.get("winner_combo") or "暂无")}
+        {_strategy_report_card("当前盈利领先", profit.get("current_profit_leader_combo") or "暂无")}
+        {_strategy_report_card("样本", f"{profit.get('ready_count') or 0} / {profit.get('total_count') or len(variants)}")}
+        {_strategy_report_card("执行淘汰", str(profit.get("disqualified_count") or 0))}
+      </section>
+      <section class="panel">
+        <h2>复盘结论</h2>
+        <p>盈利口径：{_html(str(profit.get("reason") or "-"))}</p>
+        <p>评分口径：{_html(str(decision.get("reason") or "-"))}</p>
+        <p>正式决胜条件：未淘汰组合达到样本阈值，且最高净盈亏大于 0。当前 profitable_winner_ready={_html(str(profit.get("profitable_winner_ready")))}。</p>
+      </section>
+      <section class="panel">
+        <h2>8 组合盈利排名</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>排名</th><th>组合</th><th>定位</th><th>样本</th><th>净盈亏</th><th>ROI</th><th>胜率</th>
+                <th>结算</th><th>官方</th><th>订单</th><th>成交率</th><th>评分</th><th>决策</th><th>目标代码</th>
+                <th>报告契合</th><th>状态</th><th>原因</th>
+              </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>待补样本</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组合</th><th>样本状态</th><th>结算数</th><th>订单数</th><th>说明</th></tr></thead>
+            <tbody>{missing_rows}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>执行淘汰</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组合</th><th>原因</th><th>评分</th><th>结算数</th><th>订单/成交率</th></tr></thead>
+            <tbody>{disqualified_rows}</tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
+def _strategy_report_card(label: str, value: Any) -> str:
+    return f'<div class="card"><span>{_html(label)}</span><strong>{_html(str(value))}</strong></div>'
+
+
+def _strategy_report_row(row: dict[str, Any], fallback_rank: int) -> str:
+    summary = row.get("recent_trades_summary") or {}
+    orders = row.get("order_summary") or {}
+    review = row.get("review_score") or {}
+    rank = _rank_for_variant(row, fallback_rank)
+    pnl = _number(summary.get("total_pnl"))
+    pnl_class = "good" if pnl is not None and pnl > 0 else "bad" if pnl is not None and pnl < 0 else ""
+    status_bits = []
+    if review.get("eligible_for_decision"):
+        status_bits.append("可决胜")
+    if review.get("disqualified"):
+        status_bits.append("执行淘汰")
+    if row.get("last_error"):
+        status_bits.append("运行异常")
+    if row.get("official_broadcast_error"):
+        status_bits.append("官方广播异常")
+    return f"""
+              <tr>
+                <td class="mono">{_html(str(rank))}</td>
+                <td><strong>{_html(str(row.get("combo") or row.get("variant_id") or "-"))}</strong><br><span class="muted mono">{_html(str(row.get("variant_id") or "-"))}</span></td>
+                <td>{_html(str(row.get("role") or "-"))}</td>
+                <td>{_html(str(review.get("sample_label") or "-"))}</td>
+                <td class="{pnl_class}">{_html(_format_money(summary.get("total_pnl")))}</td>
+                <td>{_html(_format_pct(summary.get("roi_pct")))}</td>
+                <td>{_html(_format_pct(summary.get("win_rate")))}</td>
+                <td>{_html(str(summary.get("settled_count") or 0))} / {_html(str(summary.get("total_count") or 0))}</td>
+                <td>{_html(str(summary.get("official_count") or 0))}</td>
+                <td>{_html(str(orders.get("total_count") or 0))}</td>
+                <td>{_html(_format_pct(orders.get("fill_rate")))}</td>
+                <td>{_html(_format_number(review.get("score"), 2))}</td>
+                <td>{_html(str(review.get("decision") or "-"))}</td>
+                <td>{_html(str(row.get("target_code_completion") or "-"))}</td>
+                <td>{_html(str(row.get("target_report_alignment") or "-"))}</td>
+                <td>{_html(" / ".join(status_bits) if status_bits else "-")}</td>
+                <td class="reason">{_html("; ".join(str(item) for item in review.get("reasons") or []))}</td>
+              </tr>"""
+
+
+def _strategy_report_pending_row(row: dict[str, Any]) -> str:
+    return f"""
+              <tr>
+                <td>{_html(str(row.get("combo") or row.get("variant_id") or "-"))}</td>
+                <td>{_html(str(row.get("sample_label") or row.get("sample_status") or "-"))}</td>
+                <td>{_html(str(row.get("settled_count") or 0))}</td>
+                <td>{_html(str(row.get("order_count") or 0))}</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>"""
+
+
+def _strategy_report_disqualified_row(row: dict[str, Any]) -> str:
+    order_text = f"{row.get('order_count') or 0} / {_format_pct(row.get('fill_rate'))}"
+    return f"""
+              <tr>
+                <td>{_html(str(row.get("combo") or row.get("variant_id") or "-"))}</td>
+                <td>{_html(str(row.get("reason") or "-"))}</td>
+                <td>{_html(_format_number(row.get("score"), 2))}</td>
+                <td>{_html(str(row.get("settled_count") or 0))}</td>
+                <td>{_html(order_text)}</td>
+              </tr>"""
+
+
+def _rank_for_variant(row: dict[str, Any], fallback_rank: int) -> int:
+    profit = row.get("profit_rank")
+    try:
+        return int(profit)
+    except (TypeError, ValueError):
+        return fallback_rank
+
+
+def _format_report_window(window: dict[str, Any]) -> str:
+    start_at = window.get("start_at")
+    end_at = window.get("end_at")
+    if start_at is None and end_at is None:
+        return "全部历史"
+    return f"{_format_report_time(start_at)} - {_format_report_time(end_at)}"
+
+
+def _format_report_time(value: Any) -> str:
+    parsed = _number(value)
+    if parsed is None:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(parsed))
+
+
+def _format_money(value: Any) -> str:
+    parsed = _number(value)
+    if parsed is None:
+        return "-"
+    prefix = "+" if parsed > 0 else ""
+    return f"{prefix}${parsed:.2f}"
+
+
+def _format_pct(value: Any) -> str:
+    parsed = _number(value)
+    if parsed is None:
+        return "-"
+    return f"{parsed:.2f}%"
+
+
+def _format_number(value: Any, digits: int = 2) -> str:
+    parsed = _number(value)
+    if parsed is None:
+        return "-"
+    return f"{parsed:.{digits}f}"
+
+
+def _number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _html(value: str) -> str:
+    return html.escape(str(value), quote=True)
 
 
 def _read_bool(payload: dict[str, Any], key: str) -> bool:
@@ -243,6 +583,12 @@ def _query_choice(query: dict[str, list[str]], key: str, choices: set[str], defa
         allowed = ", ".join(sorted(choices))
         raise ValueError(f"{key} must be one of {allowed}")
     return value
+
+
+def _query_str_optional(query: dict[str, list[str]], key: str) -> str | None:
+    raw = query.get(key, [""])[0]
+    value = str(raw or "").strip()
+    return value or None
 
 
 def _body_int(payload: dict[str, Any], key: str, minimum: int, maximum: int) -> int:

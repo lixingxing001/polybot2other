@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 from .config import Settings
@@ -20,6 +21,7 @@ from .execution import (
     sweep_taker_buy_by_shares,
     taker_fee,
 )
+from .experiments import STRATEGY_FAMILY_PAIR, StrategyVariant, selected_strategy_variants
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
 from .polymarket import PolymarketClient, market_to_payload
@@ -86,6 +88,11 @@ class PaperTradingBot:
             "browser_feed_at": None,
             "backend_rest_fallback_at": None,
         }
+        self.strategy_experiments = (
+            StrategyExperimentRunner(settings, self.polymarket, self.price_fallback)
+            if settings.strategy_experiments_enabled
+            else None
+        )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -296,6 +303,7 @@ class PaperTradingBot:
                     target_price=target_price,
                     settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
                 )
+                self._broadcast_official_resolution(slug, str(resolution["outcome"]), now, final_price, target_price)
                 if final_price is None:
                     with self._lock:
                         self._official_price_backfill_next_at[slug] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
@@ -346,6 +354,7 @@ class PaperTradingBot:
                         final_price=final_price,
                         target_price=target_price,
                     )
+                    self._broadcast_official_resolution(round_id, str(outcome), now, final_price, target_price)
                     with self._lock:
                         self._official_recheck_next_at.pop(round_id, None)
                         if final_price is None:
@@ -392,6 +401,7 @@ class PaperTradingBot:
                         final_price=final_price,
                         target_price=target_price,
                     )
+                    self._broadcast_official_resolution(round_id, str(outcome), now, final_price, target_price)
                 with self._lock:
                     if final_price is not None:
                         self._official_price_backfill_next_at.pop(round_id, None)
@@ -400,6 +410,24 @@ class PaperTradingBot:
             except Exception:  # noqa: BLE001 - retry later; dashboard exposes fatal errors elsewhere.
                 with self._lock:
                     self._official_price_backfill_next_at[round_id] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
+
+    def _broadcast_official_resolution(
+        self,
+        round_id: str,
+        outcome: str,
+        now: float,
+        final_price: float | None = None,
+        target_price: float | None = None,
+    ) -> None:
+        if self.strategy_experiments is None:
+            return
+        self.strategy_experiments.apply_official_resolution(
+            round_id,
+            outcome,
+            now,
+            final_price=final_price,
+            target_price=target_price,
+        )
 
     def _run_strategy_from_state(self) -> None:
         with self._lock:
@@ -412,6 +440,7 @@ class PaperTradingBot:
         self._manage_resting_orders(market, quotes)
         if pair_enabled:
             self._run_pair_strategy_from_state(market, price, quotes)
+            self._run_strategy_experiments(market, price, quotes)
             return
         payload = {"price": price, "quotes": quotes}
         signal = self.strategy.signal(input_from_snapshot(market, payload))
@@ -425,6 +454,17 @@ class PaperTradingBot:
                 "reason": signal.reason,
             }
         self._maybe_place_trade(market, signal)
+        self._run_strategy_experiments(market, price, quotes)
+
+    def _run_strategy_experiments(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        if self.strategy_experiments is None:
+            return
+        self.strategy_experiments.run_from_state(market, price, quotes)
 
     def _maybe_place_trade(self, market, signal) -> None:
         if signal.side not in {"Up", "Down"}:
@@ -544,6 +584,8 @@ class PaperTradingBot:
             return "配对策略可用持仓槽不足"
         if self.store.open_trade_exists_for_round(market.round_id):
             return "当前市场已有持仓，等待处理完成"
+        if self.store.active_paper_order_exists_for_round(market.round_id):
+            return "当前市场已有配对挂单，等待成交或取消"
         up_ask_size = _maybe_float(state.get("up_ask_size"))
         down_ask_size = _maybe_float(state.get("down_ask_size"))
         if up_ask_size is not None and up_ask_size < self.settings.min_ask_size:
@@ -562,8 +604,8 @@ class PaperTradingBot:
         if pair_cost is None or up_ask is None or down_ask is None or pair_cost <= 0:
             return
         order_type = normalize_order_type(self.settings.paper_entry_order_type)
-        if order_type == ORDER_TYPE_POST_ONLY:
-            self._set_last_pair_signal("PAIR_WAIT", state, "POST_ONLY 配对挂单模拟暂不生成持仓")
+        if order_type in {ORDER_TYPE_POST_ONLY, ORDER_TYPE_GTC, ORDER_TYPE_GTD}:
+            self._place_pair_resting_orders(market, state, quotes, now, order_type)
             return
         account = self.store.account()
         total_budget = min(self.settings.stake_dollars, float(account["cash_balance"]))
@@ -641,6 +683,120 @@ class PaperTradingBot:
             },
         )
         self._set_last_pair_signal("PAIR_OPEN", state, "配对策略已开双边仓")
+
+    def _place_pair_resting_orders(
+        self,
+        market: MarketRound,
+        state: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        now: float,
+        order_type: str,
+    ) -> None:
+        account = self.store.account()
+        total_budget = min(self.settings.stake_dollars, float(account["cash_balance"]))
+        up_quote = quotes.get("Up") if isinstance(quotes.get("Up"), dict) else {}
+        down_quote = quotes.get("Down") if isinstance(quotes.get("Down"), dict) else {}
+        if total_budget < 0.1:
+            self._set_last_pair_signal("PAIR_WAIT", state, "纸交易可用资金不足")
+            return
+        if not up_quote or not down_quote:
+            self._set_last_pair_signal("PAIR_WAIT", state, "配对挂单缺少双边盘口")
+            return
+
+        up_limit = self._pair_resting_limit_price(up_quote)
+        down_limit = self._pair_resting_limit_price(down_quote)
+        pair_limit_cost = round(up_limit + down_limit, 6)
+        if pair_limit_cost <= 0:
+            self._set_last_pair_signal("PAIR_WAIT", state, "配对挂单限价无效")
+            return
+        if pair_limit_cost > PAIR_ENTRY_COST_THRESHOLD:
+            self._set_last_pair_signal(
+                "PAIR_WAIT",
+                state,
+                f"配对挂单成本 {pair_limit_cost:.4f} 高于 {PAIR_ENTRY_COST_THRESHOLD:.2f}",
+            )
+            return
+        if pair_limit_cost >= 1.0:
+            self._set_last_pair_signal("PAIR_WAIT", state, f"配对挂单成本 {pair_limit_cost:.4f} 已无正期望毛边")
+            return
+
+        shares = round(total_budget / pair_limit_cost, 6)
+        if shares < self.settings.min_ask_size:
+            self._set_last_pair_signal("PAIR_WAIT", state, "配对挂单份额不足")
+            return
+        up_cash = round(shares * up_limit, 6)
+        down_cash = round(shares * down_limit, 6)
+        if up_cash <= 0 or down_cash <= 0 or up_cash + down_cash > float(account["cash_balance"]) + PAIR_EPSILON:
+            self._set_last_pair_signal("PAIR_WAIT", state, "配对挂单预算不足")
+            return
+
+        edge = round(1.0 - pair_limit_cost, 6)
+        confidence = round(max(0.0, min(1.0, edge)), 4)
+        reason = (
+            f"PAIR_OPEN_RESTING {order_type}: up_limit {up_limit:.4f}, down_limit {down_limit:.4f}, "
+            f"limit_cost {pair_limit_cost:.4f}, top_cost {state.get('pair_cost') or 0.0:.4f}, "
+            f"edge {edge:.4f}, shares {shares:.6f}"
+        )
+        up_signal = Signal("BTC", "Up", confidence, up_limit, 0.0, reason)
+        down_signal = Signal("BTC", "Down", confidence, down_limit, 0.0, reason)
+        up_intent = TradeIntent(market, up_signal, up_cash)
+        down_intent = TradeIntent(market, down_signal, down_cash)
+        expires_at = self._resting_order_expires_at(market, order_type)
+        post_only = order_type == ORDER_TYPE_POST_ONLY
+        up_result = simulate_resting_buy(
+            up_intent,
+            up_quote,
+            order_type=order_type,
+            limit_price=up_limit,
+            expires_at=expires_at,
+            post_only=post_only,
+        )
+        down_result = simulate_resting_buy(
+            down_intent,
+            down_quote,
+            order_type=order_type,
+            limit_price=down_limit,
+            expires_at=expires_at,
+            post_only=post_only,
+        )
+        self.store.place_execution_result(up_intent, up_result)
+        self.store.place_execution_result(down_intent, down_result)
+        active_statuses = {STATUS_RESTING, STATUS_PARTIAL_RESTING}
+        if up_result.status not in active_statuses or down_result.status not in active_statuses:
+            self._set_last_pair_signal(
+                "PAIR_WAIT",
+                state,
+                f"配对挂单未全部进入挂单: Up {up_result.status}, Down {down_result.status}",
+            )
+            return
+
+        self.pair_stop_loss_streak = 0
+        self._set_pair_event(
+            "PAIR_RESTING",
+            reason,
+            now,
+            {
+                "order_type": order_type,
+                "up_limit": up_limit,
+                "down_limit": down_limit,
+                "pair_limit_cost": pair_limit_cost,
+                "shares": shares,
+            },
+        )
+        self._set_last_pair_signal("PAIR_RESTING", state, reason)
+
+    def _pair_resting_limit_price(self, quote: dict[str, Any]) -> float:
+        best_bid = _maybe_float(quote.get("best_bid"))
+        best_ask = _maybe_float(quote.get("best_ask"))
+        if best_bid is not None and best_bid > 0:
+            candidate = best_bid
+        elif best_ask is not None:
+            candidate = best_ask - 0.01
+        else:
+            candidate = self.settings.max_entry_price
+        if best_ask is not None and candidate >= best_ask:
+            candidate = best_ask - 0.01
+        return round(max(0.01, min(self.settings.max_entry_price, candidate)), 4)
 
     def _max_pair_sweep_shares(
         self,
@@ -935,6 +1091,7 @@ class PaperTradingBot:
                 "latest_quotes": dict(self.latest_quotes),
                 "ws_status": dict(self.ws_status),
                 "pair_strategy": self._pair_strategy_runtime_locked(),
+                "strategy_experiments": self.strategy_experiments_snapshot(),
             }
         open_trades = self._decorate_open_trades(
             [row for row in self.store.open_trades() if row["symbol"] == "BTC"],
@@ -958,6 +1115,11 @@ class PaperTradingBot:
                 "paper_entry_order_type": self.settings.paper_entry_order_type,
                 "paper_taker_fee_rate": self.settings.paper_taker_fee_rate,
                 "paper_gtd_seconds": self.settings.paper_gtd_seconds,
+                "strategy_experiments": {
+                    "enabled": self.settings.strategy_experiments_enabled,
+                    "db_dir": str(self.settings.strategy_experiments_db_dir),
+                    "variants": self.settings.strategy_experiments_variants,
+                },
                 "pair_strategy": {
                     "entry_cost_threshold": PAIR_ENTRY_COST_THRESHOLD,
                     "exit_bid_threshold": PAIR_EXIT_BID_THRESHOLD,
@@ -983,6 +1145,60 @@ class PaperTradingBot:
         if extra:
             payload.update(extra)
         return payload
+
+    def strategy_experiments_snapshot(self) -> dict[str, Any]:
+        if self.strategy_experiments is None:
+            return {"enabled": False, "variants": []}
+        return self.strategy_experiments.snapshot()
+
+    def strategy_experiment_detail(
+        self,
+        variant_id: str,
+        trade_limit: int = 50,
+        order_limit: int = 50,
+    ) -> dict[str, Any]:
+        if self.strategy_experiments is None:
+            return {"enabled": False, "variant": None, "recent_trades": [], "recent_orders": []}
+        return self.strategy_experiments.detail(variant_id, trade_limit, order_limit)
+
+    def strategy_experiments_retrospective(
+        self,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        if start_at is not None and end_at is not None and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        if self.strategy_experiments is None:
+            return {"enabled": False, "window": {"start_at": start_at, "end_at": end_at}, "variants": []}
+        return self.strategy_experiments.retrospective(start_at, end_at)
+
+    def strategy_experiments_tables(
+        self,
+        trade_limit: int = RECENT_TRADES_DEFAULT_LIMIT,
+        order_limit: int = ORDERS_DEFAULT_LIMIT,
+        order_status_filter: str = "all",
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        if start_at is not None and end_at is not None and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        if self.strategy_experiments is None:
+            return {
+                "enabled": False,
+                "open_trades": [],
+                "recent_orders": [],
+                "recent_orders_meta": {"limit": order_limit, "loaded": 0, "total": 0, "has_more": False},
+                "recent_trades": [],
+                "recent_trades_summary": {},
+                "recent_trades_meta": {"limit": trade_limit, "loaded": 0, "total": 0, "has_more": False},
+            }
+        return self.strategy_experiments.tables(
+            trade_limit=trade_limit,
+            order_limit=order_limit,
+            order_status_filter=order_status_filter,
+            start_at=start_at,
+            end_at=end_at,
+        )
 
     def recent_trades_page(
         self,
@@ -1175,6 +1391,721 @@ class PaperTradingBot:
         enriched["estimated_total_pnl"] = _round_money(estimated_total_pnl) or 0.0
         enriched["estimated_total_pnl_pct"] = _round_pct(estimated_total_pnl / initial_balance * 100.0) if initial_balance else 0.0
         return enriched
+
+
+class StrategyExperimentRunner:
+    def __init__(self, settings: Settings, polymarket: PolymarketClient, price_fallback: PublicPriceClient) -> None:
+        self.settings = settings
+        self.variants = selected_strategy_variants(settings.strategy_experiments_variants)
+        self._lock = threading.RLock()
+        self._bots: dict[str, PaperTradingBot] = {}
+        self._errors: dict[str, str | None] = {}
+        self._official_broadcast_errors: dict[str, str | None] = {}
+        self.run_count = 0
+        self.last_run_at: float | None = None
+        self.official_broadcast_count = 0
+        self.last_official_broadcast_at: float | None = None
+        for variant in self.variants:
+            variant_settings = self._settings_for_variant(settings, variant)
+            store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
+            bot = PaperTradingBot(variant_settings, store)
+            bot.polymarket = polymarket
+            bot.price_fallback = price_fallback
+            bot.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
+            self._bots[variant.variant_id] = bot
+            self._errors[variant.variant_id] = None
+            self._official_broadcast_errors[variant.variant_id] = None
+
+    def _settings_for_variant(self, settings: Settings, variant: StrategyVariant) -> Settings:
+        db_path = settings.strategy_experiments_db_dir / f"{variant.variant_id.lower()}.sqlite3"
+        max_open_trades = max(settings.max_open_trades, 2) if variant.strategy_family == STRATEGY_FAMILY_PAIR else settings.max_open_trades
+        return replace(
+            settings,
+            db_path=db_path,
+            paper_entry_order_type=variant.order_type,
+            max_open_trades=max_open_trades,
+            strategy_experiments_enabled=False,
+            strategy_experiments_variants="",
+        )
+
+    def run_from_state(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            self.run_count += 1
+            self.last_run_at = now
+            variants = tuple(self.variants)
+        for variant in variants:
+            bot = self._bots[variant.variant_id]
+            try:
+                bot.store.upsert_round(market)
+                self._save_price_tick(bot.store, price, now)
+                with bot._lock:
+                    bot.current_market = market
+                    bot.latest_price = dict(price)
+                    bot.latest_quotes = _copy_quotes(quotes)
+                    bot.ws_status = {
+                        "market": "strategy-experiment",
+                        "price": "strategy-experiment",
+                        "browser_feed_at": now,
+                        "backend_rest_fallback_at": None,
+                    }
+                self._settle_due_from_price(bot.store, price, now)
+                bot._run_strategy_from_state()
+                bot.store.record_equity()
+                with self._lock:
+                    self._errors[variant.variant_id] = None
+            except Exception as exc:  # noqa: BLE001 - one experiment must not stop the main bot or other variants.
+                with self._lock:
+                    self._errors[variant.variant_id] = f"{type(exc).__name__}: {exc}"
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            variants_meta = tuple(self.variants)
+            errors = dict(self._errors)
+            official_errors = dict(self._official_broadcast_errors)
+            run_count = self.run_count
+            last_run_at = self.last_run_at
+            official_broadcast_count = self.official_broadcast_count
+            last_official_broadcast_at = self.last_official_broadcast_at
+        variants: list[dict[str, Any]] = []
+        for variant in variants_meta:
+            bot = self._bots[variant.variant_id]
+            variants.append(
+                self._variant_payload(
+                    variant,
+                    bot,
+                    errors.get(variant.variant_id),
+                    official_errors.get(variant.variant_id),
+                )
+            )
+        return {
+            "enabled": True,
+            "db_dir": str(self.settings.strategy_experiments_db_dir),
+            "run_count": run_count,
+            "last_run_at": last_run_at,
+            "official_broadcast_count": official_broadcast_count,
+            "last_official_broadcast_at": last_official_broadcast_at,
+            "decision_summary": _experiment_decision_summary(variants),
+            "profit_summary": _experiment_profit_summary(variants),
+            "variants": variants,
+        }
+
+    def detail(self, variant_id: str, trade_limit: int = 50, order_limit: int = 50) -> dict[str, Any]:
+        normalized = str(variant_id or "").strip().upper().replace("-", "_")
+        by_id = {variant.variant_id: variant for variant in self.variants}
+        variant = by_id.get(normalized)
+        if variant is None:
+            allowed = ", ".join(sorted(by_id))
+            raise ValueError(f"variant_id must be one of {allowed}")
+        bot = self._bots[variant.variant_id]
+        with self._lock:
+            last_error = self._errors.get(variant.variant_id)
+            official_broadcast_error = self._official_broadcast_errors.get(variant.variant_id)
+        trade_limit = max(1, min(200, int(trade_limit)))
+        order_limit = max(1, min(200, int(order_limit)))
+        detail = self._variant_payload(
+            variant,
+            bot,
+            last_error,
+            official_broadcast_error,
+        )
+        return {
+            "enabled": True,
+            "variant": detail,
+            "recent_trades_page": bot.recent_trades_page(trade_limit, 0),
+            "recent_orders_page": bot.orders_page(order_limit, 0),
+        }
+
+    def tables(
+        self,
+        trade_limit: int = RECENT_TRADES_DEFAULT_LIMIT,
+        order_limit: int = ORDERS_DEFAULT_LIMIT,
+        order_status_filter: str = "all",
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        if start_at is not None and end_at is not None and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        trade_limit = max(1, min(RECENT_TRADES_MAX_LIMIT, int(trade_limit)))
+        order_limit = max(1, min(ORDERS_MAX_LIMIT, int(order_limit)))
+        order_status_filter = normalize_paper_order_status_filter(order_status_filter)
+        with self._lock:
+            variants_meta = tuple(self.variants)
+        open_rows: list[dict[str, Any]] = []
+        order_rows: list[dict[str, Any]] = []
+        trade_rows: list[dict[str, Any]] = []
+        trade_summaries: list[dict[str, Any]] = []
+        total_orders = 0
+        total_trades = 0
+        for variant in variants_meta:
+            bot = self._bots[variant.variant_id]
+            variant_tags = _variant_tags(variant)
+            open_rows.extend(self._variant_open_trades(bot, variant_tags))
+            total_orders += bot.store.paper_order_count("BTC", order_status_filter)
+            order_rows.extend(
+                _tag_variant_rows(
+                    bot.store.recent_paper_orders(order_limit, 0, "BTC", order_status_filter),
+                    variant_tags,
+                )
+            )
+            total_trades += bot.store.recent_trade_count("BTC", start_at, end_at)
+            trade_rows.extend(
+                _tag_variant_rows(
+                    bot._decorate_recent_trades(bot.store.recent_trades(trade_limit, 0, "BTC", start_at, end_at)),
+                    variant_tags,
+                )
+            )
+            trade_summaries.append(bot.store.recent_trade_summary("BTC", start_at, end_at))
+        open_rows.sort(key=lambda row: _maybe_float(row.get("opened_at")) or 0.0, reverse=True)
+        order_rows.sort(key=lambda row: _maybe_float(row.get("created_at")) or 0.0, reverse=True)
+        trade_rows.sort(
+            key=lambda row: _maybe_float(row.get("settled_at")) or _maybe_float(row.get("opened_at")) or 0.0,
+            reverse=True,
+        )
+        order_rows = order_rows[:order_limit]
+        trade_rows = trade_rows[:trade_limit]
+        return {
+            "enabled": True,
+            "scope": "strategy_experiments",
+            "variant_count": len(variants_meta),
+            "open_trades": open_rows,
+            "recent_orders": order_rows,
+            "recent_orders_meta": {
+                "limit": order_limit,
+                "offset": 0,
+                "loaded": len(order_rows),
+                "total": total_orders,
+                "has_more": len(order_rows) < total_orders,
+                "status_filter": order_status_filter,
+            },
+            "recent_trades": trade_rows,
+            "recent_trades_summary": _merge_trade_summaries(trade_summaries, start_at, end_at),
+            "recent_trades_meta": {
+                "limit": trade_limit,
+                "offset": 0,
+                "loaded": len(trade_rows),
+                "total": total_trades,
+                "has_more": len(trade_rows) < total_trades,
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        }
+
+    @staticmethod
+    def _variant_open_trades(bot: "PaperTradingBot", variant_tags: dict[str, Any]) -> list[dict[str, Any]]:
+        with bot._lock:
+            runtime = {
+                "current_market": market_to_payload(bot.current_market),
+                "latest_price": dict(bot.latest_price),
+                "latest_quotes": _copy_quotes(bot.latest_quotes),
+            }
+        rows = [row for row in bot.store.open_trades() if row["symbol"] == "BTC"]
+        return _tag_variant_rows(bot._decorate_open_trades(rows, runtime), variant_tags)
+
+    def retrospective(self, start_at: float | None = None, end_at: float | None = None) -> dict[str, Any]:
+        if start_at is not None and end_at is not None and end_at < start_at:
+            raise ValueError("end_at must be greater than or equal to start_at")
+        with self._lock:
+            variants_meta = tuple(self.variants)
+            errors = dict(self._errors)
+            official_errors = dict(self._official_broadcast_errors)
+            run_count = self.run_count
+            last_run_at = self.last_run_at
+            official_broadcast_count = self.official_broadcast_count
+            last_official_broadcast_at = self.last_official_broadcast_at
+        variants: list[dict[str, Any]] = []
+        for variant in variants_meta:
+            bot = self._bots[variant.variant_id]
+            variants.append(
+                self._variant_payload(
+                    variant,
+                    bot,
+                    errors.get(variant.variant_id),
+                    official_errors.get(variant.variant_id),
+                    start_at=start_at,
+                    end_at=end_at,
+                )
+            )
+        return {
+            "enabled": True,
+            "window": {"start_at": start_at, "end_at": end_at},
+            "db_dir": str(self.settings.strategy_experiments_db_dir),
+            "run_count": run_count,
+            "last_run_at": last_run_at,
+            "official_broadcast_count": official_broadcast_count,
+            "last_official_broadcast_at": last_official_broadcast_at,
+            "decision_summary": _experiment_decision_summary(variants),
+            "profit_summary": _experiment_profit_summary(variants),
+            "variants": sorted(
+                variants,
+                key=lambda row: (
+                    _maybe_float((row.get("recent_trades_summary") or {}).get("total_pnl")) or 0.0,
+                    _maybe_float((row.get("recent_trades_summary") or {}).get("roi_pct")) or -999999.0,
+                    int((row.get("recent_trades_summary") or {}).get("settled_count") or 0),
+                ),
+                reverse=True,
+            ),
+        }
+
+    def _variant_payload(
+        self,
+        variant: StrategyVariant,
+        bot: "PaperTradingBot",
+        last_error: str | None,
+        official_broadcast_error: str | None,
+        *,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        order_summary = bot.store.paper_order_summary("BTC", start_at, end_at)
+        metrics = bot.store.metrics()
+        trade_summary = bot.store.recent_trade_summary("BTC", start_at, end_at)
+        return {
+            "variant_id": variant.variant_id,
+            "combo": variant.combo,
+            "strategy_family": variant.strategy_family,
+            "order_type": variant.order_type,
+            "target_code_completion": variant.target_code_completion,
+            "target_report_alignment": variant.target_report_alignment,
+            "role": variant.role,
+            "db_path": str(bot.settings.db_path),
+            "pair_strategy_enabled": bot.pair_strategy_enabled,
+            "last_signal": dict(bot.last_signal or {}),
+            "last_error": last_error,
+            "official_broadcast_error": official_broadcast_error,
+            "active_orders": len(bot.store.active_paper_orders("BTC")),
+            "window": {"start_at": start_at, "end_at": end_at},
+            "review_score": _experiment_review_score(trade_summary, order_summary, last_error, official_broadcast_error),
+            "order_summary": order_summary,
+            "metrics": metrics,
+            "recent_trades_summary": trade_summary,
+        }
+
+    def apply_official_resolution(
+        self,
+        round_id: str,
+        outcome: str,
+        now: float,
+        *,
+        final_price: float | None = None,
+        target_price: float | None = None,
+    ) -> None:
+        normalized_round_id = str(round_id or "").strip()
+        if not normalized_round_id or outcome not in {"Up", "Down"}:
+            return
+        with self._lock:
+            variants = tuple(self.variants)
+            self.official_broadcast_count += 1
+            self.last_official_broadcast_at = now
+        for variant in variants:
+            bot = self._bots[variant.variant_id]
+            try:
+                bot.store.reconcile_round_official_outcome(
+                    normalized_round_id,
+                    outcome,
+                    now,
+                    final_price=final_price,
+                    target_price=target_price,
+                )
+                bot.store.settle_round_outcome(
+                    normalized_round_id,
+                    outcome,
+                    now,
+                    final_price=final_price,
+                    target_price=target_price,
+                    settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+                )
+                with self._lock:
+                    self._official_broadcast_errors[variant.variant_id] = None
+            except Exception as exc:  # noqa: BLE001 - one experiment store must not block official broadcast to others.
+                with self._lock:
+                    self._official_broadcast_errors[variant.variant_id] = f"{type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _settle_due_from_price(store: TradeStore, price: dict[str, Any], now: float) -> None:
+        chainlink_price = _maybe_float(price.get("chainlink"))
+        if chainlink_price:
+            store.settle_due_rounds({"BTC": chainlink_price}, now)
+
+    @staticmethod
+    def _save_price_tick(store: TradeStore, price: dict[str, Any], now: float) -> None:
+        chainlink_price = _maybe_float(price.get("chainlink"))
+        binance_price = _maybe_float(price.get("binance"))
+        if chainlink_price:
+            store.save_price_tick("BTC", chainlink_price, "strategy-experiment-chainlink", now)
+        elif binance_price:
+            store.save_price_tick("BTC", binance_price, "strategy-experiment-binance", now)
+
+
+def _copy_quotes(quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    copied: dict[str, dict[str, Any]] = {}
+    for side, row in quotes.items():
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        for key in ("asks", "bids"):
+            levels = row.get(key)
+            if isinstance(levels, list):
+                item[key] = [dict(level) for level in levels if isinstance(level, dict)]
+        copied[str(side)] = item
+    return copied
+
+
+def _variant_tags(variant: StrategyVariant) -> dict[str, Any]:
+    return {
+        "variant_id": variant.variant_id,
+        "combo": variant.combo,
+        "strategy_family": variant.strategy_family,
+        "experiment_order_type": variant.order_type,
+        "account_scope": "strategy_experiment",
+    }
+
+
+def _tag_variant_rows(rows: list[dict[str, Any]], variant_tags: dict[str, Any]) -> list[dict[str, Any]]:
+    tagged: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.update(variant_tags)
+        tagged.append(item)
+    return tagged
+
+
+def _merge_trade_summaries(
+    summaries: list[dict[str, Any]],
+    start_at: float | None = None,
+    end_at: float | None = None,
+) -> dict[str, Any]:
+    numeric_int_keys = (
+        "total_count",
+        "settled_count",
+        "open_count",
+        "win_count",
+        "loss_count",
+        "breakeven_count",
+        "official_count",
+        "chainlink_count",
+        "early_exit_count",
+        "unknown_source_count",
+    )
+    numeric_float_keys = ("total_stake", "settled_stake", "open_risk", "total_payout", "total_pnl")
+    merged: dict[str, Any] = {"start_at": start_at, "end_at": end_at}
+    for key in numeric_int_keys:
+        merged[key] = int(sum(int(summary.get(key) or 0) for summary in summaries))
+    for key in numeric_float_keys:
+        merged[key] = _round_money(sum(float(summary.get(key) or 0.0) for summary in summaries)) or 0.0
+    pnl_values = [_maybe_float(summary.get("max_win")) for summary in summaries if _maybe_float(summary.get("max_win")) is not None]
+    loss_values = [_maybe_float(summary.get("max_loss")) for summary in summaries if _maybe_float(summary.get("max_loss")) is not None]
+    merged["max_win"] = _round_money(max(pnl_values)) if pnl_values else None
+    merged["max_loss"] = _round_money(min(loss_values)) if loss_values else None
+    settled_count = int(merged["settled_count"] or 0)
+    settled_stake = _maybe_float(merged["settled_stake"]) or 0.0
+    total_pnl = _maybe_float(merged["total_pnl"]) or 0.0
+    win_count = int(merged["win_count"] or 0)
+    merged["avg_pnl"] = _round_money(total_pnl / settled_count) if settled_count else None
+    merged["roi_pct"] = round(total_pnl / settled_stake * 100.0, 4) if settled_stake else None
+    merged["win_rate"] = round(win_count / settled_count * 100.0, 4) if settled_count else None
+    return merged
+
+
+def _experiment_review_score(
+    trade_summary: dict[str, Any],
+    order_summary: dict[str, Any],
+    last_error: str | None,
+    official_broadcast_error: str | None,
+) -> dict[str, Any]:
+    settled = int(trade_summary.get("settled_count") or 0)
+    orders = int(order_summary.get("total_count") or 0)
+    official = int(trade_summary.get("official_count") or 0)
+    chainlink = int(trade_summary.get("chainlink_count") or 0)
+    rejected = int(order_summary.get("rejected_count") or 0)
+    expired = int(order_summary.get("expired_count") or 0)
+    canceled = int(order_summary.get("canceled_count") or 0)
+    fill_attempts = int(order_summary.get("fill_attempt_count") or 0)
+    roi_pct = _maybe_float(trade_summary.get("roi_pct"))
+    win_rate = _maybe_float(trade_summary.get("win_rate"))
+    fill_rate = _maybe_float(order_summary.get("fill_rate"))
+    pnl = _maybe_float(trade_summary.get("total_pnl")) or 0.0
+
+    roi_score = _scale_score(roi_pct, -15.0, 20.0, 25.0)
+    pnl_score = _scale_score(pnl, -10.0, 20.0, 15.0)
+    win_score = _scale_score(win_rate, 40.0, 65.0, 15.0)
+    fill_score = _scale_score(fill_rate, 0.0, 90.0, 18.0)
+    official_ratio = official / settled * 100.0 if settled else None
+    official_score = _scale_score(official_ratio, 0.0, 90.0, 12.0)
+    sample_score = min(15.0, settled / 30.0 * 9.0 + orders / 60.0 * 6.0)
+    bad_order_ratio = (rejected + expired + canceled) / orders * 100.0 if orders else 0.0
+    bad_order_penalty = min(12.0, bad_order_ratio / 100.0 * 18.0)
+    error_penalty = 20.0 if last_error or official_broadcast_error else 0.0
+    score = max(
+        0.0,
+        min(
+            100.0,
+            roi_score + pnl_score + win_score + fill_score + official_score + sample_score - bad_order_penalty - error_penalty,
+        ),
+    )
+
+    reasons: list[str] = []
+    if settled < 30:
+        reasons.append(f"结算样本不足 {settled}/30")
+    if orders < 60:
+        reasons.append(f"订单样本不足 {orders}/60")
+    if fill_rate is not None and fill_rate < 35:
+        reasons.append(f"成交率偏低 {fill_rate:.2f}%")
+    if official_ratio is not None and official_ratio < 50:
+        reasons.append(f"官方结算占比偏低 {official_ratio:.2f}%")
+    if bad_order_ratio >= 30:
+        reasons.append(f"取消/过期/拒绝偏高 {bad_order_ratio:.2f}%")
+    if chainlink > 0:
+        reasons.append(f"仍有 {chainlink} 笔兜底结算")
+    if last_error:
+        reasons.append("组合运行异常")
+    if official_broadcast_error:
+        reasons.append("官方广播异常")
+
+    execution_disqualified = (orders >= 60 and fill_attempts == 0) or (
+        orders >= 100 and (fill_rate is not None and fill_rate < 5.0) and settled < 5
+    )
+    if execution_disqualified:
+        reasons.append("长期低成交，暂不纳入决胜")
+        sample_status = "DISQUALIFIED"
+        sample_label = "执行淘汰"
+    elif settled < 10 or orders < 10:
+        sample_status = "INSUFFICIENT"
+        sample_label = "样本不足"
+    elif settled < 30 or orders < 60:
+        sample_status = "WARMING_UP"
+        sample_label = "观察中"
+    else:
+        sample_status = "USABLE"
+        sample_label = "可比较"
+
+    if execution_disqualified:
+        decision = "执行不可用"
+        score = min(score, 25.0)
+    elif sample_status != "USABLE":
+        decision = "继续观察"
+    elif score >= 75:
+        decision = "优先候选"
+    elif score >= 60:
+        decision = "候选"
+    elif score >= 40:
+        decision = "谨慎观察"
+    else:
+        decision = "暂不优先"
+    if not reasons:
+        reasons.append("样本和执行质量暂未触发扣分提示")
+
+    return {
+        "score": round(score, 2),
+        "decision": decision,
+        "sample_status": sample_status,
+        "sample_label": sample_label,
+        "eligible_for_decision": sample_status == "USABLE",
+        "disqualified": execution_disqualified,
+        "disqualification_reason": "长期低成交" if execution_disqualified else None,
+        "settled_required": 30,
+        "orders_required": 60,
+        "official_ratio": round(official_ratio, 4) if official_ratio is not None else None,
+        "bad_order_ratio": round(bad_order_ratio, 4),
+        "components": {
+            "roi": round(roi_score, 4),
+            "pnl": round(pnl_score, 4),
+            "win_rate": round(win_score, 4),
+            "execution": round(fill_score, 4),
+            "settlement": round(official_score, 4),
+            "sample": round(sample_score, 4),
+            "bad_order_penalty": round(bad_order_penalty, 4),
+            "error_penalty": round(error_penalty, 4),
+        },
+        "reasons": reasons,
+    }
+
+
+def _experiment_decision_summary(variants: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(variants)
+    ranked = sorted(
+        variants,
+        key=lambda row: (
+            _maybe_float((row.get("review_score") or {}).get("score")) or 0.0,
+            _maybe_float((row.get("recent_trades_summary") or {}).get("total_pnl")) or 0.0,
+        ),
+        reverse=True,
+    )
+    current = ranked[0] if ranked else None
+    eligible = [row for row in ranked if (row.get("review_score") or {}).get("eligible_for_decision")]
+    disqualified = [row for row in ranked if (row.get("review_score") or {}).get("disqualified")]
+    pending = [
+        row
+        for row in ranked
+        if not (row.get("review_score") or {}).get("eligible_for_decision")
+        and not (row.get("review_score") or {}).get("disqualified")
+    ]
+    ready_count = len(eligible)
+    disqualified_count = len(disqualified)
+    pending_count = len(pending)
+    comparison_ready = total > 0 and pending_count == 0 and ready_count > 0
+    recommended = eligible[0] if comparison_ready and eligible else None
+    missing = [
+        {
+            "variant_id": row.get("variant_id"),
+            "combo": row.get("combo"),
+            "sample_status": (row.get("review_score") or {}).get("sample_status"),
+            "sample_label": (row.get("review_score") or {}).get("sample_label"),
+            "settled_count": (row.get("recent_trades_summary") or {}).get("settled_count"),
+            "order_count": (row.get("order_summary") or {}).get("total_count"),
+        }
+        for row in pending
+    ]
+    disqualified_items = [
+        {
+            "variant_id": row.get("variant_id"),
+            "combo": row.get("combo"),
+            "reason": (row.get("review_score") or {}).get("disqualification_reason"),
+            "score": (row.get("review_score") or {}).get("score"),
+            "settled_count": (row.get("recent_trades_summary") or {}).get("settled_count"),
+            "order_count": (row.get("order_summary") or {}).get("total_count"),
+            "fill_rate": (row.get("order_summary") or {}).get("fill_rate"),
+        }
+        for row in disqualified
+    ]
+
+    if not total:
+        status = "NO_DATA"
+        status_label = "暂无数据"
+        reason = "没有可比较的策略组合"
+    elif comparison_ready:
+        status = "READY"
+        status_label = "可决胜"
+        reason = "所有未淘汰组合达到样本阈值，可以按评分选择优先候选"
+    elif ready_count == 0 and pending_count == 0:
+        status = "NO_ELIGIBLE"
+        status_label = "无候选"
+        reason = "所有组合均因执行质量或异常被排除，不能给出盈利候选"
+    else:
+        status = "WAITING_FOR_SAMPLE"
+        status_label = "继续观察"
+        reason = f"还有 {pending_count} 个组合未达到样本阈值，{disqualified_count} 个组合已淘汰"
+
+    return {
+        "status": status,
+        "status_label": status_label,
+        "comparison_ready": comparison_ready,
+        "ready_count": ready_count,
+        "pending_count": pending_count,
+        "disqualified_count": disqualified_count,
+        "total_count": total,
+        "reason": reason,
+        "current_leader_variant_id": current.get("variant_id") if current else None,
+        "current_leader_combo": current.get("combo") if current else None,
+        "current_leader_score": (current.get("review_score") or {}).get("score") if current else None,
+        "recommended_variant_id": recommended.get("variant_id") if recommended else None,
+        "recommended_combo": recommended.get("combo") if recommended else None,
+        "recommended_score": (recommended.get("review_score") or {}).get("score") if recommended else None,
+        "missing_sample_variants": missing,
+        "disqualified_variants": disqualified_items,
+    }
+
+
+def _experiment_profit_summary(variants: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(variants)
+    ranked = sorted(
+        variants,
+        key=lambda row: (
+            _maybe_float((row.get("recent_trades_summary") or {}).get("total_pnl")) or 0.0,
+            _maybe_float((row.get("recent_trades_summary") or {}).get("roi_pct")) or -999999.0,
+            int((row.get("recent_trades_summary") or {}).get("settled_count") or 0),
+            _maybe_float((row.get("review_score") or {}).get("score")) or 0.0,
+        ),
+        reverse=True,
+    )
+    with_settled = [row for row in ranked if int((row.get("recent_trades_summary") or {}).get("settled_count") or 0) > 0]
+    eligible = [row for row in ranked if (row.get("review_score") or {}).get("eligible_for_decision")]
+    disqualified = [row for row in ranked if (row.get("review_score") or {}).get("disqualified")]
+    pending = [
+        row
+        for row in ranked
+        if not (row.get("review_score") or {}).get("eligible_for_decision")
+        and not (row.get("review_score") or {}).get("disqualified")
+    ]
+    current = with_settled[0] if with_settled else None
+    sample_ready = total > 0 and not pending and bool(eligible)
+    best_eligible = eligible[0] if sample_ready else None
+    best_eligible_pnl = _maybe_float((best_eligible.get("recent_trades_summary") or {}).get("total_pnl")) if best_eligible else None
+    winner = best_eligible if best_eligible_pnl is not None and best_eligible_pnl > 0 else None
+    if not total:
+        status = "NO_DATA"
+        status_label = "暂无数据"
+        reason = "没有可复盘的策略组合"
+    elif winner:
+        status = "READY"
+        status_label = "盈利可决胜"
+        reason = "所有未淘汰组合达到样本阈值，已按净盈亏优先、ROI 次优先给出盈利胜出组合"
+    elif sample_ready:
+        status = "NO_PROFIT"
+        status_label = "暂无盈利胜出"
+        reason = "样本已可比较，但最高净盈亏未大于 0，暂不应切换主策略"
+    elif not eligible and not pending:
+        status = "NO_ELIGIBLE"
+        status_label = "无盈利候选"
+        reason = "所有组合均因执行质量或异常被排除，不能给出盈利胜出组合"
+    else:
+        status = "WAITING_FOR_SAMPLE"
+        status_label = "等待盈利样本"
+        reason = f"还有 {len(pending)} 个组合未达到样本阈值，当前盈利领先只作为观察信号"
+
+    return {
+        "status": status,
+        "status_label": status_label,
+        "comparison_ready": sample_ready,
+        "profitable_winner_ready": bool(winner),
+        "ready_count": len(eligible),
+        "pending_count": len(pending),
+        "disqualified_count": len(disqualified),
+        "total_count": total,
+        "reason": reason,
+        "current_profit_leader_variant_id": current.get("variant_id") if current else None,
+        "current_profit_leader_combo": current.get("combo") if current else None,
+        "current_profit_leader_pnl": (current.get("recent_trades_summary") or {}).get("total_pnl") if current else None,
+        "current_profit_leader_roi_pct": (current.get("recent_trades_summary") or {}).get("roi_pct") if current else None,
+        "best_eligible_variant_id": best_eligible.get("variant_id") if best_eligible else None,
+        "best_eligible_combo": best_eligible.get("combo") if best_eligible else None,
+        "best_eligible_pnl": (best_eligible.get("recent_trades_summary") or {}).get("total_pnl") if best_eligible else None,
+        "best_eligible_roi_pct": (best_eligible.get("recent_trades_summary") or {}).get("roi_pct") if best_eligible else None,
+        "winner_variant_id": winner.get("variant_id") if winner else None,
+        "winner_combo": winner.get("combo") if winner else None,
+        "winner_pnl": (winner.get("recent_trades_summary") or {}).get("total_pnl") if winner else None,
+        "winner_roi_pct": (winner.get("recent_trades_summary") or {}).get("roi_pct") if winner else None,
+        "rankings": [
+            {
+                "rank": index + 1,
+                "variant_id": row.get("variant_id"),
+                "combo": row.get("combo"),
+                "sample_status": (row.get("review_score") or {}).get("sample_status"),
+                "sample_label": (row.get("review_score") or {}).get("sample_label"),
+                "eligible_for_decision": (row.get("review_score") or {}).get("eligible_for_decision"),
+                "disqualified": (row.get("review_score") or {}).get("disqualified"),
+                "total_pnl": (row.get("recent_trades_summary") or {}).get("total_pnl"),
+                "roi_pct": (row.get("recent_trades_summary") or {}).get("roi_pct"),
+                "settled_count": (row.get("recent_trades_summary") or {}).get("settled_count"),
+                "win_rate": (row.get("recent_trades_summary") or {}).get("win_rate"),
+                "fill_rate": (row.get("order_summary") or {}).get("fill_rate"),
+                "review_score": (row.get("review_score") or {}).get("score"),
+            }
+            for index, row in enumerate(ranked)
+        ],
+    }
+
+
+def _scale_score(value: float | None, floor: float, ceiling: float, weight: float) -> float:
+    if value is None or ceiling <= floor or weight <= 0:
+        return 0.0
+    normalized = (float(value) - floor) / (ceiling - floor)
+    return max(0.0, min(1.0, normalized)) * weight
 
 
 def _clean_quotes(quotes: dict[str, Any]) -> dict[str, dict[str, Any]]:

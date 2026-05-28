@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>策略实验复盘报告</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --text: #17202a;
+        --muted: #657080;
+        --line: #d9e0e8;
+        --bg: #f5f7fa;
+        --panel: #ffffff;
+        --good: #0f7a4f;
+        --bad: #b42318;
+        --warn: #9a5b00;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Arial, "Microsoft YaHei", sans-serif;
+        color: var(--text);
+        background: var(--bg);
+      }
+      main { max-width: 1280px; margin: 0 auto; padding: 24px; }
+      header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 18px; }
+      h1 { margin: 0 0 8px; font-size: 28px; }
+      h2 { margin: 0 0 12px; font-size: 18px; }
+      p { margin: 4px 0; color: var(--muted); }
+      .stamp { text-align: right; font-size: 13px; color: var(--muted); }
+      .cards { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+      .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-height: 78px; }
+      .card span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+      .card strong { display: block; font-size: 17px; line-height: 1.25; word-break: break-word; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-top: 14px; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th, td { border-bottom: 1px solid var(--line); padding: 8px 7px; text-align: left; vertical-align: top; }
+      th { color: var(--muted); font-weight: 600; background: #f8fafc; position: sticky; top: 0; }
+      .table-wrap { overflow-x: auto; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+      .muted { color: var(--muted); }
+      .good { color: var(--good); font-weight: 700; }
+      .bad { color: var(--bad); font-weight: 700; }
+      .warn { color: var(--warn); font-weight: 700; }
+      .empty { color: var(--muted); text-align: center; padding: 20px; }
+      .reason { max-width: 280px; line-height: 1.45; }
+      @media (max-width: 900px) {
+        main { padding: 14px; }
+        header { display: block; }
+        .stamp { text-align: left; margin-top: 8px; }
+        .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>策略实验复盘报告</h1>
+          <p>8 组 SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY 隔离 Paper 实验复盘。</p>
+          <p>窗口：全部历史</p>
+        </div>
+        <div class="stamp">
+          <div>生成时间：2026-05-28 16:58:24</div>
+          <div>数据源：data/strategy-experiments</div>
+        </div>
+      </header>
+      <section class="cards">
+        <div class="card"><span>盈利状态</span><strong>等待盈利样本</strong></div>
+        <div class="card"><span>正式盈利胜出</span><strong>暂无</strong></div>
+        <div class="card"><span>当前盈利领先</span><strong>SINGLE + FAK</strong></div>
+        <div class="card"><span>样本</span><strong>0 / 8</strong></div>
+        <div class="card"><span>执行淘汰</span><strong>0</strong></div>
+      </section>
+      <section class="panel">
+        <h2>复盘结论</h2>
+        <p>盈利口径：还有 8 个组合未达到样本阈值，当前盈利领先只作为观察信号</p>
+        <p>评分口径：还有 8 个组合未达到样本阈值，0 个组合已淘汰</p>
+        <p>正式决胜条件：未淘汰组合达到样本阈值，且最高净盈亏大于 0。当前 profitable_winner_ready=False。</p>
+      </section>
+      <section class="panel">
+        <h2>8 组合盈利排名</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>排名</th><th>组合</th><th>定位</th><th>样本</th><th>净盈亏</th><th>ROI</th><th>胜率</th>
+                <th>结算</th><th>官方</th><th>订单</th><th>成交率</th><th>评分</th><th>决策</th><th>目标代码</th>
+                <th>报告契合</th><th>状态</th><th>原因</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="mono">1</td>
+                <td><strong>SINGLE + FAK</strong><br><span class="muted mono">SINGLE_FAK</span></td>
+                <td>当前基线，对照组</td>
+                <td>样本不足</td>
+                <td class="good">+$13.84</td>
+                <td>55.36%</td>
+                <td>100.00%</td>
+                <td>5 / 5</td>
+                <td>5</td>
+                <td>5</td>
+                <td>100.00%</td>
+                <td>83.92</td>
+                <td>继续观察</td>
+                <td>85%</td>
+                <td>25%-35%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 5/30; 订单样本不足 5/60</td>
+              </tr>
+
+              <tr>
+                <td class="mono">2</td>
+                <td><strong>SINGLE + GTC</strong><br><span class="muted mono">SINGLE_GTC</span></td>
+                <td>单边挂单实验</td>
+                <td>样本不足</td>
+                <td class="good">+$12.14</td>
+                <td>60.71%</td>
+                <td>100.00%</td>
+                <td>4 / 4</td>
+                <td>4</td>
+                <td>5</td>
+                <td>80.00%</td>
+                <td>77.17</td>
+                <td>继续观察</td>
+                <td>75%-80%</td>
+                <td>30%-40%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 4/30; 订单样本不足 5/60</td>
+              </tr>
+
+              <tr>
+                <td class="mono">3</td>
+                <td><strong>SINGLE + GTD</strong><br><span class="muted mono">SINGLE_GTD</span></td>
+                <td>单边限时挂单实验</td>
+                <td>样本不足</td>
+                <td class="good">+$12.14</td>
+                <td>60.71%</td>
+                <td>100.00%</td>
+                <td>4 / 4</td>
+                <td>4</td>
+                <td>5</td>
+                <td>80.00%</td>
+                <td>77.17</td>
+                <td>继续观察</td>
+                <td>75%-80%</td>
+                <td>30%-40%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 4/30; 订单样本不足 5/60</td>
+              </tr>
+
+              <tr>
+                <td class="mono">4</td>
+                <td><strong>SINGLE + POST_ONLY</strong><br><span class="muted mono">SINGLE_POST_ONLY</span></td>
+                <td>单边 maker 实验</td>
+                <td>样本不足</td>
+                <td class="good">+$12.14</td>
+                <td>60.71%</td>
+                <td>100.00%</td>
+                <td>4 / 4</td>
+                <td>4</td>
+                <td>5</td>
+                <td>80.00%</td>
+                <td>77.17</td>
+                <td>继续观察</td>
+                <td>75%-80%</td>
+                <td>35%-45%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 4/30; 订单样本不足 5/60</td>
+              </tr>
+
+              <tr>
+                <td class="mono">5</td>
+                <td><strong>PAIR + FAK</strong><br><span class="muted mono">PAIR_FAK</span></td>
+                <td>配对 taker / 补单 / 应急</td>
+                <td>样本不足</td>
+                <td class="good">+$0.11</td>
+                <td>2.28%</td>
+                <td>50.00%</td>
+                <td>2 / 2</td>
+                <td>0</td>
+                <td>2</td>
+                <td>100.00%</td>
+                <td>42.20</td>
+                <td>继续观察</td>
+                <td>80%-85%</td>
+                <td>55%-65%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 2/30; 订单样本不足 2/60; 官方结算占比偏低 0.00%</td>
+              </tr>
+
+              <tr>
+                <td class="mono">6</td>
+                <td><strong>PAIR + GTC</strong><br><span class="muted mono">PAIR_GTC</span></td>
+                <td>核心候选</td>
+                <td>样本不足</td>
+                <td class="bad">$-0.36</td>
+                <td>-7.21%</td>
+                <td>0.00%</td>
+                <td>2 / 2</td>
+                <td>0</td>
+                <td>2</td>
+                <td>100.00%</td>
+                <td>29.19</td>
+                <td>继续观察</td>
+                <td>90%+</td>
+                <td>85%-90%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 2/30; 订单样本不足 2/60; 官方结算占比偏低 0.00%</td>
+              </tr>
+
+              <tr>
+                <td class="mono">7</td>
+                <td><strong>PAIR + GTD</strong><br><span class="muted mono">PAIR_GTD</span></td>
+                <td>核心候选，尤其适合 5m 市场</td>
+                <td>样本不足</td>
+                <td class="bad">$-0.36</td>
+                <td>-7.21%</td>
+                <td>0.00%</td>
+                <td>2 / 2</td>
+                <td>0</td>
+                <td>2</td>
+                <td>100.00%</td>
+                <td>29.19</td>
+                <td>继续观察</td>
+                <td>90%+</td>
+                <td>85%-90%</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 2/30; 订单样本不足 2/60; 官方结算占比偏低 0.00%</td>
+              </tr>
+
+              <tr>
+                <td class="mono">8</td>
+                <td><strong>PAIR + POST_ONLY</strong><br><span class="muted mono">PAIR_POST_ONLY</span></td>
+                <td>最核心目标</td>
+                <td>样本不足</td>
+                <td class="bad">$-0.36</td>
+                <td>-7.21%</td>
+                <td>0.00%</td>
+                <td>2 / 2</td>
+                <td>0</td>
+                <td>2</td>
+                <td>100.00%</td>
+                <td>29.19</td>
+                <td>继续观察</td>
+                <td>90%+</td>
+                <td>90%+</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 2/30; 订单样本不足 2/60; 官方结算占比偏低 0.00%</td>
+              </tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>待补样本</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组合</th><th>样本状态</th><th>结算数</th><th>订单数</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>SINGLE + FAK</td>
+                <td>样本不足</td>
+                <td>5</td>
+                <td>5</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>SINGLE + GTC</td>
+                <td>样本不足</td>
+                <td>4</td>
+                <td>5</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>SINGLE + GTD</td>
+                <td>样本不足</td>
+                <td>4</td>
+                <td>5</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>SINGLE + POST_ONLY</td>
+                <td>样本不足</td>
+                <td>4</td>
+                <td>5</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>PAIR + FAK</td>
+                <td>样本不足</td>
+                <td>2</td>
+                <td>2</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>PAIR + GTC</td>
+                <td>样本不足</td>
+                <td>2</td>
+                <td>2</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>PAIR + GTD</td>
+                <td>样本不足</td>
+                <td>2</td>
+                <td>2</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>PAIR + POST_ONLY</td>
+                <td>样本不足</td>
+                <td>2</td>
+                <td>2</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>执行淘汰</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组合</th><th>原因</th><th>评分</th><th>结算数</th><th>订单/成交率</th></tr></thead>
+            <tbody><tr><td colspan="5" class="empty">暂无执行淘汰组合</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -13,12 +13,18 @@ const ids = {
   maxDrawdown: document.getElementById("max-drawdown"),
   lastTick: document.getElementById("last-tick"),
   markets: document.getElementById("markets"),
+  strategyExperimentMeta: document.getElementById("strategy-experiment-meta"),
+  strategyExperimentSummary: document.getElementById("strategy-experiment-summary"),
+  strategyExperiments: document.getElementById("strategy-experiments"),
+  openDataScope: document.getElementById("open-data-scope"),
   openTrades: document.getElementById("open-trades"),
   openTradesHead: document.getElementById("open-trades-head"),
   openFieldOptions: document.getElementById("open-field-options"),
+  orderDataScope: document.getElementById("order-data-scope"),
   recentOrders: document.getElementById("recent-orders"),
   recentOrdersHead: document.getElementById("recent-orders-head"),
   orderFieldOptions: document.getElementById("order-field-options"),
+  recentDataScope: document.getElementById("recent-data-scope"),
   recentTrades: document.getElementById("recent-trades"),
   recentTradesHead: document.getElementById("recent-trades-head"),
   recentFieldOptions: document.getElementById("recent-field-options"),
@@ -40,8 +46,6 @@ const ids = {
   chart: document.getElementById("equity-chart"),
   chartTooltip: document.getElementById("equity-tooltip"),
   tickButton: document.getElementById("tick-button"),
-  pairStrategyToggle: document.getElementById("pair-strategy-toggle"),
-  pairStrategyStatus: document.getElementById("pair-strategy-status"),
 };
 
 const MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -91,6 +95,14 @@ let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_
 let recentSummary = null;
 let recentFilters = { start_at: null, end_at: null };
 let recentLoading = true;
+let openDataScope = "main";
+let orderDataScope = "main";
+let recentDataScope = "main";
+let strategyTables = null;
+let strategyTablesLoading = false;
+let lastStrategyTablesFetchMs = 0;
+let strategyOrderLimit = ORDER_PAGE_SIZE;
+let strategyTradeLimit = RECENT_PAGE_SIZE;
 let recentTransitionTimer = null;
 let orderRows = [];
 let orderStatusFilter = "all";
@@ -98,6 +110,9 @@ let orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_mo
 let expandedOrderId = null;
 let loadingOrderId = null;
 const orderFillCache = new Map();
+let expandedExperimentId = null;
+let loadingExperimentId = null;
+const experimentDetailCache = new Map();
 let pageVisible = document.visibilityState !== "hidden";
 let renderQueued = false;
 let pendingRenderData = null;
@@ -105,6 +120,7 @@ let pendingRenderOptions = {};
 let lastChartRenderMs = 0;
 let lastRecentRenderKey = "";
 let lastOrderRenderKey = "";
+let lastExperimentRenderKey = "";
 let pendingOrderRender = false;
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
@@ -201,6 +217,22 @@ const recentOrderFields = [
   { key: "reason", label: "原因", render: (row) => safe(row.reason), cellClass: "reason-cell" },
 ];
 
+const comboField = {
+  key: "combo",
+  label: "组合",
+  render: (row) => `
+    <strong>${safe(row.combo || "主账户")}</strong>
+    <span class="subtle mono-cell">${safe(row.variant_id || row.account_scope || "")}</span>
+  `,
+};
+
+const experimentOpenFields = [comboField, ...openTradeFields];
+const experimentRecentFields = [comboField, ...recentTradeFields];
+const experimentOrderFields = [
+  comboField,
+  ...recentOrderFields.filter((field) => !["detail_toggle", "cancel_action"].includes(field.key)),
+];
+
 const defaultOpenFieldKeys = [
   "strategy_type", "side", "stake", "entry_price", "shares", "current_bid", "current_ask",
   "exit_value", "unrealized_pnl", "unrealized_roi_pct", "max_payout",
@@ -218,6 +250,11 @@ const defaultOrderFieldKeys = [
   "detail_toggle", "cancel_action", "created_at", "side", "order_type", "status", "limit_price", "requested_cash",
   "avg_fill_price", "filled_shares", "cash_spent", "fee", "fill_count", "reason",
 ];
+
+function experimentFieldKeys(kind) {
+  const base = selectedFields[kind] || [];
+  return ["combo", ...base.filter((key) => !["detail_toggle", "cancel_action"].includes(key))];
+}
 
 let selectedFields = {
   open: loadSelectedFields("open", openTradeFields, defaultOpenFieldKeys),
@@ -330,12 +367,263 @@ function renderRuntime(runtime) {
   ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus}`;
 }
 
-function renderPairStrategy(data) {
-  const pair = data.runtime?.pair_strategy || {};
-  const enabled = Boolean(pair.enabled);
-  ids.pairStrategyToggle.checked = enabled;
-  ids.pairStrategyStatus.textContent = enabled ? "已开启" : "关闭";
-  ids.pairStrategyStatus.className = `status-text ${enabled ? "positive" : ""}`;
+function renderStrategyExperiments(runtime = {}) {
+  if (!ids.strategyExperiments) return;
+  const experiments = runtime.strategy_experiments || {};
+  const variants = Array.isArray(experiments.variants) ? experiments.variants : [];
+  const decision = experiments.decision_summary || {};
+  const profit = experiments.profit_summary || {};
+  const ranked = rankExperimentVariants(variants);
+  const settledTotal = variants.reduce((sum, row) => sum + (toNumber(row.recent_trades_summary?.settled_count) || 0), 0);
+  const activeTotal = variants.reduce((sum, row) => sum + (toNumber(row.active_orders) || 0), 0);
+  const openTotal = variants.reduce((sum, row) => sum + (toNumber(row.metrics?.open_trades) || 0), 0);
+
+  ids.strategyExperimentMeta.textContent = `${variants.length} 组 · tick ${experiments.run_count || 0}`;
+  const renderKey = experimentRenderKey(experiments, variants, decision, profit);
+  if (renderKey === lastExperimentRenderKey) return;
+  lastExperimentRenderKey = renderKey;
+  ids.strategyExperimentSummary.innerHTML = [
+    experimentSummaryItem("推荐", decision.recommended_combo || decision.current_leader_combo || "等待样本"),
+    experimentSummaryItem("盈利", profit.winner_combo || profit.current_profit_leader_combo || "等待样本"),
+    experimentSummaryItem("状态", decision.status_label || "继续观察"),
+    experimentSummaryItem("官方", fmtNumberCell(experiments.official_broadcast_count, 0)),
+    experimentSummaryItem("可比", `${fmtNumberCell(decision.ready_count, 0)} / ${fmtNumberCell(decision.total_count || variants.length, 0)}`),
+    experimentSummaryItem("淘汰", fmtNumberCell(decision.disqualified_count, 0)),
+    experimentSummaryItem("已结算", fmtNumberCell(settledTotal, 0)),
+    experimentSummaryItem("持仓", fmtNumberCell(openTotal, 0)),
+    experimentSummaryItem("挂单", fmtNumberCell(activeTotal, 0)),
+  ].join("");
+
+  if (!experiments.enabled) {
+    ids.strategyExperiments.innerHTML = `<tr><td colspan="15" class="empty">实验未启用</td></tr>`;
+    return;
+  }
+  if (!ranked.length) {
+    ids.strategyExperiments.innerHTML = `<tr><td colspan="15" class="empty">暂无实验数据</td></tr>`;
+    return;
+  }
+
+  ids.strategyExperiments.innerHTML = ranked.map((row, index) => renderExperimentRow(row, index + 1)).join("");
+}
+
+function experimentSummaryItem(label, value) {
+  return `<span><b>${safe(label)}</b>${safe(value)}</span>`;
+}
+
+function experimentRenderKey(experiments, variants, decision = {}, profit = {}) {
+  return JSON.stringify({
+    enabled: Boolean(experiments.enabled),
+    official_broadcast_count: experiments.official_broadcast_count || 0,
+    decision: {
+      status: decision.status,
+      leader: decision.current_leader_variant_id,
+      recommended: decision.recommended_variant_id,
+      ready: decision.ready_count,
+      pending: decision.pending_count,
+      disqualified: decision.disqualified_count,
+      total: decision.total_count,
+    },
+    profit: {
+      status: profit.status,
+      leader: profit.current_profit_leader_variant_id,
+      winner: profit.winner_variant_id,
+      pnl: profit.current_profit_leader_pnl,
+      ready: profit.ready_count,
+      pending: profit.pending_count,
+      disqualified: profit.disqualified_count,
+    },
+    expanded: expandedExperimentId,
+    loading: loadingExperimentId,
+    detail_keys: [...experimentDetailCache.keys()],
+    variants: variants.map((row) => ({
+      id: row.variant_id,
+      pnl: row.recent_trades_summary?.total_pnl,
+      roi: row.recent_trades_summary?.roi_pct,
+      wins: row.recent_trades_summary?.win_count,
+      settled: row.recent_trades_summary?.settled_count,
+      fill_rate: row.order_summary?.fill_rate,
+      orders: row.order_summary?.total_count,
+      rejected: row.order_summary?.rejected_count,
+      expired: row.order_summary?.expired_count,
+      canceled: row.order_summary?.canceled_count,
+      score: row.review_score?.score,
+      decision: row.review_score?.decision,
+      sample: row.review_score?.sample_status,
+      open: row.metrics?.open_trades,
+      active: row.active_orders,
+      signal: row.last_signal?.side,
+      error: row.last_error,
+      official_error: row.official_broadcast_error,
+    })),
+  });
+}
+
+function rankExperimentVariants(variants) {
+  const anySettled = variants.some((row) => (toNumber(row.recent_trades_summary?.settled_count) || 0) > 0);
+  if (!anySettled) return [...variants];
+  return [...variants].sort((a, b) => {
+    const scoreA = toNumber(a.review_score?.score) || 0;
+    const scoreB = toNumber(b.review_score?.score) || 0;
+    const settledA = toNumber(a.recent_trades_summary?.settled_count) || 0;
+    const settledB = toNumber(b.recent_trades_summary?.settled_count) || 0;
+    const pnlA = toNumber(a.recent_trades_summary?.total_pnl) || 0;
+    const pnlB = toNumber(b.recent_trades_summary?.total_pnl) || 0;
+    const roiA = toNumber(a.recent_trades_summary?.roi_pct) || 0;
+    const roiB = toNumber(b.recent_trades_summary?.roi_pct) || 0;
+    if (Math.abs(scoreA - scoreB) > 0.000001) return scoreB - scoreA;
+    if (settledA !== settledB && (settledA === 0 || settledB === 0)) return settledB - settledA;
+    if (Math.abs(pnlA - pnlB) > 0.000001) return pnlB - pnlA;
+    if (Math.abs(roiA - roiB) > 0.000001) return roiB - roiA;
+    return String(a.variant_id || "").localeCompare(String(b.variant_id || ""));
+  });
+}
+
+function renderExperimentRow(row, rank) {
+  const summary = row.recent_trades_summary || {};
+  const metrics = row.metrics || {};
+  const orders = row.order_summary || {};
+  const review = row.review_score || {};
+  const settled = toNumber(summary.settled_count) || 0;
+  const total = toNumber(summary.total_count) || 0;
+  const open = toNumber(metrics.open_trades) || 0;
+  const active = toNumber(row.active_orders) || 0;
+  const orderQuality = `${fmtNumberCell(orders.filled_count, 0)} 成 · ${fmtNumberCell(orders.canceled_count, 0)} 取 · ${fmtNumberCell(orders.expired_count, 0)} 过 · ${fmtNumberCell(orders.rejected_count, 0)} 拒`;
+  const rowError = row.last_error || row.official_broadcast_error;
+  const signal = rowError || row.last_signal?.reason || row.last_signal?.side || "-";
+  const signalSide = rowError ? "异常" : row.last_signal?.side || "-";
+  const detailOpen = expandedExperimentId === row.variant_id;
+  return `
+    <tr>
+      <td class="mono-cell">${rank}</td>
+      <td>
+        <strong class="${scoreClass(review.score)}">${fmtNumberCell(review.score, 2)}</strong>
+        <span class="subtle">${safe(review.decision)}</span>
+      </td>
+      <td>${safe(review.sample_label || "-")}</td>
+      <td>
+        <strong>${safe(row.combo || row.variant_id)}</strong>
+        <span class="subtle mono-cell">${safe(row.variant_id)}</span>
+      </td>
+      <td>${safe(row.role)}</td>
+      <td>${fmtSignedMoneyCell(summary.total_pnl)}</td>
+      <td>${fmtSignedPctCell(summary.roi_pct)}</td>
+      <td>${fmtPctCell(summary.win_rate)}</td>
+      <td>${fmtPctCell(orders.fill_rate)}</td>
+      <td>${safe(orderQuality)}</td>
+      <td>${fmtNumberCell(settled, 0)} / ${fmtNumberCell(total, 0)}</td>
+      <td>${fmtNumberCell(open, 0)} 持仓 · ${fmtNumberCell(active, 0)} 挂单</td>
+      <td>${safe(row.target_report_alignment)}</td>
+      <td class="reason-cell"><span class="${rowError ? "negative" : ""}">${safe(signalSide)}</span> · ${safe(signal)}</td>
+      <td><button class="table-action" type="button" data-experiment-id="${safe(row.variant_id)}">${detailOpen ? "收起" : "详情"}</button></td>
+    </tr>
+    ${detailOpen ? renderExperimentDetailRow(row.variant_id, 15) : ""}
+  `;
+}
+
+function renderExperimentDetailRow(variantId, colspan) {
+  const detail = experimentDetailCache.get(variantId);
+  const body = loadingExperimentId === variantId
+    ? `<div class="experiment-detail-empty">加载组合详情...</div>`
+    : experimentDetailHtml(detail);
+  return `
+    <tr class="experiment-detail-row">
+      <td colspan="${Math.max(1, colspan)}">${body}</td>
+    </tr>
+  `;
+}
+
+function experimentDetailHtml(detail) {
+  if (!detail || !detail.variant) return `<div class="experiment-detail-empty">暂无组合详情</div>`;
+  const variant = detail.variant || {};
+  const tradePage = detail.recent_trades_page || {};
+  const orderPage = detail.recent_orders_page || {};
+  const trades = Array.isArray(tradePage.recent_trades) ? tradePage.recent_trades.slice(0, 6) : [];
+  const orders = Array.isArray(orderPage.recent_orders) ? orderPage.recent_orders.slice(0, 6) : [];
+  const summary = variant.recent_trades_summary || {};
+  const orderSummary = variant.order_summary || {};
+  const review = variant.review_score || {};
+  return `
+    <div class="experiment-detail">
+      <div class="experiment-detail-metrics">
+        ${experimentMetric("评分", `<span class="${scoreClass(review.score)}">${fmtNumberCell(review.score, 2)}</span>`)}
+        ${experimentMetric("决策", safe(review.decision))}
+        ${experimentMetric("净盈亏", fmtSignedMoneyCell(summary.total_pnl))}
+        ${experimentMetric("ROI", fmtSignedPctCell(summary.roi_pct))}
+        ${experimentMetric("官方/兜底", `${fmtNumberCell(summary.official_count, 0)} / ${fmtNumberCell(summary.chainlink_count, 0)}`)}
+        ${experimentMetric("成交率", fmtPctCell(orderSummary.fill_rate))}
+        ${experimentMetric("订单", `${fmtNumberCell(orderSummary.total_count, 0)} 总 · ${fmtNumberCell(orderSummary.active_count, 0)} 活跃`)}
+      </div>
+      <div class="experiment-score-reasons">${experimentScoreReasons(review)}</div>
+      <div class="experiment-detail-grid">
+        <div class="experiment-detail-section">
+          <h3>最近交易</h3>
+          ${experimentTradesTable(trades)}
+        </div>
+        <div class="experiment-detail-section">
+          <h3>订单流水</h3>
+          ${experimentOrdersTable(orders)}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function experimentMetric(label, valueHtml) {
+  return `<span><b>${safe(label)}</b>${valueHtml}</span>`;
+}
+
+function experimentScoreReasons(review) {
+  const reasons = Array.isArray(review?.reasons) ? review.reasons : [];
+  if (!reasons.length) return "";
+  return reasons.map((item) => `<span>${safe(item)}</span>`).join("");
+}
+
+function scoreClass(value) {
+  const parsed = toNumber(value);
+  if (parsed == null) return "";
+  if (parsed >= 70) return "positive";
+  if (parsed < 40) return "negative";
+  return "";
+}
+
+function experimentTradesTable(rows) {
+  if (!rows.length) return `<div class="experiment-detail-empty">暂无最近交易</div>`;
+  return `
+    <table class="experiment-mini-table">
+      <thead><tr><th>时间</th><th>方向</th><th>状态</th><th>盈亏</th><th>来源</th></tr></thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            <td>${fmtDateTimeCell(row.settled_at || row.opened_at)}</td>
+            <td><span class="${sideClass(row.side)}">${safe(row.side)}</span></td>
+            <td>${safe(row.status)}</td>
+            <td>${fmtSignedMoneyCell(row.pnl)}</td>
+            <td>${safe(row.settlement_source_label || row.settlement_source || "-")}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+function experimentOrdersTable(rows) {
+  if (!rows.length) return `<div class="experiment-detail-empty">暂无订单流水</div>`;
+  return `
+    <table class="experiment-mini-table">
+      <thead><tr><th>时间</th><th>方向</th><th>类型</th><th>状态</th><th>成交</th></tr></thead>
+      <tbody>
+        ${rows.map((row) => `
+          <tr>
+            <td>${fmtDateTimeCell(row.created_at)}</td>
+            <td><span class="${sideClass(row.side)}">${safe(row.side)}</span></td>
+            <td>${safe(row.order_type)}</td>
+            <td>${orderStatusText(row.status)}</td>
+            <td>${fmtNumberCell(row.filled_shares, 4)} / ${fmtMoneyCell(row.cash_spent)}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
 }
 
 function marketTargetPrice(market) {
@@ -418,20 +706,29 @@ function quoteText(row) {
   return `${bid} / ${ask}`;
 }
 
-function renderOpenTrades(rows) {
-  ids.openCount.textContent = rows.length;
-  renderTradeTable("open", rows, openTradeFields, ids.openTradesHead, ids.openTrades);
+function renderOpenTrades(rows, scope = openDataScope) {
+  if (scope === "experiment" && strategyTablesLoading && !strategyTables) {
+    ids.openCount.textContent = "加载中";
+    renderTradeTable("open", [], experimentOpenFields, ids.openTradesHead, ids.openTrades, experimentFieldKeys("open"));
+    return;
+  }
+  ids.openCount.textContent = scope === "experiment" ? `${rows.length} / 8组` : rows.length;
+  const fields = scope === "experiment" ? experimentOpenFields : openTradeFields;
+  const selected = scope === "experiment" ? experimentFieldKeys("open") : selectedFields.open;
+  renderTradeTable("open", rows, fields, ids.openTradesHead, ids.openTrades, selected);
 }
 
 function renderRecentOrders(rows, options = {}) {
-  const total = Number(orderMeta.total || rows.length || 0);
+  const scope = options.scope || orderDataScope;
+  const meta = options.meta || (scope === "experiment" ? strategyTables?.recent_orders_meta || {} : orderMeta);
+  const total = Number(meta.total || rows.length || 0);
   const loaded = rows.length;
   ids.orderCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
-  ids.orderPageInfo.textContent = total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`;
-  ids.loadMoreOrders.hidden = !orderMeta.has_more;
+  ids.orderPageInfo.textContent = `${scope === "experiment" ? "策略实验" : "主账户"} · ${total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`}`;
+  ids.loadMoreOrders.hidden = !meta.has_more;
   ids.loadMoreOrders.disabled = false;
   updateOrderActionButtons(rows);
-  const renderKey = orderRenderKey(rows);
+  const renderKey = orderRenderKey(rows, scope, meta);
   if (!options.force && renderKey === lastOrderRenderKey) return;
   if (!options.force && isOrderInteractionActive()) {
     pendingOrderRender = true;
@@ -442,32 +739,39 @@ function renderRecentOrders(rows, options = {}) {
   const tableWrap = orderTableWrap();
   const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
-  renderTradeTable("order", rows, recentOrderFields, ids.recentOrdersHead, ids.recentOrders);
+  const fields = scope === "experiment" ? experimentOrderFields : recentOrderFields;
+  const selected = scope === "experiment" ? experimentFieldKeys("order") : selectedFields.order;
+  renderTradeTable("order", rows, fields, ids.recentOrdersHead, ids.recentOrders, selected);
   if (tableWrap) {
     tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
     tableWrap.scrollLeft = Math.min(scrollLeft, Math.max(0, tableWrap.scrollWidth - tableWrap.clientWidth));
   }
 }
 
-function renderRecentTrades(rows) {
+function renderRecentTrades(rows, options = {}) {
+  const scope = options.scope || recentDataScope;
+  const meta = options.meta || (scope === "experiment" ? strategyTables?.recent_trades_meta || {} : recentMeta);
+  const summary = options.summary || (scope === "experiment" ? strategyTables?.recent_trades_summary || {} : recentSummary);
   if (recentLoading) {
     renderRecentSkeleton();
     return;
   }
-  const total = Number(recentMeta.total || rows.length || 0);
+  const total = Number(meta.total || rows.length || 0);
   const loaded = rows.length;
   const filtered = recentFilterActive();
   ids.tradeCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
   ids.recentPageInfo.textContent = total > loaded
-    ? `${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
-    : `${filtered ? "范围" : "最近"} ${loaded} 条`;
-  ids.loadMoreRecent.hidden = !recentMeta.has_more;
+    ? `${scope === "experiment" ? "策略实验" : "主账户"} · ${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
+    : `${scope === "experiment" ? "策略实验" : "主账户"} · ${filtered ? "范围" : "最近"} ${loaded} 条`;
+  ids.loadMoreRecent.hidden = !meta.has_more;
   ids.loadMoreRecent.disabled = false;
-  renderRecentSummary(recentSummary);
-  const renderKey = recentRenderKey(rows);
+  renderRecentSummary(summary, scope);
+  const renderKey = recentRenderKey(rows, scope, meta, summary);
   if (renderKey === lastRecentRenderKey) return;
   lastRecentRenderKey = renderKey;
-  renderTradeTable("recent", rows, recentTradeFields, ids.recentTradesHead, ids.recentTrades);
+  const fields = scope === "experiment" ? experimentRecentFields : recentTradeFields;
+  const selected = scope === "experiment" ? experimentFieldKeys("recent") : selectedFields.recent;
+  renderTradeTable("recent", rows, fields, ids.recentTradesHead, ids.recentTrades, selected);
   applyRecentContentTransition();
 }
 
@@ -493,7 +797,7 @@ function renderRecentSkeleton() {
 
 function renderRecentSummarySkeleton() {
   if (!ids.recentSummary) return;
-  ids.recentSummary.innerHTML = Array.from({ length: 8 }, (_, index) => `
+  ids.recentSummary.innerHTML = Array.from({ length: 9 }, (_, index) => `
     <div class="recent-summary-item skeleton-summary-item">
       <span class="skeleton skeleton-label skeleton-w-${(index % 3) + 1}"></span>
       <strong><span class="skeleton skeleton-value skeleton-w-${(index % 4) + 1}"></span></strong>
@@ -532,17 +836,18 @@ function applyRecentContentTransition() {
   }, 260);
 }
 
-function renderRecentSummary(summary) {
+function renderRecentSummary(summary, scope = recentDataScope) {
   if (!ids.recentSummary) return;
   const data = summary || {};
   const sourceText = `官 ${Number(data.official_count || 0)} / 兜 ${Number(data.chainlink_count || 0)} / 平 ${Number(data.early_exit_count || 0)}`;
   const items = [
+    ["范围", scope === "experiment" ? "策略实验" : "主账户"],
     ["交易", `${Number(data.total_count || 0)} 笔`],
     ["已结算", `${Number(data.settled_count || 0)} 笔`],
     ["总盈亏", fmtSignedMoneyCell(data.total_pnl)],
     ["ROI", fmtSignedPctCell(data.roi_pct)],
     ["胜率", `${fmtPctCell(data.win_rate)} (${Number(data.win_count || 0)}/${Number(data.loss_count || 0)})`],
-    ["本金", fmtMoneyCell(data.settled_stake)],
+    ["累计投入", fmtMoneyCell(data.settled_stake)],
     ["回款", fmtMoneyCell(data.total_payout)],
     ["来源", sourceText],
   ];
@@ -554,23 +859,25 @@ function renderRecentSummary(summary) {
   `).join("");
 }
 
-function recentRenderKey(rows) {
-  const idsKey = rows.map((row) => `${row.id}:${row.status}:${row.settled_at || ""}:${row.pnl ?? ""}:${row.reason || ""}`).join(",");
+function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summary = recentSummary) {
+  const idsKey = rows.map((row) => `${row.variant_id || "main"}:${row.id}:${row.status}:${row.settled_at || ""}:${row.pnl ?? ""}:${row.reason || ""}`).join(",");
   return [
+    scope,
     idsKey,
-    selectedFields.recent.join(","),
-    recentMeta.loaded,
-    recentMeta.total,
-    recentMeta.has_more,
-    recentMeta.start_at || "",
-    recentMeta.end_at || "",
-    recentSummary?.total_pnl ?? "",
+    (scope === "experiment" ? experimentFieldKeys("recent") : selectedFields.recent).join(","),
+    meta.loaded,
+    meta.total,
+    meta.has_more,
+    meta.start_at || "",
+    meta.end_at || "",
+    summary?.total_pnl ?? "",
   ].join("|");
 }
 
-function orderRenderKey(rows) {
+function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
   const expandedFills = expandedOrderId ? orderFillCache.get(expandedOrderId) || [] : [];
   const rowsKey = rows.map((row) => [
+    row.variant_id || "main",
     row.id,
     row.status,
     row.updated_at || "",
@@ -583,12 +890,13 @@ function orderRenderKey(rows) {
     row.reason || "",
   ].join(":")).join(",");
   return [
+    scope,
     rowsKey,
-    selectedFields.order.join(","),
-    orderMeta.loaded,
-    orderMeta.total,
-    orderMeta.has_more,
-    orderMeta.status_filter,
+    (scope === "experiment" ? experimentFieldKeys("order") : selectedFields.order).join(","),
+    meta.loaded,
+    meta.total,
+    meta.has_more,
+    meta.status_filter,
     expandedOrderId || "",
     loadingOrderId || "",
     expandedFills.length,
@@ -624,6 +932,7 @@ function isOrderInteractionActive() {
 }
 
 function currentOrderRows() {
+  if (orderDataScope === "experiment") return strategyTables?.recent_orders || [];
   if (orderRows.length) return orderRows;
   return latestStatus?.recent_orders || [];
 }
@@ -641,6 +950,7 @@ function orderToggleText(row) {
 }
 
 function canCancelOrder(row) {
+  if (row?.account_scope === "strategy_experiment") return false;
   return row?.status === "RESTING" || row?.status === "PARTIAL_RESTING";
 }
 
@@ -663,6 +973,11 @@ function cancelableOrderCount(rows, scope) {
 }
 
 function updateOrderActionButtons(rows) {
+  if (orderDataScope === "experiment") {
+    ids.cancelCurrentOrders.disabled = true;
+    ids.cancelAllOrders.disabled = true;
+    return;
+  }
   const reservedCash = Number(latestStatus?.metrics?.reserved_cash || 0);
   const hasReservedCash = reservedCash > 0.000001;
   ids.cancelCurrentOrders.disabled = !activeMarket || (!hasReservedCash && cancelableOrderCount(rows, "current_market") === 0);
@@ -670,6 +985,7 @@ function updateOrderActionButtons(rows) {
 }
 
 function orderCancelButton(row) {
+  if (row?.account_scope === "strategy_experiment") return "-";
   if (!canCancelOrder(row)) return "-";
   return `<button class="table-action" type="button" data-cancel-order-id="${safe(row.id)}">取消</button>`;
 }
@@ -704,8 +1020,8 @@ function orderFillsHtml(fills) {
   `;
 }
 
-function renderTradeTable(kind, rows, fields, headEl, bodyEl) {
-  const selected = selectedFields[kind];
+function renderTradeTable(kind, rows, fields, headEl, bodyEl, selectedOverride = null) {
+  const selected = selectedOverride || selectedFields[kind];
   const visibleFields = fields.filter((field) => selected.includes(field.key));
   headEl.innerHTML = `<tr>${visibleFields.map((field) => `<th>${safe(field.label)}</th>`).join("")}</tr>`;
   if (!rows.length) {
@@ -713,12 +1029,15 @@ function renderTradeTable(kind, rows, fields, headEl, bodyEl) {
     bodyEl.innerHTML = `<tr><td class="empty" colspan="${Math.max(1, visibleFields.length)}">${emptyText}</td></tr>`;
     return;
   }
-  bodyEl.innerHTML = rows.map((row) => `
-    <tr${kind === "order" ? ` data-order-id="${safe(row.id)}"` : ""}>
+  bodyEl.innerHTML = rows.map((row) => {
+    const experimentOrder = kind === "order" && row.account_scope === "strategy_experiment";
+    return `
+    <tr${kind === "order" && !experimentOrder ? ` data-order-id="${safe(row.id)}"` : ""}>
       ${visibleFields.map((field) => `<td class="${field.cellClass || ""}">${field.render(row)}</td>`).join("")}
     </tr>
-    ${kind === "order" ? renderOrderFillRow(row, visibleFields.length) : ""}
-  `).join("");
+    ${kind === "order" && !experimentOrder ? renderOrderFillRow(row, visibleFields.length) : ""}
+  `;
+  }).join("");
 }
 
 function initFieldOptions() {
@@ -1085,6 +1404,9 @@ async function loadStatus(manual = false) {
   renderAll(data, { forceOrder: manual });
   loadEquityCurve(false).catch(showError);
   loadOrders(orderStatusFilter !== "all").catch(showError);
+  if (strategyExperimentViewActive()) {
+    loadStrategyExperimentTables({ force: manual }).catch(showError);
+  }
 }
 
 async function loadEquityCurve(force = false) {
@@ -1165,7 +1487,42 @@ function applyOrderPage(rows = [], meta = {}, options = {}) {
   }
 }
 
+function strategyExperimentViewActive() {
+  return openDataScope === "experiment" || orderDataScope === "experiment" || recentDataScope === "experiment";
+}
+
+async function loadStrategyExperimentTables(options = {}) {
+  if (strategyTablesLoading) return;
+  const force = Boolean(options.force);
+  const now = Date.now();
+  if (!force && strategyTables && now - lastStrategyTablesFetchMs < 5_000) return;
+  strategyTablesLoading = true;
+  try {
+    const params = new URLSearchParams({
+      trade_limit: String(options.tradeLimit || strategyTradeLimit),
+      order_limit: String(options.orderLimit || strategyOrderLimit),
+      status: orderStatusFilter,
+    });
+    if (recentFilters.start_at !== null) params.set("start_at", String(recentFilters.start_at));
+    if (recentFilters.end_at !== null) params.set("end_at", String(recentFilters.end_at));
+    const res = await fetch(`/api/strategy-experiments-tables?${params.toString()}`);
+    if (!res.ok) throw new Error(`strategy experiment tables HTTP ${res.status}`);
+    strategyTables = await res.json();
+    lastStrategyTablesFetchMs = Date.now();
+    strategyOrderLimit = Number(strategyTables?.recent_orders_meta?.limit || strategyOrderLimit);
+    strategyTradeLimit = Number(strategyTables?.recent_trades_meta?.limit || strategyTradeLimit);
+    if (recentDataScope === "experiment") recentLoading = false;
+  } finally {
+    strategyTablesLoading = false;
+  }
+  renderAll(latestStatus, { force: true, forceOrder: true });
+}
+
 async function loadOrders(force = false) {
+  if (orderDataScope === "experiment") {
+    await loadStrategyExperimentTables({ force, orderLimit: strategyOrderLimit });
+    return;
+  }
   if (!force && orderRows.length && orderMeta.status_filter === orderStatusFilter) return;
   const params = new URLSearchParams({ limit: String(ORDER_PAGE_SIZE), offset: "0", status: orderStatusFilter });
   const res = await fetch(`/api/orders?${params.toString()}`);
@@ -1178,6 +1535,11 @@ async function loadOrders(force = false) {
 async function loadMoreOrders() {
   ids.loadMoreOrders.disabled = true;
   try {
+    if (orderDataScope === "experiment") {
+      strategyOrderLimit = Math.min(200, Number(strategyTables?.recent_orders_meta?.loaded || 0) + ORDER_PAGE_SIZE);
+      await loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit });
+      return;
+    }
     const params = new URLSearchParams({
       limit: String(ORDER_PAGE_SIZE),
       offset: String(orderRows.length),
@@ -1232,6 +1594,34 @@ async function toggleOrderFills(orderId) {
   renderRecentOrders(orderRows, { force: true });
 }
 
+async function toggleExperimentDetail(variantId) {
+  if (!variantId) return;
+  if (expandedExperimentId === variantId) {
+    expandedExperimentId = null;
+    lastExperimentRenderKey = "";
+    renderStrategyExperiments(latestStatus?.runtime || {});
+    return;
+  }
+  expandedExperimentId = variantId;
+  loadingExperimentId = variantId;
+  lastExperimentRenderKey = "";
+  renderStrategyExperiments(latestStatus?.runtime || {});
+  try {
+    const params = new URLSearchParams({
+      variant_id: variantId,
+      trade_limit: "6",
+      order_limit: "6",
+    });
+    const res = await fetch(`/api/strategy-experiments?${params.toString()}`);
+    if (!res.ok) throw new Error(`strategy experiment HTTP ${res.status}`);
+    experimentDetailCache.set(variantId, await res.json());
+  } finally {
+    loadingExperimentId = null;
+  }
+  lastExperimentRenderKey = "";
+  renderStrategyExperiments(latestStatus?.runtime || {});
+}
+
 async function cancelOrder(orderId) {
   if (!orderId) return;
   const res = await fetch("/api/cancel-order", {
@@ -1277,7 +1667,39 @@ function handleOrderStatusFilterChange() {
     latestStatus.recent_orders_meta = orderMeta;
   }
   renderRecentOrders(orderRows, { force: true });
-  loadOrders(true).catch(showError);
+  if (orderDataScope === "experiment") {
+    strategyOrderLimit = ORDER_PAGE_SIZE;
+    loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit }).catch(showError);
+  } else {
+    loadOrders(true).catch(showError);
+  }
+}
+
+function handleDataScopeChange(kind, value) {
+  const normalized = value === "experiment" ? "experiment" : "main";
+  if (kind === "open") openDataScope = normalized;
+  if (kind === "order") {
+    orderDataScope = normalized;
+    expandedOrderId = null;
+    loadingOrderId = null;
+    lastOrderRenderKey = "";
+  }
+  if (kind === "recent") {
+    recentDataScope = normalized;
+    lastRecentRenderKey = "";
+    if (normalized === "experiment") recentLoading = false;
+    else if (!recentRows.length) recentLoading = true;
+  }
+  renderAll(latestStatus, { force: true, forceOrder: true });
+  if (normalized === "experiment") {
+    if (kind === "order") strategyOrderLimit = ORDER_PAGE_SIZE;
+    if (kind === "recent") strategyTradeLimit = RECENT_PAGE_SIZE;
+    loadStrategyExperimentTables({ force: true }).catch(showError);
+  } else if (kind === "order") {
+    loadOrders(true).catch(showError);
+  } else if (kind === "recent" && !recentRows.length) {
+    loadRecentTradesPage(true).catch(showError);
+  }
 }
 
 function confirmCancelOrders(scope) {
@@ -1318,6 +1740,11 @@ function recentTradeQueryParams(offset) {
 }
 
 async function loadRecentTradesPage(replace = false) {
+  if (recentDataScope === "experiment") {
+    strategyTradeLimit = replace ? RECENT_PAGE_SIZE : Math.min(500, Number(strategyTables?.recent_trades_meta?.loaded || 0) + RECENT_PAGE_SIZE);
+    await loadStrategyExperimentTables({ force: true, tradeLimit: strategyTradeLimit });
+    return;
+  }
   const offset = replace ? 0 : recentRows.length;
   const params = recentTradeQueryParams(offset);
   const res = await fetch(`/api/recent-trades?${params.toString()}`);
@@ -1391,22 +1818,6 @@ async function loadMoreRecentTrades() {
   }
 }
 
-async function setPairStrategyEnabled(enabled) {
-  ids.pairStrategyToggle.disabled = true;
-  try {
-    const res = await fetch("/api/strategy-settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pair_strategy_enabled: enabled }),
-    });
-    if (!res.ok) throw new Error(`strategy settings HTTP ${res.status}`);
-    latestStatus = await res.json();
-    renderAll(latestStatus);
-  } finally {
-    ids.pairStrategyToggle.disabled = false;
-  }
-}
-
 function renderAll(data = latestStatus, options = {}) {
   if (data) pendingRenderData = data;
   pendingRenderOptions = {
@@ -1430,13 +1841,30 @@ function renderAll(data = latestStatus, options = {}) {
 function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   renderRuntime(data.runtime);
-  renderPairStrategy(data);
   renderMetrics(data.metrics);
   renderMarket(data.runtime);
-  renderOpenTrades(data.open_trades);
-  const visibleOrderRows = orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
-  renderRecentOrders(visibleOrderRows, { force: Boolean(options.force || options.forceOrder) });
-  renderRecentTrades(recentRows.length ? recentRows : data.recent_trades);
+  renderStrategyExperiments(data.runtime);
+  if (strategyExperimentViewActive() && !strategyTablesLoading) {
+    loadStrategyExperimentTables(false).catch(showError);
+  }
+  const openRows = openDataScope === "experiment" ? strategyTables?.open_trades || [] : data.open_trades || [];
+  renderOpenTrades(openRows, openDataScope);
+  const visibleOrderRows = orderDataScope === "experiment"
+    ? strategyTables?.recent_orders || []
+    : orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
+  renderRecentOrders(visibleOrderRows, {
+    force: Boolean(options.force || options.forceOrder),
+    scope: orderDataScope,
+    meta: orderDataScope === "experiment" ? strategyTables?.recent_orders_meta || {} : orderMeta,
+  });
+  const visibleRecentRows = recentDataScope === "experiment"
+    ? strategyTables?.recent_trades || []
+    : recentRows.length ? recentRows : data.recent_trades;
+  renderRecentTrades(visibleRecentRows || [], {
+    scope: recentDataScope,
+    meta: recentDataScope === "experiment" ? strategyTables?.recent_trades_meta || {} : recentMeta,
+    summary: recentDataScope === "experiment" ? strategyTables?.recent_trades_summary || {} : recentSummary,
+  });
   const now = Date.now();
   if (options.forceChart || now - lastChartRenderMs >= CHART_RENDER_INTERVAL_MS) {
     currentChartRows = buildChartRows(data.equity_curve);
@@ -1800,6 +2228,12 @@ function queueChartHoverDraw() {
 }
 
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.strategyExperiments.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-experiment-id]");
+  if (!button) return;
+  event.stopPropagation();
+  toggleExperimentDetail(String(button.dataset.experimentId || "")).catch(showError);
+});
 ids.recentOrders.addEventListener("click", (event) => {
   const cancelButton = event.target.closest("[data-cancel-order-id]");
   if (cancelButton) {
@@ -1817,17 +2251,14 @@ ids.recentOrders.addEventListener("click", (event) => {
 });
 ids.loadMoreOrders.addEventListener("click", () => loadMoreOrders().catch(showError));
 ids.orderStatusFilter.addEventListener("change", handleOrderStatusFilterChange);
+ids.openDataScope.addEventListener("change", () => handleDataScopeChange("open", ids.openDataScope.value));
+ids.orderDataScope.addEventListener("change", () => handleDataScopeChange("order", ids.orderDataScope.value));
+ids.recentDataScope.addEventListener("change", () => handleDataScopeChange("recent", ids.recentDataScope.value));
 bindCancelOrdersButton(ids.cancelCurrentOrders, "current_market");
 bindCancelOrdersButton(ids.cancelAllOrders, "all");
 ids.loadMoreRecent.addEventListener("click", () => loadMoreRecentTrades().catch(showError));
 ids.applyRecentFilter.addEventListener("click", () => applyRecentTradeFilter().catch(showError));
 ids.resetRecentFilter.addEventListener("click", () => resetRecentTradeFilter().catch(showError));
-ids.pairStrategyToggle.addEventListener("change", () => {
-  setPairStrategyEnabled(ids.pairStrategyToggle.checked).catch((error) => {
-    ids.pairStrategyToggle.checked = !ids.pairStrategyToggle.checked;
-    showError(error);
-  });
-});
 ids.chart.addEventListener("mousemove", handleChartMove);
 ids.chart.addEventListener("mouseleave", handleChartLeave);
 document.addEventListener("selectionchange", () => window.setTimeout(flushPendingOrderRender, 120));

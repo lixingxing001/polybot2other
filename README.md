@@ -13,6 +13,7 @@ This project is intentionally paper-only:
 - If the browser WebSocket feed is stale or closed, the backend falls back to CLOB REST orderbook and public BTC price APIs for display and paper-trading continuity.
 - Paper entries are simulated as CLOB-style orders. The default entry mode is FAK, walks visible ask levels up to the execution limit, and charges the configured taker fee per filled level.
 - Paper order attempts and per-level paper fills are stored separately from positions for execution-quality review.
+- Strategy experiments can run the 8 `SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY` combinations in isolated shadow Paper databases, so each combo has its own cash, orders, trades, and PnL.
 - Trades, settlements, and equity curve are stored in SQLite.
 - Recent trades include a trade-level settlement source. `polymarket_official` means the market winner came from Polymarket Gamma resolved prices; `chainlink_fallback` means the bot used the local Chainlink price against the target because the official winner was not available yet; `early_exit` means the position was closed before market settlement. The bot periodically rechecks fallback settlements and upgrades or corrects them when the official outcome appears. When Polymarket exposes `finalPrice` / `priceToBeat` in event metadata, the bot records those official settlement prices for final price and final distance display; if metadata is missing, it falls back to a one-time Polymarket page payload parse after settlement.
 
@@ -34,6 +35,12 @@ http://127.0.0.1:8787
 rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
+## Retrospective Snapshot
+
+```bash
+rtk proxy env PYTHONPATH=src python3 -m polybot2other.report_snapshot --output docs/strategy-experiments-retrospective-latest.html
+```
+
 ## Runtime Files
 
 ```text
@@ -46,6 +53,11 @@ data/polybot2other-real-btc.sqlite3
 GET /api/recent-trades?limit=100&offset=0&start_at=1779870000&end_at=1779873600
 GET /api/orders?limit=20&offset=0&status=all
 GET /api/order-fills?order_id=1
+GET /api/strategy-experiments
+GET /api/strategy-experiments?variant_id=PAIR_GTD&trade_limit=50&order_limit=50
+GET /api/strategy-experiments-retrospective?start_at=1779870000&end_at=1779873600
+GET /api/strategy-experiments-tables?trade_limit=100&order_limit=20&status=all
+GET /strategy-experiments-retrospective.html?start_at=1779870000&end_at=1779873600
 POST /api/cancel-order {"order_id":1}
 POST /api/cancel-orders {"scope":"current_market"}
 POST /api/cancel-orders {"scope":"all"}
@@ -66,6 +78,9 @@ POLYBOT2OTHER_MAX_ENTRY_PRICE=0.72
 POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE=FAK
 POLYBOT2OTHER_PAPER_TAKER_FEE_RATE=0.07
 POLYBOT2OTHER_PAPER_GTD_SECONDS=90
+POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED=true
+POLYBOT2OTHER_STRATEGY_EXPERIMENTS_DB_DIR=data/strategy-experiments
+POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS=
 POLYBOT2OTHER_GAMMA_URL=https://gamma-api.polymarket.com
 POLYBOT2OTHER_CLOB_URL=https://clob.polymarket.com
 ```

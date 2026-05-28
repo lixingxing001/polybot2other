@@ -6,10 +6,17 @@ import unittest
 from pathlib import Path
 
 from polybot2other.config import Settings
-from polybot2other.bot import PaperTradingBot
+from polybot2other.bot import (
+    PaperTradingBot,
+    _experiment_decision_summary,
+    _experiment_profit_summary,
+    _experiment_review_score,
+)
 from polybot2other.execution import STATUS_FILLED, STATUS_PARTIAL, simulate_fak_buy, simulate_post_only_buy, taker_fee
+from polybot2other.experiments import STRATEGY_VARIANTS
 from polybot2other.models import MarketRound, Signal
 from polybot2other.polymarket import PolymarketClient
+from polybot2other.report_snapshot import generate_strategy_experiment_report_snapshot
 from polybot2other.storage import (
     SETTLEMENT_SOURCE_CHAINLINK,
     SETTLEMENT_SOURCE_EARLY_EXIT,
@@ -17,6 +24,7 @@ from polybot2other.storage import (
     TradeStore,
 )
 from polybot2other.strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
+from polybot2other.web import _strategy_experiments_retrospective_report_html
 
 
 class TradingCoreTest(unittest.TestCase):
@@ -172,6 +180,52 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(recent[0]["outcome"], "Up")
             self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
+
+    def test_bot_broadcasts_official_resolution_to_strategy_experiments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                strategy_experiments_variants="SINGLE_FAK",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-official-broadcast",
+                symbol="BTC",
+                started_at=now - 301,
+                ends_at=now - 1,
+                target_price=100.0,
+            )
+            signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "official broadcast")
+            store.upsert_round(market)
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.settle_due_rounds({"BTC": 99.5}, now)
+
+            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot.store.upsert_round(market)
+            variant_bot.store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            variant_bot.store.settle_due_rounds({"BTC": 99.5}, now)
+            bot.polymarket.get_resolution = (
+                lambda slug: {"outcome": "Up", "final_price": 101.0, "target_price": 100.0}
+                if slug == market.round_id
+                else None
+            )
+
+            bot._reconcile_official_settlements(now + 10)
+
+            main_recent = store.recent_trades(1)
+            self.assertEqual(main_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
+            variant_detail = bot.strategy_experiment_detail("SINGLE_FAK", trade_limit=5, order_limit=5)
+            variant_recent = variant_detail["recent_trades_page"]["recent_trades"]
+            self.assertEqual(variant_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(variant_bot.store.account()["cash_balance"], 95.0, places=6)
+            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["official_count"], 1)
+            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["chainlink_count"], 0)
+            self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
 
     def test_bot_records_official_resolution_final_and_target_prices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1123,6 +1177,495 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(all("PAIR_EXIT" in row["reason"] for row in recent))
             self.assertTrue(all("fee" in row["reason"] for row in recent))
             self.assertGreater(store.metrics()["realized_pnl"], 0)
+
+    def test_strategy_variants_cover_all_eight_target_combinations(self) -> None:
+        combos = [variant.combo for variant in STRATEGY_VARIANTS]
+
+        self.assertEqual(
+            combos,
+            [
+                "SINGLE + FAK",
+                "SINGLE + GTC",
+                "SINGLE + GTD",
+                "SINGLE + POST_ONLY",
+                "PAIR + FAK",
+                "PAIR + GTC",
+                "PAIR + GTD",
+                "PAIR + POST_ONLY",
+            ],
+        )
+
+    def test_pair_strategy_gtd_places_two_resting_pair_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=2,
+                stake_dollars=5.0,
+                paper_entry_order_type="GTD",
+                paper_gtd_seconds=60.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-pair-gtd",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+            bot.set_pair_strategy_enabled(True)
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            active_orders = sorted(store.active_paper_orders("BTC"), key=lambda row: row["side"])
+            self.assertEqual([row["side"] for row in active_orders], ["Down", "Up"])
+            self.assertTrue(all(row["order_type"] == "GTD" for row in active_orders))
+            self.assertTrue(all(row["status"] == "RESTING" for row in active_orders))
+            self.assertTrue(all("PAIR_OPEN_RESTING GTD" in row["reason"] for row in active_orders))
+            self.assertAlmostEqual(sum(row["requested_cash"] for row in active_orders), 5.0, places=5)
+            self.assertLessEqual(active_orders[0]["expires_at"], now + 61.0)
+            self.assertEqual(bot.last_signal["side"], "PAIR_RESTING")
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(len(store.active_paper_orders("BTC")), 2)
+
+    def test_pair_strategy_post_only_places_two_maker_pair_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=2,
+                stake_dollars=5.0,
+                paper_entry_order_type="POST_ONLY",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-pair-post-only",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+            bot.set_pair_strategy_enabled(True)
+
+            bot._run_strategy_from_state()
+
+            active_orders = sorted(store.active_paper_orders("BTC"), key=lambda row: row["side"])
+            self.assertEqual(len(active_orders), 2)
+            self.assertTrue(all(row["order_type"] == "POST_ONLY" for row in active_orders))
+            self.assertTrue(all(row["post_only"] == 1 for row in active_orders))
+            self.assertLess(active_orders[0]["limit_price"], 0.5)
+            self.assertLess(active_orders[1]["limit_price"], 0.4)
+            self.assertEqual(store.open_trades(), [])
+
+    def test_strategy_experiments_run_all_variants_in_isolated_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                max_open_trades=2,
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-experiments",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            snapshot = bot.strategy_experiments_snapshot()
+            variants = {row["variant_id"]: row for row in snapshot["variants"]}
+            self.assertEqual(len(variants), 8)
+            self.assertEqual(snapshot["run_count"], 1)
+            self.assertIn("profit_summary", snapshot)
+            self.assertEqual(snapshot["profit_summary"]["status"], "WAITING_FOR_SAMPLE")
+            self.assertIsNone(snapshot["profit_summary"]["winner_variant_id"])
+            self.assertFalse(snapshot["decision_summary"]["comparison_ready"])
+            self.assertEqual(snapshot["decision_summary"]["status"], "WAITING_FOR_SAMPLE")
+            self.assertEqual(snapshot["decision_summary"]["ready_count"], 0)
+            self.assertEqual(snapshot["decision_summary"]["total_count"], 8)
+            self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
+            self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
+            self.assertTrue(all(row["last_error"] is None for row in variants.values()))
+            self.assertIn("review_score", variants["SINGLE_FAK"])
+            self.assertIn("score", variants["SINGLE_FAK"]["review_score"])
+            self.assertEqual(variants["SINGLE_FAK"]["review_score"]["sample_status"], "INSUFFICIENT")
+            self.assertIn("结算样本不足", variants["SINGLE_FAK"]["review_score"]["reasons"][0])
+            self.assertEqual(variants["SINGLE_FAK"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["PAIR_FAK"]["metrics"]["open_trades"], 2)
+            self.assertEqual(variants["PAIR_GTD"]["active_orders"], 2)
+            self.assertEqual(variants["PAIR_POST_ONLY"]["active_orders"], 2)
+            self.assertEqual(variants["PAIR_FAK"]["order_summary"]["filled_count"], 2)
+            self.assertEqual(variants["PAIR_FAK"]["order_summary"]["fill_rate"], 100.0)
+            self.assertEqual(variants["PAIR_GTD"]["order_summary"]["active_count"], 2)
+            self.assertEqual(variants["PAIR_GTD"]["order_summary"]["fill_rate"], 0.0)
+            self.assertNotEqual(variants["SINGLE_FAK"]["db_path"], variants["PAIR_FAK"]["db_path"])
+
+            detail = bot.strategy_experiment_detail("PAIR_GTD", trade_limit=5, order_limit=5)
+            self.assertEqual(detail["variant"]["variant_id"], "PAIR_GTD")
+            self.assertEqual(detail["variant"]["order_summary"]["total_count"], 2)
+            self.assertEqual(detail["recent_orders_page"]["recent_orders_meta"]["total"], 2)
+            self.assertEqual(detail["recent_trades_page"]["recent_trades_meta"]["total"], 0)
+
+            retrospective = bot.strategy_experiments_retrospective()
+            self.assertTrue(retrospective["enabled"])
+            self.assertEqual(len(retrospective["variants"]), 8)
+            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 8)
+            self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
+
+            tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)
+            self.assertTrue(tables["enabled"])
+            self.assertGreaterEqual(len(tables["open_trades"]), 3)
+            self.assertTrue(all("combo" in row for row in tables["open_trades"]))
+            self.assertTrue(any(row["variant_id"] == "SINGLE_FAK" for row in tables["open_trades"]))
+            self.assertTrue(any(row["variant_id"] == "PAIR_FAK" for row in tables["open_trades"]))
+            self.assertGreaterEqual(tables["recent_orders_meta"]["total"], 8)
+            self.assertTrue(all("combo" in row for row in tables["recent_orders"]))
+            self.assertGreaterEqual(tables["recent_trades_meta"]["total"], 3)
+            self.assertEqual(tables["recent_trades_summary"]["total_count"], tables["recent_trades_meta"]["total"])
+
+            with self.assertRaises(ValueError):
+                bot.strategy_experiment_detail("bad-variant")
+
+    def test_strategy_experiment_low_fill_variant_is_disqualified(self) -> None:
+        review = _experiment_review_score(
+            {
+                "settled_count": 0,
+                "official_count": 0,
+                "chainlink_count": 0,
+                "roi_pct": None,
+                "win_rate": None,
+                "total_pnl": 0.0,
+            },
+            {
+                "total_count": 60,
+                "rejected_count": 0,
+                "expired_count": 0,
+                "canceled_count": 0,
+                "fill_attempt_count": 0,
+                "fill_rate": 0.0,
+            },
+            None,
+            None,
+        )
+
+        self.assertEqual(review["sample_status"], "DISQUALIFIED")
+        self.assertEqual(review["sample_label"], "执行淘汰")
+        self.assertEqual(review["decision"], "执行不可用")
+        self.assertTrue(review["disqualified"])
+        self.assertFalse(review["eligible_for_decision"])
+        self.assertLessEqual(review["score"], 25.0)
+        self.assertIn("长期低成交，暂不纳入决胜", review["reasons"])
+
+    def test_strategy_experiment_decision_can_finish_with_disqualified_variants(self) -> None:
+        variants = [
+            {
+                "variant_id": "PAIR_POST_ONLY",
+                "combo": "PAIR + POST_ONLY",
+                "review_score": {"score": 82.0, "eligible_for_decision": True, "disqualified": False},
+                "recent_trades_summary": {"settled_count": 40, "total_pnl": 12.0},
+                "order_summary": {"total_count": 90, "fill_rate": 58.0},
+            },
+            {
+                "variant_id": "PAIR_GTC",
+                "combo": "PAIR + GTC",
+                "review_score": {
+                    "score": 18.0,
+                    "eligible_for_decision": False,
+                    "disqualified": True,
+                    "disqualification_reason": "长期低成交",
+                },
+                "recent_trades_summary": {"settled_count": 0, "total_pnl": 0.0},
+                "order_summary": {"total_count": 80, "fill_rate": 0.0},
+            },
+        ]
+
+        summary = _experiment_decision_summary(variants)
+
+        self.assertTrue(summary["comparison_ready"])
+        self.assertEqual(summary["status"], "READY")
+        self.assertEqual(summary["recommended_variant_id"], "PAIR_POST_ONLY")
+        self.assertEqual(summary["ready_count"], 1)
+        self.assertEqual(summary["pending_count"], 0)
+        self.assertEqual(summary["disqualified_count"], 1)
+        self.assertEqual(summary["disqualified_variants"][0]["variant_id"], "PAIR_GTC")
+
+    def test_strategy_experiment_profit_summary_separates_leader_from_final_winner(self) -> None:
+        variants = [
+            {
+                "variant_id": "SINGLE_FAK",
+                "combo": "SINGLE + FAK",
+                "review_score": {"score": 55.0, "eligible_for_decision": False, "disqualified": False},
+                "recent_trades_summary": {"settled_count": 4, "total_pnl": 15.0, "roi_pct": 75.0, "win_rate": 100.0},
+                "order_summary": {"fill_rate": 100.0},
+            },
+            {
+                "variant_id": "PAIR_POST_ONLY",
+                "combo": "PAIR + POST_ONLY",
+                "review_score": {"score": 82.0, "eligible_for_decision": True, "disqualified": False},
+                "recent_trades_summary": {"settled_count": 40, "total_pnl": 12.0, "roi_pct": 24.0, "win_rate": 62.5},
+                "order_summary": {"fill_rate": 58.0},
+            },
+        ]
+
+        waiting = _experiment_profit_summary(variants)
+
+        self.assertEqual(waiting["status"], "WAITING_FOR_SAMPLE")
+        self.assertEqual(waiting["current_profit_leader_variant_id"], "SINGLE_FAK")
+        self.assertIsNone(waiting["winner_variant_id"])
+        self.assertFalse(waiting["comparison_ready"])
+
+        variants[0]["review_score"] = {"score": 20.0, "eligible_for_decision": False, "disqualified": True}
+        ready = _experiment_profit_summary(variants)
+
+        self.assertEqual(ready["status"], "READY")
+        self.assertEqual(ready["current_profit_leader_variant_id"], "SINGLE_FAK")
+        self.assertEqual(ready["winner_variant_id"], "PAIR_POST_ONLY")
+        self.assertTrue(ready["comparison_ready"])
+        self.assertTrue(ready["profitable_winner_ready"])
+
+        variants[1]["recent_trades_summary"]["total_pnl"] = -1.0
+        no_profit = _experiment_profit_summary(variants)
+
+        self.assertEqual(no_profit["status"], "NO_PROFIT")
+        self.assertTrue(no_profit["comparison_ready"])
+        self.assertFalse(no_profit["profitable_winner_ready"])
+        self.assertEqual(no_profit["best_eligible_variant_id"], "PAIR_POST_ONLY")
+        self.assertIsNone(no_profit["winner_variant_id"])
+
+    def test_strategy_experiment_html_report_escapes_and_summarizes_variants(self) -> None:
+        report = {
+            "enabled": True,
+            "db_dir": "data/strategy-experiments",
+            "window": {"start_at": None, "end_at": None},
+            "profit_summary": {
+                "status_label": "等待盈利样本",
+                "winner_combo": None,
+                "current_profit_leader_combo": "PAIR + POST_ONLY",
+                "ready_count": 1,
+                "total_count": 2,
+                "disqualified_count": 0,
+                "profitable_winner_ready": False,
+                "reason": "还有 1 个组合未达到样本阈值",
+            },
+            "decision_summary": {
+                "reason": "继续观察",
+                "missing_sample_variants": [
+                    {
+                        "combo": "SINGLE + FAK",
+                        "sample_label": "样本不足",
+                        "settled_count": 2,
+                        "order_count": 4,
+                    }
+                ],
+                "disqualified_variants": [],
+            },
+            "variants": [
+                {
+                    "variant_id": "PAIR_POST_ONLY",
+                    "combo": "PAIR + POST_ONLY",
+                    "role": "最核心目标",
+                    "target_code_completion": "90%+",
+                    "target_report_alignment": "90%+",
+                    "recent_trades_summary": {
+                        "total_pnl": 3.25,
+                        "roi_pct": 12.5,
+                        "win_rate": 66.7,
+                        "settled_count": 3,
+                        "total_count": 4,
+                        "official_count": 3,
+                    },
+                    "order_summary": {"total_count": 8, "fill_rate": 62.5},
+                    "review_score": {
+                        "score": 76.5,
+                        "decision": "优先候选",
+                        "sample_label": "观察中",
+                        "eligible_for_decision": False,
+                        "disqualified": False,
+                        "reasons": ["reason <script>alert(1)</script>"],
+                    },
+                }
+            ],
+        }
+
+        html = _strategy_experiments_retrospective_report_html(report, generated_at=1_779_871_200)
+
+        self.assertIn("策略实验复盘报告", html)
+        self.assertIn("PAIR + POST_ONLY", html)
+        self.assertIn("+$3.25", html)
+        self.assertIn("reason &lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("reason <script>alert(1)</script>", html)
+
+    def test_strategy_experiment_report_snapshot_writes_docs_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                strategy_experiments_variants="SINGLE_FAK",
+            )
+            output = Path(tmp) / "docs" / "snapshot.html"
+
+            result = generate_strategy_experiment_report_snapshot(
+                settings,
+                output,
+                generated_at=1_779_871_200,
+            )
+
+            self.assertEqual(result["output_path"], str(output))
+            self.assertEqual(result["variant_count"], 1)
+            self.assertTrue(output.exists())
+            html = output.read_text(encoding="utf-8")
+            self.assertIn("策略实验复盘报告", html)
+            self.assertIn("SINGLE + FAK", html)
+            self.assertIn("数据源", html)
+
+    def test_paper_order_summary_supports_time_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradeStore(Path(tmp) / "test.sqlite3", 100.0)
+            now = time.time()
+            old_market = MarketRound(
+                round_id="btc-updown-5m-order-window-old",
+                symbol="BTC",
+                started_at=now - 600,
+                ends_at=now - 300,
+                target_price=100.0,
+            )
+            new_market = MarketRound(
+                round_id="btc-updown-5m-order-window-new",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 240,
+                target_price=100.0,
+            )
+            store.upsert_round(old_market)
+            store.upsert_round(new_market)
+            store._insert_paper_order(
+                market=old_market,
+                side="Up",
+                order_type="GTC",
+                status="RESTING",
+                limit_price=0.5,
+                post_only=False,
+                expires_at=None,
+                requested_cash=1.0,
+                reserved_cash=1.0,
+                remaining_cash=1.0,
+                filled_shares=0.0,
+                avg_fill_price=None,
+                notional=0.0,
+                fee=0.0,
+                cash_spent=0.0,
+                trade_id=None,
+                confidence=0.6,
+                move_bps=10.0,
+                reason="old",
+                now=now - 500,
+            )
+            store._insert_paper_order(
+                market=new_market,
+                side="Down",
+                order_type="GTC",
+                status="RESTING",
+                limit_price=0.5,
+                post_only=False,
+                expires_at=None,
+                requested_cash=1.0,
+                reserved_cash=1.0,
+                remaining_cash=1.0,
+                filled_shares=0.0,
+                avg_fill_price=None,
+                notional=0.0,
+                fee=0.0,
+                cash_spent=0.0,
+                trade_id=None,
+                confidence=0.6,
+                move_bps=-10.0,
+                reason="new",
+                now=now - 10,
+            )
+
+            summary = store.paper_order_summary("BTC", start_at=now - 60, end_at=now)
+
+            self.assertEqual(summary["total_count"], 1)
+            self.assertEqual(summary["active_count"], 1)
+            self.assertEqual(summary["requested_cash"], 1.0)
 
     def test_real_strategy_uses_orderbook_ask_price(self) -> None:
         settings = Settings(min_confidence=0.55, min_edge=0.0, max_entry_price=0.8)

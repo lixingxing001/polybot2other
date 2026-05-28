@@ -336,6 +336,20 @@ class TradeStore:
         return row is not None
 
     @_locked
+    def active_paper_order_exists_for_round(self, round_id: str) -> bool:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        row = self.conn.execute(
+            f"""
+            SELECT id
+            FROM paper_orders
+            WHERE round_id = ? AND status IN ({placeholders})
+            LIMIT 1
+            """,
+            (round_id, *ACTIVE_ORDER_STATUSES),
+        ).fetchone()
+        return row is not None
+
+    @_locked
     def open_trade_count(self, symbol: str | None = None) -> int:
         if symbol:
             row = self.conn.execute(
@@ -439,7 +453,7 @@ class TradeStore:
             requested_cash=getattr(result, "requested_cash", None) or intent.stake_dollars,
             expires_at=getattr(result, "expires_at", None),
             post_only=bool(getattr(result, "post_only", False)),
-            reason=str(getattr(result, "reason", "")),
+            reason=_append_reason(str(intent.signal.reason or ""), str(getattr(result, "reason", ""))),
         )
         return []
 
@@ -1385,6 +1399,72 @@ class TradeStore:
             tuple(params),
         ).fetchone()
         return int(row["count"])
+
+    @_locked
+    def paper_order_summary(
+        self,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if start_at is not None:
+            conditions.append("created_at >= ?")
+            params.append(float(start_at))
+        if end_at is not None:
+            conditions.append("created_at <= ?")
+            params.append(float(end_at))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE WHEN status IN ('RESTING', 'PARTIAL_RESTING') THEN 1 ELSE 0 END), 0) AS active_count,
+                COALESCE(SUM(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END), 0) AS filled_count,
+                COALESCE(SUM(CASE WHEN status = 'PARTIAL' THEN 1 ELSE 0 END), 0) AS partial_count,
+                COALESCE(SUM(CASE WHEN status = 'PARTIAL_RESTING' THEN 1 ELSE 0 END), 0) AS partial_resting_count,
+                COALESCE(SUM(CASE WHEN status = 'CANCELED' THEN 1 ELSE 0 END), 0) AS canceled_count,
+                COALESCE(SUM(CASE WHEN status = 'EXPIRED' THEN 1 ELSE 0 END), 0) AS expired_count,
+                COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0) AS rejected_count,
+                COALESCE(SUM(CASE WHEN post_only = 1 THEN 1 ELSE 0 END), 0) AS post_only_count,
+                COALESCE(SUM(requested_cash), 0) AS requested_cash,
+                COALESCE(SUM(remaining_cash), 0) AS remaining_cash,
+                COALESCE(SUM(filled_shares), 0) AS filled_shares,
+                COALESCE(SUM(cash_spent), 0) AS cash_spent,
+                COALESCE(SUM(fee), 0) AS fee
+            FROM paper_orders
+            {where}
+            """,
+            tuple(params),
+        ).fetchone()
+        summary = dict(row)
+        total_count = int(summary["total_count"] or 0)
+        fill_attempt_count = int(summary["filled_count"] or 0) + int(summary["partial_count"] or 0) + int(summary["partial_resting_count"] or 0)
+        summary.update(
+            {
+                "total_count": total_count,
+                "active_count": int(summary["active_count"] or 0),
+                "filled_count": int(summary["filled_count"] or 0),
+                "partial_count": int(summary["partial_count"] or 0),
+                "partial_resting_count": int(summary["partial_resting_count"] or 0),
+                "canceled_count": int(summary["canceled_count"] or 0),
+                "expired_count": int(summary["expired_count"] or 0),
+                "rejected_count": int(summary["rejected_count"] or 0),
+                "post_only_count": int(summary["post_only_count"] or 0),
+                "fill_attempt_count": fill_attempt_count,
+                "fill_rate": round(fill_attempt_count / total_count * 100.0, 4) if total_count else None,
+                "requested_cash": round(float(summary["requested_cash"] or 0.0), 6),
+                "remaining_cash": round(float(summary["remaining_cash"] or 0.0), 6),
+                "filled_shares": round(float(summary["filled_shares"] or 0.0), 6),
+                "cash_spent": round(float(summary["cash_spent"] or 0.0), 6),
+                "fee": round(float(summary["fee"] or 0.0), 6),
+            }
+        )
+        return summary
 
     @_locked
     def paper_order_fills(self, order_id: int) -> list[dict[str, Any]]:

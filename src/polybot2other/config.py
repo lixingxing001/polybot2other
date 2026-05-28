@@ -32,6 +32,9 @@ class Settings:
     paper_entry_order_type: str = "FAK"
     paper_taker_fee_rate: float = 0.07
     paper_gtd_seconds: float = 90.0
+    strategy_experiments_enabled: bool = False
+    strategy_experiments_db_dir: Path = Path("data/strategy-experiments")
+    strategy_experiments_variants: str = ""
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
 
@@ -62,6 +65,18 @@ def _int_env(name: str, default: int, minimum: int | None = None) -> int:
     return value
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 def load_settings() -> Settings:
     return Settings(
         initial_balance=_float_env("POLYBOT2OTHER_INITIAL_BALANCE", 100.0, 1.0),
@@ -85,6 +100,11 @@ def load_settings() -> Settings:
         paper_entry_order_type=os.environ.get("POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE", "FAK"),
         paper_taker_fee_rate=_float_env("POLYBOT2OTHER_PAPER_TAKER_FEE_RATE", 0.07, 0.0),
         paper_gtd_seconds=_float_env("POLYBOT2OTHER_PAPER_GTD_SECONDS", 90.0, 1.0),
+        strategy_experiments_enabled=_bool_env("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED", True),
+        strategy_experiments_db_dir=Path(
+            os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_DB_DIR", "data/strategy-experiments")
+        ),
+        strategy_experiments_variants=os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS", ""),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
     )
