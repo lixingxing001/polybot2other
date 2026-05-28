@@ -368,7 +368,7 @@ def _strategy_experiments_retrospective_report_html(report: dict[str, Any], gene
       <header>
         <div>
           <h1>{_html(title)}</h1>
-          <p>8 组 SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY 隔离 Paper 实验复盘。</p>
+          <p>{len(variants)} 组 SINGLE/PAIR 策略实验隔离 Paper 复盘。</p>
           <p>窗口：{_html(_format_report_window(window))}</p>
         </div>
         <div class="stamp">
@@ -390,7 +390,7 @@ def _strategy_experiments_retrospective_report_html(report: dict[str, Any], gene
         <p>正式决胜条件：未淘汰组合达到样本阈值，且最高净盈亏大于 0。当前 profitable_winner_ready={_html(str(profit.get("profitable_winner_ready")))}。</p>
       </section>
       <section class="panel">
-        <h2>8 组合盈利排名</h2>
+        <h2>{len(variants)} 组合盈利排名</h2>
         <div class="table-wrap">
           <table>
             <thead>

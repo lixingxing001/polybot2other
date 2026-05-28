@@ -21,7 +21,15 @@ from .execution import (
     sweep_taker_buy_by_shares,
     taker_fee,
 )
-from .experiments import STRATEGY_FAMILY_PAIR, StrategyVariant, selected_strategy_variants
+from .experiments import (
+    SINGLE_ENTRY_MODE_LEGACY,
+    SINGLE_ENTRY_MODE_REVERSAL,
+    SINGLE_ENTRY_MODE_STOP_AND_FLIP,
+    SINGLE_ENTRY_MODE_STRICT,
+    STRATEGY_FAMILY_PAIR,
+    StrategyVariant,
+    selected_strategy_variants,
+)
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
 from .polymarket import PolymarketClient, market_to_payload
@@ -61,6 +69,9 @@ PAIR_DAILY_LOSS_PCT = 10.0
 PAIR_DAILY_LOSS_NOTE = "Paper采样阈值，实盘不得沿用"
 PAIR_STOP_STREAK_LIMIT = 3
 PAIR_EPSILON = 0.000001
+SINGLE_STRICT_MARKER = "SINGLE_STRICT"
+SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
+SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
 POST_ONLY_MIN_REST_SECONDS = 8.0
 POST_ONLY_CROSS_BUFFER = 0.005
 POST_ONLY_QUEUE_INITIAL_FILL_RATIO = 0.25
@@ -90,6 +101,7 @@ class PaperTradingBot:
         self.pair_strategy_enabled = False
         self.pair_stop_loss_streak = 0
         self.last_pair_event: dict[str, Any] | None = None
+        self.single_entry_mode = SINGLE_ENTRY_MODE_LEGACY
         self.ws_status: dict[str, Any] = {
             "market": "waiting",
             "price": "waiting",
@@ -479,12 +491,37 @@ class PaperTradingBot:
             return
         if self.store.daily_realized_pnl() <= -abs(self.settings.max_daily_loss):
             return
-        if self.store.open_trade_count("BTC") >= self.settings.max_open_trades:
+        single_entry_mode = self.single_entry_mode
+        round_open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        same_side_open = any(row.get("side") == signal.side for row in round_open_rows)
+        opposite_rows = [row for row in round_open_rows if row.get("side") != signal.side]
+        closing_count = len(opposite_rows) if single_entry_mode == SINGLE_ENTRY_MODE_STOP_AND_FLIP else 0
+        if self.store.open_trade_count("BTC") - closing_count >= self.settings.max_open_trades:
             return
-        if self.store.open_trade_exists(market.round_id, signal.side):
+        if same_side_open:
+            if single_entry_mode in {
+                SINGLE_ENTRY_MODE_STRICT,
+                SINGLE_ENTRY_MODE_REVERSAL,
+                SINGLE_ENTRY_MODE_STOP_AND_FLIP,
+            }:
+                self._append_last_signal_reason(f"{single_entry_mode} 当前市场已有同方向持仓，跳过重复开仓")
+            return
+        if single_entry_mode == SINGLE_ENTRY_MODE_STRICT and round_open_rows:
+            existing_sides = _side_list_text(row.get("side") for row in round_open_rows)
+            self._append_last_signal_reason(f"{SINGLE_STRICT_MARKER} 当前市场已有 {existing_sides} 持仓，禁止反向开仓")
             return
         if self.store.active_paper_order_exists(market.round_id, signal.side):
             self._append_last_signal_reason("已有同方向挂单等待成交")
+            return
+        if single_entry_mode == SINGLE_ENTRY_MODE_STRICT and self.store.active_paper_order_exists_for_round(market.round_id):
+            self._append_last_signal_reason(f"{SINGLE_STRICT_MARKER} 当前市场已有挂单，禁止再次开仓")
+            return
+        if single_entry_mode == SINGLE_ENTRY_MODE_STOP_AND_FLIP and self.store.active_paper_order_exists_for_round(market.round_id):
+            self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 当前市场有活跃挂单，暂不止损反手")
             return
         account = self.store.account()
         stake = min(self.settings.stake_dollars, float(account["cash_balance"]))
@@ -494,6 +531,41 @@ class PaperTradingBot:
             quotes = dict(self.latest_quotes)
         quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
         quote = self._quote_with_depth(market, signal.side, quote)
+        if single_entry_mode == SINGLE_ENTRY_MODE_REVERSAL and opposite_rows:
+            existing_sides = _side_list_text(row.get("side") for row in opposite_rows)
+            note = f"{SINGLE_REVERSAL_MARKER} 双边反转开仓: 已有 {existing_sides} 持仓, 新开 {signal.side}"
+            signal = replace(signal, reason=_append_reason_text(signal.reason, note))
+            self._append_last_signal_reason(note)
+        if single_entry_mode == SINGLE_ENTRY_MODE_STOP_AND_FLIP and opposite_rows:
+            precheck_intent = TradeIntent(market=market, signal=signal, stake_dollars=stake)
+            precheck = self._execute_entry_order(precheck_intent, quote)
+            if not precheck.fills:
+                self.store.place_execution_result(precheck_intent, precheck)
+                self._append_last_signal_reason(
+                    f"{SINGLE_STOP_AND_FLIP_MARKER} 新方向不可成交，保留旧仓 | {precheck.reason}"
+                )
+                return
+            exit_side = str(opposite_rows[0].get("side") or "")
+            exit_quote = quotes.get(exit_side) if isinstance(quotes.get(exit_side), dict) else {}
+            exit_quote = self._quote_with_bid(market, exit_side, exit_quote)
+            exit_bid = _maybe_float(exit_quote.get("best_bid"))
+            if exit_bid is None or exit_bid <= 0:
+                self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 缺少 {exit_side} 买一价，保留旧仓")
+                return
+            close_shares = sum(_maybe_float(row.get("shares")) or 0.0 for row in opposite_rows)
+            now = time.time()
+            close_reason = f"{SINGLE_STOP_AND_FLIP_MARKER} 平旧仓后反手 {exit_side}->{signal.side}"
+            closed = self._close_side_shares(opposite_rows, exit_side, close_shares, exit_bid, now, close_reason)
+            if not closed:
+                self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 旧仓平仓失败，取消反手开仓")
+                return
+            closed_pnl = sum(_maybe_float(row.get("pnl")) or 0.0 for row in closed)
+            note = (
+                f"{SINGLE_STOP_AND_FLIP_MARKER} 平旧仓后反手: {exit_side}->{signal.side}, "
+                f"close_bid {exit_bid:.4f}, closed {len(closed)}, pnl {closed_pnl:.6f}"
+            )
+            signal = replace(signal, reason=_append_reason_text(signal.reason, note))
+            self._append_last_signal_reason(note)
         intent = TradeIntent(market=market, signal=signal, stake_dollars=stake)
         result = self._execute_entry_order(intent, quote)
         trade_ids = self.store.place_execution_result(intent, result)
@@ -1016,6 +1088,18 @@ class PaperTradingBot:
             limit_price=limit_price,
         )
 
+    def _quote_with_bid(self, market: MarketRound, side: str, quote: dict[str, Any]) -> dict[str, Any]:
+        if _maybe_float(quote.get("best_bid")) is not None:
+            return quote
+        token_id = market.up_token if side == "Up" else market.down_token if side == "Down" else ""
+        if not token_id:
+            return quote
+        try:
+            fresh = self.polymarket.get_quote(token_id, side).to_dict()
+        except Exception:  # noqa: BLE001 - missing stop-and-flip exit bid should not stop the bot loop.
+            return quote
+        return fresh or quote
+
     def _quote_with_depth(self, market: MarketRound, side: str, quote: dict[str, Any]) -> dict[str, Any]:
         if isinstance(quote.get("asks"), list) and quote.get("asks"):
             return quote
@@ -1451,6 +1535,7 @@ class StrategyExperimentRunner:
             bot.polymarket = polymarket
             bot.price_fallback = price_fallback
             bot.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
+            bot.single_entry_mode = variant.single_entry_mode
             self._bots[variant.variant_id] = bot
             self._errors[variant.variant_id] = None
             self._official_broadcast_errors[variant.variant_id] = None
@@ -1732,6 +1817,7 @@ class StrategyExperimentRunner:
             "combo": variant.combo,
             "strategy_family": variant.strategy_family,
             "order_type": variant.order_type,
+            "single_entry_mode": variant.single_entry_mode,
             "target_code_completion": variant.target_code_completion,
             "target_report_alignment": variant.target_report_alignment,
             "role": variant.role,
@@ -1746,6 +1832,18 @@ class StrategyExperimentRunner:
             "order_summary": order_summary,
             "metrics": metrics,
             "recent_trades_summary": trade_summary,
+            "single_reversal_summary": bot.store.trade_reason_summary(
+                SINGLE_REVERSAL_MARKER,
+                "BTC",
+                start_at,
+                end_at,
+            ),
+            "single_stop_and_flip_summary": bot.store.trade_reason_summary(
+                SINGLE_STOP_AND_FLIP_MARKER,
+                "BTC",
+                start_at,
+                end_at,
+            ),
         }
 
     def apply_official_resolution(
@@ -1818,12 +1916,26 @@ def _copy_quotes(quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]
     return copied
 
 
+def _append_reason_text(existing: str, addition: str) -> str:
+    existing_text = str(existing or "").strip()
+    addition_text = str(addition or "").strip()
+    if existing_text and addition_text:
+        return f"{existing_text} | {addition_text}"
+    return existing_text or addition_text
+
+
+def _side_list_text(sides: Any) -> str:
+    values = sorted({str(side) for side in sides if str(side or "") in {"Up", "Down"}})
+    return ",".join(values) if values else "-"
+
+
 def _variant_tags(variant: StrategyVariant) -> dict[str, Any]:
     return {
         "variant_id": variant.variant_id,
         "combo": variant.combo,
         "strategy_family": variant.strategy_family,
         "experiment_order_type": variant.order_type,
+        "single_entry_mode": variant.single_entry_mode,
         "account_scope": "strategy_experiment",
     }
 

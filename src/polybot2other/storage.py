@@ -1346,6 +1346,59 @@ class TradeStore:
         )
         return summary
 
+    @_locked
+    def trade_reason_summary(
+        self,
+        reason_marker: str,
+        symbol: str | None = None,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        marker = str(reason_marker or "").strip()
+        if not marker:
+            return _empty_trade_reason_summary(marker, start_at, end_at)
+        where, params = self._recent_trade_where(symbol, start_at, end_at)
+        marker_where = f"{where} AND t.reason LIKE ?" if where else "WHERE t.reason LIKE ?"
+        marker_params = (*params, f"%{marker}%")
+        row = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_count,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN 1 ELSE 0 END), 0) AS settled_count,
+                COALESCE(SUM(CASE WHEN t.status = 'OPEN' THEN 1 ELSE 0 END), 0) AS open_count,
+                COALESCE(SUM(t.stake), 0) AS total_stake,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN t.stake ELSE 0 END), 0) AS settled_stake,
+                COALESCE(SUM(CASE WHEN t.status = 'OPEN' THEN t.stake ELSE 0 END), 0) AS open_risk,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' THEN COALESCE(t.pnl, 0) ELSE 0 END), 0) AS total_pnl,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' AND t.pnl > 0 THEN 1 ELSE 0 END), 0) AS win_count,
+                COALESCE(SUM(CASE WHEN t.status = 'SETTLED' AND t.pnl < 0 THEN 1 ELSE 0 END), 0) AS loss_count
+            FROM trades t
+            {marker_where}
+            """,
+            marker_params,
+        ).fetchone()
+        summary = dict(row)
+        settled_count = int(summary["settled_count"] or 0)
+        settled_stake = float(summary["settled_stake"] or 0.0)
+        win_count = int(summary["win_count"] or 0)
+        total_pnl = float(summary["total_pnl"] or 0.0)
+        return {
+            "reason_marker": marker,
+            "start_at": start_at,
+            "end_at": end_at,
+            "total_count": int(summary["total_count"] or 0),
+            "settled_count": settled_count,
+            "open_count": int(summary["open_count"] or 0),
+            "win_count": win_count,
+            "loss_count": int(summary["loss_count"] or 0),
+            "total_stake": round(float(summary["total_stake"] or 0.0), 6),
+            "settled_stake": round(settled_stake, 6),
+            "open_risk": round(float(summary["open_risk"] or 0.0), 6),
+            "total_pnl": round(total_pnl, 6),
+            "roi_pct": round(total_pnl / settled_stake * 100.0, 4) if settled_stake else None,
+            "win_rate": round(win_count / settled_count * 100.0, 4) if settled_count else None,
+        }
+
     def _recent_trade_where(
         self,
         symbol: str | None = None,
@@ -2065,6 +2118,25 @@ def _append_reason(existing: str, reason: str) -> str:
     if not reason:
         return existing
     return f"{existing} | {reason}"
+
+
+def _empty_trade_reason_summary(marker: str, start_at: float | None, end_at: float | None) -> dict[str, Any]:
+    return {
+        "reason_marker": marker,
+        "start_at": start_at,
+        "end_at": end_at,
+        "total_count": 0,
+        "settled_count": 0,
+        "open_count": 0,
+        "win_count": 0,
+        "loss_count": 0,
+        "total_stake": 0.0,
+        "settled_stake": 0.0,
+        "open_risk": 0.0,
+        "total_pnl": 0.0,
+        "roi_pct": None,
+        "win_rate": None,
+    }
 
 
 def _nullable_price(value: float | None) -> float | None:

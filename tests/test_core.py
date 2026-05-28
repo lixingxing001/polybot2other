@@ -13,7 +13,13 @@ from polybot2other.bot import (
     _experiment_review_score,
 )
 from polybot2other.execution import STATUS_FILLED, STATUS_PARTIAL, simulate_fak_buy, simulate_post_only_buy, taker_fee
-from polybot2other.experiments import STRATEGY_VARIANTS
+from polybot2other.experiments import (
+    SINGLE_ENTRY_MODE_LEGACY,
+    SINGLE_ENTRY_MODE_REVERSAL,
+    SINGLE_ENTRY_MODE_STOP_AND_FLIP,
+    SINGLE_ENTRY_MODE_STRICT,
+    STRATEGY_VARIANTS,
+)
 from polybot2other.models import MarketRound, Signal
 from polybot2other.polymarket import PolymarketClient
 from polybot2other.report_snapshot import generate_strategy_experiment_report_snapshot
@@ -635,6 +641,133 @@ class TradingCoreTest(unittest.TestCase):
             self.assertGreater(rows[0]["entry_price"], 0.34)
             self.assertIn("levels 2", rows[0]["reason"])
             self.assertIn("limit 0.7000", rows[0]["reason"])
+
+    def test_single_fak_legacy_allows_implicit_opposite_side_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_edge=0.0,
+                max_entry_price=0.8,
+                max_open_trades=2,
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.single_entry_mode = SINGLE_ENTRY_MODE_LEGACY
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-legacy", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.39, "best_ask": 0.4, "asks": [{"price": 0.4, "size": 100}]},
+                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "asks": [{"price": 0.5, "size": 100}]},
+                }
+
+            bot._maybe_place_trade(market, Signal("BTC", "Up", 0.7, 0.4, 10.0, "legacy first"))
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.5, -10.0, "legacy flip"))
+
+            rows = sorted(store.open_trades(), key=lambda row: row["side"])
+            self.assertEqual([row["side"] for row in rows], ["Down", "Up"])
+            self.assertFalse(any("SINGLE_REVERSAL" in row["reason"] for row in rows))
+
+    def test_single_fak_strict_blocks_opposite_side_entry_for_same_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_edge=0.0,
+                max_entry_price=0.8,
+                max_open_trades=2,
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.single_entry_mode = SINGLE_ENTRY_MODE_STRICT
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-strict", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.39, "best_ask": 0.4, "asks": [{"price": 0.4, "size": 100}]},
+                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "asks": [{"price": 0.5, "size": 100}]},
+                }
+
+            bot._maybe_place_trade(market, Signal("BTC", "Up", 0.7, 0.4, 10.0, "strict first"))
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.5, -10.0, "strict blocked"))
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Up")
+            self.assertIn("SINGLE_STRICT", bot.last_signal["reason"])
+
+    def test_single_fak_reversal_marks_opposite_side_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_edge=0.0,
+                max_entry_price=0.8,
+                max_open_trades=2,
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.single_entry_mode = SINGLE_ENTRY_MODE_REVERSAL
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-reversal", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.39, "best_ask": 0.4, "asks": [{"price": 0.4, "size": 100}]},
+                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "asks": [{"price": 0.5, "size": 100}]},
+                }
+
+            bot._maybe_place_trade(market, Signal("BTC", "Up", 0.7, 0.4, 10.0, "reversal first"))
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.5, -10.0, "reversal flip"))
+
+            rows = sorted(store.open_trades(), key=lambda row: row["side"])
+            self.assertEqual([row["side"] for row in rows], ["Down", "Up"])
+            down = next(row for row in rows if row["side"] == "Down")
+            self.assertIn("SINGLE_REVERSAL", down["reason"])
+            summary = store.trade_reason_summary("SINGLE_REVERSAL", "BTC")
+            self.assertEqual(summary["total_count"], 1)
+            self.assertEqual(summary["open_count"], 1)
+
+    def test_single_fak_stop_and_flip_closes_old_side_before_new_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_edge=0.0,
+                max_entry_price=0.8,
+                max_open_trades=1,
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.single_entry_mode = SINGLE_ENTRY_MODE_STOP_AND_FLIP
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-stop-flip", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.36, "best_ask": 0.4, "asks": [{"price": 0.4, "size": 100}]},
+                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "asks": [{"price": 0.5, "size": 100}]},
+                }
+
+            bot._maybe_place_trade(market, Signal("BTC", "Up", 0.7, 0.4, 10.0, "stop flip first"))
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.5, -10.0, "stop flip new side"))
+
+            open_rows = store.open_trades()
+            self.assertEqual(len(open_rows), 1)
+            self.assertEqual(open_rows[0]["side"], "Down")
+            recent = store.recent_trades(5)
+            closed_up = next(row for row in recent if row["side"] == "Up")
+            self.assertEqual(closed_up["status"], "SETTLED")
+            self.assertEqual(closed_up["settlement_source"], SETTLEMENT_SOURCE_EARLY_EXIT)
+            self.assertIn("SINGLE_STOP_AND_FLIP", closed_up["reason"])
+            self.assertIn("SINGLE_STOP_AND_FLIP", open_rows[0]["reason"])
+            summary = store.trade_reason_summary("SINGLE_STOP_AND_FLIP", "BTC")
+            self.assertEqual(summary["total_count"], 2)
+            self.assertEqual(summary["settled_count"], 1)
+            self.assertEqual(summary["open_count"], 1)
 
     def test_bot_fetches_rest_depth_when_snapshot_has_only_best_ask(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1416,13 +1549,16 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(all("fee" in row["reason"] for row in recent))
             self.assertGreater(store.metrics()["realized_pnl"], 0)
 
-    def test_strategy_variants_cover_all_eight_target_combinations(self) -> None:
+    def test_strategy_variants_cover_target_combinations_and_single_fak_modes(self) -> None:
         combos = [variant.combo for variant in STRATEGY_VARIANTS]
 
         self.assertEqual(
             combos,
             [
                 "SINGLE + FAK",
+                "SINGLE + FAK STRICT",
+                "SINGLE + FAK REVERSAL",
+                "SINGLE + FAK STOP_AND_FLIP",
                 "SINGLE + GTC",
                 "SINGLE + GTD",
                 "SINGLE + POST_ONLY",
@@ -1589,7 +1725,7 @@ class TradingCoreTest(unittest.TestCase):
 
             snapshot = bot.strategy_experiments_snapshot()
             variants = {row["variant_id"]: row for row in snapshot["variants"]}
-            self.assertEqual(len(variants), 8)
+            self.assertEqual(len(variants), 11)
             self.assertEqual(snapshot["run_count"], 1)
             self.assertIn("profit_summary", snapshot)
             self.assertEqual(snapshot["profit_summary"]["status"], "WAITING_FOR_SAMPLE")
@@ -1597,7 +1733,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertFalse(snapshot["decision_summary"]["comparison_ready"])
             self.assertEqual(snapshot["decision_summary"]["status"], "WAITING_FOR_SAMPLE")
             self.assertEqual(snapshot["decision_summary"]["ready_count"], 0)
-            self.assertEqual(snapshot["decision_summary"]["total_count"], 8)
+            self.assertEqual(snapshot["decision_summary"]["total_count"], 11)
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
@@ -1606,6 +1742,9 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variants["SINGLE_FAK"]["review_score"]["sample_status"], "INSUFFICIENT")
             self.assertIn("结算样本不足", variants["SINGLE_FAK"]["review_score"]["reasons"][0])
             self.assertEqual(variants["SINGLE_FAK"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["SINGLE_FAK_STRICT"]["single_entry_mode"], "STRICT")
+            self.assertEqual(variants["SINGLE_FAK_REVERSAL"]["single_entry_mode"], "REVERSAL")
+            self.assertEqual(variants["SINGLE_FAK_STOP_AND_FLIP"]["single_entry_mode"], "STOP_AND_FLIP")
             self.assertEqual(variants["PAIR_FAK"]["metrics"]["open_trades"], 2)
             self.assertEqual(variants["PAIR_GTD"]["active_orders"], 2)
             self.assertEqual(variants["PAIR_POST_ONLY"]["active_orders"], 2)
@@ -1623,8 +1762,8 @@ class TradingCoreTest(unittest.TestCase):
 
             retrospective = bot.strategy_experiments_retrospective()
             self.assertTrue(retrospective["enabled"])
-            self.assertEqual(len(retrospective["variants"]), 8)
-            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 8)
+            self.assertEqual(len(retrospective["variants"]), 11)
+            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 11)
             self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
 
             tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)

@@ -1,5 +1,51 @@
 # polybot2other-progress
 
+## 2026-05-29 v2.66
+
+### 已完成
+
+1. 保留现有 `SINGLE_FAK` 行为不变，继续作为历史基线和隐式反转双边买入对照组。
+2. 新增 `SINGLE_FAK_STRICT` 实验组合：同一市场已有任意方向持仓或挂单时，不再开反方向新仓，适合作为小资金实盘保守候选。
+3. 新增 `SINGLE_FAK_REVERSAL` 实验组合：允许信号反转后买入另一边，但订单和持仓原因会写入 `SINGLE_REVERSAL`，便于单独统计反转腿表现。
+4. 新增 `SINGLE_FAK_STOP_AND_FLIP` 实验组合：信号反转时先按旧方向买一价平旧仓，再尝试开新方向，用 `SINGLE_STOP_AND_FLIP` 标记真实止损反手路径。
+5. 策略实验组合总数从 8 个扩展到 11 个，复盘 HTML 文案改为根据实际组合数动态展示。
+6. 策略实验 payload 增加 `single_entry_mode`、`single_reversal_summary` 和 `single_stop_and_flip_summary`，用于区分基线、严格单边、显式反转和止损反手。
+
+### 已确认决策
+
+1. 不直接修改 `SINGLE_FAK` 的历史逻辑，避免新旧数据口径混在一起。
+2. `SINGLE_FAK_REVERSAL` 先复刻当前隐式反转的核心行为，但必须显式标记和单独统计。
+3. `SINGLE_FAK_STOP_AND_FLIP` 才代表真正止损反手；它和双边持有不是同一种策略。
+4. 小资金实盘默认仍应优先评估 `SINGLE_FAK_STRICT`，不能把当前隐式双边行为当成天然止损。
+
+### 待办和后期优化
+
+1. 前端详情区可进一步展示 `single_reversal_summary` 和 `single_stop_and_flip_summary` 的 PnL、胜率、资金占用。
+2. 后续需要给实盘配置增加显式策略模式选择，避免主账户默认沿用 Paper 实验模式。
+3. 后续可增加反转专用风控：同一市场最多一次反转、反转价格上限、双边总投入上限和更强信号确认。
+
+### 已知坑位
+
+1. 新增组合会从新 SQLite 库开始采样，不能直接和已有 `SINGLE_FAK` 历史样本等量比较。
+2. `SINGLE_FAK_REVERSAL` 是显式双边反转，不是止损；旧方向仍会持有到结算。
+3. `SINGLE_FAK_STOP_AND_FLIP` 使用 Paper 盘口 `best_bid` 模拟退出，实盘还需要真实卖单、滑点、手续费、最小订单量和失败重试处理。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_single_fak_legacy_allows_implicit_opposite_side_entry tests.test_core.TradingCoreTest.test_single_fak_strict_blocks_opposite_side_entry_for_same_round tests.test_core.TradingCoreTest.test_single_fak_reversal_marks_opposite_side_entry tests.test_core.TradingCoreTest.test_single_fak_stop_and_flip_closes_old_side_before_new_entry`，4 个定向测试通过。
+2. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py src/polybot2other/experiments.py src/polybot2other/storage.py src/polybot2other/web.py src/polybot2other/report_snapshot.py`，编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_strategy_variants_cover_target_combinations_and_single_fak_modes tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores tests.test_core.TradingCoreTest.test_strategy_experiment_report_snapshot_writes_docs_html`，3 个策略实验定向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，55 个测试通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`。
+8. 已请求 `/api/status`，确认 `runtime.running=true`、`runtime.last_error=null`、实验组合数为 11，且返回 `SINGLE_FAK`、`SINGLE_FAK_STRICT`、`SINGLE_FAK_REVERSAL`、`SINGLE_FAK_STOP_AND_FLIP` 四个 `SINGLE_FAK*` 组合。
+
+### 回滚建议
+
+1. 如需回滚本轮扩展，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/bot.py`、`src/polybot2other/storage.py`、`src/polybot2other/web.py`、`src/polybot2other/report_snapshot.py`、`tests/test_core.py` 和本进度文档中的 v2.66 改动。
+2. 本轮不修改数据库结构；如已运行服务并生成新实验库，只需停止服务后删除 `data/strategy-experiments/single_fak_strict.sqlite3`、`single_fak_reversal.sqlite3`、`single_fak_stop_and_flip.sqlite3` 及对应 WAL/SHM 文件即可清空新增组合样本。
+
 ## 2026-05-28 v2.65
 
 ### 已完成

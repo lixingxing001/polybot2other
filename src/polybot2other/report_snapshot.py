@@ -20,7 +20,7 @@ def generate_strategy_experiment_report_snapshot(
     end_at: float | None = None,
     generated_at: float | None = None,
 ) -> dict[str, Any]:
-    """生成 8 组合复盘 HTML 快照；只读现有 Paper 数据，不启动交易循环。"""
+    """生成策略实验复盘 HTML 快照；只读现有 Paper 数据，不启动交易循环。"""
 
     settings = settings or load_settings()
     generated_at = time.time() if generated_at is None else float(generated_at)
