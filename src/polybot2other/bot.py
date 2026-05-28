@@ -55,7 +55,10 @@ PAIR_ENTRY_MIN_SECONDS_LEFT = 45
 PAIR_RESIDUAL_REDUCE_SECONDS_LEFT = 45
 PAIR_FORCE_FLATTEN_SECONDS_LEFT = 30
 PAIR_RESIDUAL_STOP_LOSS_PCT = -20.0
-PAIR_DAILY_LOSS_PCT = 3.0
+# Paper-only sampling guard: loosened to collect strategy-experiment samples.
+# Do not reuse this threshold for live trading risk; live must use stricter loss controls.
+PAIR_DAILY_LOSS_PCT = 10.0
+PAIR_DAILY_LOSS_NOTE = "Paper采样阈值，实盘不得沿用"
 PAIR_STOP_STREAK_LIMIT = 3
 PAIR_EPSILON = 0.000001
 POST_ONLY_MIN_REST_SECONDS = 8.0
@@ -584,7 +587,7 @@ class PaperTradingBot:
         if market.target_price <= 0:
             return "配对策略缺少官方目标价，停止开新仓"
         if self.store.daily_realized_pnl() <= -abs(self.settings.initial_balance * PAIR_DAILY_LOSS_PCT / 100.0):
-            return "配对策略日内回撤达到 3%，停止开新仓"
+            return f"配对策略日内回撤达到 {PAIR_DAILY_LOSS_PCT:g}%（{PAIR_DAILY_LOSS_NOTE}），停止开新仓"
         if self.pair_stop_loss_streak >= PAIR_STOP_STREAK_LIMIT:
             return "配对策略连续残余止损达到上限，停止开新仓"
         if time_left <= PAIR_ENTRY_MIN_SECONDS_LEFT:
@@ -1152,6 +1155,7 @@ class PaperTradingBot:
                     "force_flatten_seconds_left": PAIR_FORCE_FLATTEN_SECONDS_LEFT,
                     "residual_stop_loss_pct": PAIR_RESIDUAL_STOP_LOSS_PCT,
                     "daily_loss_pct": PAIR_DAILY_LOSS_PCT,
+                    "daily_loss_note": PAIR_DAILY_LOSS_NOTE,
                     "stop_streak_limit": PAIR_STOP_STREAK_LIMIT,
                 },
                 "paper_only": True,

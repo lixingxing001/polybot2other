@@ -1,5 +1,46 @@
 # polybot2other-progress
 
+## 2026-05-28 v2.65
+
+### 已完成
+
+1. 配对策略 Paper 采样日内亏损停止开仓阈值从 `3%` 提高到 `10%`，用于继续积累 `PAIR_GTC`、`PAIR_GTD`、`PAIR_POST_ONLY` 等实验组合样本。
+2. 阈值常量旁增加代码注释，明确该值是 Paper-only sampling guard，不能复用为实盘风控。
+3. 阻断文案改为 `配对策略日内回撤达到 10%（Paper采样阈值，实盘不得沿用），停止开新仓`。
+4. `/api/status` 的 `config.pair_strategy` 增加 `daily_loss_note`，前端或后续排查可以直接看到该阈值备注。
+
+### 已确认决策
+
+1. 当前阶段优先积累 Paper 样本，不用 3% 过早停止实验组合。
+2. 仍保留 10% 基本熔断，避免亏损组合完全无上限采样。
+3. 该阈值只适用于 Paper 采样；未来接实盘时必须重新设计更严格的实盘账户风控，不能沿用本轮采样阈值。
+
+### 待办和后期优化
+
+1. 后续接实盘前，需要把 Paper 采样阈值和实盘风控阈值拆成独立配置，实盘默认必须更严格。
+2. 可在策略实验页显式展示 `daily_loss_note`，避免只从 API 才能看到备注。
+
+### 已知坑位
+
+1. 提高阈值后，亏损组合会继续产生样本，短期 Paper 账户回撤可能扩大。
+2. 如果后续看到 `10%`，必须先确认运行模式是 Paper；不能把它作为实盘默认值。
+
+### 验证记录
+
+1. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_pair_strategy_opens_two_sides_and_exits_on_bid_sum tests.test_core.TradingCoreTest.test_pair_strategy_does_not_open_without_official_target`，2 个配对策略定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，51 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk git diff --check`，未发现空白错误。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+7. 已请求 `/api/status`，确认 `settings.pair_strategy.daily_loss_pct = 10.0`，`daily_loss_note = Paper采样阈值，实盘不得沿用`，且 `running=True`。
+8. 已请求 `/api/strategy-experiments`，确认 `PAIR_GTC`、`PAIR_GTD`、`PAIR_POST_ONLY` 仍处于继续观察/样本积累状态，未被标记为执行淘汰。
+
+### 回滚建议
+
+1. 如需恢复原风控采样阈值，把 `PAIR_DAILY_LOSS_PCT` 改回 `3.0`，并同步恢复阻断文案和本进度记录。
+2. 本轮不涉及数据库结构，无需迁移回滚。
+
 ## 2026-05-28 v2.64
 
 ### 已完成
