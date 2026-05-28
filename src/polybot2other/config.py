@@ -29,6 +29,9 @@ class Settings:
     market_refresh_seconds: float = 2.0
     price_history_limit: int = 180
     request_timeout_seconds: float = 4.0
+    paper_entry_order_type: str = "FAK"
+    paper_taker_fee_rate: float = 0.07
+    paper_gtd_seconds: float = 90.0
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
 
@@ -79,6 +82,9 @@ def load_settings() -> Settings:
         max_quote_age_ms=_int_env("POLYBOT2OTHER_MAX_QUOTE_AGE_MS", 3000, 100),
         live_snapshot_max_age_seconds=_float_env("POLYBOT2OTHER_LIVE_SNAPSHOT_MAX_AGE_SECONDS", 8.0, 1.0),
         market_refresh_seconds=_float_env("POLYBOT2OTHER_MARKET_REFRESH_SECONDS", 2.0, 0.5),
+        paper_entry_order_type=os.environ.get("POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE", "FAK"),
+        paper_taker_fee_rate=_float_env("POLYBOT2OTHER_PAPER_TAKER_FEE_RATE", 0.07, 0.0),
+        paper_gtd_seconds=_float_env("POLYBOT2OTHER_PAPER_GTD_SECONDS", 90.0, 1.0),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
     )

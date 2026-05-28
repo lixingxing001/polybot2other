@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +15,7 @@ from .models import MarketRound
 
 
 BTC_5M_WINDOW_SECONDS = 300
+MAX_BOOK_LEVELS = 50
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,8 @@ class PolymarketQuote:
     best_ask: float | None
     bid_size: float | None = None
     ask_size: float | None = None
+    bids: list[dict[str, float]] = field(default_factory=list)
+    asks: list[dict[str, float]] = field(default_factory=list)
     updated_at_ms: int | None = None
     source: str = "rest"
 
@@ -77,10 +80,10 @@ class PolymarketClient:
 
     def get_quote(self, token_id: str, outcome: str) -> PolymarketQuote:
         book = self._get_json(f"{self.clob_url}/book", {"token_id": token_id})
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
-        best_bid = max(bids, key=lambda level: float(level["price"])) if bids else None
-        best_ask = min(asks, key=lambda level: float(level["price"])) if asks else None
+        bids = _book_levels(book.get("bids"), reverse=True)
+        asks = _book_levels(book.get("asks"), reverse=False)
+        best_bid = bids[0] if bids else None
+        best_ask = asks[0] if asks else None
         return PolymarketQuote(
             token_id=token_id,
             outcome=outcome,
@@ -88,6 +91,8 @@ class PolymarketClient:
             best_ask=_level_float(best_ask, "price"),
             bid_size=_level_float(best_bid, "size"),
             ask_size=_level_float(best_ask, "size"),
+            bids=bids,
+            asks=asks,
             updated_at_ms=int(time.time() * 1000),
             source="rest",
         )
@@ -311,6 +316,21 @@ def _level_float(level: Any, key: str) -> float | None:
     if not isinstance(level, dict):
         return None
     return _maybe_float(level.get(key))
+
+
+def _book_levels(levels: Any, *, reverse: bool) -> list[dict[str, float]]:
+    if not isinstance(levels, list):
+        return []
+    parsed: list[dict[str, float]] = []
+    for row in levels:
+        if not isinstance(row, dict):
+            continue
+        price = _maybe_float(row.get("price"))
+        size = _maybe_float(row.get("size"))
+        if price is None or size is None or price <= 0 or price >= 1 or size <= 0:
+            continue
+        parsed.append({"price": round(price, 4), "size": round(size, 6)})
+    return sorted(parsed, key=lambda row: row["price"], reverse=reverse)[:MAX_BOOK_LEVELS]
 
 
 def _maybe_float(value: Any) -> float | None:

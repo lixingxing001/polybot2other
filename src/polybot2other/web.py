@@ -15,7 +15,7 @@ from typing import Any
 
 from .bot import PaperTradingBot
 from .config import Settings, load_settings
-from .storage import TradeStore
+from .storage import PAPER_ORDER_STATUS_FILTERS, TradeStore
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -44,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/equity-curve":
             self._send_json(self.server.bot.equity_curve_window(), include_body=False)
             return
+        if path == "/api/orders":
+            self._send_json(self.server.bot.orders_page(), include_body=False)
+            return
         if path.startswith("/static/"):
             self._send_static(path.removeprefix("/static/"), include_body=False)
             return
@@ -63,6 +66,19 @@ class Handler(BaseHTTPRequestHandler):
             limit = _query_int(query, "limit", 100, 1, 500)
             offset = _query_int(query, "offset", 0, 0, 100_000)
             self._send_json(self.server.bot.recent_trades_page(limit, offset))
+            return
+        if path == "/api/orders":
+            try:
+                limit = _query_int(query, "limit", 20, 1, 200)
+                offset = _query_int(query, "offset", 0, 0, 100_000)
+                status_filter = _query_choice(query, "status", set(PAPER_ORDER_STATUS_FILTERS), "all")
+                self._send_json(self.server.bot.orders_page(limit, offset, status_filter))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/order-fills":
+            order_id = _query_int(query, "order_id", 0, 1, 1_000_000_000)
+            self._send_json(self.server.bot.order_fills(order_id))
             return
         if path == "/api/equity-curve":
             days = _query_int(query, "days", 90, 1, 365)
@@ -97,6 +113,22 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_json_body()
                 enabled = _read_bool(payload, "pair_strategy_enabled")
                 self._send_json(self.server.bot.set_pair_strategy_enabled(enabled))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/cancel-order":
+            try:
+                payload = self._read_json_body()
+                order_id = _body_int(payload, "order_id", 1, 1_000_000_000)
+                self._send_json(self.server.bot.cancel_order(order_id))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/cancel-orders":
+            try:
+                payload = self._read_json_body()
+                scope = _body_choice(payload, "scope", {"current_market", "all"}, "current_market")
+                self._send_json(self.server.bot.cancel_orders(scope))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -184,6 +216,36 @@ def _query_int(query: dict[str, list[str]], key: str, default: int, minimum: int
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+def _query_choice(query: dict[str, list[str]], key: str, choices: set[str], default: str) -> str:
+    raw = query.get(key, [default])[0]
+    value = str(raw or default).strip().lower().replace("-", "_")
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{key} must be one of {allowed}")
+    return value
+
+
+def _body_int(payload: dict[str, Any], key: str, minimum: int, maximum: int) -> int:
+    if key not in payload:
+        raise ValueError(f"{key} is required")
+    try:
+        value = int(payload[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
+def _body_choice(payload: dict[str, Any], key: str, choices: set[str], default: str) -> str:
+    raw = payload.get(key, default)
+    value = str(raw or default).strip().lower().replace("-", "_")
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{key} must be one of {allowed}")
+    return value
 
 
 def build_app(settings: Settings | None = None) -> tuple[DashboardServer, PaperTradingBot]:

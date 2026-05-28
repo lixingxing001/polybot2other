@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-28">
   </head>
   <body>
     <main class="app-shell">
@@ -40,6 +40,10 @@
         <div class="metric">
           <span>可用资金</span>
           <strong id="cash-balance">$0.00</strong>
+        </div>
+        <div class="metric">
+          <span>挂单预留</span>
+          <strong id="reserved-cash">$0.00</strong>
         </div>
         <div class="metric">
           <span>持仓风险</span>
@@ -99,6 +103,41 @@
         <div class="panel">
           <div class="panel-head">
             <div>
+              <h2>订单流水</h2>
+              <span id="order-count">0</span>
+            </div>
+            <div class="panel-actions order-actions">
+              <select id="order-status-filter" aria-label="订单状态筛选">
+                <option value="all">全部</option>
+                <option value="active">活跃</option>
+                <option value="filled">成交</option>
+                <option value="canceled">已取消</option>
+                <option value="expired">已过期</option>
+                <option value="rejected">已拒绝</option>
+              </select>
+              <button id="cancel-current-orders" type="button" disabled>取消当前市场</button>
+              <button id="cancel-all-orders" type="button" disabled>取消全部挂单</button>
+              <details class="field-menu">
+                <summary>字段</summary>
+                <div id="order-field-options" class="field-options"></div>
+              </details>
+            </div>
+          </div>
+          <div class="table-wrap order-table-wrap">
+            <table class="trade-table">
+              <thead id="recent-orders-head"></thead>
+              <tbody id="recent-orders"></tbody>
+            </table>
+          </div>
+          <div class="table-footer">
+            <span id="order-page-info">最近 0 / 0 条</span>
+            <button id="load-more-orders" type="button" hidden>查看更多</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
               <h2>最近交易</h2>
               <span id="trade-count">0</span>
             </div>
@@ -121,6 +160,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260528-v2-32"></script>
   </body>
 </html>

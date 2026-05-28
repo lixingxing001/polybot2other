@@ -7,6 +7,7 @@ const ids = {
   totalPnl: document.getElementById("total-pnl"),
   unrealizedPnl: document.getElementById("unrealized-pnl"),
   cashBalance: document.getElementById("cash-balance"),
+  reservedCash: document.getElementById("reserved-cash"),
   openRisk: document.getElementById("open-risk"),
   winRate: document.getElementById("win-rate"),
   maxDrawdown: document.getElementById("max-drawdown"),
@@ -15,11 +16,20 @@ const ids = {
   openTrades: document.getElementById("open-trades"),
   openTradesHead: document.getElementById("open-trades-head"),
   openFieldOptions: document.getElementById("open-field-options"),
+  recentOrders: document.getElementById("recent-orders"),
+  recentOrdersHead: document.getElementById("recent-orders-head"),
+  orderFieldOptions: document.getElementById("order-field-options"),
   recentTrades: document.getElementById("recent-trades"),
   recentTradesHead: document.getElementById("recent-trades-head"),
   recentFieldOptions: document.getElementById("recent-field-options"),
   openCount: document.getElementById("open-count"),
+  orderCount: document.getElementById("order-count"),
   tradeCount: document.getElementById("trade-count"),
+  orderPageInfo: document.getElementById("order-page-info"),
+  loadMoreOrders: document.getElementById("load-more-orders"),
+  orderStatusFilter: document.getElementById("order-status-filter"),
+  cancelCurrentOrders: document.getElementById("cancel-current-orders"),
+  cancelAllOrders: document.getElementById("cancel-all-orders"),
   recentPageInfo: document.getElementById("recent-page-info"),
   loadMoreRecent: document.getElementById("load-more-recent"),
   chart: document.getElementById("equity-chart"),
@@ -36,6 +46,7 @@ const RTDS_PING_MS = 5_000;
 const SNAPSHOT_POST_MS = 1_000;
 const STATUS_POLL_MS = 2_000;
 const RECENT_PAGE_SIZE = 100;
+const ORDER_PAGE_SIZE = 20;
 const CHART_RENDER_INTERVAL_MS = 5_000;
 const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
@@ -46,7 +57,17 @@ const SNAPSHOT_LEADER_TTL_MS = 2_500;
 const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 const FIELD_STORAGE_KEYS = {
   open: "polybot2other:open-trade-fields",
+  order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
+};
+const ORDER_STATUS_LABELS = {
+  RESTING: "挂单中",
+  PARTIAL_RESTING: "部分成交挂单",
+  FILLED: "完全成交",
+  PARTIAL: "部分成交",
+  CANCELED: "已取消",
+  EXPIRED: "已过期",
+  REJECTED: "已拒绝",
 };
 
 let activeMarket = null;
@@ -61,12 +82,20 @@ let snapshotInFlight = false;
 let latestStatus = null;
 let recentRows = [];
 let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false };
+let orderRows = [];
+let orderStatusFilter = "all";
+let orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
+let expandedOrderId = null;
+let loadingOrderId = null;
+const orderFillCache = new Map();
 let pageVisible = document.visibilityState !== "hidden";
 let renderQueued = false;
 let pendingRenderData = null;
 let pendingRenderOptions = {};
 let lastChartRenderMs = 0;
 let lastRecentRenderKey = "";
+let lastOrderRenderKey = "";
+let pendingOrderRender = false;
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
 let lastEquityCurveFetchMs = 0;
@@ -133,6 +162,7 @@ const recentTradeFields = [
   { key: "max_payout", label: "最大回款", render: (row) => fmtMoneyCell(row.max_payout) },
   { key: "max_profit", label: "最大盈利", render: (row) => fmtSignedMoneyCell(row.max_profit) },
   { key: "outcome", label: "结果", render: (row) => `<span class="${sideClass(row.outcome)}">${safe(row.outcome)}</span>` },
+  { key: "settlement_source_label", label: "结算来源", render: (row) => safe(row.settlement_source_label || row.settlement_source || "-") },
   { key: "target_price", label: "目标价", render: (row) => fmtMoneyCell(row.target_price) },
   { key: "final_price", label: "最终价", render: (row) => fmtMoneyCell(row.final_price) },
   { key: "final_distance_bps", label: "最终距离bps", render: (row) => fmtSignedBpsCell(row.final_distance_bps) },
@@ -140,6 +170,25 @@ const recentTradeFields = [
   { key: "move_bps", label: "开仓距离bps", render: (row) => fmtSignedBpsCell(row.move_bps) },
   { key: "exit_note", label: "退出标记", render: (row) => safe(row.exit_note), cellClass: "reason-cell" },
   { key: "reason", label: "开仓原因", render: (row) => safe(row.reason), cellClass: "reason-cell" },
+];
+
+const recentOrderFields = [
+  { key: "detail_toggle", label: "明细", render: (row) => orderToggleText(row), cellClass: "mono-cell" },
+  { key: "cancel_action", label: "操作", render: (row) => orderCancelButton(row) },
+  { key: "created_at", label: "时间", render: (row) => fmtDateTimeCell(row.created_at) },
+  { key: "round_id", label: "市场", render: (row) => safe(row.round_id), cellClass: "mono-cell" },
+  { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
+  { key: "order_type", label: "类型", render: (row) => safe(row.order_type) },
+  { key: "status", label: "状态", render: (row) => orderStatusText(row.status) },
+  { key: "limit_price", label: "限价", render: (row) => fmtNumberCell(row.limit_price, 4) },
+  { key: "requested_cash", label: "预算", render: (row) => fmtMoneyCell(row.requested_cash) },
+  { key: "avg_fill_price", label: "均价", render: (row) => fmtNumberCell(row.avg_fill_price, 4) },
+  { key: "filled_shares", label: "成交份额", render: (row) => fmtNumberCell(row.filled_shares, 6) },
+  { key: "cash_spent", label: "花费", render: (row) => fmtMoneyCell(row.cash_spent) },
+  { key: "fee", label: "手续费", render: (row) => fmtMoneyCell(row.fee) },
+  { key: "fill_count", label: "成交档", render: (row) => fmtNumberCell(row.fill_count, 0) },
+  { key: "trade_id", label: "持仓ID", render: (row) => safe(row.trade_id || "-"), cellClass: "mono-cell" },
+  { key: "reason", label: "原因", render: (row) => safe(row.reason), cellClass: "reason-cell" },
 ];
 
 const defaultOpenFieldKeys = [
@@ -152,11 +201,17 @@ const defaultOpenFieldKeys = [
 const defaultRecentFieldKeys = [
   "opened_at", "settled_at", "strategy_type", "side", "status", "stake", "entry_price",
   "shares", "payout", "pnl", "roi_pct", "outcome", "target_price",
-  "final_price", "final_distance_bps", "exit_note", "reason",
+  "settlement_source_label", "final_price", "final_distance_bps", "exit_note", "reason",
+];
+
+const defaultOrderFieldKeys = [
+  "detail_toggle", "cancel_action", "created_at", "side", "order_type", "status", "limit_price", "requested_cash",
+  "avg_fill_price", "filled_shares", "cash_spent", "fee", "fill_count", "reason",
 ];
 
 let selectedFields = {
   open: loadSelectedFields("open", openTradeFields, defaultOpenFieldKeys),
+  order: loadSelectedFields("order", recentOrderFields, defaultOrderFieldKeys),
   recent: loadSelectedFields("recent", recentTradeFields, defaultRecentFieldKeys),
 };
 
@@ -251,6 +306,7 @@ function renderMetrics(metrics) {
   setMetric(ids.totalPnl, metrics.total_pnl, signedMoney, cls);
   setMetric(ids.unrealizedPnl, metrics.unrealized_pnl, signedMoney, cls);
   setMetric(ids.cashBalance, metrics.cash_balance, money, null);
+  setMetric(ids.reservedCash, metrics.reserved_cash, money, null);
   setMetric(ids.openRisk, metrics.open_risk, money, null);
   setMetric(ids.winRate, metrics.win_rate, percentText, null);
   setMetric(ids.maxDrawdown, metrics.max_drawdown, money, null);
@@ -357,6 +413,32 @@ function renderOpenTrades(rows) {
   renderTradeTable("open", rows, openTradeFields, ids.openTradesHead, ids.openTrades);
 }
 
+function renderRecentOrders(rows, options = {}) {
+  const total = Number(orderMeta.total || rows.length || 0);
+  const loaded = rows.length;
+  ids.orderCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
+  ids.orderPageInfo.textContent = total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`;
+  ids.loadMoreOrders.hidden = !orderMeta.has_more;
+  ids.loadMoreOrders.disabled = false;
+  updateOrderActionButtons(rows);
+  const renderKey = orderRenderKey(rows);
+  if (!options.force && renderKey === lastOrderRenderKey) return;
+  if (!options.force && isOrderInteractionActive()) {
+    pendingOrderRender = true;
+    return;
+  }
+  pendingOrderRender = false;
+  lastOrderRenderKey = renderKey;
+  const tableWrap = orderTableWrap();
+  const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
+  const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
+  renderTradeTable("order", rows, recentOrderFields, ids.recentOrdersHead, ids.recentOrders);
+  if (tableWrap) {
+    tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
+    tableWrap.scrollLeft = Math.min(scrollLeft, Math.max(0, tableWrap.scrollWidth - tableWrap.clientWidth));
+  }
+}
+
 function renderRecentTrades(rows) {
   const total = Number(recentMeta.total || rows.length || 0);
   const loaded = rows.length;
@@ -375,23 +457,162 @@ function recentRenderKey(rows) {
   return `${idsKey}|${selectedFields.recent.join(",")}|${recentMeta.loaded}|${recentMeta.total}|${recentMeta.has_more}`;
 }
 
+function orderRenderKey(rows) {
+  const expandedFills = expandedOrderId ? orderFillCache.get(expandedOrderId) || [] : [];
+  const rowsKey = rows.map((row) => [
+    row.id,
+    row.status,
+    row.updated_at || "",
+    row.remaining_cash ?? "",
+    row.filled_shares ?? "",
+    row.avg_fill_price ?? "",
+    row.cash_spent ?? "",
+    row.fee ?? "",
+    row.fill_count ?? "",
+    row.reason || "",
+  ].join(":")).join(",");
+  return [
+    rowsKey,
+    selectedFields.order.join(","),
+    orderMeta.loaded,
+    orderMeta.total,
+    orderMeta.has_more,
+    orderMeta.status_filter,
+    expandedOrderId || "",
+    loadingOrderId || "",
+    expandedFills.length,
+  ].join("|");
+}
+
+function orderRoot() {
+  return ids.recentOrders.closest(".panel") || ids.recentOrders;
+}
+
+function orderTableWrap() {
+  return ids.recentOrders.closest(".order-table-wrap");
+}
+
+function nodeInside(root, node) {
+  if (!root || !node) return false;
+  const element = node.nodeType === 1 ? node : node.parentElement;
+  return Boolean(element && root.contains(element));
+}
+
+function orderSelectionActive() {
+  const selection = window.getSelection ? window.getSelection() : null;
+  if (!selection || selection.isCollapsed || !selection.toString().trim()) return false;
+  const root = orderRoot();
+  return nodeInside(root, selection.anchorNode) || nodeInside(root, selection.focusNode);
+}
+
+function isOrderInteractionActive() {
+  const root = orderRoot();
+  const active = document.activeElement;
+  if (active && active !== document.body && root.contains(active)) return true;
+  return orderSelectionActive();
+}
+
+function currentOrderRows() {
+  if (orderRows.length) return orderRows;
+  return latestStatus?.recent_orders || [];
+}
+
+function flushPendingOrderRender() {
+  if (!pendingOrderRender || isOrderInteractionActive()) return;
+  renderRecentOrders(currentOrderRows(), { force: true });
+}
+
+function orderToggleText(row) {
+  const count = Number(row.fill_count || 0);
+  if (!count) return "-";
+  if (loadingOrderId === row.id) return "加载中";
+  return expandedOrderId === row.id ? "收起" : "展开";
+}
+
+function canCancelOrder(row) {
+  return row?.status === "RESTING" || row?.status === "PARTIAL_RESTING";
+}
+
+function orderStatusText(status) {
+  const raw = String(status || "").trim();
+  if (!raw) return "-";
+  const label = ORDER_STATUS_LABELS[raw];
+  return label ? `${safe(raw)}(${safe(label)})` : safe(raw);
+}
+
+function isCurrentMarketOrder(row) {
+  const currentIds = [activeMarket?.round_id, activeMarket?.slug].filter(Boolean).map(String);
+  return currentIds.includes(String(row?.round_id || ""));
+}
+
+function cancelableOrderCount(rows, scope) {
+  const activeRows = (rows || []).filter(canCancelOrder);
+  if (scope === "current_market") return activeRows.filter(isCurrentMarketOrder).length;
+  return activeRows.length;
+}
+
+function updateOrderActionButtons(rows) {
+  const reservedCash = Number(latestStatus?.metrics?.reserved_cash || 0);
+  const hasReservedCash = reservedCash > 0.000001;
+  ids.cancelCurrentOrders.disabled = !activeMarket || (!hasReservedCash && cancelableOrderCount(rows, "current_market") === 0);
+  ids.cancelAllOrders.disabled = !hasReservedCash && cancelableOrderCount(rows, "all") === 0;
+}
+
+function orderCancelButton(row) {
+  if (!canCancelOrder(row)) return "-";
+  return `<button class="table-action" type="button" data-cancel-order-id="${safe(row.id)}">取消</button>`;
+}
+
+function renderOrderFillRow(row, colspan) {
+  if (expandedOrderId !== row.id) return "";
+  const fills = orderFillCache.get(row.id) || [];
+  const body = loadingOrderId === row.id
+    ? `<div class="order-fill-empty">加载逐档成交...</div>`
+    : orderFillsHtml(fills);
+  return `
+    <tr class="order-detail-row">
+      <td colspan="${Math.max(1, colspan)}">${body}</td>
+    </tr>
+  `;
+}
+
+function orderFillsHtml(fills) {
+  if (!fills.length) return `<div class="order-fill-empty">暂无逐档成交</div>`;
+  return `
+    <div class="order-fill-grid">
+      ${fills.map((fill) => `
+        <div class="order-fill-item">
+          <span>#${safe(fill.level_index)}</span>
+          <strong>${fmtNumberCell(fill.price, 4)}</strong>
+          <span>${fmtNumberCell(fill.shares, 6)} 份</span>
+          <span>${fmtMoneyCell(fill.cash_spent)}</span>
+          <span>fee ${fmtMoneyCell(fill.fee)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderTradeTable(kind, rows, fields, headEl, bodyEl) {
   const selected = selectedFields[kind];
   const visibleFields = fields.filter((field) => selected.includes(field.key));
   headEl.innerHTML = `<tr>${visibleFields.map((field) => `<th>${safe(field.label)}</th>`).join("")}</tr>`;
   if (!rows.length) {
-    bodyEl.innerHTML = `<tr><td class="empty" colspan="${Math.max(1, visibleFields.length)}">${kind === "open" ? "暂无持仓" : "暂无交易"}</td></tr>`;
+    const emptyText = kind === "open" ? "暂无持仓" : kind === "order" ? "暂无订单" : "暂无交易";
+    bodyEl.innerHTML = `<tr><td class="empty" colspan="${Math.max(1, visibleFields.length)}">${emptyText}</td></tr>`;
     return;
   }
   bodyEl.innerHTML = rows.map((row) => `
-    <tr>
+    <tr${kind === "order" ? ` data-order-id="${safe(row.id)}"` : ""}>
       ${visibleFields.map((field) => `<td class="${field.cellClass || ""}">${field.render(row)}</td>`).join("")}
     </tr>
+    ${kind === "order" ? renderOrderFillRow(row, visibleFields.length) : ""}
   `).join("");
 }
 
 function initFieldOptions() {
   renderFieldOptions("open", openTradeFields, ids.openFieldOptions);
+  renderFieldOptions("order", recentOrderFields, ids.orderFieldOptions);
   renderFieldOptions("recent", recentTradeFields, ids.recentFieldOptions);
 }
 
@@ -420,7 +641,8 @@ function renderFieldOptions(kind, fields, container) {
     selectedFields[kind] = fields.filter((field) => next.has(field.key)).map((field) => field.key);
     localStorage.setItem(FIELD_STORAGE_KEYS[kind], JSON.stringify(selectedFields[kind]));
     if (kind === "recent") lastRecentRenderKey = "";
-    renderAll();
+    if (kind === "order") lastOrderRenderKey = "";
+    renderAll(latestStatus, { forceOrder: kind === "order" });
   });
 }
 
@@ -737,8 +959,15 @@ async function loadStatus(manual = false) {
     priceState = { ...priceState, ...data.runtime.latest_price };
   }
   applyRecentPage(data.recent_trades, data.recent_trades_meta);
-  renderAll(data);
+  if (orderStatusFilter === "all") {
+    applyOrderPage(data.recent_orders, data.recent_orders_meta);
+  } else {
+    data.recent_orders = orderRows;
+    data.recent_orders_meta = orderMeta;
+  }
+  renderAll(data, { forceOrder: manual });
   loadEquityCurve(false).catch(showError);
+  loadOrders(orderStatusFilter !== "all").catch(showError);
 }
 
 async function loadEquityCurve(force = false) {
@@ -783,6 +1012,164 @@ function applyRecentPage(rows = [], meta = {}) {
     latestStatus.recent_trades = recentRows;
     latestStatus.recent_trades_meta = recentMeta;
   }
+}
+
+function applyOrderPage(rows = [], meta = {}, options = {}) {
+  const incoming = Array.isArray(rows) ? rows : [];
+  const incomingFilter = String(meta.status_filter || orderStatusFilter || "all");
+  const replaceRows = Boolean(options.replace) || incomingFilter !== orderMeta.status_filter;
+  if (replaceRows) {
+    orderRows = incoming;
+  } else if (orderRows.length > incoming.length) {
+    const seen = new Set(incoming.map((row) => row.id));
+    orderRows = incoming.concat(orderRows.filter((row) => !seen.has(row.id)));
+  } else {
+    orderRows = incoming;
+  }
+  const total = Number(meta.total || orderRows.length || 0);
+  orderMeta = {
+    limit: Number(meta.limit || ORDER_PAGE_SIZE),
+    offset: 0,
+    loaded: orderRows.length,
+    total,
+    has_more: Boolean(meta.has_more || orderRows.length < total),
+    status_filter: incomingFilter,
+  };
+  if (latestStatus) {
+    latestStatus.recent_orders = orderRows;
+    latestStatus.recent_orders_meta = orderMeta;
+  }
+}
+
+async function loadOrders(force = false) {
+  if (!force && orderRows.length && orderMeta.status_filter === orderStatusFilter) return;
+  const params = new URLSearchParams({ limit: String(ORDER_PAGE_SIZE), offset: "0", status: orderStatusFilter });
+  const res = await fetch(`/api/orders?${params.toString()}`);
+  if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
+  const page = await res.json();
+  applyOrderPage(page.recent_orders, page.recent_orders_meta || { status_filter: orderStatusFilter }, { replace: force });
+  renderRecentOrders(orderRows, { force });
+}
+
+async function loadMoreOrders() {
+  ids.loadMoreOrders.disabled = true;
+  try {
+    const params = new URLSearchParams({
+      limit: String(ORDER_PAGE_SIZE),
+      offset: String(orderRows.length),
+      status: orderStatusFilter,
+    });
+    const res = await fetch(`/api/orders?${params.toString()}`);
+    if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
+    const page = await res.json();
+    const nextRows = Array.isArray(page.recent_orders) ? page.recent_orders : [];
+    const seen = new Set(orderRows.map((row) => row.id));
+    orderRows = orderRows.concat(nextRows.filter((row) => !seen.has(row.id)));
+    const meta = page.recent_orders_meta || {};
+    orderMeta = {
+      limit: Number(meta.limit || ORDER_PAGE_SIZE),
+      offset: 0,
+      loaded: orderRows.length,
+      total: Number(meta.total || orderRows.length),
+      has_more: orderRows.length < Number(meta.total || orderRows.length),
+      status_filter: String(meta.status_filter || orderStatusFilter),
+    };
+    if (latestStatus) {
+      latestStatus.recent_orders = orderRows;
+      latestStatus.recent_orders_meta = orderMeta;
+    }
+    renderRecentOrders(orderRows, { force: true });
+  } finally {
+    ids.loadMoreOrders.disabled = false;
+  }
+}
+
+async function toggleOrderFills(orderId) {
+  if (!orderId) return;
+  if (expandedOrderId === orderId) {
+    expandedOrderId = null;
+    renderRecentOrders(orderRows, { force: true });
+    return;
+  }
+  expandedOrderId = orderId;
+  if (!orderFillCache.has(orderId)) {
+    loadingOrderId = orderId;
+    renderRecentOrders(orderRows, { force: true });
+    try {
+      const params = new URLSearchParams({ order_id: String(orderId) });
+      const res = await fetch(`/api/order-fills?${params.toString()}`);
+      if (!res.ok) throw new Error(`order fills HTTP ${res.status}`);
+      const payload = await res.json();
+      orderFillCache.set(orderId, Array.isArray(payload.fills) ? payload.fills : []);
+    } finally {
+      loadingOrderId = null;
+    }
+  }
+  renderRecentOrders(orderRows, { force: true });
+}
+
+async function cancelOrder(orderId) {
+  if (!orderId) return;
+  const res = await fetch("/api/cancel-order", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ order_id: orderId }),
+  });
+  if (!res.ok) throw new Error(`cancel order HTTP ${res.status}`);
+  const payload = await res.json();
+  if (payload.not_canceled && Object.keys(payload.not_canceled).length) {
+    const reason = payload.not_canceled[String(orderId)] || "取消失败";
+    throw new Error(reason);
+  }
+  await loadStatus(true);
+  await loadOrders(true);
+  renderRecentOrders(orderRows, { force: true });
+}
+
+async function cancelOrders(scope) {
+  const res = await fetch("/api/cancel-orders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope }),
+  });
+  if (!res.ok) throw new Error(`cancel orders HTTP ${res.status}`);
+  const payload = await res.json();
+  if (!(payload.canceled || []).length && payload.not_canceled && Object.keys(payload.not_canceled).length) {
+    throw new Error(Object.values(payload.not_canceled)[0] || "批量取消失败");
+  }
+  await loadStatus(true);
+  await loadOrders(true);
+  renderRecentOrders(orderRows, { force: true });
+}
+
+function handleOrderStatusFilterChange() {
+  orderStatusFilter = ids.orderStatusFilter.value || "all";
+  expandedOrderId = null;
+  loadingOrderId = null;
+  orderRows = [];
+  orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
+  if (latestStatus) {
+    latestStatus.recent_orders = orderRows;
+    latestStatus.recent_orders_meta = orderMeta;
+  }
+  renderRecentOrders(orderRows, { force: true });
+  loadOrders(true).catch(showError);
+}
+
+function confirmCancelOrders(scope) {
+  const label = scope === "all" ? "取消全部 Paper 活跃挂单" : "取消当前市场 Paper 活跃挂单";
+  return window.confirm(`确认${label}？`);
+}
+
+function bindCancelOrdersButton(button, scope) {
+  button.addEventListener("click", () => {
+    if (!confirmCancelOrders(scope)) return;
+    button.disabled = true;
+    cancelOrders(scope).catch((error) => {
+      button.disabled = false;
+      showError(error);
+    });
+  });
 }
 
 async function loadMoreRecentTrades() {
@@ -837,6 +1224,7 @@ function renderAll(data = latestStatus, options = {}) {
   pendingRenderOptions = {
     force: Boolean(pendingRenderOptions.force || options.force),
     forceChart: Boolean(pendingRenderOptions.forceChart || options.forceChart),
+    forceOrder: Boolean(pendingRenderOptions.forceOrder || options.forceOrder),
   };
   if (!pageVisible && !pendingRenderOptions.force) return;
   if (renderQueued) return;
@@ -858,6 +1246,8 @@ function renderAllNow(data = latestStatus, options = {}) {
   renderMetrics(data.metrics);
   renderMarket(data.runtime);
   renderOpenTrades(data.open_trades);
+  const visibleOrderRows = orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
+  renderRecentOrders(visibleOrderRows, { force: Boolean(options.force || options.forceOrder) });
   renderRecentTrades(recentRows.length ? recentRows : data.recent_trades);
   const now = Date.now();
   if (options.forceChart || now - lastChartRenderMs >= CHART_RENDER_INTERVAL_MS) {
@@ -935,6 +1325,8 @@ function connectMarketSocket() {
         best_ask: bestAsk(message.asks)?.price,
         bid_size: bestBid(message.bids)?.size,
         ask_size: bestAsk(message.asks)?.size,
+        bids: normalizeBookLevels(message.bids, true),
+        asks: normalizeBookLevels(message.asks, false),
         source: "market-ws-book",
       });
     } else if (message.event_type === "best_bid_ask") {
@@ -1077,6 +1469,17 @@ function bestAsk(levels) {
   return (levels || []).slice().sort((a, b) => Number(a.price) - Number(b.price))[0] || null;
 }
 
+function normalizeBookLevels(levels, reverse) {
+  return (levels || [])
+    .map((level) => ({
+      price: toNumber(level.price),
+      size: toNumber(level.size),
+    }))
+    .filter((level) => level.price > 0 && level.price < 1 && level.size > 0)
+    .sort((a, b) => reverse ? b.price - a.price : a.price - b.price)
+    .slice(0, 50);
+}
+
 function parseMessage(data) {
   if (data === "PONG" || data === "PING") return null;
   try {
@@ -1209,6 +1612,25 @@ function queueChartHoverDraw() {
 }
 
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.recentOrders.addEventListener("click", (event) => {
+  const cancelButton = event.target.closest("[data-cancel-order-id]");
+  if (cancelButton) {
+    event.stopPropagation();
+    cancelButton.disabled = true;
+    cancelOrder(Number(cancelButton.dataset.cancelOrderId)).catch((error) => {
+      cancelButton.disabled = false;
+      showError(error);
+    });
+    return;
+  }
+  const row = event.target.closest("tr[data-order-id]");
+  if (!row) return;
+  toggleOrderFills(Number(row.dataset.orderId)).catch(showError);
+});
+ids.loadMoreOrders.addEventListener("click", () => loadMoreOrders().catch(showError));
+ids.orderStatusFilter.addEventListener("change", handleOrderStatusFilterChange);
+bindCancelOrdersButton(ids.cancelCurrentOrders, "current_market");
+bindCancelOrdersButton(ids.cancelAllOrders, "all");
 ids.loadMoreRecent.addEventListener("click", () => loadMoreRecentTrades().catch(showError));
 ids.pairStrategyToggle.addEventListener("change", () => {
   setPairStrategyEnabled(ids.pairStrategyToggle.checked).catch((error) => {
@@ -1218,6 +1640,9 @@ ids.pairStrategyToggle.addEventListener("change", () => {
 });
 ids.chart.addEventListener("mousemove", handleChartMove);
 ids.chart.addEventListener("mouseleave", handleChartLeave);
+document.addEventListener("selectionchange", () => window.setTimeout(flushPendingOrderRender, 120));
+document.addEventListener("focusout", () => window.setTimeout(flushPendingOrderRender, 120));
+document.addEventListener("mouseup", () => window.setTimeout(flushPendingOrderRender, 120));
 
 initFieldOptions();
 loadStatus(true).then(() => {

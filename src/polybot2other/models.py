@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -49,3 +49,35 @@ class TradeIntent:
     market: MarketRound
     signal: Signal
     stake_dollars: float
+
+
+@dataclass(frozen=True)
+class PaperFillLevel:
+    """纸面逐档成交；price 为合约价格，cash_spent 单位为 USD。"""
+
+    price: float
+    shares: float
+    notional: float
+    fee: float
+    cash_spent: float
+
+
+@dataclass(frozen=True)
+class PaperFill:
+    """纸面成交结果；cash_spent 单位为 USD，shares 单位为合约份额。"""
+
+    market: MarketRound
+    signal: Signal
+    side: str
+    order_type: str
+    status: str
+    limit_price: float
+    fill_price: float
+    shares: float
+    notional: float
+    fee: float
+    cash_spent: float
+    quote_size: float | None
+    reason: str
+    levels: tuple[PaperFillLevel, ...] = field(default_factory=tuple)
+    requested_cash: float | None = None

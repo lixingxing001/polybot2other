@@ -1,5 +1,604 @@
 # polybot2other-progress
 
+## 2026-05-28 v2.34
+
+### 已完成
+
+1. `trades` 新增交易级 `settlement_source` 字段，schema version 升到 6。
+2. 市场到期时，官方结算写入 `polymarket_official`，Chainlink 兜底写入 `chainlink_fallback`，提前平仓写入 `early_exit`。
+3. 新增官方补偿核对：最近 24 小时内使用 Chainlink 兜底或历史未记录来源的已结算 BTC 市场，会每轮最多检查 5 个，并对单个市场按 10 秒间隔节流。
+4. 官方结果出现后，如果与兜底结果一致，只升级市场和交易来源为 `polymarket_official`，不改资金。
+5. 官方结果与兜底结果不一致时，按官方 winner 重算对应市场结算交易的 `payout`、`pnl`、`exit_price`，并把账户 `cash_balance`、`realized_pnl` 做差额补偿。
+6. 提前平仓交易不会参与官方补偿重算，避免被市场最终结果误改。
+7. 最近交易优先展示交易级结算来源，缺省时才回退市场级来源。
+8. README 补充 `polymarket_official`、`chainlink_fallback`、`early_exit` 与官方补偿核对说明。
+
+### 已确认决策
+
+1. 官方结果仍优先信任 Polymarket winner。
+2. Polymarket 官方 winner 不是最终 BTC 价格；官方结算路径继续不伪造 `final_price`。
+3. Chainlink 兜底只是临时兜底，后续官方结果出现后必须升级或修正。
+4. 官方补偿只处理市场结算交易，不处理 `early_exit`。
+
+### 待办和后期优化
+
+1. 如果后续找到官方最终 BTC 价格的稳定来源，可以把官方 `final_price` 填入补偿路径。
+2. 如果历史库里存在 v2.34 之前的提前平仓且交易级来源为空，展示仍可能依赖旧数据特征推断，不能做到 100% 反推。
+
+### 已知坑位
+
+1. 官方结果延迟期间，最近交易可能短暂显示 `Chainlink兜底`；补偿核对拿到官方 winner 后会更新为 `Polymarket官方`。
+2. 如果官方 winner 与兜底方向相反，历史盈亏和现金余额会被差额修正，这是为了接近真实结算，不是重复结算。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_trade_settlement_updates_pnl_with_real_market_side tests.test_core.TradingCoreTest.test_chainlink_fallback_settlement_records_source_and_final_price tests.test_core.TradingCoreTest.test_official_recheck_upgrades_matching_chainlink_fallback_source tests.test_core.TradingCoreTest.test_official_recheck_corrects_mismatched_chainlink_fallback_pnl tests.test_core.TradingCoreTest.test_bot_rechecks_fallback_settlement_until_official_resolution tests.test_core.TradingCoreTest.test_partial_close_keeps_account_and_open_position_consistent`，6 个结算相关测试通过。
+2. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py tests/test_core.py`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，31 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求 `/api/status`，确认 `running=True`，最近交易返回 `settlement_source_label` 字段。
+9. 已只读打开默认库，确认 `meta.schema_version = 6`，且 `trades`、`market_rounds` 都存在 `settlement_source` 列。
+
+### 回滚建议
+
+1. 如需回滚本轮官方补偿核对，撤销 `storage.py`、`bot.py`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.34 改动。
+2. SQLite 新增列不会影响旧代码读取；如必须彻底移除 `trades.settlement_source`，需要停服务、备份数据库后重建表，默认不建议。
+
+## 2026-05-28 v2.32
+
+### 已完成
+
+1. `market_rounds` 新增 `settlement_source` 字段，schema version 升到 5。
+2. 官方 Polymarket 结算路径记录 `settlement_source = polymarket_official`。
+3. Chainlink 本地兜底结算路径记录 `settlement_source = chainlink_fallback`。
+4. 官方 winner 结算时不再把 `target_price` 写入 `final_price` 作为占位；官方路径下没有真实最终 BTC 价时，`final_price` 保持 `NULL`。
+5. 最近交易新增“结算来源”字段，默认展示 `Polymarket官方`、`Chainlink兜底`、`提前平仓` 或 `-`。
+6. README 补充最近交易结算来源说明。
+7. 补充测试，覆盖官方结算来源、官方路径 `final_price = NULL`、Chainlink 兜底来源和兜底 final price。
+
+### 已确认决策
+
+1. `结果 outcome` 继续优先信任 Polymarket 官方 winner。
+2. 官方结果接口当前只提供 winner，不把目标价伪装成真实最终 BTC 价格。
+3. Chainlink 兜底是 fallback，不等同官方真实结算；来源字段必须暴露给前端。
+4. 提前平仓类最近交易没有市场结算来源，前端显示为“提前平仓”。
+
+### 待办和后期优化
+
+1. 如果后续找到官方 final BTC price 的稳定来源，可以在官方结算路径传入真实 `final_price`。
+2. 历史 v2.32 之前已结算记录没有 `settlement_source`，只能显示为空或历史未记录，不能反推为官方或 Chainlink。
+
+### 已知坑位
+
+1. 本轮新增 SQLite 列，旧库会自动 `ALTER TABLE` 追加；不做破坏性迁移。
+2. 官方结算记录的 `final_price` 为空是正确行为，表示没有官方最终 BTC 价，不是数据丢失。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_trade_settlement_updates_pnl_with_real_market_side tests.test_core.TradingCoreTest.test_chainlink_fallback_settlement_records_source_and_final_price`，2 个结算来源测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py tests/test_core.py`，编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，28 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求首页 HTML，确认脚本地址为 `/static/app.js?v=20260528-v2-32`。
+9. 已只读打开默认库，确认 `meta.schema_version = 5`，且 `market_rounds` 存在 `settlement_source` 列。
+10. 已请求 `/api/status`，确认 `running=True`，最近交易返回 `settlement_source_label` 字段；默认库历史记录首条来源为 `-`，符合 v2.32 前历史来源未记录的预期。
+
+### 回滚建议
+
+1. 如需回滚本轮结算来源能力，撤销 `storage.py`、`bot.py`、`static/app.js`、`static/index.html`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.32 改动。
+2. SQLite 新增列不会影响旧代码读取；如必须彻底清理列，需要停服务、备份数据库后重建表，默认不建议。
+
+## 2026-05-28 v2.30
+
+### 已完成
+
+1. 订单流水新增 `orderRenderKey`，订单数据、字段选择、分页状态、展开状态没有变化时不再重绘表格。
+2. 自动轮询刷新时，如果用户正在订单流水区域选中文字、焦点在订单流水面板内，延后订单表格 DOM 替换，避免复制和选中被打断。
+3. 必须重绘订单流水时会保留 `order-table-wrap` 的纵向和横向滚动位置。
+4. 订单流水字段选择、展开逐档成交、撤单、切换筛选、查看更多等用户主动操作仍会强制刷新，保证操作反馈及时。
+5. 新增 `selectionchange`、`focusout`、`mouseup` 后的延迟刷新检查，用户结束选择或焦点离开后会补渲染挂起的订单更新。
+6. 首页脚本版本号升级到 `/static/app.js?v=20260528-v2-30`，避免浏览器继续使用旧脚本。
+
+### 已确认决策
+
+1. 本轮只优化前端渲染策略，不改变订单接口、订单状态和 Paper 执行逻辑。
+2. 自动轮询不再无条件替换订单流水 DOM；用户主动动作仍优先立即生效。
+3. 保护范围限定在订单流水面板，避免影响当前持仓、最近交易、行情和指标刷新。
+
+### 待办和后期优化
+
+1. 如果后续需要更细粒度，可以把订单流水改成按行 diff 更新，而不是整表更新。
+2. 当前环境没有浏览器自动化工具，后续可补 Playwright 截图/DOM 坐标验证，覆盖复制文本和滚动保持。
+
+### 已知坑位
+
+1. 如果用户长时间保持订单流水里的文本选区，自动轮询数据会先进入内存状态，表格 DOM 会等选区释放后再补渲染。
+2. 用户手动点击同步、撤单、查看更多、切换筛选时会强制刷新订单流水，这是预期行为。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk git diff --check`，未发现空白错误。
+3. 已请求首页 HTML，确认脚本地址为 `/static/app.js?v=20260528-v2-30`。
+4. 已请求新版 app.js，确认存在 `orderRenderKey`、`isOrderInteractionActive`、`flushPendingOrderRender` 和 `forceOrder` 逻辑。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，27 个测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+
+### 回滚建议
+
+1. 如需回滚本轮防闪烁逻辑，撤销 `static/app.js`、`static/index.html` 和本进度文档中的 v2.30 改动。
+2. 本轮未修改数据库结构，无需迁移回滚。
+
+## 2026-05-28 v2.29
+
+### 已完成
+
+1. 订单流水状态列改为 `状态码(中文含义)` 格式，例如 `FILLED(完全成交)`。
+2. 新增前端状态展示映射：`RESTING(挂单中)`、`PARTIAL_RESTING(部分成交挂单)`、`FILLED(完全成交)`、`PARTIAL(部分成交)`、`CANCELED(已取消)`、`EXPIRED(已过期)`、`REJECTED(已拒绝)`。
+3. 首页脚本增加版本参数 `/static/app.js?v=20260528-v2-29`，避免浏览器继续使用旧 JS。
+
+### 已确认决策
+
+1. 只改变前端展示，不改变 `/api/orders` 返回的原始 `status` 值。
+2. 状态筛选仍继续使用原始状态分组，不受中文展示影响。
+3. 本轮只作用于订单流水状态列，最近交易状态列保持原样。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk git diff --check`，未发现空白错误。
+3. 已请求首页 HTML，确认脚本地址为 `/static/app.js?v=20260528-v2-29`。
+4. 已请求新版 app.js，确认存在 `ORDER_STATUS_LABELS` 和订单流水状态列 `orderStatusText(row.status)`。
+
+### 回滚建议
+
+1. 如需回滚本轮状态展示格式，撤销 `static/app.js`、`static/index.html` 和本进度文档中的 v2.29 改动。
+2. 本轮未修改数据库结构，无需迁移回滚。
+
+## 2026-05-28 v2.28
+
+### 已完成
+
+1. 订单流水表格容器新增 `order-table-wrap`，可视高度限制为约 4 条数据行，超出后在表格内部滚动查看。
+2. 订单流水表头设置 sticky，内部滚动时字段头保持可见。
+3. 订单流水原因列在该表内改为单行省略，避免长原因撑高行高导致 4 行可视高度失效。
+4. 前端订单分页大小从 50 改为 20；超过 20 条时通过“查看更多”加载下一页。
+5. 后端 `ORDERS_DEFAULT_LIMIT` 和 `/api/orders` 默认 limit 同步改为 20，避免 `/api/status` 首屏仍返回 50 条。
+6. 首页 CSS 版本号升级到 `v2-28`，避免浏览器继续命中旧样式缓存。
+7. README 中 `/api/orders` 示例 limit 更新为 20。
+
+### 已确认决策
+
+1. 可视高度按“约 4 条数据行 + 表头”控制，已加载的 20 条以内数据通过表格内部滚动查看。
+2. 数据分页仍由后端负责，前端点击“查看更多”时按当前状态筛选继续请求下一页。
+3. 默认库当前订单总数不足 20 时，“查看更多”隐藏是正确行为。
+
+### 待办和后期优化
+
+1. 如后续需要严格像素级 4 行，可根据真实浏览器截图再微调 `order-table-wrap` 的 `max-height`。
+2. 后续可以给订单流水增加“当前已加载 20 条，每页 20 条”的更明确提示。
+
+### 已知坑位
+
+1. 展开逐档成交明细时，明细区域会占用表格内部滚动高度；这是可接受行为，不会把整个页面撑长。
+2. 当前环境没有 Playwright/Chromium，未做截图级验证；已通过运行中 HTML/CSS 和接口返回验证。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/bot.py src/polybot2other/web.py`，编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_bot_orders_page_and_order_fills_are_paginated tests.test_core.TradingCoreTest.test_orders_page_filters_by_paper_order_status`，2 个订单分页/筛选测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，27 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求首页 HTML，确认 CSS 链接为 `/static/styles.css?v=20260528-v2-28`，订单流水容器为 `table-wrap order-table-wrap`。
+9. 已请求新版 CSS，确认存在 `.order-table-wrap { max-height: 226px; overflow: auto; }`、sticky 表头和订单原因列单行规则。
+10. 已请求 `/api/status`，确认 `recent_orders_meta.limit = 20`。
+11. 已请求 `/api/orders?offset=0&status=all`，确认默认 `limit = 20`。
+
+### 回滚建议
+
+1. 如需回滚本轮 UI/分页调整，撤销 `static/index.html`、`static/styles.css`、`static/app.js`、`bot.py`、`web.py`、`README.md` 和本进度文档中的 v2.28 改动。
+2. 本轮未修改数据库结构，无需迁移回滚。
+
+## 2026-05-28 v2.24
+
+### 已完成
+
+1. `/api/orders` 新增 `status` 查询参数，支持 `all`、`active`、`filled`、`canceled`、`expired`、`rejected`。
+2. `TradeStore.recent_paper_orders()` 和 `paper_order_count()` 增加服务端状态筛选，避免只过滤当前前端页导致漏看历史活跃挂单。
+3. `PaperTradingBot.orders_page()` 返回 `recent_orders_meta.status_filter`，前端可识别当前分页对应的筛选条件。
+4. 前端订单流水新增状态筛选下拉框；切换筛选时会清空旧分页缓存并重新请求后端。
+5. 单笔撤单和批量撤单后会按当前筛选条件重新加载订单页，避免 active 筛选下继续显示已取消订单。
+6. README 补充 `/api/orders` 的 `status` 参数和取值。
+7. 补充测试，覆盖 active、canceled、filled 三类筛选和非法筛选值。
+
+### 已确认决策
+
+1. 状态筛选必须在后端 SQL 层完成，不能只靠前端过滤当前已加载行。
+2. `active` 映射到 `RESTING` / `PARTIAL_RESTING`，对应仍有剩余挂单资金或等待撮合的订单。
+3. `filled` 同时包含 `FILLED` 和 `PARTIAL`；当前 Paper 里的 FAK 部分成交属于终态成交审计，不属于 active。
+4. `/api/status` 继续返回默认 all 首屏订单；当前端选择非 all 筛选时，前端会额外请求 `/api/orders?status=<filter>` 保持筛选视图准确。
+
+### 待办和后期优化
+
+1. 增加市场、方向和订单类型筛选。
+2. 增加 maker 队列位置和排队成交概率模拟。
+3. 实盘设计时需要把本地筛选和交易所订单状态同步结果区分开，避免把本地状态当作交易所最终状态。
+
+### 已知坑位
+
+1. 当前状态筛选只覆盖本地 Paper 订单状态，不代表真实 CLOB 订单状态。
+2. 前端在非 all 筛选下会额外请求 `/api/orders`，状态轮询时多一次轻量查询；当前订单规模下影响可接受。
+3. `filled` 包含 FAK 部分成交终态，名称偏审计视角；后续如果加真实 live 订单，需要单独区分部分成交后仍在挂单的状态。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_orders_page_filters_by_paper_order_status tests.test_core.TradingCoreTest.test_bot_orders_page_and_order_fills_are_paginated`，2 个订单分页/筛选测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py src/polybot2other/web.py tests/test_core.py`，编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，27 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求 `/api/status`，确认 `running=True`、`metrics.reserved_cash = 0.0`、`settings.paper_entry_order_type = FAK`、`recent_orders_meta.status_filter = all`。
+9. 已请求 `/api/orders?limit=5&offset=0&status=active`，返回 `recent_orders_meta.status_filter = active`，默认库当前 active 订单数为 0。
+10. 已请求 `/api/orders?status=bad`，返回 HTTP 400，确认非法筛选值不会静默降级。
+
+### 回滚建议
+
+1. 如需回滚本轮状态筛选，撤销 `storage.py`、`bot.py`、`web.py`、`static/index.html`、`static/app.js`、`static/styles.css`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.24 改动。
+2. 本轮未修改数据库结构，无需迁移回滚。
+
+## 2026-05-28 v2.23
+
+### 已完成
+
+1. 新增 Paper 批量撤单接口 `POST /api/cancel-orders`，请求体支持 `{"scope":"current_market"}` 和 `{"scope":"all"}`。
+2. `TradeStore.cancel_active_paper_orders()` 支持按 symbol 和可选 round_id 取消 `RESTING` / `PARTIAL_RESTING` 活跃挂单。
+3. 批量取消会把订单状态改为 `CANCELED`，清零 `remaining_cash`，汇总释放预留资金回 `cash_balance`，并返回 `canceled`、`not_canceled`、`released_cash` 和订单快照。
+4. `PaperTradingBot.cancel_orders()` 封装当前市场和全部活跃挂单两个作用域，并在取消后刷新订单分页。
+5. 前端订单流水新增“取消当前市场”和“取消全部挂单”入口，点击前弹出确认；按钮会根据当前状态和预留资金自动禁用。
+6. README 补充批量撤单 API。
+7. 补充测试，覆盖当前市场批量取消不会误取消其他市场，全部取消会释放剩余挂单资金。
+
+### 已确认决策
+
+1. `scope=current_market` 只取消当前 `current_market.round_id` 对应的活跃 Paper 挂单。
+2. `scope=all` 取消所有 BTC Paper 活跃挂单，等价于本地 Paper 的 cancel all。
+3. 批量取消仍只影响本地 Paper 数据，不调用真实 CLOB 取消接口，不需要签名或 L2 认证。
+4. 前端禁用按钮只做交互提示；后端仍以存储层活跃订单状态为最终判断，避免分页未加载完整时漏取消。
+
+### 待办和后期优化
+
+1. 增加订单状态筛选，只看 RESTING/PARTIAL_RESTING 活跃挂单。
+2. 增加 maker 队列位置和排队成交概率模拟。
+3. 实盘设计时需要处理真实取消部分失败、订单已成交但本地未同步、网络超时后状态不确定等竞态。
+
+### 已知坑位
+
+1. 当前批量取消是本地 Paper 状态变更，不代表真实 Polymarket CLOB 已取消。
+2. 前端按钮根据最近订单页和 `reserved_cash` 判断是否可点；如果历史页里有很老的活跃挂单，按钮可点但具体取消范围仍以后端为准。
+3. 当前市场不可用时，`scope=current_market` 会返回空取消结果和 `not_canceled.scope`，不会猜测市场。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_cancel_orders_scopes_current_market_and_all_active_orders`，1 个批量撤单作用域测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_cancel_resting_order_releases_reserved_cash tests.test_core.TradingCoreTest.test_cancel_orders_scopes_current_market_and_all_active_orders tests.test_core.TradingCoreTest.test_post_only_rests_reserves_cash_and_later_fills_as_maker tests.test_core.TradingCoreTest.test_gtd_resting_order_expires_and_releases_reserved_cash`，4 个挂单取消/生命周期测试通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py src/polybot2other/web.py tests/test_core.py`，编译检查通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，26 个测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+7. 已执行 `rtk git diff --check`，未发现空白错误。
+8. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+9. 已请求 `/api/status`，确认 `running=True`、`metrics.reserved_cash = 0.0`、`settings.paper_entry_order_type = FAK`。
+10. 已在默认库 `reserved_cash = 0.0` 的前提下请求 `/api/cancel-orders`，返回 `scope=current_market`、`canceled=[]`、`not_canceled={}`、`released_cash=0.0`。
+
+### 回滚建议
+
+1. 如需回滚本轮批量撤单能力，撤销 `storage.py`、`bot.py`、`web.py`、`static/index.html`、`static/app.js`、`static/styles.css`、`README.md`、`tests/test_core.py` 和本进度文档中的 v2.23 改动。
+2. 本轮未修改数据库结构，无需迁移回滚。
+
+## 2026-05-28 v2.22
+
+### 已完成
+
+1. 新增 Paper 手动撤单接口 `POST /api/cancel-order`，请求体为 `{"order_id": <id>}`。
+2. `TradeStore.cancel_paper_order()` 只允许取消 `RESTING` / `PARTIAL_RESTING` 订单，取消后状态改为 `CANCELED`，`remaining_cash` 清零，并释放预留资金回 `cash_balance`。
+3. 取消接口返回结构对齐 Polymarket 取消语义：包含 `canceled` 和 `not_canceled`；不可取消订单会给出原因。
+4. `PaperTradingBot.cancel_order()` 封装取消后刷新订单分页，方便前端立即更新订单流水。
+5. 前端订单流水新增“取消”操作，仅对 `RESTING` / `PARTIAL_RESTING` 显示按钮。
+6. 点击取消按钮不会触发行展开；取消成功后刷新状态、订单流水和挂单预留指标。
+7. README 补充本地 Paper 取消接口。
+8. 补充测试，覆盖取消 RESTING 订单释放预留资金、重复取消返回 `not_canceled`。
+
+### 已确认决策
+
+1. 本地 Paper 取消使用 `POST /api/cancel-order`，不调用真实 CLOB DELETE 接口，不需要 L2 认证。
+2. 只有 active resting order 可以取消；FILLED、EXPIRED、CANCELED、REJECTED 等终态不会被二次修改。
+3. 取消释放的是 `remaining_cash`，已成交部分不会回滚，符合部分成交后取消剩余挂单的语义。
+
+### 待办和后期优化
+
+1. 增加批量取消当前市场/全部挂单能力，对齐官方 cancel market / cancel all 能力。
+2. 对前端取消按钮增加确认弹层，避免误点。
+3. 增加状态筛选，只看 RESTING/PARTIAL_RESTING 活跃挂单。
+4. 后续实盘设计必须处理真实取消失败、认证失败、订单已成交但本地未同步等竞态。
+
+### 已知坑位
+
+1. 当前取消是本地 Paper 状态更新，不代表真实 CLOB 取消。
+2. 如果取消点击和行情触发 fill 在同一个 tick 附近发生，当前由本地存储锁决定先后顺序；真实实盘还需要用交易所返回状态做最终仲裁。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_cancel_resting_order_releases_reserved_cash tests.test_core.TradingCoreTest.test_post_only_rests_reserves_cash_and_later_fills_as_maker tests.test_core.TradingCoreTest.test_gtd_resting_order_expires_and_releases_reserved_cash`，3 个挂单取消/生命周期测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m py_compile src/polybot2other/storage.py src/polybot2other/bot.py src/polybot2other/web.py tests/test_core.py`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，25 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求 `/api/status`，确认 `running=True`、`metrics.reserved_cash = 0.0`。
+9. 已请求 `/api/cancel-order` 取消默认库中的非活跃订单，返回 `canceled=[]` 且 `not_canceled` 包含该订单 ID，确认不会误改终态订单。
+
+### 回滚建议
+
+1. 如需撤销本轮取消订单改动，恢复 `src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-28 v2.22` 记录。
+
+## 2026-05-28 v2.21
+
+### 已完成
+
+1. 扩展 Paper 订单类型：`POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE` 支持 `FAK`、`POST_ONLY`、`GTC`、`GTD`。
+2. 新增 Paper resting order 生命周期：POST_ONLY/GTC/GTD 下单后进入 `RESTING`，不会立即生成持仓。
+3. `paper_orders` 增加挂单字段：`post_only`、`expires_at`、`reserved_cash`、`remaining_cash`、`confidence`、`move_bps`；schema version 升到 4。
+4. RESTING/PARTIAL_RESTING 订单会预留现金，`cash_balance` 代表可用资金，`reserved_cash` 代表挂单占用资金。
+5. 账户总资产口径修正为 `cash_balance + open_risk + reserved_cash`，避免挂单预留导致总资产假性下降。
+6. 策略开 POST_ONLY/GTC/GTD 时使用非 marketable maker 限价，优先挂在 best bid；若会吃到卖一则向下避让。
+7. 行情更新时会扫描 RESTING/PARTIAL_RESTING 订单；当当前 ask 穿过挂单限价时，按 maker fill 模拟成交，手续费记为 0。
+8. GTD 按 `POLYBOT2OTHER_PAPER_GTD_SECONDS` 到期；GTC/POST_ONLY 最晚在市场结束时过期。
+9. 订单到期会更新为 `EXPIRED` 并释放 `remaining_cash`。
+10. UI 顶部新增“挂单预留”指标。
+11. README 补充 `POLYBOT2OTHER_PAPER_GTD_SECONDS`。
+12. 补充测试，覆盖 POST_ONLY 预留现金后 maker 成交、GTD 到期释放现金。
+
+### 已确认决策
+
+1. 本轮只模拟 BUY 侧 maker 挂单；当前项目策略没有 SELL 开仓路径。
+2. POST_ONLY 在本地作为 “GTC + post-only flag” 的便捷模式记录，符合官方 post-only 只能和 GTC/GTD 组合使用的约束。
+3. Maker fill 暂按 0 fee 处理；maker rebate 暂未计入收益，避免把 Paper 做得过于乐观。
+4. GTC 在 5 分钟市场结束时过期，避免有限市场结束后残留无效挂单。
+
+### 待办和后期优化
+
+1. 增加显式撤单接口和前端按钮，把手动取消记录为 `CANCELED` 并释放预留资金。
+2. 增加 maker queue 模型，避免“ask 穿过限价就立即满额成交”的乐观假设。
+3. 增加 maker rebate 参数和开关，默认仍建议关闭或单独展示。
+4. 支持 POST_ONLY + GTD 的组合配置，而不是当前 `POST_ONLY` 固定近似为 GTC post-only。
+
+### 已知坑位
+
+1. 当前 maker 成交用 orderbook 快照判断，仍没有真实队列位置、前序挂单、网络延迟和撮合竞争。
+2. RESTING 部分成交会生成独立 trade；同一个 order 多次部分成交时，`paper_fills` 可逐档追踪，但 `paper_orders.trade_id` 只保留第一笔关联 trade。
+3. GTD 的真实 Polymarket wire expiration 有额外安全阈值；Paper 里用 `POLYBOT2OTHER_PAPER_GTD_SECONDS` 表示本地有效生命周期。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_post_only_rests_reserves_cash_and_later_fills_as_maker tests.test_core.TradingCoreTest.test_gtd_resting_order_expires_and_releases_reserved_cash tests.test_core.TradingCoreTest.test_bot_orders_page_and_order_fills_are_paginated`，3 个挂单生命周期相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，24 个测试通过。
+5. 已执行 `rtk git diff --check`，未发现空白错误。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+7. 已只读查询默认 SQLite，确认 `meta.schema_version = 4`，且 `paper_orders` 已存在 `post_only`、`expires_at`、`reserved_cash`、`remaining_cash`、`confidence`、`move_bps` 列。
+8. 已请求 `/api/status`，确认 `running=True`、`settings.paper_gtd_seconds = 90.0`、`metrics.reserved_cash = 0.0`。
+
+### 回滚建议
+
+1. 如需撤销本轮挂单生命周期改动，恢复 `src/polybot2other/execution.py`、`src/polybot2other/config.py`、`src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-28 v2.21` 记录。
+2. 已迁移到 schema version 4 的 SQLite 追加列可保留，不影响 FAK 路径；如确需清理，先停服务并备份数据库。
+
+## 2026-05-28 v2.20
+
+### 已完成
+
+1. 新增 `/api/orders?limit=50&offset=0`，支持 Paper 订单流水独立分页，返回 `recent_orders` 和 `recent_orders_meta`。
+2. 新增 `/api/order-fills?order_id=<id>`，按订单 ID 返回该订单的逐档 `paper_fills` 明细。
+3. `PaperTradingBot` 新增 `orders_page()` 和 `order_fills()`，复用存储层分页和逐档成交查询。
+4. `TradeStore.recent_paper_orders()` 支持 offset，新增 `paper_order_count()`，避免前端只能依赖 `/api/status` 的固定 50 条。
+5. 前端订单流水改为独立分页状态：支持“查看更多”，并显示订单总数/已加载数量。
+6. 前端订单行支持点击展开，按需请求 `/api/order-fills` 展示逐档成交价格、份额、现金花费和 fee。
+7. README 补充订单分页和逐档 fill 查询接口。
+8. 补充测试，覆盖订单分页元数据和逐档 fill 查询。
+
+### 已确认决策
+
+1. `/api/status` 继续返回首屏最近订单，保持现有页面兼容；前端会同时使用 `/api/orders` 做独立分页。
+2. 逐档 fill 明细按需加载，不放进 `/api/status`，避免页面轮询时 payload 持续变大。
+3. 本轮不改变撮合逻辑，不新增订单状态机，只补审计查询和展示。
+
+### 待办和后期优化
+
+1. 实现 POST_ONLY/GTC/GTD resting order 状态机：挂单、排队、部分成交、撤单、过期。
+2. 给 `/api/orders` 增加状态、市场、方向筛选。
+3. 增加订单详情中的滑点汇总，例如 best ask、avg fill、limit、fee bps。
+4. 对前端展开态增加键盘可访问性和更明确的点击区域。
+
+### 已知坑位
+
+1. 点击整行展开订单明细，当前还没有单独的“详情”按钮；如果后续表格可编辑，需要避免点击冲突。
+2. 当前逐档明细只展示已成交订单；REJECTED/CANCELED/RESTING 订单没有 fill 明细是正常结果。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_storage_records_paper_order_and_each_fill_level tests.test_core.TradingCoreTest.test_storage_records_rejected_order_without_open_trade tests.test_core.TradingCoreTest.test_bot_orders_page_and_order_fills_are_paginated`，3 个订单接口相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m py_compile src/polybot2other/web.py src/polybot2other/bot.py src/polybot2other/storage.py tests/test_core.py`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，22 个测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+8. 已请求 `/api/status`，确认 `running=True` 且返回 `recent_orders`。
+9. 已请求 `/api/orders?limit=5&offset=0`，返回 HTTP 200，`recent_orders_meta.total = 1`。
+10. 已请求 `/api/order-fills?order_id=1`，返回 HTTP 200，`fills` 数量为 1。
+
+### 回滚建议
+
+1. 如需撤销本轮订单分页和展开明细改动，恢复 `src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-28 v2.20` 记录。
+
+## 2026-05-28 v2.19
+
+### 已完成
+
+1. 新增 `paper_orders` 表，记录 Paper 下单尝试：市场、方向、订单类型、状态、限价、预算、成交均价、成交份额、notional、fee、现金花费、关联 trade、原因和时间。
+2. 新增 `paper_fills` 表，记录每个 Paper 订单的逐档成交：档位序号、价格、份额、notional、fee、现金花费。
+3. `TradeStore.place_execution_result()` 统一处理 FAK/POST_ONLY 执行结果：有 fill 时写持仓、订单和逐档成交；无 fill 时也记录 REJECTED/CANCELED/RESTING 订单。
+4. 普通策略开仓改为通过 `place_execution_result()` 入库，避免无成交订单丢失审计记录。
+5. 配对策略的双腿 FAK fill 会分别写入 `paper_orders` / `paper_fills`，每腿记录各自真实现金花费。
+6. `/api/status` 返回 `recent_orders`，前端新增“订单流水”表展示订单类型、状态、限价、预算、均价、成交份额、花费、fee、成交档和原因。
+7. README 补充 Paper 订单和逐档成交会独立存储。
+8. 补充测试，覆盖逐档 fill 持久化、被拒订单无持仓但有订单记录。
+
+### 已确认决策
+
+1. 本轮只追加新表，不修改旧 `trades` 表结构，不重算历史 Paper 交易。
+2. `trades` 继续作为账户持仓和盈亏主表；`paper_orders` / `paper_fills` 作为执行质量审计表。
+3. 旧历史交易不会反向生成订单流水，因为旧记录缺少原始 orderbook 和逐档 fill 证据。
+
+### 待办和后期优化
+
+1. 增加 `/api/orders` 独立分页接口，避免长期运行后 `/api/status` 返回过多订单。
+2. 对 `paper_orders` 增加撤单、过期、POST_ONLY 后续成交等状态更新能力。
+3. UI 增加订单详情展开，展示每一档 `paper_fills`，而不是只显示 `fill_count`。
+4. 进一步模拟 tick size、min order size、接口拒单和网络延迟。
+
+### 已知坑位
+
+1. 订单流水从 v2.19 之后的新 Paper 执行开始记录；之前默认库里的老交易不会有对应 `paper_orders`。
+2. `paper_fills` 已持久化逐档成交，但当前 UI 只展示订单级汇总和成交档数，逐档明细需要后续详情视图或接口查看。
+3. POST_ONLY 仍未实现真实 resting queue，本轮只保证无成交订单也会有审计记录。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_storage_records_paper_order_and_each_fill_level tests.test_core.TradingCoreTest.test_storage_records_rejected_order_without_open_trade tests.test_core.TradingCoreTest.test_bot_fak_entry_records_fee_in_open_risk`，3 个订单持久化相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，21 个测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+5. 已执行 `rtk git diff --check`，未发现空白错误。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200，`/api/status` 返回 `running=True`。
+7. 已只读查询默认 SQLite，确认 `paper_orders` / `paper_fills` 表已创建，`meta.schema_version = 3`；旧历史交易未反向生成订单流水，当前新表计数为 0。
+
+### 回滚建议
+
+1. 如需撤销本轮订单流水改动，恢复 `src/polybot2other/models.py`、`src/polybot2other/execution.py`、`src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-28 v2.19` 记录。
+2. 已创建过的 SQLite 追加表可以保留不影响旧逻辑；如确需清理，必须先停服务并备份数据库后再处理。
+
+## 2026-05-28 v2.18
+
+### 已完成
+
+1. REST CLOB quote 保留排序后的 `bids` / `asks` 多档深度，不再只留下 best bid / best ask。
+2. 浏览器 market WebSocket 的 `book` 消息会把前 50 档 `bids` / `asks` 随 live snapshot 上报给后端。
+3. FAK 买入模拟改为按 ask 多档逐档成交，逐档扣 taker fee，并用加权均价写入 Paper 持仓。
+4. 普通策略 FAK 限价改为使用 `confidence - min_edge` 与 `max_entry_price` 推导的优势保护限价；只有在限价允许时才会从 0.34 继续吃到更高 ask 档位。
+5. 配对策略开仓改为按双腿多档深度计算最大等量 shares，并以含费净成本 `< 1.0` 作为正毛边保护。
+6. Paper 持仓 reason 记录多档成交均价、成交层数、限价、notional 和 fee，便于排查滑点。
+7. README 更新 Paper 执行模型说明。
+8. 补充测试，覆盖多档 FAK、bot 多档均价入场、best-only snapshot 触发 REST 深度补全、REST quote 多档排序保留。
+
+### 已确认决策
+
+1. 本轮不修改数据库结构，不新增 `paper_orders` / `paper_fills` 表；成交细节仍聚合到现有 trade reason 中。
+2. 多档深度只使用官方 CLOB REST 或 market WebSocket 实际提供的 `asks`，不根据 best ask 人工虚构深度。
+3. FAK 仍然是限价单模拟，不是无上限 market buy；如果限价不允许，价格不会吃穿到更高档。
+4. WebSocket 上报和 REST quote 暂时保留前 50 档，避免 live snapshot payload 过大。
+
+### 待办和后期优化
+
+1. 增加 `paper_orders` / `paper_fills` 独立表，记录逐档 fill、取消、过期和 order lifecycle；这涉及数据库结构变更，需要单独确认。
+2. 增加 UI 展示：成交均价、成交层数、limit、fee、order status、滑点。
+3. 增加真实下单前的 tick size、min order size、min size、接口拒单原因模拟。
+4. 如果后续要更贴近 maker-first 报告策略，需要完整实现 POST_ONLY/GTC/GTD 挂单队列和未成交率统计。
+
+### 已知坑位
+
+1. 当前多档 FAK 是按快照 orderbook 模拟，仍不包含网络延迟期间盘口变化、撮合竞争和接口失败。
+2. 多档 fill 仍聚合为一笔 trade；没有独立 fill 表前，无法精确复盘每一档成交。
+3. 普通策略会在保住 `min_edge` 的前提下允许吃更高 ask 档；这比之前更接近 marketable limit，但也会让新 Paper 成交均价高于页面卖一。
+4. POST_ONLY 仍只做 marketable 拒单，不持久化 resting order。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_fak_execution_walks_multiple_ask_levels_when_limit_allows tests.test_core.TradingCoreTest.test_bot_fak_entry_uses_multi_level_average_with_edge_limit tests.test_core.TradingCoreTest.test_polymarket_quote_keeps_sorted_orderbook_levels`，3 个多档订单簿相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_bot_fetches_rest_depth_when_snapshot_has_only_best_ask tests.test_core.TradingCoreTest.test_bot_fak_entry_uses_multi_level_average_with_edge_limit`，2 个深度补全相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，19 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk git diff --check`，未发现空白错误。
+7. 已重启默认库服务 `http://127.0.0.1:8788`，首页返回 HTTP 200，`/api/status` 返回 `running=True`、`paper_entry_order_type=FAK`。
+8. 已用 `PolymarketClient.get_quotes()` 实测当前 BTC 5m 市场 CLOB REST 深度，Up/Down 都能返回多档 `asks` / `bids`。
+
+### 回滚建议
+
+1. 如需撤销本轮多档 orderbook 改动，恢复 `src/polybot2other/execution.py`、`src/polybot2other/polymarket.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-28 v2.18` 记录。
+
+## 2026-05-27 v2.14
+
+### 已完成
+
+1. 新增 `execution.py` 纸面执行层，支持 FAK 买入模拟、POST_ONLY marketable 拒单判断、Crypto taker fee 计算。
+2. 普通方向策略不再把信号直接写成持仓，而是先走纸面执行；只有 FAK 实际产生 fill 后才写入 OPEN trade。
+3. FAK 成交会受当前卖一价、卖一深度、预算和 taker fee 约束；深度不足时会部分成交，剩余自动取消。
+4. 持仓 `stake` 改为记录实际现金成本，包含成交 notional 和 taker fee；`shares` 因 fee 影响会低于 `stake / ask` 的乐观结果。
+5. 配对策略开仓按双腿 ask、双腿可见 ask size 和双腿 taker fee 计算等量份额；reason 中记录 gross cost、net cost、fee 和 edge。
+6. 配对提前平仓、尾盘强平和残余仓位处理会按 bid 侧 taker fee 扣减回款。
+7. 新增配置项 `POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE` 和 `POLYBOT2OTHER_PAPER_TAKER_FEE_RATE`；默认 `FAK` 和 `0.07`。
+8. README 补充 Paper 执行模型和新增配置。
+9. 补充回归测试，覆盖 FAK fee/部分成交、POST_ONLY marketable 拒单、bot FAK 成交持仓含 fee、配对开平仓 reason 含 fee。
+
+### 已确认决策
+
+1. 当前仍然只做 paper，不接私钥、不签名、不发真实订单。
+2. 第一阶段先用 top-of-book ask/bid size 做执行模拟，不伪造不存在的多档深度。
+3. FAK 是默认模拟模式，用于让 Paper 收益先扣除 taker fee 和可见深度限制。
+4. POST_ONLY 当前只模拟“会立即成交则拒单”的安全边界，暂不持久化 resting order 队列。
+
+### 待办和后期优化
+
+1. 增加 `paper_orders` / `paper_fills` 独立表，记录订单生命周期、部分成交、取消和过期；这会涉及数据库结构变更，需要单独确认。
+2. 接入多档 orderbook 深度，按多档价格计算滑点，而不是只看 top-of-book。
+3. 完整实现 POST_ONLY/GTC/GTD resting order 队列和撮合更新。
+4. 对配对策略增加双腿原子性控制，避免一腿成交后一腿失败形成过大残余。
+5. UI 增加 fee、order type、fill status、net cost 等展示字段。
+
+### 已知坑位
+
+1. 当前 FAK 只使用可见卖一/买一档位，不能模拟 0.34 吃穿多档到 0.45 的完整滑点；多档深度接入前仍然偏保守但不完整。
+2. POST_ONLY 不会生成持久挂单，因此还不能评估 maker-first 的真实未成交率和队列位置。
+3. `POLYBOT2OTHER_PAPER_TAKER_FEE_RATE=0.07` 来自当前 Polymarket Crypto fee 文档；实盘前必须按具体 market 的 `feesEnabled` 和 fee params 再确认。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_fak_execution_charges_fee_and_caps_by_top_ask_size tests.test_core.TradingCoreTest.test_post_only_marketable_order_rejects_instead_of_taking_liquidity tests.test_core.TradingCoreTest.test_bot_fak_entry_records_fee_in_open_risk tests.test_core.TradingCoreTest.test_pair_strategy_opens_two_sides_and_exits_on_bid_sum`，4 个执行层相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，15 个测试通过。
+5. 已执行 `rtk git diff --check`，未发现空白错误。
+6. 已用 `/tmp/polybot2other-v214.sqlite3` 启动隔离服务 `http://127.0.0.1:8788`，首页返回 HTTP 200。
+7. 已请求 `http://127.0.0.1:8788/api/status`，确认 `settings.paper_entry_order_type = FAK`、`settings.paper_taker_fee_rate = 0.07`，且实际 Paper 持仓 reason 出现 `FAK FILLED` 和 `fee`。
+
+### 回滚建议
+
+1. 如需撤销本轮实盘接近化改动，恢复 `src/polybot2other/execution.py`、`src/polybot2other/models.py`、`src/polybot2other/config.py`、`src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`tests/test_core.py`、`README.md` 和本进度文档顶部 `2026-05-27 v2.14` 记录。
+
 ## 2026-05-27 v2.13
 
 ### 已完成

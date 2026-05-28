@@ -7,10 +7,30 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from .models import MarketRound, Signal, TradeIntent
+from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
+ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING")
+SETTLEMENT_SOURCE_POLYMARKET = "polymarket_official"
+SETTLEMENT_SOURCE_CHAINLINK = "chainlink_fallback"
+SETTLEMENT_SOURCE_EARLY_EXIT = "early_exit"
+PAPER_ORDER_STATUS_FILTERS: dict[str, tuple[str, ...]] = {
+    "all": (),
+    "active": ACTIVE_ORDER_STATUSES,
+    "filled": ("FILLED", "PARTIAL"),
+    "canceled": ("CANCELED",),
+    "expired": ("EXPIRED",),
+    "rejected": ("REJECTED",),
+}
+
+
+def normalize_paper_order_status_filter(value: str | None) -> str:
+    normalized = str(value or "all").strip().lower().replace("-", "_")
+    if normalized not in PAPER_ORDER_STATUS_FILTERS:
+        allowed = ", ".join(sorted(PAPER_ORDER_STATUS_FILTERS))
+        raise ValueError(f"status must be one of {allowed}")
+    return normalized
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -71,7 +91,8 @@ class TradeStore:
                 url TEXT,
                 final_price REAL,
                 outcome TEXT,
-                settled_at REAL
+                settled_at REAL,
+                settlement_source TEXT
             );
 
             CREATE TABLE IF NOT EXISTS trades (
@@ -90,9 +111,62 @@ class TradeStore:
                 exit_price REAL,
                 payout REAL,
                 pnl REAL,
+                settlement_source TEXT,
                 reason TEXT NOT NULL,
                 FOREIGN KEY(round_id) REFERENCES market_rounds(round_id)
             );
+
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                limit_price REAL,
+                post_only INTEGER NOT NULL DEFAULT 0,
+                expires_at REAL,
+                requested_cash REAL NOT NULL,
+                reserved_cash REAL NOT NULL DEFAULT 0,
+                remaining_cash REAL NOT NULL DEFAULT 0,
+                filled_shares REAL NOT NULL DEFAULT 0,
+                avg_fill_price REAL,
+                notional REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                cash_spent REAL NOT NULL DEFAULT 0,
+                trade_id INTEGER,
+                confidence REAL NOT NULL DEFAULT 0,
+                move_bps REAL NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(round_id) REFERENCES market_rounds(round_id),
+                FOREIGN KEY(trade_id) REFERENCES trades(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS paper_fills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                trade_id INTEGER,
+                level_index INTEGER NOT NULL,
+                price REAL NOT NULL,
+                shares REAL NOT NULL,
+                notional REAL NOT NULL,
+                fee REAL NOT NULL,
+                cash_spent REAL NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES paper_orders(id),
+                FOREIGN KEY(trade_id) REFERENCES trades(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_round_created
+                ON paper_orders(round_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_trade_id
+                ON paper_orders(trade_id);
+
+            CREATE INDEX IF NOT EXISTS idx_paper_fills_order_id
+                ON paper_fills(order_id, level_index);
 
             CREATE TABLE IF NOT EXISTS price_ticks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +195,14 @@ class TradeStore:
         self._ensure_column("market_rounds", "up_token", "TEXT")
         self._ensure_column("market_rounds", "down_token", "TEXT")
         self._ensure_column("market_rounds", "url", "TEXT")
+        self._ensure_column("market_rounds", "settlement_source", "TEXT")
+        self._ensure_column("trades", "settlement_source", "TEXT")
+        self._ensure_column("paper_orders", "post_only", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("paper_orders", "expires_at", "REAL")
+        self._ensure_column("paper_orders", "reserved_cash", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_orders", "remaining_cash", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_orders", "confidence", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_orders", "move_bps", "REAL NOT NULL DEFAULT 0")
         self.conn.commit()
 
     @_locked
@@ -239,6 +321,21 @@ class TradeStore:
         return row is not None
 
     @_locked
+    def active_paper_order_exists(self, round_id: str, side: str) -> bool:
+        normalized = _normalize_side(side)
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        row = self.conn.execute(
+            f"""
+            SELECT id
+            FROM paper_orders
+            WHERE round_id = ? AND side = ? AND status IN ({placeholders})
+            LIMIT 1
+            """,
+            (round_id, normalized, *ACTIVE_ORDER_STATUSES),
+        ).fetchone()
+        return row is not None
+
+    @_locked
     def open_trade_count(self, symbol: str | None = None) -> int:
         if symbol:
             row = self.conn.execute(
@@ -255,6 +352,15 @@ class TradeStore:
         if row is None:
             raise RuntimeError("account was not initialized")
         return dict(row)
+
+    @_locked
+    def reserved_cash(self) -> float:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(remaining_cash), 0) AS reserved FROM paper_orders WHERE status IN ({placeholders})",
+            ACTIVE_ORDER_STATUSES,
+        ).fetchone()
+        return round(float(row["reserved"] or 0.0), 6)
 
     @_locked
     def daily_realized_pnl(self) -> float:
@@ -321,6 +427,240 @@ class TradeStore:
         return trade_ids
 
     @_locked
+    def place_execution_result(self, intent: TradeIntent, result: Any) -> list[int]:
+        if getattr(result, "fills", None):
+            return self.place_fills(list(result.fills))
+        self.record_paper_order(
+            intent,
+            order_type=str(getattr(result, "order_type", "")),
+            status=str(getattr(result, "status", "")),
+            side=intent.signal.side,
+            limit_price=getattr(result, "limit_price", None),
+            requested_cash=getattr(result, "requested_cash", None) or intent.stake_dollars,
+            expires_at=getattr(result, "expires_at", None),
+            post_only=bool(getattr(result, "post_only", False)),
+            reason=str(getattr(result, "reason", "")),
+        )
+        return []
+
+    @_locked
+    def record_paper_order(
+        self,
+        intent: TradeIntent,
+        *,
+        order_type: str,
+        status: str,
+        side: str,
+        limit_price: float | None,
+        requested_cash: float,
+        reason: str,
+        expires_at: float | None = None,
+        post_only: bool = False,
+    ) -> int:
+        now = time.time()
+        should_reserve = status in ACTIVE_ORDER_STATUSES
+        reserve_cash = round(float(requested_cash or 0.0), 6) if should_reserve else 0.0
+        if should_reserve:
+            account = self.account()
+            if account["cash_balance"] + 1e-9 < reserve_cash:
+                status = "REJECTED"
+                reason = _append_reason(reason, "纸交易可用资金不足，挂单拒绝")
+                reserve_cash = 0.0
+        with self.conn:
+            if reserve_cash > 0:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance - ?, updated_at = ? WHERE id = 1",
+                    (reserve_cash, now),
+                )
+            order_id = self._insert_paper_order(
+                market=intent.market,
+                side=side,
+                order_type=order_type,
+                status=status,
+                limit_price=limit_price,
+                post_only=post_only,
+                expires_at=expires_at,
+                requested_cash=requested_cash,
+                reserved_cash=reserve_cash,
+                remaining_cash=reserve_cash,
+                filled_shares=0.0,
+                avg_fill_price=None,
+                notional=0.0,
+                fee=0.0,
+                cash_spent=0.0,
+                trade_id=None,
+                confidence=intent.signal.confidence,
+                move_bps=intent.signal.move_bps,
+                reason=reason,
+                now=now,
+            )
+        self.record_equity()
+        return order_id
+
+    @_locked
+    def place_fills(self, fills: list[PaperFill]) -> list[int]:
+        valid_fills = [fill for fill in fills if fill.shares > 0 and fill.cash_spent > 0]
+        if not valid_fills:
+            return []
+        account = self.account()
+        total_cash_spent = round(sum(float(fill.cash_spent) for fill in valid_fills), 6)
+        if account["cash_balance"] + 1e-9 < total_cash_spent:
+            raise ValueError("insufficient paper cash")
+        now = time.time()
+        trade_ids: list[int] = []
+        with self.conn:
+            self.conn.execute(
+                "UPDATE account SET cash_balance = cash_balance - ?, updated_at = ? WHERE id = 1",
+                (total_cash_spent, now),
+            )
+            for fill in valid_fills:
+                reason = _append_reason(fill.signal.reason, fill.reason)
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO trades(
+                        round_id, symbol, side, stake, entry_price, shares, confidence,
+                        move_bps, status, opened_at, reason
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                    """,
+                    (
+                        fill.market.round_id,
+                        fill.market.symbol,
+                        _normalize_side(fill.side),
+                        round(float(fill.cash_spent), 6),
+                        max(0.01, min(0.99, round(float(fill.fill_price), 4))),
+                        round(float(fill.shares), 6),
+                        fill.signal.confidence,
+                        fill.signal.move_bps,
+                        now,
+                        reason,
+                    ),
+                )
+                trade_ids.append(int(cur.lastrowid))
+                self._insert_paper_order_for_fill(fill, int(cur.lastrowid), reason, now)
+        self.record_equity()
+        return trade_ids
+
+    def _insert_paper_order_for_fill(self, fill: PaperFill, trade_id: int, reason: str, now: float) -> int:
+        order_id = self._insert_paper_order(
+            market=fill.market,
+            side=fill.side,
+            order_type=fill.order_type,
+            status=fill.status,
+            limit_price=fill.limit_price,
+            post_only=False,
+            expires_at=None,
+            requested_cash=fill.requested_cash if fill.requested_cash is not None else fill.cash_spent,
+            reserved_cash=0.0,
+            remaining_cash=0.0,
+            filled_shares=fill.shares,
+            avg_fill_price=fill.fill_price,
+            notional=fill.notional,
+            fee=fill.fee,
+            cash_spent=fill.cash_spent,
+            trade_id=trade_id,
+            confidence=fill.signal.confidence,
+            move_bps=fill.signal.move_bps,
+            reason=reason,
+            now=now,
+        )
+        self._insert_paper_fill_levels(order_id, trade_id, fill, now)
+        return order_id
+
+    def _insert_paper_order(
+        self,
+        *,
+        market: MarketRound,
+        side: str,
+        order_type: str,
+        status: str,
+        limit_price: float | None,
+        post_only: bool,
+        expires_at: float | None,
+        requested_cash: float,
+        reserved_cash: float,
+        remaining_cash: float,
+        filled_shares: float,
+        avg_fill_price: float | None,
+        notional: float,
+        fee: float,
+        cash_spent: float,
+        trade_id: int | None,
+        confidence: float,
+        move_bps: float,
+        reason: str,
+        now: float,
+    ) -> int:
+        cur = self.conn.execute(
+            """
+            INSERT INTO paper_orders(
+                round_id, symbol, side, order_type, status, limit_price, post_only,
+                expires_at, requested_cash, reserved_cash, remaining_cash, filled_shares,
+                avg_fill_price, notional, fee, cash_spent, trade_id, confidence,
+                move_bps, reason, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                market.round_id,
+                market.symbol,
+                _normalize_side(side),
+                str(order_type or ""),
+                str(status or ""),
+                _nullable_price(limit_price),
+                1 if post_only else 0,
+                expires_at,
+                round(float(requested_cash or 0.0), 6),
+                round(float(reserved_cash or 0.0), 6),
+                round(float(remaining_cash or 0.0), 6),
+                round(float(filled_shares or 0.0), 6),
+                _nullable_price(avg_fill_price),
+                round(float(notional or 0.0), 6),
+                round(float(fee or 0.0), 6),
+                round(float(cash_spent or 0.0), 6),
+                trade_id,
+                round(float(confidence or 0.0), 6),
+                round(float(move_bps or 0.0), 6),
+                str(reason or ""),
+                now,
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def _insert_paper_fill_levels(self, order_id: int, trade_id: int, fill: PaperFill, now: float) -> None:
+        levels = fill.levels or (
+            PaperFillLevel(
+                price=fill.fill_price,
+                shares=fill.shares,
+                notional=fill.notional,
+                fee=fill.fee,
+                cash_spent=fill.cash_spent,
+            ),
+        )
+        for index, level in enumerate(levels, start=1):
+            self.conn.execute(
+                """
+                INSERT INTO paper_fills(
+                    order_id, trade_id, level_index, price, shares,
+                    notional, fee, cash_spent, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    trade_id,
+                    index,
+                    round(float(level.price), 4),
+                    round(float(level.shares), 6),
+                    round(float(level.notional), 6),
+                    round(float(level.fee), 6),
+                    round(float(level.cash_spent), 6),
+                    now,
+                ),
+            )
+
+    @_locked
     def close_trade_shares(
         self,
         trade_id: int,
@@ -328,6 +668,7 @@ class TradeStore:
         exit_price: float,
         now: float | None = None,
         reason: str = "manual close",
+        fee: float = 0.0,
     ) -> dict[str, Any] | None:
         now = time.time() if now is None else now
         exit_price = max(0.0, min(1.0, round(float(exit_price), 4)))
@@ -347,18 +688,26 @@ class TradeStore:
         close_all = close_shares >= open_shares - 0.000001
         close_ratio = 1.0 if close_all else close_shares / open_shares
         close_stake = round(float(trade["stake"]) * close_ratio, 6)
-        payout = round(close_shares * exit_price, 6)
+        close_fee = max(0.0, round(float(fee), 6))
+        payout = round(max(0.0, close_shares * exit_price - close_fee), 6)
         pnl = round(payout - close_stake, 6)
-        close_reason = _append_reason(str(trade["reason"] or ""), reason)
+        fee_reason = f"{reason} fee {close_fee:.6f}" if close_fee > 0 else reason
+        close_reason = _append_reason(str(trade["reason"] or ""), fee_reason)
         with self.conn:
             if close_all:
                 self.conn.execute(
                     """
                     UPDATE trades
-                    SET status = 'SETTLED', settled_at = ?, exit_price = ?, payout = ?, pnl = ?, reason = ?
+                    SET status = 'SETTLED',
+                        settled_at = ?,
+                        exit_price = ?,
+                        payout = ?,
+                        pnl = ?,
+                        settlement_source = ?,
+                        reason = ?
                     WHERE id = ?
                     """,
-                    (now, exit_price, payout, pnl, close_reason, trade_id),
+                    (now, exit_price, payout, pnl, SETTLEMENT_SOURCE_EARLY_EXIT, close_reason, trade_id),
                 )
                 closed_id = trade_id
                 remaining_stake = 0.0
@@ -378,9 +727,10 @@ class TradeStore:
                     """
                     INSERT INTO trades(
                         round_id, symbol, side, stake, entry_price, shares, confidence,
-                        move_bps, status, opened_at, settled_at, exit_price, payout, pnl, reason
+                        move_bps, status, opened_at, settled_at, exit_price, payout, pnl,
+                        settlement_source, reason
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'SETTLED', ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'SETTLED', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         trade["round_id"],
@@ -396,6 +746,7 @@ class TradeStore:
                         exit_price,
                         payout,
                         pnl,
+                        SETTLEMENT_SOURCE_EARLY_EXIT,
                         close_reason,
                     ),
                 )
@@ -422,6 +773,7 @@ class TradeStore:
                 "exit_price": exit_price,
                 "payout": payout,
                 "pnl": pnl,
+                "settlement_source": SETTLEMENT_SOURCE_EARLY_EXIT,
                 "reason": close_reason,
                 "remaining_stake": remaining_stake,
                 "remaining_shares": remaining_shares,
@@ -482,7 +834,15 @@ class TradeStore:
             if final_price is None:
                 continue
             outcome = "Up" if final_price >= row["target_price"] else "Down"
-            settled.extend(self._settle_round(row["round_id"], final_price, outcome, now))
+            settled.extend(
+                self._settle_round(
+                    row["round_id"],
+                    final_price,
+                    outcome,
+                    now,
+                    SETTLEMENT_SOURCE_CHAINLINK,
+                )
+            )
         if settled:
             self.record_equity()
         return settled
@@ -494,18 +854,25 @@ class TradeStore:
         outcome: str,
         now: float | None = None,
         final_price: float | None = None,
+        settlement_source: str = SETTLEMENT_SOURCE_POLYMARKET,
     ) -> list[dict[str, Any]]:
         now = time.time() if now is None else now
-        row = self.get_round(round_id)
-        fallback_price = float(row["target_price"]) if row and row.get("target_price") is not None else 0.0
-        settled = self._settle_round(round_id, final_price if final_price is not None else fallback_price, _normalize_side(outcome), now)
+        settled = self._settle_round(round_id, final_price, _normalize_side(outcome), now, settlement_source)
         if settled:
             self.record_equity()
         return settled
 
     @_locked
-    def _settle_round(self, round_id: str, final_price: float, outcome: str, now: float) -> list[dict[str, Any]]:
+    def _settle_round(
+        self,
+        round_id: str,
+        final_price: float | None,
+        outcome: str,
+        now: float,
+        settlement_source: str,
+    ) -> list[dict[str, Any]]:
         normalized_outcome = _normalize_side(outcome)
+        normalized_source = str(settlement_source or "").strip() or SETTLEMENT_SOURCE_CHAINLINK
         trades = self.conn.execute(
             "SELECT * FROM trades WHERE round_id = ? AND status = 'OPEN'",
             (round_id,),
@@ -515,10 +882,10 @@ class TradeStore:
             self.conn.execute(
                 """
                 UPDATE market_rounds
-                SET final_price = ?, outcome = ?, settled_at = ?
+                SET final_price = ?, outcome = ?, settled_at = ?, settlement_source = ?
                 WHERE round_id = ?
                 """,
-                (final_price, normalized_outcome, now, round_id),
+                (final_price, normalized_outcome, now, normalized_source, round_id),
             )
             for trade in trades:
                 win = _normalize_side(trade["side"]) == normalized_outcome
@@ -527,10 +894,15 @@ class TradeStore:
                 self.conn.execute(
                     """
                     UPDATE trades
-                    SET status = 'SETTLED', settled_at = ?, exit_price = ?, payout = ?, pnl = ?
+                    SET status = 'SETTLED',
+                        settled_at = ?,
+                        exit_price = ?,
+                        payout = ?,
+                        pnl = ?,
+                        settlement_source = ?
                     WHERE id = ?
                     """,
-                    (now, 1.0 if win else 0.0, payout, pnl, trade["id"]),
+                    (now, 1.0 if win else 0.0, payout, pnl, normalized_source, trade["id"]),
                 )
                 self.conn.execute(
                     """
@@ -543,9 +915,165 @@ class TradeStore:
                     (payout, pnl, now),
                 )
                 item = dict(trade)
-                item.update({"outcome": normalized_outcome, "payout": payout, "pnl": pnl, "final_price": final_price})
+                item.update(
+                    {
+                        "outcome": normalized_outcome,
+                        "status": "SETTLED",
+                        "settled_at": now,
+                        "exit_price": 1.0 if win else 0.0,
+                        "payout": payout,
+                        "pnl": pnl,
+                        "final_price": final_price,
+                        "settlement_source": normalized_source,
+                    }
+                )
                 settled.append(item)
         return settled
+
+    @_locked
+    def official_recheck_candidates(
+        self,
+        now: float,
+        lookback_seconds: float,
+        limit: int = 5,
+        symbol: str = "BTC",
+    ) -> list[dict[str, Any]]:
+        cutoff = now - max(0.0, float(lookback_seconds))
+        safe_limit = max(1, min(50, int(limit)))
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM market_rounds
+            WHERE symbol = ?
+              AND settled_at IS NOT NULL
+              AND ends_at >= ?
+              AND (settlement_source IS NULL OR settlement_source = ?)
+            ORDER BY ends_at DESC, round_id DESC
+            LIMIT ?
+            """,
+            (symbol, cutoff, SETTLEMENT_SOURCE_CHAINLINK, safe_limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def reconcile_round_official_outcome(
+        self,
+        round_id: str,
+        official_outcome: str,
+        now: float | None = None,
+        final_price: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        normalized_outcome = _normalize_side(official_outcome)
+        if normalized_outcome not in {"Up", "Down"}:
+            raise ValueError("official_outcome must be Up or Down")
+
+        round_row = self.get_round(round_id)
+        if round_row is None:
+            return {
+                "round_id": round_id,
+                "previous_outcome": None,
+                "official_outcome": normalized_outcome,
+                "corrected": False,
+                "updated_trades": 0,
+                "cash_delta": 0.0,
+                "pnl_delta": 0.0,
+            }
+
+        previous_outcome = _normalize_side(round_row.get("outcome")) if round_row.get("outcome") else None
+        market_settled_at = _maybe_float(round_row.get("settled_at"))
+        trades = self.conn.execute(
+            """
+            SELECT *
+            FROM trades
+            WHERE round_id = ?
+              AND status = 'SETTLED'
+              AND (
+                    settlement_source = ?
+                    OR (
+                        settlement_source IS NULL
+                        AND (? IS NULL OR settled_at IS NULL OR ABS(settled_at - ?) <= 0.001)
+                    )
+              )
+            ORDER BY id ASC
+            """,
+            (round_id, SETTLEMENT_SOURCE_CHAINLINK, market_settled_at, market_settled_at),
+        ).fetchall()
+
+        cash_delta = 0.0
+        pnl_delta = 0.0
+        updated_trades = 0
+        corrected = previous_outcome in {"Up", "Down"} and previous_outcome != normalized_outcome
+        reconcile_note = ""
+        if corrected:
+            reconcile_note = f"OFFICIAL_RECONCILE {previous_outcome}->{normalized_outcome}"
+
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE market_rounds
+                SET final_price = ?,
+                    outcome = ?,
+                    settled_at = COALESCE(settled_at, ?),
+                    settlement_source = ?
+                WHERE round_id = ?
+                """,
+                (final_price, normalized_outcome, now, SETTLEMENT_SOURCE_POLYMARKET, round_id),
+            )
+            for trade in trades:
+                win = _normalize_side(trade["side"]) == normalized_outcome
+                payout = round(float(trade["shares"]) if win else 0.0, 6)
+                pnl = round(payout - float(trade["stake"]), 6)
+                old_payout = round(float(trade["payout"] or 0.0), 6)
+                old_pnl = round(float(trade["pnl"] or 0.0), 6)
+                cash_delta = round(cash_delta + payout - old_payout, 6)
+                pnl_delta = round(pnl_delta + pnl - old_pnl, 6)
+                reason = _append_reason(str(trade["reason"] or ""), reconcile_note)
+                self.conn.execute(
+                    """
+                    UPDATE trades
+                    SET exit_price = ?,
+                        payout = ?,
+                        pnl = ?,
+                        settlement_source = ?,
+                        reason = ?,
+                        settled_at = COALESCE(settled_at, ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        1.0 if win else 0.0,
+                        payout,
+                        pnl,
+                        SETTLEMENT_SOURCE_POLYMARKET,
+                        reason,
+                        now,
+                        trade["id"],
+                    ),
+                )
+                updated_trades += 1
+            if abs(cash_delta) > 0.000001 or abs(pnl_delta) > 0.000001:
+                self.conn.execute(
+                    """
+                    UPDATE account
+                    SET cash_balance = cash_balance + ?,
+                        realized_pnl = realized_pnl + ?,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (cash_delta, pnl_delta, now),
+                )
+
+        if abs(cash_delta) > 0.000001 or abs(pnl_delta) > 0.000001:
+            self.record_equity()
+        return {
+            "round_id": round_id,
+            "previous_outcome": previous_outcome,
+            "official_outcome": normalized_outcome,
+            "corrected": corrected,
+            "updated_trades": updated_trades,
+            "cash_delta": round(cash_delta, 6),
+            "pnl_delta": round(pnl_delta, 6),
+        }
 
     @_locked
     def open_trades(self) -> list[dict[str, Any]]:
@@ -561,7 +1089,8 @@ class TradeStore:
                 r.down_token,
                 r.url,
                 r.final_price,
-                r.outcome
+                r.outcome,
+                r.settlement_source AS market_settlement_source
             FROM trades t
             JOIN market_rounds r ON r.round_id = t.round_id
             WHERE t.status = 'OPEN'
@@ -577,10 +1106,28 @@ class TradeStore:
         rows = self.conn.execute(
             f"""
             SELECT
-                t.*,
+                t.id,
+                t.round_id,
+                t.symbol,
+                t.side,
+                t.stake,
+                t.entry_price,
+                t.shares,
+                t.confidence,
+                t.move_bps,
+                t.status,
+                t.opened_at,
+                t.settled_at,
+                t.exit_price,
+                t.payout,
+                t.pnl,
+                t.reason,
+                COALESCE(t.settlement_source, r.settlement_source) AS settlement_source,
+                t.settlement_source AS trade_settlement_source,
                 r.target_price,
                 r.final_price,
                 r.outcome,
+                r.settlement_source AS market_settlement_source,
                 r.ends_at,
                 r.question,
                 r.condition_id,
@@ -610,20 +1157,412 @@ class TradeStore:
         return int(row["count"])
 
     @_locked
+    def recent_paper_orders(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        symbol: str | None = None,
+        status_filter: str = "all",
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(200, int(limit)))
+        offset = max(0, int(offset))
+        status_key = normalize_paper_order_status_filter(status_filter)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            conditions.append("o.symbol = ?")
+            params.append(symbol)
+        status_values = PAPER_ORDER_STATUS_FILTERS[status_key]
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            conditions.append(f"o.status IN ({placeholders})")
+            params.extend(status_values)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.extend([limit, offset])
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                o.*,
+                r.question,
+                r.condition_id,
+                r.url,
+                COALESCE(f.fill_count, 0) AS fill_count
+            FROM paper_orders o
+            JOIN market_rounds r ON r.round_id = o.round_id
+            LEFT JOIN (
+                SELECT order_id, COUNT(*) AS fill_count
+                FROM paper_fills
+                GROUP BY order_id
+            ) f ON f.order_id = o.id
+            {where}
+            ORDER BY o.created_at DESC, o.id DESC
+            LIMIT ?
+            OFFSET ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def paper_order_count(self, symbol: str | None = None, status_filter: str = "all") -> int:
+        status_key = normalize_paper_order_status_filter(status_filter)
+        conditions: list[str] = []
+        params: list[Any] = []
+        if symbol:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        status_values = PAPER_ORDER_STATUS_FILTERS[status_key]
+        if status_values:
+            placeholders = ",".join("?" for _ in status_values)
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(status_values)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM paper_orders {where}",
+            tuple(params),
+        ).fetchone()
+        return int(row["count"])
+
+    @_locked
+    def paper_order_fills(self, order_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM paper_fills
+            WHERE order_id = ?
+            ORDER BY level_index ASC, id ASC
+            """,
+            (order_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def active_paper_orders(self, symbol: str = "BTC", round_id: str | None = None) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        params: list[Any] = [symbol, *ACTIVE_ORDER_STATUSES]
+        round_filter = ""
+        if round_id:
+            round_filter = " AND o.round_id = ?"
+            params.append(round_id)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                o.*,
+                r.target_price,
+                r.ends_at,
+                r.question,
+                r.condition_id,
+                r.up_token,
+                r.down_token,
+                r.url
+            FROM paper_orders o
+            JOIN market_rounds r ON r.round_id = o.round_id
+            WHERE o.symbol = ? AND o.status IN ({placeholders}){round_filter}
+            ORDER BY o.created_at ASC, o.id ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def expire_resting_orders(self, now: float) -> list[dict[str, Any]]:
+        active_orders = self.active_paper_orders()
+        expired = [
+            order
+            for order in active_orders
+            if (_maybe_float(order.get("expires_at")) is not None and float(order["expires_at"]) <= now)
+            or (_maybe_float(order.get("ends_at")) is not None and float(order["ends_at"]) <= now)
+        ]
+        if not expired:
+            return []
+        results: list[dict[str, Any]] = []
+        with self.conn:
+            for order in expired:
+                remaining_cash = max(0.0, round(float(order.get("remaining_cash") or 0.0), 6))
+                reason = _append_reason(str(order.get("reason") or ""), f"EXPIRED release {remaining_cash:.6f}")
+                self.conn.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status = 'EXPIRED',
+                        remaining_cash = 0,
+                        reason = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (reason, now, order["id"]),
+                )
+                if remaining_cash > 0:
+                    self.conn.execute(
+                        "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                        (remaining_cash, now),
+                    )
+                item = dict(order)
+                item.update({"status": "EXPIRED", "remaining_cash": 0.0, "released_cash": remaining_cash, "reason": reason})
+                results.append(item)
+        self.record_equity()
+        return results
+
+    @_locked
+    def cancel_paper_order(self, order_id: int, reason: str = "manual cancel", now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        row = self.conn.execute(
+            "SELECT * FROM paper_orders WHERE id = ?",
+            (int(order_id),),
+        ).fetchone()
+        if row is None:
+            return {"canceled": [], "not_canceled": {str(order_id): "order not found"}}
+        order = dict(row)
+        if order["status"] not in ACTIVE_ORDER_STATUSES:
+            return {"canceled": [], "not_canceled": {str(order_id): f"order status is {order['status']}"}}
+        remaining_cash = max(0.0, round(float(order.get("remaining_cash") or 0.0), 6))
+        cancel_reason = _append_reason(str(order.get("reason") or ""), f"CANCELED {reason} release {remaining_cash:.6f}")
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = 'CANCELED',
+                    remaining_cash = 0,
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (cancel_reason, now, order["id"]),
+            )
+            if remaining_cash > 0:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                    (remaining_cash, now),
+                )
+        self.record_equity()
+        return {
+            "canceled": [int(order_id)],
+            "not_canceled": {},
+            "released_cash": remaining_cash,
+            "order": {
+                **order,
+                "status": "CANCELED",
+                "remaining_cash": 0.0,
+                "reason": cancel_reason,
+                "updated_at": now,
+            },
+        }
+
+    @_locked
+    def cancel_active_paper_orders(
+        self,
+        *,
+        symbol: str = "BTC",
+        round_id: str | None = None,
+        reason: str = "manual batch cancel",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        orders = self.active_paper_orders(symbol, round_id)
+        if not orders:
+            return {"canceled": [], "not_canceled": {}, "released_cash": 0.0, "orders": []}
+
+        canceled: list[int] = []
+        updated_orders: list[dict[str, Any]] = []
+        released_cash = 0.0
+        with self.conn:
+            for order in orders:
+                order_id = int(order["id"])
+                remaining_cash = max(0.0, round(float(order.get("remaining_cash") or 0.0), 6))
+                cancel_reason = _append_reason(str(order.get("reason") or ""), f"CANCELED {reason} release {remaining_cash:.6f}")
+                self.conn.execute(
+                    """
+                    UPDATE paper_orders
+                    SET status = 'CANCELED',
+                        remaining_cash = 0,
+                        reason = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (cancel_reason, now, order_id),
+                )
+                canceled.append(order_id)
+                released_cash = round(released_cash + remaining_cash, 6)
+                updated = dict(order)
+                updated.update(
+                    {
+                        "status": "CANCELED",
+                        "remaining_cash": 0.0,
+                        "released_cash": remaining_cash,
+                        "reason": cancel_reason,
+                        "updated_at": now,
+                    }
+                )
+                updated_orders.append(updated)
+            if released_cash > 0:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                    (released_cash, now),
+                )
+        self.record_equity()
+        return {
+            "canceled": canceled,
+            "not_canceled": {},
+            "released_cash": released_cash,
+            "orders": updated_orders,
+        }
+
+    @_locked
+    def fill_resting_order(
+        self,
+        order: dict[str, Any],
+        *,
+        fill_price: float,
+        shares: float,
+        notional: float,
+        fee: float,
+        cash_spent: float,
+        level_price: float,
+        reason: str,
+        now: float,
+    ) -> dict[str, Any] | None:
+        if shares <= 0 or cash_spent <= 0:
+            return None
+        order_id = int(order["id"])
+        current = self.conn.execute(
+            "SELECT * FROM paper_orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if current is None or current["status"] not in ACTIVE_ORDER_STATUSES:
+            return None
+        remaining_cash = max(0.0, round(float(current["remaining_cash"] or 0.0), 6))
+        cash_spent = min(round(float(cash_spent), 6), remaining_cash)
+        if cash_spent <= 0:
+            return None
+        fill_price = max(0.01, min(0.99, round(float(fill_price), 4)))
+        shares = round(min(float(shares), cash_spent / fill_price), 6)
+        if shares <= 0:
+            return None
+        notional = round(shares * fill_price, 6)
+        fee = max(0.0, round(float(fee), 6))
+        cash_spent = round(notional + fee, 6)
+        next_remaining = max(0.0, round(remaining_cash - cash_spent, 6))
+        previous_shares = round(float(current["filled_shares"] or 0.0), 6)
+        previous_notional = round(float(current["notional"] or 0.0), 6)
+        previous_fee = round(float(current["fee"] or 0.0), 6)
+        previous_cash_spent = round(float(current["cash_spent"] or 0.0), 6)
+        total_shares = round(previous_shares + shares, 6)
+        total_notional = round(previous_notional + notional, 6)
+        total_fee = round(previous_fee + fee, 6)
+        total_cash_spent = round(previous_cash_spent + cash_spent, 6)
+        avg_fill_price = round(total_notional / total_shares, 4) if total_shares > 0 else fill_price
+        status = "FILLED" if next_remaining <= 0.000001 else "PARTIAL_RESTING"
+        order_reason = _append_reason(str(current["reason"] or ""), reason)
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                INSERT INTO trades(
+                    round_id, symbol, side, stake, entry_price, shares, confidence,
+                    move_bps, status, opened_at, reason
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """,
+                (
+                    current["round_id"],
+                    current["symbol"],
+                    current["side"],
+                    cash_spent,
+                    fill_price,
+                    shares,
+                    float(current["confidence"] or 0.0),
+                    float(current["move_bps"] or 0.0),
+                    now,
+                    order_reason,
+                ),
+            )
+            trade_id = int(cur.lastrowid)
+            level_row = self.conn.execute(
+                "SELECT COALESCE(MAX(level_index), 0) + 1 AS next_index FROM paper_fills WHERE order_id = ?",
+                (order_id,),
+            ).fetchone()
+            level_index = int(level_row["next_index"] or 1)
+            self.conn.execute(
+                """
+                INSERT INTO paper_fills(
+                    order_id, trade_id, level_index, price, shares,
+                    notional, fee, cash_spent, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    trade_id,
+                    level_index,
+                    round(float(level_price), 4),
+                    shares,
+                    notional,
+                    fee,
+                    cash_spent,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = ?,
+                    filled_shares = ?,
+                    avg_fill_price = ?,
+                    notional = ?,
+                    fee = ?,
+                    cash_spent = ?,
+                    remaining_cash = ?,
+                    trade_id = COALESCE(trade_id, ?),
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    total_shares,
+                    avg_fill_price,
+                    total_notional,
+                    total_fee,
+                    total_cash_spent,
+                    next_remaining,
+                    trade_id,
+                    order_reason,
+                    now,
+                    order_id,
+                ),
+            )
+        self.record_equity()
+        result = dict(current)
+        result.update(
+            {
+                "status": status,
+                "trade_id": trade_id,
+                "filled_shares": total_shares,
+                "avg_fill_price": avg_fill_price,
+                "notional": total_notional,
+                "fee": total_fee,
+                "cash_spent": total_cash_spent,
+                "remaining_cash": next_remaining,
+                "reason": order_reason,
+            }
+        )
+        return result
+
+    @_locked
     def metrics(self) -> dict[str, Any]:
         account = self.account()
         open_rows = self.open_trades()
         open_risk = round(sum(float(row["stake"]) for row in open_rows), 6)
+        reserved_cash = self.reserved_cash()
         settled = self.conn.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'SETTLED'").fetchone()["c"]
         wins = self.conn.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'SETTLED' AND pnl > 0").fetchone()["c"]
         losses = self.conn.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'SETTLED' AND pnl < 0").fetchone()["c"]
         row = self.conn.execute("SELECT COALESCE(MIN(total_equity), ?) AS min_equity FROM equity_curve", (account["initial_balance"],)).fetchone()
-        total_equity = round(float(account["cash_balance"]) + open_risk, 6)
+        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash, 6)
         total_pnl = round(total_equity - float(account["initial_balance"]), 6)
         max_drawdown = round(float(account["initial_balance"]) - float(row["min_equity"]), 6)
         return {
             "initial_balance": float(account["initial_balance"]),
             "cash_balance": round(float(account["cash_balance"]), 6),
+            "reserved_cash": reserved_cash,
             "open_risk": open_risk,
             "realized_pnl": round(float(account["realized_pnl"]), 6),
             "unrealized_pnl": 0.0,
@@ -643,7 +1582,8 @@ class TradeStore:
     def record_equity(self) -> None:
         account = self.account()
         open_risk = round(sum(float(row["stake"]) for row in self.open_trades()), 6)
-        total_equity = round(float(account["cash_balance"]) + open_risk, 6)
+        reserved_cash = self.reserved_cash()
+        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash, 6)
         self.conn.execute(
             """
             INSERT INTO equity_curve(cash_balance, open_risk, realized_pnl, total_equity, created_at)
@@ -754,3 +1694,18 @@ def _append_reason(existing: str, reason: str) -> str:
     if not reason:
         return existing
     return f"{existing} | {reason}"
+
+
+def _nullable_price(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return max(0.0, min(1.0, round(float(value), 4)))
+
+
+def _maybe_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

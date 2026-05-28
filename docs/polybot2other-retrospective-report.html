@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>polybot2other 策略交易历史复盘报告</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --text: #1d2939;
+      --muted: #667085;
+      --line: #d0d5dd;
+      --head: #101828;
+      --blue: #175cd3;
+      --green: #067647;
+      --red: #b42318;
+      --amber: #b54708;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", Arial, sans-serif; line-height: 1.62; letter-spacing: 0; }
+    main { width: min(1220px, calc(100% - 36px)); margin: 0 auto; padding: 28px 0 56px; }
+    header { border-bottom: 2px solid var(--head); padding: 20px 0 22px; }
+    h1, h2, h3 { color: var(--head); margin: 0; line-height: 1.25; letter-spacing: 0; }
+    h1 { font-size: 32px; margin-bottom: 10px; }
+    h2 { font-size: 22px; margin-bottom: 14px; }
+    h3 { font-size: 17px; margin-bottom: 8px; }
+    p { margin: 0 0 10px; }
+    section { border-bottom: 1px solid var(--line); padding: 24px 0; }
+    code { background: #eef2f6; border: 1px solid #d0d5dd; border-radius: 4px; padding: 1px 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 10px 0 18px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; font-size: 14px; }
+    th { background: #eef2f6; color: var(--head); font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    .meta { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 14px; }
+    .chip { display: inline-flex; align-items: center; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 2px 8px; white-space: nowrap; }
+    .chip.good { color: var(--green); border-color: #abefc6; background: #ecfdf3; }
+    .chip.warn { color: var(--amber); border-color: #fedf89; background: #fffaeb; }
+    .chip.bad { color: var(--red); border-color: #fecdca; background: #fef3f2; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-height: 104px; }
+    .metric .label { color: var(--muted); font-size: 13px; }
+    .metric .value { color: var(--head); font-size: 23px; font-weight: 800; margin-top: 4px; overflow-wrap: anywhere; }
+    .metric .note { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .callout { border-left: 4px solid var(--blue); background: var(--panel); padding: 12px 14px; margin: 12px 0; }
+    .callout.warn { border-left-color: var(--amber); }
+    .callout.bad { border-left-color: var(--red); }
+    .pos { color: var(--green); font-weight: 700; }
+    .neg { color: var(--red); font-weight: 700; }
+    .muted { color: var(--muted); }
+    ul, ol { margin: 8px 0 0 22px; padding: 0; }
+    li { margin: 6px 0; }
+    .rank { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 920px) {
+      main { width: min(100% - 24px, 1220px); padding-top: 16px; }
+      h1 { font-size: 26px; }
+      .grid, .split, .rank { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>polybot2other 策略交易历史复盘报告</h1>
+    <div class="meta">
+      <span class="chip ">生成时间：2026-05-28 10:44:00 SGT</span>
+      <span class="chip ">数据库：data/polybot2other-real-btc.sqlite3</span>
+      <span class="chip ">交易开仓窗口：2026-05-27 17:07:31 SGT 至 2026-05-28 10:42:45 SGT</span>
+      <span class="chip ">交易结算窗口：2026-05-27 17:10:01 SGT 至 2026-05-28 10:35:02 SGT</span>
+      <span class="chip ">数据口径：SQLite 实际交易、订单、成交、权益曲线</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>一、结论先讲清楚</h2>
+    <div class="callout warn">
+      <strong>当前结论：</strong>这批 Paper 数据是盈利的，但还不能直接推导为可实盘放量。主要理由是样本窗口只有约 17.5 小时，最大回撤达到 $59.28，且净利润明显受少数低入场价大赔率交易影响。策略有可继续验证的 edge，但需要先收紧 fallback 数据源、入场价格带和回撤控制。
+    </div>
+    <p>本报告基于本地默认库的真实记录计算：市场轮次 209 个，交易 169 笔，订单 96 条，逐档成交 97 条，权益曲线点 18311 个。</p>
+    <div class="grid"><div class="metric"><div class="label">初始资金</div><div class="value">$100.00</div><div class="note">Paper 起始账户余额</div></div><div class="metric"><div class="label">当前现金</div><div class="value">$192.47</div><div class="note">SQLite account.cash_balance</div></div><div class="metric"><div class="label">已实现 PnL</div><div class="value"><span class="pos">+$102.47</span></div><div class="note">相对初始资金 102.47%</div></div><div class="metric"><div class="label">估算总权益</div><div class="value">$202.47</div><div class="note">现金 + open risk + reserved cash</div></div><div class="metric"><div class="label">已结算交易</div><div class="value">167 / 169</div><div class="note">当前 open 2 笔</div></div><div class="metric"><div class="label">胜率</div><div class="value">61.68%</div><div class="note">胜 103 / 负 64 / 平 0</div></div><div class="metric"><div class="label">Profit Factor</div><div class="value">1.32</div><div class="note">总盈利 / 总亏损绝对值</div></div><div class="metric"><div class="label">最大回撤</div><div class="value">$59.28</div><div class="note">发生于 2026-05-28 09:00:16 SGT</div></div></div>
+  </section>
+
+  <section>
+    <h2>二、总体收益和风险</h2>
+    <div class="split">
+      <div class="panel">
+        <h3>收益质量</h3>
+        <ul>
+          <li>已结算 PnL：<span class="pos">+$102.47</span>，已结算本金合计 $835.00，按已结算本金计算 ROI 为 12.27%。</li>
+          <li>平均单笔 PnL：<span class="pos">+$0.61</span>；中位数 PnL：<span class="pos">+$2.19</span>。</li>
+          <li>最大单笔盈利：<span class="pos">+$36.67</span>；最大单笔亏损：<span class="neg">$-5.00</span>。</li>
+          <li>剔除最大盈利单后，剩余已结算 PnL 为 <span class="pos">+$65.81</span>，剩余本金 ROI 为 7.93%。</li>
+          <li>Profit Factor 为 1.32，说明盈利单总额高于亏损单总额，但优势不算厚。</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>风险质量</h3>
+        <ul>
+          <li>权益曲线最低值：$94.30，最高值：$230.95，当前最后权益点：$202.47。</li>
+          <li>最大回撤：$59.28，发生于 2026-05-28 09:00:16 SGT。</li>
+          <li>当前还有 2 笔 OPEN 交易，open risk 为 $10.00。</li>
+          <li>当前活跃挂单 0 条，reserved cash 为 $0.00。</li>
+          <li>按 $100 初始资金看，这种回撤比例对实盘不可接受，必须保留日亏损上限、连续亏损暂停和单市场风险上限。</li>
+        </ul>
+      </div>
+    </div>
+    <table class=""><thead><tr><th>状态</th><th>数量</th><th>本金</th><th>PnL</th></tr></thead><tbody><tr><td>SETTLED</td><td>167</td><td>$835.00</td><td><span class="pos">+$102.47</span></td></tr><tr><td>OPEN</td><td>2</td><td>$10.00</td><td><span class="muted">$0.00</span></td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>三、策略拆解</h2>
+    <h3>按策略类型</h3>
+    <table class=""><thead><tr><th>策略类型</th><th>数量</th><th>胜/负</th><th>胜率</th><th>本金</th><th>PnL</th><th>ROI</th><th>最大盈利</th><th>最大亏损</th></tr></thead><tbody><tr><td>PAIR</td><td>1</td><td>0/1</td><td>0.00%</td><td>$5.00</td><td><span class="neg">$-1.30</span></td><td>-26.09%</td><td><span class="neg">$-1.30</span></td><td><span class="neg">$-1.30</span></td></tr><tr><td>SINGLE</td><td>166</td><td>103/63</td><td>62.05%</td><td>$830.00</td><td><span class="pos">+$103.78</span></td><td>12.50%</td><td><span class="pos">+$36.67</span></td><td><span class="neg">$-5.00</span></td></tr></tbody></table>
+    <div class="callout">
+      <strong>判断：</strong>SINGLE 是当前主要收益来源；PAIR 只有 1 笔已结算且亏损，样本不足，不能评价为有效策略，也不建议仅凭这一笔开启默认放量。
+    </div>
+
+    <h3>按方向</h3>
+    <table class=""><thead><tr><th>方向</th><th>数量</th><th>胜/负</th><th>胜率</th><th>本金</th><th>PnL</th><th>平均 PnL</th></tr></thead><tbody><tr><td>Down</td><td>93</td><td>56/37</td><td>60.22%</td><td>$465.00</td><td><span class="pos">+$67.94</span></td><td><span class="pos">+$0.73</span></td></tr><tr><td>Up</td><td>74</td><td>47/27</td><td>63.51%</td><td>$370.00</td><td><span class="pos">+$34.53</span></td><td><span class="pos">+$0.47</span></td></tr></tbody></table>
+    <div class="callout">
+      <strong>判断：</strong>Up 和 Down 都为正收益，但 Down 的交易数更多、总 PnL 和平均 PnL 更高。后续需要继续观察这是市场阶段性方向偏差，还是策略在 Down 侧确实更有效。
+    </div>
+  </section>
+
+  <section>
+    <h2>四、入场条件复盘</h2>
+    <h3>按入场价格区间</h3>
+    <table class=""><thead><tr><th>入场价区间</th><th>数量</th><th>胜/负</th><th>胜率</th><th>平均入场价</th><th>本金</th><th>PnL</th><th>平均 PnL</th></tr></thead><tbody><tr><td>&lt;0.30</td><td>5</td><td>1/4</td><td>20.00%</td><td>0.2260</td><td>$25.00</td><td><span class="pos">+$16.67</span></td><td><span class="pos">+$3.33</span></td></tr><tr><td>0.30-0.39</td><td>9</td><td>6/3</td><td>66.67%</td><td>0.3578</td><td>$45.00</td><td><span class="pos">+$35.80</span></td><td><span class="pos">+$3.98</span></td></tr><tr><td>0.40-0.49</td><td>25</td><td>15/10</td><td>60.00%</td><td>0.4500</td><td>$125.00</td><td><span class="pos">+$44.50</span></td><td><span class="pos">+$1.78</span></td></tr><tr><td>0.50-0.59</td><td>57</td><td>28/29</td><td>49.12%</td><td>0.5498</td><td>$285.00</td><td><span class="neg">$-34.20</span></td><td><span class="neg">$-0.60</span></td></tr><tr><td>0.60-0.69</td><td>53</td><td>40/13</td><td>75.47%</td><td>0.6438</td><td>$265.00</td><td><span class="pos">+$39.94</span></td><td><span class="pos">+$0.75</span></td></tr><tr><td>&gt;=0.70</td><td>18</td><td>13/5</td><td>72.22%</td><td>0.7144</td><td>$90.00</td><td><span class="neg">$-0.24</span></td><td><span class="neg">$-0.01</span></td></tr></tbody></table>
+    <div class="callout warn">
+      <strong>关键问题：</strong><code>0.50-0.59</code> 区间是当前最大负贡献，57 笔合计 <span class="neg">$-34.20</span>。低价区间虽然总收益高，但 <code>&lt;0.30</code> 只有 5 笔且胜率低，收益主要依赖大赔率单，不能简单放大。
+    </div>
+
+    <h3>按 move_bps 绝对值</h3>
+    <table class=""><thead><tr><th>|move_bps| 区间</th><th>数量</th><th>胜数</th><th>胜率</th><th>平均绝对 bps</th><th>PnL</th><th>平均 PnL</th></tr></thead><tbody><tr><td>&lt;2bps</td><td>20</td><td>11</td><td>55.00%</td><td>1.74</td><td><span class="neg">$-4.48</span></td><td><span class="neg">$-0.22</span></td></tr><tr><td>2-4bps</td><td>67</td><td>40</td><td>59.70%</td><td>3.07</td><td><span class="pos">+$74.83</span></td><td><span class="pos">+$1.12</span></td></tr><tr><td>4-6bps</td><td>48</td><td>30</td><td>62.50%</td><td>4.85</td><td><span class="pos">+$23.74</span></td><td><span class="pos">+$0.49</span></td></tr><tr><td>6-8bps</td><td>19</td><td>13</td><td>68.42%</td><td>6.84</td><td><span class="pos">+$7.47</span></td><td><span class="pos">+$0.39</span></td></tr><tr><td>&gt;=8bps</td><td>13</td><td>9</td><td>69.23%</td><td>9.53</td><td><span class="pos">+$0.91</span></td><td><span class="pos">+$0.07</span></td></tr></tbody></table>
+    <div class="callout">
+      <strong>判断：</strong><code>2-4bps</code> 是当前最强区间，<code>&lt;2bps</code> 为负收益，<code>&gt;=8bps</code> 接近打平。建议把过小波动过滤掉，同时不要简单追逐过大偏离，因为盘口价格可能已经充分反映。
+    </div>
+
+    <h3>按 confidence</h3>
+    <table class=""><thead><tr><th>confidence 区间</th><th>数量</th><th>胜数</th><th>胜率</th><th>平均 confidence</th><th>PnL</th><th>平均 PnL</th></tr></thead><tbody><tr><td>0.60-0.64</td><td>63</td><td>31</td><td>49.21%</td><td>0.6329</td><td><span class="pos">+$15.32</span></td><td><span class="pos">+$0.24</span></td></tr><tr><td>0.65-0.69</td><td>38</td><td>24</td><td>63.16%</td><td>0.6708</td><td><span class="pos">+$41.78</span></td><td><span class="pos">+$1.10</span></td></tr><tr><td>0.70-0.74</td><td>33</td><td>24</td><td>72.73%</td><td>0.7248</td><td><span class="pos">+$26.12</span></td><td><span class="pos">+$0.79</span></td></tr><tr><td>&gt;=0.75</td><td>33</td><td>24</td><td>72.73%</td><td>0.8011</td><td><span class="pos">+$19.26</span></td><td><span class="pos">+$0.58</span></td></tr></tbody></table>
+    <div class="callout">
+      <strong>判断：</strong><code>0.65-0.69</code> 当前收益最好，最高 confidence 区间并没有线性更优。这说明 confidence 还不是完全校准的真实胜率，不能只按 confidence 放大仓位。
+    </div>
+  </section>
+
+  <section>
+    <h2>五、价格源和官方修正复盘</h2>
+    <table class=""><thead><tr><th>信号/价格来源特征</th><th>数量</th><th>胜数</th><th>胜率</th><th>PnL</th><th>平均 PnL</th></tr></thead><tbody><tr><td>fallback_signal_or_price</td><td>89</td><td>51</td><td>57.30%</td><td><span class="pos">+$2.61</span></td><td><span class="pos">+$0.03</span></td></tr><tr><td>chainlink_signal</td><td>64</td><td>44</td><td>68.75%</td><td><span class="pos">+$101.16</span></td><td><span class="pos">+$1.58</span></td></tr><tr><td>official_reconciled</td><td>14</td><td>8</td><td>57.14%</td><td><span class="neg">$-1.30</span></td><td><span class="neg">$-0.09</span></td></tr></tbody></table>
+    <div class="callout bad">
+      <strong>重点风险：</strong>原因中含 <code>fallback</code> 的交易有 89 笔，但最终只贡献 <span class="pos">+$2.61</span>，平均单笔接近打平；原因中含 <code>Chainlink</code> 的交易贡献明显更高。建议 fallback 价格源降权、缩小仓位或直接不作为入场依据。
+    </div>
+    <h3>结算来源</h3>
+    <table class=""><thead><tr><th>结算来源</th><th>数量</th><th>胜/负</th><th>本金</th><th>PnL</th></tr></thead><tbody><tr><td>polymarket_official</td><td>166</td><td>103/63</td><td>$830.00</td><td><span class="pos">+$103.78</span></td></tr><tr><td>NULL</td><td>1</td><td>0/1</td><td>$5.00</td><td><span class="neg">$-1.30</span></td></tr></tbody></table>
+    <h3>市场轮次来源</h3>
+    <table class=""><thead><tr><th>市场结算来源</th><th>市场轮次数</th></tr></thead><tbody><tr><td>polymarket_official</td><td>207</td></tr><tr><td>NULL</td><td>2</td></tr></tbody></table>
+    <h3>官方修正样本</h3>
+    <table class=""><thead><tr><th>交易数</th><th>胜/负</th><th>最终 PnL</th><th>说明</th></tr></thead><tbody><tr><td>14</td><td>8/6</td><td><span class="neg">$-1.30</span></td><td>这些交易含 OFFICIAL_RECONCILE 标记，表示本地临时判断与官方 winner 曾出现不一致。</td></tr></tbody></table>
+    <p class="muted">官方修正交易指原因中包含 <code>OFFICIAL_RECONCILE</code> 的交易。它们说明临界市场在本地 Chainlink 或 fallback 判断与 Polymarket 官方 winner 之间确实会发生翻转。</p>
+  </section>
+
+  <section>
+    <h2>六、订单执行质量</h2>
+    <div class="split">
+      <div class="panel">
+        <h3>订单和手续费</h3>
+        <ul>
+          <li>订单总数：96；逐档成交记录：97。</li>
+          <li>实际花费：$470.00；成交名义金额：$456.54；手续费：$13.46。</li>
+          <li>手续费占实际花费：2.86%。</li>
+          <li>有成交订单平均吃单层数：1.03；最大层数：2；多档成交订单：3。</li>
+          <li>成交订单平均 VWAP：0.5781。</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>执行判断</h3>
+        <ul>
+          <li>当前 $5 资金规模下，多数订单只吃一档，多档滑点还不严重。</li>
+          <li>手续费已经吃掉 $13.46，约为当前净利润的 13.13%，实盘必须继续计入。</li>
+          <li>如果放大仓位，不能用当前 $5 样本推断滑点；必须基于盘口深度模拟更大订单。</li>
+          <li>两个 FAK 订单因为卖一高于限价被取消，这是正确的限价保护。</li>
+        </ul>
+      </div>
+    </div>
+    <h3>订单状态</h3>
+    <table class=""><thead><tr><th>订单状态</th><th>数量</th><th>请求资金</th><th>实际花费</th><th>手续费</th><th>剩余冻结</th></tr></thead><tbody><tr><td>FILLED</td><td>94</td><td>$470.00</td><td>$470.00</td><td>$13.46</td><td>$0.00</td></tr><tr><td>CANCELED</td><td>2</td><td>$10.00</td><td>$0.00</td><td>$0.00</td><td>$0.00</td></tr></tbody></table>
+    <h3>多档成交订单</h3>
+    <table class=""><thead><tr><th>订单 ID</th><th>交易 ID</th><th>方向</th><th>均价</th><th>花费</th><th>手续费</th><th>层数</th><th>原因摘要</th></tr></thead><tbody><tr><td>4</td><td>79</td><td>Up</td><td>0.6892</td><td>$5.00</td><td>$0.11</td><td>2</td><td>真实 BTC 5m Up: Chainlink 75198.33 vs target 75176.11, 距离 2.96bps, ask 0.68, edge 0.069 | FAK FILLED: fill 7.100484 @ avg 0.6892, notional ...</td></tr><tr><td>41</td><td>114</td><td>Down</td><td>0.6533</td><td>$5.00</td><td>$0.12</td><td>2</td><td>真实 BTC 5m Down: fallback 75137.99 vs target 75168.23, 距离 -4.02bps, ask 0.65, edge 0.133 | FAK FILLED: fill 7.472037 @ avg 0.6533, notiona...</td></tr><tr><td>49</td><td>122</td><td>Down</td><td>0.6369</td><td>$5.00</td><td>$0.12</td><td>2</td><td>真实 BTC 5m Down: fallback 74323.37 vs target 74373.47, 距离 -6.74bps, ask 0.63, edge 0.098 | FAK FILLED: fill 7.655577 @ avg 0.6369, notiona...</td></tr></tbody></table>
+    <h3>被取消订单</h3>
+    <table class=""><thead><tr><th>订单 ID</th><th>方向</th><th>类型</th><th>请求资金</th><th>原因</th></tr></thead><tbody><tr><td>5</td><td>Up</td><td>FAK</td><td>$5.00</td><td>FAK 卖一价 0.7100 高于限价 0.7005</td></tr><tr><td>24</td><td>Up</td><td>FAK</td><td>$5.00</td><td>FAK 卖一价 0.7000 高于限价 0.6561</td></tr></tbody></table>
+  </section>
+
+  <section>
+    <h2>七、时间维度表现</h2>
+    <table class=""><thead><tr><th>UTC 日期</th><th>交易数</th><th>本金</th><th>已结算 PnL</th></tr></thead><tbody><tr><td>2026-05-27</td><td>140</td><td>$700.00</td><td><span class="pos">+$93.98</span></td></tr><tr><td>2026-05-28</td><td>29</td><td>$145.00</td><td><span class="pos">+$8.49</span></td></tr></tbody></table>
+    <div class="callout warn">
+      <strong>判断：</strong>样本集中在 2026-05-27 到 2026-05-28，时间跨度太短。当前盈利不能覆盖不同波动率、不同流动性、不同交易时段下的表现。
+    </div>
+  </section>
+
+  <section>
+    <h2>八、最好和最差交易</h2>
+    <div class="rank">
+      <div>
+        <h3>Top 盈利</h3>
+        <table class=""><thead><tr><th>ID</th><th>方向</th><th>入场价</th><th>本金</th><th>回款</th><th>PnL</th><th>来源</th><th>原因摘要</th></tr></thead><tbody><tr><td>58</td><td>Down</td><td>0.1200</td><td>$5.00</td><td>$41.67</td><td><span class="pos">+$36.67</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: Chainlink 74920.65 vs target 74942.18, 距离 -2.87bps, ask 0.12, edge 0.506</td></tr><tr><td>13</td><td>Down</td><td>0.3400</td><td>$5.00</td><td>$14.71</td><td><span class="pos">+$9.71</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: Chainlink 75775.77 vs target 75792.69, 距离 -2.23bps, ask 0.34, edge 0.316</td></tr><tr><td>103</td><td>Down</td><td>0.3500</td><td>$5.00</td><td>$13.66</td><td><span class="pos">+$8.66</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: fallback 74890.40 vs target 74913.99, 距离 -3.15bps, ask 0.35, edge 0.272 | FAK FILLED: fill 13.664002 ...</td></tr><tr><td>9</td><td>Up</td><td>0.3700</td><td>$5.00</td><td>$13.51</td><td><span class="pos">+$8.51</span></td><td>polymarket_official</td><td>真实 BTC 5m Up: Chainlink 75853.00 vs target 75834.00, 距离 2.51bps, ask 0.37, edge 0.295</td></tr><tr><td>29</td><td>Up</td><td>0.3800</td><td>$5.00</td><td>$13.16</td><td><span class="pos">+$8.16</span></td><td>polymarket_official</td><td>真实 BTC 5m Up: fallback 75750.60 vs target 75711.03, 距离 5.23bps, ask 0.38, edge 0.506</td></tr><tr><td>153</td><td>Down</td><td>0.3700</td><td>$5.00</td><td>$12.94</td><td><span class="pos">+$7.94</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: fallback 74337.45 vs target 74382.85, 距离 -6.10bps, ask 0.37, edge 0.368 | FAK FILLED: fill 12.942739 ...</td></tr></tbody></table>
+      </div>
+      <div>
+        <h3>Top 亏损</h3>
+        <table class=""><thead><tr><th>ID</th><th>方向</th><th>入场价</th><th>本金</th><th>回款</th><th>PnL</th><th>来源</th><th>原因摘要</th></tr></thead><tbody><tr><td>1</td><td>Down</td><td>0.5400</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: fallback 75621.60 vs target 75648.41, 距离 -3.54bps, ask 0.54, edge 0.123</td></tr><tr><td>7</td><td>Down</td><td>0.4800</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: Chainlink 75762.27 vs target 75801.52, 距离 -5.18bps, ask 0.48, edge 0.170</td></tr><tr><td>8</td><td>Up</td><td>0.5500</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Up: Chainlink 75790.82 vs target 75778.36, 距离 1.64bps, ask 0.55, edge 0.096</td></tr><tr><td>11</td><td>Up</td><td>0.6600</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Up: Chainlink 75910.26 vs target 75884.97, 距离 3.33bps, ask 0.66, edge 0.036 | OFFICIAL_RECONCILE Up-&gt;Down</td></tr><tr><td>14</td><td>Down</td><td>0.3200</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: fallback 75747.70 vs target 75772.51, 距离 -3.28bps, ask 0.32, edge 0.307</td></tr><tr><td>16</td><td>Down</td><td>0.4000</td><td>$5.00</td><td>$0.00</td><td><span class="neg">$-5.00</span></td><td>polymarket_official</td><td>真实 BTC 5m Down: fallback 75769.48 vs target 75789.86, 距离 -2.69bps, ask 0.40, edge 0.244 | OFFICIAL_RECONCILE Down-&gt;Up</td></tr></tbody></table>
+      </div>
+    </div>
+    <div class="callout">
+      <strong>观察：</strong>最大盈利来自 entry_price 0.12 的 Down 单，单笔贡献 <span class="pos">+$36.67</span>。这是策略收益的重要组成，但也说明当前净利润受少数大赔率交易影响，评估时必须看剔除最大单后的表现。
+    </div>
+  </section>
+
+  <section>
+    <h2>九、当前敞口</h2>
+    <h3>OPEN 交易</h3>
+    <table class=""><thead><tr><th>ID</th><th>市场</th><th>方向</th><th>本金</th><th>入场价</th><th>份额</th><th>confidence</th><th>move_bps</th><th>开仓时间</th><th>原因</th></tr></thead><tbody><tr><td>168</td><td>btc-updown-5m-1779935700</td><td>Down</td><td>$5.00</td><td>0.6900</td><td>7.092470</td><td>0.7291</td><td>-4.59</td><td>2026-05-28 10:38:01 SGT</td><td>真实 BTC 5m Down: fallback 74069.62 vs target 74103.64, 距离 -4.59bps, ask 0.69, edge 0.039 | FAK FILLED: fill 7.092470 @ avg 0.6900, notional 4.893804...</td></tr><tr><td>169</td><td>btc-updown-5m-1779936000</td><td>Down</td><td>$5.00</td><td>0.6000</td><td>8.106355</td><td>0.6203</td><td>-2.46</td><td>2026-05-28 10:42:45 SGT</td><td>真实 BTC 5m Down: fallback 74129.96 vs target 74148.16, 距离 -2.46bps, ask 0.60, edge 0.020 | FAK FILLED: fill 8.106355 @ avg 0.6000, notional 4.863813...</td></tr></tbody></table>
+    <h3>活跃挂单</h3>
+    <p class="muted">当前没有 RESTING 或 PARTIAL_RESTING 活跃挂单。</p>
+  </section>
+
+  <section>
+    <h2>十、策略结论和下一步</h2>
+    <div class="split">
+      <div class="panel">
+        <h3>建议保留</h3>
+        <ul>
+          <li>保留“无官方目标价不交易”。这是防止错误市场边界的核心保护。</li>
+          <li>保留 FAK 限价保护、多档成交、手续费和订单流水审计。</li>
+          <li>保留官方结算补偿核对，尤其是临界市场的 <code>OFFICIAL_RECONCILE</code> 修正。</li>
+          <li>保留固定小额 stake 继续收样本，不建议现在放大。</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h3>建议调整</h3>
+        <ul>
+          <li>fallback 价格源降权：fallback 样本接近打平，应该缩小仓位或不入场。</li>
+          <li>过滤 <code>|move_bps| &lt; 2</code> 的弱信号。</li>
+          <li>重点复查 <code>entry_price 0.50-0.59</code> 的入场规则，该区间当前负贡献最大。</li>
+          <li>不要按 confidence 线性加仓；先做校准曲线。</li>
+          <li>设置更硬的回撤熔断：最大回撤相对初始资金过高。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="callout bad">
+      <strong>实盘前置结论：</strong>当前数据支持“继续 Paper 验证和优化”，不支持“直接实盘放量”。至少需要跨更多日期、更多市场状态、更多波动环境，并验证放大订单后的滑点曲线。
+    </div>
+  </section>
+</main>
+</body>
+</html>
