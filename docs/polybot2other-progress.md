@@ -1,5 +1,141 @@
 # polybot2other-progress
 
+## 2026-05-28 v2.64
+
+### 已完成
+
+1. 修复 Paper resting maker 部分成交会生成大量 `$0.00` 微型持仓的问题。
+2. 同一个 `paper_orders` 挂单的多次部分成交会合并更新同一个 `trades` 持仓，不再每次部分成交都新建一条持仓。
+3. 低于 `$0.01` 的 resting 微型成交不会生成持仓；已有部分成交且剩余预留资金小于等于 `$0.05` 时，会释放残余资金并把挂单收口为 `FILLED`。
+4. 当前持仓、仓位数量和“是否已有仓位”的判断忽略低于 `$0.01` 的历史碎片持仓，避免历史 Paper 碎片继续阻塞新样本。
+5. README 补充 Paper resting dust 处理规则。
+6. 补充测试，覆盖多次部分成交合并、残余 dust 释放、极小初始成交不建仓。
+
+### 已确认决策
+
+1. 本轮不删除历史 SQLite 数据，避免破坏复盘审计链路。
+2. 历史低于 `$0.01` 的 OPEN 碎片持仓从当前持仓和风控计数中忽略，但结算逻辑仍会按原始 `trades` 表处理。
+3. 本轮不引入数据库迁移，所有变更走代码层过滤和新成交写入规则。
+
+### 待办和后期优化
+
+1. 后续可把 `$0.01` 最小成交金额和 `$0.05` dust 释放阈值配置化。
+2. 后续如接入真实 Polymarket 下单，需要改为读取市场 `mos` 等官方最小订单约束，而不是只用本地 Paper 阈值。
+3. 后续可做一次只读 dust 审计报表，统计历史库里被忽略的碎片持仓数量和总金额。
+
+### 已知坑位
+
+1. 本轮会影响后续新 resting 成交和当前持仓展示，不会重算已经写入的历史成交均价。
+2. 历史碎片 OPEN 记录仍在数据库里，最近交易或原始 SQL 审计仍可能看到它们。
+3. Paper dust 阈值只是为了避免不现实的微型样本污染，不代表真实 CLOB 的全部最小订单规则。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_resting_order_partial_fills_update_existing_trade_and_release_dust tests.test_core.TradingCoreTest.test_resting_order_tiny_initial_fill_does_not_create_dust_trade tests.test_core.TradingCoreTest.test_post_only_rests_reserves_cash_and_later_fills_as_maker_queue tests.test_core.TradingCoreTest.test_gtc_resting_order_can_fill_without_post_only_queue_delay`，4 个定向测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，51 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新后台进程 PID 为 `3047284`。
+7. 已请求 `/api/status`，确认 `last_error=None`，当前 `paper_entry_order_type=FAK`。
+8. 已请求 `/api/strategy-experiments-tables?trade_limit=200&order_limit=20&status=all`，确认当前返回的实验持仓中低于 `$0.01` 的碎片持仓数量为 0。
+
+### 回滚建议
+
+1. 如需回滚本轮 dust 修复，撤销 `src/polybot2other/storage.py`、`tests/test_core.py`、`README.md` 和本进度文档中的 v2.64 改动即可。
+2. 本轮没有数据库迁移；回滚后历史 dust 数据仍保持原样。
+
+## 2026-05-28 v2.63
+
+### 已完成
+
+1. 首页顶部新增“资金口径”选择器，支持 `主账户` 和 8 个 `SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY` 策略实验隔离账户。
+2. 顶部资金卡片跟随资金口径切换，展示所选账户的总资产、总盈亏、未实现盈亏、可用资金、挂单预留、持仓风险、胜率和最大回撤。
+3. 资金曲线跟随同一个资金口径切换；选择策略实验组合时读取对应 shadow SQLite 库的 equity curve。
+4. `/api/equity-curve` 增加 `account_scope` 和 `variant_id` 查询参数，兼容默认主账户口径。
+5. 策略实验组合 metrics 增加持仓 mark-to-market 估算，避免选中有持仓的组合时顶部未实现盈亏长期显示为 0。
+6. 首页静态资源版本升级到 `v2-63`。
+7. README 补充主账户和策略实验账户的资金曲线接口示例。
+
+### 已确认决策
+
+1. 不做“8 组合累计总资产”顶部卡片，避免把 8 个隔离实验账户误读成一个真实账户。
+2. 顶部资金卡片和资金曲线使用同一个选择器，减少“卡片一个口径、曲线另一个口径”的混淆。
+3. 策略实验账户只读展示资金状态，不改变主账户下单和撤单行为。
+
+### 待办和后期优化
+
+1. 后续可让持仓、订单流水、最近交易的数据范围跟顶部资金口径进一步联动到单个组合。
+2. 后续可给资金曲线增加多组合对比模式，但需要独立命名为“实验对比”，不能叫总资产。
+3. 后续可在曲线 tooltip 中补充当前组合、订单类型和策略族。
+
+### 已知坑位
+
+1. 选择策略实验组合后，顶部数据来自对应 shadow Paper 库，不代表主账户真实资金。
+2. 历史 equity curve 不会因为后续执行模型增强而重算，只会从新采样继续追加。
+3. 当前资金曲线仍是账户权益曲线，不是逐笔收益归因图。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_bot_equity_curve_window_supports_strategy_experiment_scope tests.test_core.TradingCoreTest.test_strategy_experiments_run_all_variants_in_isolated_stores`，2 个定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，49 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新后台进程 PID 为 `2912110`。
+7. 已请求 `/api/equity-curve?account_scope=main&days=90&max_points=5`，确认返回 `equity_curve_meta.account_scope=main`。
+8. 已请求 `/api/equity-curve?account_scope=strategy_experiment&variant_id=SINGLE_FAK&days=90&max_points=5`，确认返回 `variant_id=SINGLE_FAK` 和 `combo=SINGLE + FAK`。
+9. 已请求首页，确认静态资源版本为 `v2-63`，包含 `account-scope-select` 和“资金口径”。
+
+### 回滚建议
+
+1. 如需回滚本轮口径切换，撤销 `src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档中的 v2.63 改动。
+2. 本轮没有数据库迁移；回滚后已存在的 shadow equity curve 数据可保留。
+
+## 2026-05-28 v2.62
+
+### 已完成
+
+1. 增强 POST_ONLY Paper maker 成交模型：不再只要 ask 触达限价就全额成交。
+2. POST_ONLY 新增最短挂单等待、价格穿透限价缓冲和队列成交比例，成交后更容易表现为 `PARTIAL_RESTING`。
+3. GTC/GTD 继续使用普通 resting maker 模型：ask 触达或穿过限价即可按可见深度成交，不套用 POST_ONLY 队列等待。
+4. 保留 GTD 的限时语义，仍按 `POLYBOT2OTHER_PAPER_GTD_SECONDS` 提前过期释放预留资金。
+5. README 补充 FAK/GTC/GTD/POST_ONLY Paper 执行差异。
+6. 补充测试，覆盖 POST_ONLY 队列部分成交、GTC 无需 POST_ONLY 队列延迟成交、GTD 到期释放预留资金。
+
+### 已确认决策
+
+1. 本轮只增强 Paper 执行近似，不改数据库结构、接口返回结构和前端字段。
+2. GTC 与 GTD 的成交逻辑应保持一致，核心差异是 GTD 会更早过期；强行给 GTD 加额外滑点或随机失败会降低可解释性。
+3. POST_ONLY 的真实成交依赖队列位置和前序挂单，Paper 只能用保守近似模拟，不能宣称等价实盘撮合。
+
+### 待办和后期优化
+
+1. 后续可把 POST_ONLY 最短等待、价格穿透缓冲和队列比例配置化，便于按实盘回放校准。
+2. 后续可在策略实验复盘中单独展示 POST_ONLY 部分成交率和平均挂单年龄。
+3. 后续如接入真实 CLOB 下单，需要把 POST_ONLY 与 GTC/GTD 的 wire order 参数分开建模。
+
+### 已知坑位
+
+1. 当前队列成交比例仍是本地 Paper 近似，不知道真实排队位置、前序挂单量和网络延迟。
+2. GTC/GTD 如果都在 GTD 到期前成交，历史数据仍可能接近，这是订单类型语义决定的，不一定是 bug。
+3. 本轮改动只影响后续新成交和新样本，不会重算已经写入 SQLite 的历史订单。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core.TradingCoreTest.test_post_only_rests_reserves_cash_and_later_fills_as_maker_queue tests.test_core.TradingCoreTest.test_gtc_resting_order_can_fill_without_post_only_queue_delay tests.test_core.TradingCoreTest.test_gtd_resting_order_expires_and_releases_reserved_cash`，3 个定向测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src python3 -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+5. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest discover -s tests`，48 个测试通过。
+6. 已重启默认库服务 `http://127.0.0.1:8788`，新后台进程 PID 为 `2890808`。
+7. 已请求 `/api/status`，确认 `running=true`、`last_error=null`、8 个策略实验组合继续返回，当前仍处于 `WAITING_FOR_SAMPLE`。
+
+### 回滚建议
+
+1. 如需回滚本轮增强，撤销 `src/polybot2other/bot.py`、`tests/test_core.py`、`README.md` 和本进度文档中的 v2.62 改动即可。
+2. 本轮没有数据库迁移；回滚代码后，历史已生成的 `POST_ONLY_QUEUE_FILL` 订单记录可保留作为审计数据。
+
 ## 2026-05-28 v2.61
 
 ### 已完成

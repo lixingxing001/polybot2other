@@ -12,6 +12,9 @@ from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 SCHEMA_VERSION = 6
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING")
+PAPER_MIN_RESTING_FILL_CASH = 0.01
+PAPER_DUST_RELEASE_CASH = 0.05
+PAPER_MIN_OPEN_TRADE_STAKE = 0.01
 SETTLEMENT_SOURCE_POLYMARKET = "polymarket_official"
 SETTLEMENT_SOURCE_CHAINLINK = "chainlink_fallback"
 SETTLEMENT_SOURCE_EARLY_EXIT = "early_exit"
@@ -307,16 +310,31 @@ class TradeStore:
     def open_trade_exists(self, round_id: str, side: str) -> bool:
         normalized = _normalize_side(side)
         row = self.conn.execute(
-            "SELECT id FROM trades WHERE round_id = ? AND side = ? AND status = 'OPEN' LIMIT 1",
-            (round_id, normalized),
+            """
+            SELECT id
+            FROM trades
+            WHERE round_id = ?
+              AND side = ?
+              AND status = 'OPEN'
+              AND stake >= ?
+            LIMIT 1
+            """,
+            (round_id, normalized, PAPER_MIN_OPEN_TRADE_STAKE),
         ).fetchone()
         return row is not None
 
     @_locked
     def open_trade_exists_for_round(self, round_id: str) -> bool:
         row = self.conn.execute(
-            "SELECT id FROM trades WHERE round_id = ? AND status = 'OPEN' LIMIT 1",
-            (round_id,),
+            """
+            SELECT id
+            FROM trades
+            WHERE round_id = ?
+              AND status = 'OPEN'
+              AND stake >= ?
+            LIMIT 1
+            """,
+            (round_id, PAPER_MIN_OPEN_TRADE_STAKE),
         ).fetchone()
         return row is not None
 
@@ -353,11 +371,25 @@ class TradeStore:
     def open_trade_count(self, symbol: str | None = None) -> int:
         if symbol:
             row = self.conn.execute(
-                "SELECT COUNT(*) AS count FROM trades WHERE status = 'OPEN' AND symbol = ?",
-                (symbol,),
+                """
+                SELECT COUNT(*) AS count
+                FROM trades
+                WHERE status = 'OPEN'
+                  AND symbol = ?
+                  AND stake >= ?
+                """,
+                (symbol, PAPER_MIN_OPEN_TRADE_STAKE),
             ).fetchone()
             return int(row["count"])
-        row = self.conn.execute("SELECT COUNT(*) AS count FROM trades WHERE status = 'OPEN'").fetchone()
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM trades
+            WHERE status = 'OPEN'
+              AND stake >= ?
+            """,
+            (PAPER_MIN_OPEN_TRADE_STAKE,),
+        ).fetchone()
         return int(row["count"])
 
     @_locked
@@ -1151,9 +1183,10 @@ class TradeStore:
                 r.settlement_source AS market_settlement_source
             FROM trades t
             JOIN market_rounds r ON r.round_id = t.round_id
-            WHERE t.status = 'OPEN'
+            WHERE t.status = 'OPEN' AND t.stake >= ?
             ORDER BY t.opened_at DESC
-            """
+            """,
+            (PAPER_MIN_OPEN_TRADE_STAKE,),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1673,7 +1706,15 @@ class TradeStore:
         if current is None or current["status"] not in ACTIVE_ORDER_STATUSES:
             return None
         remaining_cash = max(0.0, round(float(current["remaining_cash"] or 0.0), 6))
+        previous_shares = round(float(current["filled_shares"] or 0.0), 6)
+        previous_notional = round(float(current["notional"] or 0.0), 6)
+        previous_fee = round(float(current["fee"] or 0.0), 6)
+        previous_cash_spent = round(float(current["cash_spent"] or 0.0), 6)
         cash_spent = min(round(float(cash_spent), 6), remaining_cash)
+        if cash_spent < PAPER_MIN_RESTING_FILL_CASH:
+            if previous_shares > 0 and remaining_cash <= PAPER_DUST_RELEASE_CASH:
+                return self._release_resting_order_dust(dict(current), remaining_cash, now)
+            return None
         if cash_spent <= 0:
             return None
         fill_price = max(0.01, min(0.99, round(float(fill_price), 4)))
@@ -1684,40 +1725,29 @@ class TradeStore:
         fee = max(0.0, round(float(fee), 6))
         cash_spent = round(notional + fee, 6)
         next_remaining = max(0.0, round(remaining_cash - cash_spent, 6))
-        previous_shares = round(float(current["filled_shares"] or 0.0), 6)
-        previous_notional = round(float(current["notional"] or 0.0), 6)
-        previous_fee = round(float(current["fee"] or 0.0), 6)
-        previous_cash_spent = round(float(current["cash_spent"] or 0.0), 6)
         total_shares = round(previous_shares + shares, 6)
         total_notional = round(previous_notional + notional, 6)
         total_fee = round(previous_fee + fee, 6)
         total_cash_spent = round(previous_cash_spent + cash_spent, 6)
         avg_fill_price = round(total_notional / total_shares, 4) if total_shares > 0 else fill_price
-        status = "FILLED" if next_remaining <= 0.000001 else "PARTIAL_RESTING"
         order_reason = _append_reason(str(current["reason"] or ""), reason)
+        dust_release = 0.0
+        if next_remaining <= PAPER_DUST_RELEASE_CASH:
+            dust_release = next_remaining
+            next_remaining = 0.0
+            if dust_release > 0:
+                order_reason = _append_reason(order_reason, f"DUST_RELEASE release {dust_release:.6f}")
+        status = "FILLED" if next_remaining <= 0.000001 else "PARTIAL_RESTING"
         with self.conn:
-            cur = self.conn.execute(
-                """
-                INSERT INTO trades(
-                    round_id, symbol, side, stake, entry_price, shares, confidence,
-                    move_bps, status, opened_at, reason
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-                """,
-                (
-                    current["round_id"],
-                    current["symbol"],
-                    current["side"],
-                    cash_spent,
-                    fill_price,
-                    shares,
-                    float(current["confidence"] or 0.0),
-                    float(current["move_bps"] or 0.0),
-                    now,
-                    order_reason,
-                ),
+            trade_id = self._upsert_resting_order_trade(
+                current,
+                fill_price=fill_price,
+                shares=shares,
+                cash_spent=cash_spent,
+                fill_reason=reason,
+                order_reason=order_reason,
+                now=now,
             )
-            trade_id = int(cur.lastrowid)
             level_row = self.conn.execute(
                 "SELECT COALESCE(MAX(level_index), 0) + 1 AS next_index FROM paper_fills WHERE order_id = ?",
                 (order_id,),
@@ -1743,6 +1773,11 @@ class TradeStore:
                     now,
                 ),
             )
+            if dust_release > 0:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                    (dust_release, now),
+                )
             self.conn.execute(
                 """
                 UPDATE paper_orders
@@ -1787,6 +1822,99 @@ class TradeStore:
                 "reason": order_reason,
             }
         )
+        return result
+
+    def _upsert_resting_order_trade(
+        self,
+        current: sqlite3.Row,
+        *,
+        fill_price: float,
+        shares: float,
+        cash_spent: float,
+        fill_reason: str,
+        order_reason: str,
+        now: float,
+    ) -> int:
+        existing_trade_id = int(current["trade_id"] or 0)
+        existing_trade = None
+        if existing_trade_id > 0:
+            existing_trade = self.conn.execute(
+                "SELECT * FROM trades WHERE id = ? AND status = 'OPEN'",
+                (existing_trade_id,),
+            ).fetchone()
+        if existing_trade is None:
+            cur = self.conn.execute(
+                """
+                INSERT INTO trades(
+                    round_id, symbol, side, stake, entry_price, shares, confidence,
+                    move_bps, status, opened_at, reason
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """,
+                (
+                    current["round_id"],
+                    current["symbol"],
+                    current["side"],
+                    cash_spent,
+                    fill_price,
+                    shares,
+                    float(current["confidence"] or 0.0),
+                    float(current["move_bps"] or 0.0),
+                    now,
+                    order_reason,
+                ),
+            )
+            return int(cur.lastrowid)
+
+        previous_stake = round(float(existing_trade["stake"] or 0.0), 6)
+        previous_shares = round(float(existing_trade["shares"] or 0.0), 6)
+        total_stake = round(previous_stake + cash_spent, 6)
+        total_shares = round(previous_shares + shares, 6)
+        previous_notional = round(previous_shares * float(existing_trade["entry_price"] or 0.0), 6)
+        next_notional = round(previous_notional + shares * fill_price, 6)
+        avg_entry_price = round(next_notional / total_shares, 4) if total_shares > 0 else fill_price
+        trade_reason = _append_reason(str(existing_trade["reason"] or ""), fill_reason)
+        self.conn.execute(
+            """
+            UPDATE trades
+            SET stake = ?,
+                entry_price = ?,
+                shares = ?,
+                reason = ?
+            WHERE id = ?
+            """,
+            (total_stake, avg_entry_price, total_shares, trade_reason, existing_trade_id),
+        )
+        return existing_trade_id
+
+    def _release_resting_order_dust(self, current: dict[str, Any], remaining_cash: float, now: float) -> dict[str, Any] | None:
+        order_id = int(current["id"])
+        release_cash = max(0.0, round(float(remaining_cash or 0.0), 6))
+        if release_cash <= 0:
+            return None
+        reason = _append_reason(
+            str(current.get("reason") or ""),
+            f"DUST_RELEASE skipped fill below {PAPER_MIN_RESTING_FILL_CASH:.2f}, release {release_cash:.6f}",
+        )
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = 'FILLED',
+                    remaining_cash = 0,
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (reason, now, order_id),
+            )
+            self.conn.execute(
+                "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                (release_cash, now),
+            )
+        self.record_equity()
+        result = dict(current)
+        result.update({"status": "FILLED", "remaining_cash": 0.0, "reason": reason})
         return result
 
     @_locked

@@ -12,6 +12,8 @@ This project is intentionally paper-only:
 - The browser dashboard uses Polymarket CLOB market WebSocket and RTDS crypto price WebSocket where available.
 - If the browser WebSocket feed is stale or closed, the backend falls back to CLOB REST orderbook and public BTC price APIs for display and paper-trading continuity.
 - Paper entries are simulated as CLOB-style orders. The default entry mode is FAK, walks visible ask levels up to the execution limit, and charges the configured taker fee per filled level.
+- GTC/GTD/POST_ONLY are simulated as resting maker orders. GTC can rest until market end, GTD expires after `POLYBOT2OTHER_PAPER_GTD_SECONDS`, and POST_ONLY additionally requires queue time, price-through-limit movement, and partial queue fills.
+- Resting maker partial fills from the same paper order are aggregated into one open position. Tiny resting fills below `$0.01` are ignored, and residual reserved cash at or below `$0.05` is released as dust instead of creating `$0.00` open positions.
 - Paper order attempts and per-level paper fills are stored separately from positions for execution-quality review.
 - Strategy experiments can run the 8 `SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY` combinations in isolated shadow Paper databases, so each combo has its own cash, orders, trades, and PnL.
 - Trades, settlements, and equity curve are stored in SQLite.
@@ -53,6 +55,8 @@ data/polybot2other-real-btc.sqlite3
 GET /api/recent-trades?limit=100&offset=0&start_at=1779870000&end_at=1779873600
 GET /api/orders?limit=20&offset=0&status=all
 GET /api/order-fills?order_id=1
+GET /api/equity-curve?account_scope=main&days=90&max_points=1200
+GET /api/equity-curve?account_scope=strategy_experiment&variant_id=SINGLE_FAK&days=90&max_points=1200
 GET /api/strategy-experiments
 GET /api/strategy-experiments?variant_id=PAIR_GTD&trade_limit=50&order_limit=50
 GET /api/strategy-experiments-retrospective?start_at=1779870000&end_at=1779873600

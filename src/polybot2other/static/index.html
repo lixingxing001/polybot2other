@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-61">
+    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-63">
   </head>
   <body>
     <main class="app-shell">
@@ -20,6 +20,19 @@
       </header>
 
       <section class="metric-grid" aria-label="账户指标">
+        <div class="account-scope-card">
+          <div>
+            <span>资金口径</span>
+            <strong id="account-scope-label">主账户</strong>
+            <small id="account-scope-source">主 Paper 账户</small>
+          </div>
+          <label class="scope-switch">
+            账户
+            <select id="account-scope-select" aria-label="资金口径">
+              <option value="main">主账户</option>
+            </select>
+          </label>
+        </div>
         <div class="metric">
           <span>总资产</span>
           <strong id="total-equity">$0.00</strong>
@@ -66,7 +79,7 @@
         <div class="panel chart-panel">
           <div class="panel-head">
             <h2>资金曲线</h2>
-            <span id="paper-only">Paper Only</span>
+            <span id="paper-only">主账户 · Paper Only</span>
           </div>
           <div class="chart-body">
             <canvas id="equity-chart" width="680" height="190"></canvas>
@@ -232,6 +245,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260528-v2-61"></script>
+    <script src="/static/app.js?v=20260528-v2-63"></script>
   </body>
 </html>

@@ -49,7 +49,7 @@ ORDERS_MAX_LIMIT = 200
 EQUITY_CURVE_DEFAULT_DAYS = 90
 EQUITY_CURVE_DEFAULT_MAX_POINTS = 1200
 EQUITY_CURVE_MAX_POINTS = 5000
-PAIR_ENTRY_COST_THRESHOLD = 0.92
+PAIR_ENTRY_COST_THRESHOLD = 0.98
 PAIR_EXIT_BID_THRESHOLD = 0.98
 PAIR_ENTRY_MIN_SECONDS_LEFT = 45
 PAIR_RESIDUAL_REDUCE_SECONDS_LEFT = 45
@@ -58,6 +58,11 @@ PAIR_RESIDUAL_STOP_LOSS_PCT = -20.0
 PAIR_DAILY_LOSS_PCT = 3.0
 PAIR_STOP_STREAK_LIMIT = 3
 PAIR_EPSILON = 0.000001
+POST_ONLY_MIN_REST_SECONDS = 8.0
+POST_ONLY_CROSS_BUFFER = 0.005
+POST_ONLY_QUEUE_INITIAL_FILL_RATIO = 0.25
+POST_ONLY_QUEUE_MAX_FILL_RATIO = 0.75
+POST_ONLY_QUEUE_FULL_SECONDS = 90.0
 
 
 class PaperTradingBot:
@@ -504,24 +509,43 @@ class PaperTradingBot:
                 continue
             side = str(order.get("side") or "")
             quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
-            fill = self._resting_order_fill(order, quote)
+            fill = self._resting_order_fill(order, quote, now)
             if not fill:
                 continue
             self.store.fill_resting_order(order, now=now, **fill)
 
-    def _resting_order_fill(self, order: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any] | None:
+    def _resting_order_fill(self, order: dict[str, Any], quote: dict[str, Any], now: float | None = None) -> dict[str, Any] | None:
         limit_price = _maybe_float(order.get("limit_price"))
         remaining_cash = _maybe_float(order.get("remaining_cash")) or 0.0
         if limit_price is None or limit_price <= 0 or remaining_cash <= 0:
             return None
-        levels = [level for level in ask_levels_from_quote(quote) if level.price <= limit_price + PAIR_EPSILON]
+        now = time.time() if now is None else now
+        order_type = normalize_order_type(str(order.get("order_type") or ""))
+        post_only = order_type == ORDER_TYPE_POST_ONLY or int(order.get("post_only") or 0) == 1
+        created_at = _maybe_float(order.get("created_at")) or now
+        age_seconds = max(0.0, now - created_at)
+        eligible_limit = limit_price + PAIR_EPSILON
+        fill_budget = remaining_cash
+        reason_prefix = "RESTING_FILL"
+        queue_ratio: float | None = None
+        if post_only:
+            if age_seconds < POST_ONLY_MIN_REST_SECONDS:
+                return None
+            eligible_limit = limit_price - POST_ONLY_CROSS_BUFFER
+            queue_ratio = _post_only_queue_fill_ratio(age_seconds)
+            fill_budget = remaining_cash * queue_ratio
+            reason_prefix = "POST_ONLY_QUEUE_FILL"
+        levels = [level for level in ask_levels_from_quote(quote) if level.price <= eligible_limit + PAIR_EPSILON]
         if not levels:
             return None
         available_shares = round(sum(level.size for level in levels), 6)
-        shares = round(min(available_shares, remaining_cash / limit_price), 6)
+        if post_only and queue_ratio is not None:
+            available_shares = round(available_shares * queue_ratio, 6)
+        shares = round(min(available_shares, fill_budget / limit_price), 6)
         if shares <= PAIR_EPSILON:
             return None
         notional = round(shares * limit_price, 6)
+        queue_text = f", age {age_seconds:.1f}s, queue_ratio {queue_ratio:.2f}" if queue_ratio is not None else ""
         return {
             "fill_price": limit_price,
             "shares": shares,
@@ -530,8 +554,8 @@ class PaperTradingBot:
             "cash_spent": notional,
             "level_price": levels[0].price,
             "reason": (
-                f"RESTING_FILL maker fill {shares:.6f} @ {limit_price:.4f}, "
-                f"trigger_ask {levels[0].price:.4f}, fee 0.000000"
+                f"{reason_prefix} maker fill {shares:.6f} @ {limit_price:.4f}, "
+                f"trigger_ask {levels[0].price:.4f}{queue_text}, fee 0.000000"
             ),
         }
 
@@ -1291,19 +1315,30 @@ class PaperTradingBot:
         self,
         days: int = EQUITY_CURVE_DEFAULT_DAYS,
         max_points: int = EQUITY_CURVE_DEFAULT_MAX_POINTS,
+        account_scope: str = "main",
+        variant_id: str | None = None,
     ) -> dict[str, Any]:
         days = max(1, min(365, int(days)))
         max_points = max(2, min(EQUITY_CURVE_MAX_POINTS, int(max_points)))
-        rows = self.store.equity_curve_window(days, max_points)
-        return {
-            "equity_curve": rows,
-            "equity_curve_meta": {
-                "days": days,
-                "max_points": max_points,
-                "points": len(rows),
-                "initial_balance": self.settings.initial_balance,
-            },
-        }
+        normalized_scope = str(account_scope or "main").strip().lower().replace("-", "_")
+        if normalized_scope in {"main", "main_account"}:
+            rows = self.store.equity_curve_window(days, max_points)
+            return {
+                "equity_curve": rows,
+                "equity_curve_meta": {
+                    "account_scope": "main",
+                    "label": "主账户",
+                    "days": days,
+                    "max_points": max_points,
+                    "points": len(rows),
+                    "initial_balance": self.settings.initial_balance,
+                },
+            }
+        if normalized_scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
+            if self.strategy_experiments is None:
+                raise ValueError("strategy experiments are not enabled")
+            return self.strategy_experiments.equity_curve_window(variant_id, days, max_points)
+        raise ValueError("account_scope must be main or strategy_experiment")
 
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
         state = _pair_quote_state(self.latest_quotes, time.time())
@@ -1521,6 +1556,28 @@ class StrategyExperimentRunner:
             "recent_orders_page": bot.orders_page(order_limit, 0),
         }
 
+    def equity_curve_window(self, variant_id: str | None, days: int, max_points: int) -> dict[str, Any]:
+        normalized = str(variant_id or "").strip().upper().replace("-", "_")
+        by_id = {variant.variant_id: variant for variant in self.variants}
+        variant = by_id.get(normalized)
+        if variant is None:
+            allowed = ", ".join(sorted(by_id))
+            raise ValueError(f"variant_id must be one of {allowed}")
+        rows = self._bots[variant.variant_id].store.equity_curve_window(days, max_points)
+        return {
+            "equity_curve": rows,
+            "equity_curve_meta": {
+                "account_scope": "strategy_experiment",
+                "variant_id": variant.variant_id,
+                "combo": variant.combo,
+                "label": variant.combo,
+                "days": days,
+                "max_points": max_points,
+                "points": len(rows),
+                "initial_balance": self._bots[variant.variant_id].settings.initial_balance,
+            },
+        }
+
     def tables(
         self,
         trade_limit: int = RECENT_TRADES_DEFAULT_LIMIT,
@@ -1663,7 +1720,8 @@ class StrategyExperimentRunner:
         end_at: float | None = None,
     ) -> dict[str, Any]:
         order_summary = bot.store.paper_order_summary("BTC", start_at, end_at)
-        metrics = bot.store.metrics()
+        open_trades = self._variant_open_trades(bot, _variant_tags(variant))
+        metrics = bot._metrics_with_open_marks(bot.store.metrics(), open_trades)
         trade_summary = bot.store.recent_trade_summary("BTC", start_at, end_at)
         return {
             "variant_id": variant.variant_id,
@@ -2106,6 +2164,16 @@ def _scale_score(value: float | None, floor: float, ceiling: float, weight: floa
         return 0.0
     normalized = (float(value) - floor) / (ceiling - floor)
     return max(0.0, min(1.0, normalized)) * weight
+
+
+def _post_only_queue_fill_ratio(age_seconds: float) -> float:
+    if age_seconds <= 0:
+        return POST_ONLY_QUEUE_INITIAL_FILL_RATIO
+    progress = min(1.0, age_seconds / POST_ONLY_QUEUE_FULL_SECONDS)
+    ratio = POST_ONLY_QUEUE_INITIAL_FILL_RATIO + (
+        POST_ONLY_QUEUE_MAX_FILL_RATIO - POST_ONLY_QUEUE_INITIAL_FILL_RATIO
+    ) * progress
+    return max(POST_ONLY_QUEUE_INITIAL_FILL_RATIO, min(POST_ONLY_QUEUE_MAX_FILL_RATIO, ratio))
 
 
 def _clean_quotes(quotes: dict[str, Any]) -> dict[str, dict[str, Any]]:

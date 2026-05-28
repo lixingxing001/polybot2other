@@ -3,6 +3,9 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 
 const ids = {
   runtime: document.getElementById("runtime-pill"),
+  accountScopeSelect: document.getElementById("account-scope-select"),
+  accountScopeLabel: document.getElementById("account-scope-label"),
+  accountScopeSource: document.getElementById("account-scope-source"),
   totalEquity: document.getElementById("total-equity"),
   totalPnl: document.getElementById("total-pnl"),
   unrealizedPnl: document.getElementById("unrealized-pnl"),
@@ -45,6 +48,7 @@ const ids = {
   loadMoreRecent: document.getElementById("load-more-recent"),
   chart: document.getElementById("equity-chart"),
   chartTooltip: document.getElementById("equity-tooltip"),
+  paperOnly: document.getElementById("paper-only"),
   tickButton: document.getElementById("tick-button"),
 };
 
@@ -98,6 +102,8 @@ let recentLoading = true;
 let openDataScope = "main";
 let orderDataScope = "main";
 let recentDataScope = "main";
+let accountScope = "main";
+let accountScopeOptionsKey = "";
 let strategyTables = null;
 let strategyTablesLoading = false;
 let lastStrategyTablesFetchMs = 0;
@@ -124,8 +130,10 @@ let lastExperimentRenderKey = "";
 let pendingOrderRender = false;
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
+let equityCurveMeta = {};
 let lastEquityCurveFetchMs = 0;
 let equityCurveInFlight = false;
+let equityCurvePendingForce = false;
 let currentChartRows = [];
 let chartHoverX = null;
 let chartHoverQueued = false;
@@ -348,7 +356,7 @@ function formatMetricValue(formatter, value) {
   return String(value);
 }
 
-function renderMetrics(metrics) {
+function renderMetrics(metrics = {}) {
   setMetric(ids.totalEquity, metrics.total_equity, money, null);
   setMetric(ids.totalPnl, metrics.total_pnl, signedMoney, cls);
   setMetric(ids.unrealizedPnl, metrics.unrealized_pnl, signedMoney, cls);
@@ -357,6 +365,75 @@ function renderMetrics(metrics) {
   setMetric(ids.openRisk, metrics.open_risk, money, null);
   setMetric(ids.winRate, metrics.win_rate, percentText, null);
   setMetric(ids.maxDrawdown, metrics.max_drawdown, money, null);
+}
+
+function renderAccountScope(data = latestStatus) {
+  const options = accountScopeOptions(data);
+  if (!options.some((option) => option.value === accountScope)) {
+    accountScope = "main";
+    equityCurveRows = [];
+    equityCurveMeta = {};
+    lastEquityCurveFetchMs = 0;
+  }
+  const optionsKey = options.map((option) => `${option.value}:${option.label}`).join("|");
+  if (ids.accountScopeSelect && optionsKey !== accountScopeOptionsKey) {
+    ids.accountScopeSelect.innerHTML = options
+      .map((option) => `<option value="${safe(option.value)}">${safe(option.label)}</option>`)
+      .join("");
+    accountScopeOptionsKey = optionsKey;
+  }
+  if (ids.accountScopeSelect) ids.accountScopeSelect.value = accountScope;
+  const current = accountScopeMeta(data);
+  if (ids.accountScopeLabel) ids.accountScopeLabel.textContent = current.label;
+  if (ids.accountScopeSource) ids.accountScopeSource.textContent = current.source;
+  if (ids.paperOnly) ids.paperOnly.textContent = `${current.label} · Paper Only`;
+}
+
+function accountScopeOptions(data = latestStatus) {
+  const variants = strategyExperimentVariants(data);
+  return [
+    { value: "main", label: "主账户" },
+    ...variants.map((row) => ({
+      value: `experiment:${row.variant_id}`,
+      label: row.combo || row.variant_id,
+    })),
+  ];
+}
+
+function strategyExperimentVariants(data = latestStatus) {
+  const variants = data?.runtime?.strategy_experiments?.variants;
+  return Array.isArray(variants) ? variants : [];
+}
+
+function selectedAccountVariant(data = latestStatus) {
+  const selection = parseAccountScope(accountScope);
+  if (selection.scope !== "experiment") return null;
+  return strategyExperimentVariants(data).find((row) => row.variant_id === selection.variantId) || null;
+}
+
+function selectedAccountMetrics(data = latestStatus) {
+  const variant = selectedAccountVariant(data);
+  if (variant) return variant.metrics || {};
+  return data?.metrics || {};
+}
+
+function accountScopeMeta(data = latestStatus) {
+  const variant = selectedAccountVariant(data);
+  if (variant) {
+    return {
+      label: variant.combo || variant.variant_id,
+      source: `策略实验隔离账户 · ${variant.variant_id}`,
+    };
+  }
+  return { label: "主账户", source: "主 Paper 账户" };
+}
+
+function parseAccountScope(value) {
+  const text = String(value || "main");
+  if (text.startsWith("experiment:")) {
+    return { scope: "experiment", variantId: text.slice("experiment:".length).toUpperCase() };
+  }
+  return { scope: "main", variantId: null };
 }
 
 function renderRuntime(runtime) {
@@ -1244,7 +1321,9 @@ function drawChart(points) {
 }
 
 function chartInitialBalance() {
-  return toNumber(latestStatus?.metrics?.initial_balance)
+  const metrics = selectedAccountMetrics(latestStatus);
+  return toNumber(metrics?.initial_balance)
+    || toNumber(equityCurveMeta?.initial_balance)
     || toNumber(latestStatus?.settings?.initial_balance)
     || 100;
 }
@@ -1260,6 +1339,21 @@ function buildChartRows(statusRows = []) {
   }
   const rows = Array.from(rowsByTime.values()).sort((a, b) => a.created_at - b.created_at);
   return downsampleEquityRows(rows, EQUITY_CURVE_MAX_POINTS + 120);
+}
+
+function selectedAccountCurrentPoint(data = latestStatus) {
+  const metrics = selectedAccountMetrics(data);
+  const totalEquity = toNumber(metrics?.total_equity);
+  if (totalEquity == null) return null;
+  const initialBalance = toNumber(metrics?.initial_balance) || chartInitialBalance();
+  return {
+    cash_balance: toNumber(metrics?.cash_balance) ?? totalEquity,
+    open_risk: toNumber(metrics?.open_risk) ?? 0,
+    realized_pnl: toNumber(metrics?.realized_pnl) ?? totalEquity - initialBalance,
+    total_equity: totalEquity,
+    total_pnl: toNumber(metrics?.total_pnl) ?? totalEquity - initialBalance,
+    created_at: toNumber(data?.runtime?.last_tick_at) || Date.now() / 1000,
+  };
 }
 
 function normalizeEquityPoint(row, initialBalance) {
@@ -1411,23 +1505,40 @@ async function loadStatus(manual = false) {
 
 async function loadEquityCurve(force = false) {
   const now = Date.now();
-  if (equityCurveInFlight) return;
+  if (equityCurveInFlight) {
+    if (force) equityCurvePendingForce = true;
+    return;
+  }
   if (!force && now - lastEquityCurveFetchMs < EQUITY_CURVE_REFRESH_MS) return;
   equityCurveInFlight = true;
+  const requestScope = accountScope;
+  const selection = parseAccountScope(requestScope);
   try {
     const params = new URLSearchParams({
       days: String(EQUITY_CURVE_DAYS),
       max_points: String(EQUITY_CURVE_MAX_POINTS),
     });
+    if (selection.scope === "experiment") {
+      params.set("account_scope", "strategy_experiment");
+      params.set("variant_id", selection.variantId);
+    } else {
+      params.set("account_scope", "main");
+    }
     const res = await fetch(`/api/equity-curve?${params.toString()}`);
     if (!res.ok) throw new Error(`equity curve HTTP ${res.status}`);
     const payload = await res.json();
+    if (requestScope !== accountScope) return;
     const rows = Array.isArray(payload.equity_curve) ? payload.equity_curve : [];
     equityCurveRows = rows;
+    equityCurveMeta = payload.equity_curve_meta || {};
     lastEquityCurveFetchMs = Date.now();
     renderAll(latestStatus, { forceChart: true });
   } finally {
     equityCurveInFlight = false;
+    if (equityCurvePendingForce) {
+      equityCurvePendingForce = false;
+      loadEquityCurve(true).catch(showError);
+    }
   }
 }
 
@@ -1841,7 +1952,8 @@ function renderAll(data = latestStatus, options = {}) {
 function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   renderRuntime(data.runtime);
-  renderMetrics(data.metrics);
+  renderAccountScope(data);
+  renderMetrics(selectedAccountMetrics(data));
   renderMarket(data.runtime);
   renderStrategyExperiments(data.runtime);
   if (strategyExperimentViewActive() && !strategyTablesLoading) {
@@ -1867,7 +1979,8 @@ function renderAllNow(data = latestStatus, options = {}) {
   });
   const now = Date.now();
   if (options.forceChart || now - lastChartRenderMs >= CHART_RENDER_INTERVAL_MS) {
-    currentChartRows = buildChartRows(data.equity_curve);
+    const currentPoint = selectedAccountCurrentPoint(data);
+    currentChartRows = buildChartRows(currentPoint ? [currentPoint] : []);
     drawChart(currentChartRows);
     lastChartRenderMs = now;
   }
@@ -2218,6 +2331,17 @@ function handleChartLeave() {
   queueChartHoverDraw();
 }
 
+function handleAccountScopeChange() {
+  accountScope = ids.accountScopeSelect?.value || "main";
+  equityCurveRows = [];
+  equityCurveMeta = {};
+  lastEquityCurveFetchMs = 0;
+  chartHoverX = null;
+  if (ids.chartTooltip) ids.chartTooltip.hidden = true;
+  renderAll(latestStatus, { force: true, forceChart: true });
+  loadEquityCurve(true).catch(showError);
+}
+
 function queueChartHoverDraw() {
   if (chartHoverQueued) return;
   chartHoverQueued = true;
@@ -2228,6 +2352,7 @@ function queueChartHoverDraw() {
 }
 
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.accountScopeSelect.addEventListener("change", handleAccountScopeChange);
 ids.strategyExperiments.addEventListener("click", (event) => {
   const button = event.target.closest("[data-experiment-id]");
   if (!button) return;

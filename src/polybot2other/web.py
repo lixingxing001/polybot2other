@@ -106,9 +106,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(self.server.bot.order_fills(order_id))
             return
         if path == "/api/equity-curve":
-            days = _query_int(query, "days", 90, 1, 365)
-            max_points = _query_int(query, "max_points", 1200, 2, 5000)
-            self._send_json(self.server.bot.equity_curve_window(days, max_points))
+            try:
+                days = _query_int(query, "days", 90, 1, 365)
+                max_points = _query_int(query, "max_points", 1200, 2, 5000)
+                account_scope = _query_str_optional(query, "account_scope") or "main"
+                variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                self._send_json(
+                    self.server.bot.equity_curve_window(
+                        days,
+                        max_points,
+                        account_scope=account_scope,
+                        variant_id=variant_id,
+                    )
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/strategy-experiments":
             try:

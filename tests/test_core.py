@@ -419,6 +419,46 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(all(start <= row["created_at"] <= now for row in curve))
             self.assertEqual(curve[-1]["total_pnl"], 6.0)
 
+    def test_bot_equity_curve_window_supports_strategy_experiment_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                strategy_experiments_variants="SINGLE_FAK",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            now = time.time()
+            with variant_bot.store.conn:
+                variant_bot.store.conn.execute(
+                    """
+                    INSERT INTO equity_curve(cash_balance, open_risk, realized_pnl, total_equity, created_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (105.0, 0.0, 5.0, 105.0, now),
+                )
+
+            main_curve = bot.equity_curve_window(account_scope="main", days=90, max_points=10)
+            variant_curve = bot.equity_curve_window(
+                account_scope="strategy_experiment",
+                variant_id="SINGLE_FAK",
+                days=90,
+                max_points=10,
+            )
+
+            self.assertEqual(main_curve["equity_curve_meta"]["account_scope"], "main")
+            self.assertEqual(main_curve["equity_curve_meta"]["label"], "主账户")
+            self.assertEqual(variant_curve["equity_curve_meta"]["account_scope"], "strategy_experiment")
+            self.assertEqual(variant_curve["equity_curve_meta"]["variant_id"], "SINGLE_FAK")
+            self.assertEqual(variant_curve["equity_curve_meta"]["combo"], "SINGLE + FAK")
+            self.assertTrue(any(row["total_equity"] == 105.0 for row in variant_curve["equity_curve"]))
+            with self.assertRaises(ValueError):
+                bot.equity_curve_window(account_scope="strategy_experiment", variant_id="bad-variant")
+            with self.assertRaises(ValueError):
+                bot.equity_curve_window(account_scope="bad-scope")
+
     def test_snapshot_keeps_unrealized_pnl_out_of_total_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3")
@@ -809,7 +849,7 @@ class TradingCoreTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bot.orders_page(status_filter="bad-status")
 
-    def test_post_only_rests_reserves_cash_and_later_fills_as_maker(self) -> None:
+    def test_post_only_rests_reserves_cash_and_later_fills_as_maker_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="POST_ONLY", stake_dollars=5.0)
             store = TradeStore(settings.db_path, settings.initial_balance)
@@ -848,7 +888,93 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(orders[0]["status"], "RESTING")
             self.assertEqual(orders[0]["post_only"], 1)
             self.assertAlmostEqual(orders[0]["limit_price"], 0.33, places=6)
+            order_id = int(orders[0]["id"])
+            with store.conn:
+                store.conn.execute(
+                    "UPDATE paper_orders SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (now - 30.0, now - 30.0, order_id),
+                )
 
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.32,
+                        "best_ask": 0.33,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.33, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    }
+                }
+            bot._manage_resting_orders(market, bot.latest_quotes)
+
+            self.assertEqual(store.open_trades(), [])
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(orders[0]["status"], "RESTING")
+
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.31,
+                        "best_ask": 0.32,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.32, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    }
+                }
+            bot._manage_resting_orders(market, bot.latest_quotes)
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertAlmostEqual(rows[0]["entry_price"], 0.33, places=6)
+            self.assertIn("POST_ONLY_QUEUE_FILL", rows[0]["reason"])
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(orders[0]["status"], "PARTIAL_RESTING")
+            self.assertGreater(orders[0]["remaining_cash"], 0.0)
+            self.assertLess(orders[0]["remaining_cash"], 5.0)
+            self.assertGreater(store.metrics()["reserved_cash"], 0.0)
+            self.assertLess(store.metrics()["reserved_cash"], 5.0)
+            fills = store.paper_order_fills(orders[0]["id"])
+            self.assertEqual(len(fills), 1)
+            self.assertAlmostEqual(fills[0]["fee"], 0.0, places=6)
+
+    def test_gtc_resting_order_can_fill_without_post_only_queue_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="GTC", stake_dollars=5.0)
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-gtc-resting-fill",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.35, 10.0, "gtc maker signal")
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.33,
+                        "best_ask": 0.35,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.35, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    }
+                }
+
+            bot._maybe_place_trade(market, signal)
+
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(orders[0]["status"], "RESTING")
+            self.assertEqual(orders[0]["order_type"], "GTC")
+            self.assertEqual(orders[0]["post_only"], 0)
             with bot._lock:
                 bot.latest_quotes = {
                     "Up": {
@@ -869,10 +995,122 @@ class TradingCoreTest(unittest.TestCase):
             orders = store.recent_paper_orders(10, 0, "BTC")
             self.assertEqual(orders[0]["status"], "FILLED")
             self.assertAlmostEqual(orders[0]["remaining_cash"], 0.0, places=6)
+
+    def test_resting_order_partial_fills_update_existing_trade_and_release_dust(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="GTC", stake_dollars=5.0)
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-resting-dust-release",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "dust resting")
+            intent = type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})()
+            store.record_paper_order(
+                intent,
+                order_type="GTC",
+                status="RESTING",
+                side="Up",
+                limit_price=0.5,
+                requested_cash=5.0,
+                reason="resting dust",
+            )
+
+            first_order = store.active_paper_orders("BTC")[0]
+            first_fill = store.fill_resting_order(
+                first_order,
+                fill_price=0.5,
+                shares=5.0,
+                notional=2.5,
+                fee=0.0,
+                cash_spent=2.5,
+                level_price=0.49,
+                reason="RESTING_FILL first",
+                now=now + 1,
+            )
+            self.assertIsNotNone(first_fill)
+            second_order = store.active_paper_orders("BTC")[0]
+            second_fill = store.fill_resting_order(
+                second_order,
+                fill_price=0.5,
+                shares=4.92,
+                notional=2.46,
+                fee=0.0,
+                cash_spent=2.46,
+                level_price=0.49,
+                reason="RESTING_FILL second",
+                now=now + 2,
+            )
+
+            self.assertIsNotNone(second_fill)
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertAlmostEqual(rows[0]["stake"], 4.96, places=6)
+            self.assertAlmostEqual(rows[0]["shares"], 9.92, places=6)
+            self.assertAlmostEqual(rows[0]["entry_price"], 0.5, places=6)
+            self.assertIn("RESTING_FILL first", rows[0]["reason"])
+            self.assertIn("RESTING_FILL second", rows[0]["reason"])
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(orders[0]["status"], "FILLED")
+            self.assertAlmostEqual(orders[0]["remaining_cash"], 0.0, places=6)
+            self.assertAlmostEqual(orders[0]["cash_spent"], 4.96, places=6)
+            self.assertIn("DUST_RELEASE", orders[0]["reason"])
+            self.assertAlmostEqual(store.account()["cash_balance"], 95.04, places=6)
             self.assertAlmostEqual(store.metrics()["reserved_cash"], 0.0, places=6)
             fills = store.paper_order_fills(orders[0]["id"])
-            self.assertEqual(len(fills), 1)
-            self.assertAlmostEqual(fills[0]["fee"], 0.0, places=6)
+            self.assertEqual(len(fills), 2)
+            self.assertEqual({fill["trade_id"] for fill in fills}, {rows[0]["id"]})
+
+    def test_resting_order_tiny_initial_fill_does_not_create_dust_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="POST_ONLY", stake_dollars=5.0)
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-resting-tiny-initial",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "tiny initial")
+            intent = type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})()
+            store.record_paper_order(
+                intent,
+                order_type="POST_ONLY",
+                status="RESTING",
+                side="Up",
+                limit_price=0.5,
+                requested_cash=5.0,
+                post_only=True,
+                reason="tiny initial",
+            )
+
+            order = store.active_paper_orders("BTC")[0]
+            result = store.fill_resting_order(
+                order,
+                fill_price=0.5,
+                shares=0.01,
+                notional=0.005,
+                fee=0.0,
+                cash_spent=0.005,
+                level_price=0.49,
+                reason="RESTING_FILL tiny",
+                now=now + 1,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(store.open_trades(), [])
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(orders[0]["status"], "RESTING")
+            self.assertAlmostEqual(orders[0]["remaining_cash"], 5.0, places=6)
+            self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
 
     def test_gtd_resting_order_expires_and_releases_reserved_cash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

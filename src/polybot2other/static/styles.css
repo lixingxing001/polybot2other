@@ -134,6 +134,40 @@ button:hover {
   border-radius: 8px;
 }
 
+.account-scope-card {
+  grid-column: 1 / -1;
+  min-height: 58px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.account-scope-card > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.account-scope-card span,
+.account-scope-card small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.account-scope-card strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .metric {
   min-height: 94px;
   padding: 16px;
@@ -1017,6 +1051,11 @@ tbody tr:hover {
   .top-actions {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .account-scope-card {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .field-options {
