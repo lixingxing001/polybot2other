@@ -1,5 +1,1980 @@
 # polybot2other-progress
 
+## 2026-05-29 v3.31
+
+### 已完成
+
+1. 重构 Dashboard 实盘卡片：配置项从卡片头部常驻展示改为右上角齿轮按钮打开的设置表单。
+2. 实盘操作按钮重新分组：常规操作包含重载凭证、预检、首单检查、刷新挂单；危险操作包含执行首单、实盘急停。
+3. 按钮增加 hover、active 和 loading spinner 状态；点击请求期间禁用按钮，降低重复提交风险。
+4. 新增 `Live Terminal` 区域，以终端日志风格展示 readiness、预检、首单检查、one-shot、刷新挂单、急停等事件。
+5. 终端日志最新记录置顶，最大高度内部滚动，不再用多块普通结果面板撑高实盘卡片。
+6. 原 `live-readiness`、`live-preflight-result`、`live-doctor-result`、`live-once-result` 保留为隐藏状态源，避免大幅改动现有状态流。
+7. 静态资源版本提升到 `20260529-v2-86`，避免浏览器继续使用旧 CSS/JS。
+
+### 已确认决策
+
+1. 本次只改前端交互和展示，不改实盘下单、预检、doctor、资金授权和风控接口。
+2. 设置面板使用点击打开/点击外部或 ESC 关闭，不使用 hover 展开，避免实盘配置误触。
+3. 日志采用前端本地去重和最近 80 条上限；实时 API 返回的业务结果仍以后端接口为准。
+
+### 待办和后期优化
+
+1. 后续可以把终端日志持久化到后端审计表，方便刷新页面后仍保留操作历史。
+2. 若后续实盘组合增多，设置面板可增加组合选择和组合级配置锁定提示。
+
+### 已知坑位
+
+1. 当前终端日志是浏览器内存态，刷新页面后会从最新 status 重新生成，不等同于后端审计日志。
+2. 本机没有 Playwright/浏览器二进制，未做自动截图回归；已通过服务返回 HTML/CSS/JS 内容做烟测。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已烟测 `http://127.0.0.1:8791/`，确认返回 HTML 包含 `live-settings-toggle`、`live-terminal-lines` 和 v86 静态资源。
+4. 已烟测 `/static/styles.css?v=20260529-v2-86` 和 `/static/app.js?v=20260529-v2-86`，确认包含 terminal 样式和 `appendLiveLog` 逻辑。
+
+### 回滚建议
+
+1. 如需回滚本次 UI 调整，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/styles.css`、`src/polybot2other/static/app.js` 和本进度文档的 v3.31 改动。
+
+## 2026-05-29 v3.22
+
+### 已完成
+
+1. 新增本机交互式凭证初始化工具 `polybot2other.live_env_setup` / `polybot2other-live-setup`。
+2. 工具会在终端里隐藏输入 private key、可选 CLOB API credentials，写入本地 `.env.live`，并设置文件权限为 `0600`。
+3. 工具保留 `.env.live` 里已有的非凭证配置，只更新 live 凭证字段。
+4. 工具校验 private key、signature type、funder address、API credentials 完整性；EOA 模式会校验 funder 等于私钥 signer。
+5. 工具支持 `--service-url http://127.0.0.1:8791`，写完后自动调用运行中 Dashboard 的 `/api/live-reload-credentials`，输出只包含 masked address、布尔状态和错误，不打印密钥。
+6. README 和实盘 runbook 补充本机凭证初始化命令。
+
+### 已确认决策
+
+1. 不要求 Lee 在聊天里粘贴私钥；所有敏感输入只在本机终端完成。
+2. `.env.live` 的非凭证字段继续由模板/现有文件控制，setup 工具只负责 credentials，避免误改风控或数据库路径。
+3. optional API credentials 必须三项全填或全空；全空时沿用 SDK 从 private key 派生 API credentials 的模式。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_env_setup -v`，2 个 setup 测试通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_env_setup --help`，CLI 帮助可正常输出。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，77 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，145 个核心测试通过。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+9. 已烟测 `live_env_setup --help` 和 `/api/live-doctor?refresh=false&include_snapshot=false`；当前仍因 credentials 缺失阻断，未提交真实订单。
+
+### 已知坑位
+
+1. 工具只是安全写入和重载凭证，不会自动充值 collateral/pUSD，也不会自动授权 CLOB allowance。
+2. 当前真实首单仍需要 Lee 在本机终端填入真实凭证后重新跑 doctor/preflight；没有官方 order id 前目标尚未完成。
+
+### 回滚建议
+
+1. 如需回滚本次凭证初始化工具，删除 `src/polybot2other/live_env_setup.py`，撤销 `pyproject.toml` 的 `polybot2other-live-setup` entry point，撤销 `tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.22 改动。
+
+## 2026-05-29 v3.21
+
+### 已完成
+
+1. Dashboard 实盘面板新增 `执行首单` 按钮，复用现有 `/api/live-once` 受控首单路径。
+2. 按钮默认禁用，只有刷新后的 `首单检查` 显示 one-shot 可执行且没有 fatal blocker 时才解锁。
+3. 点击 `执行首单` 会再次刷新 doctor；如果新 doctor 有 fatal blocker，则不会调用 `/api/live-once`。
+4. 真正提交前需要在浏览器 prompt 中输入 `PLACE_REAL_ORDER`；后端仍会二次校验同一个确认短语和 `max_stake_dollars` cap。
+5. one-shot 返回后，页面新增结果面板展示 `submitted/blocked`、官方订单 id、本地订单状态、阻断项、错误和审计文件路径。
+6. README 和实盘 runbook 补充 Dashboard 首单按钮的保护条件和使用方式。
+
+### 已确认决策
+
+1. 页面按钮只作为 CLI 的同等受控入口，不绕过 doctor、确认短语、max-stake cap、后端 preflight、disable_after 和 evidence。
+2. 首单执行前必须刷新 doctor，避免用户看着旧的 `READY` 状态，在市场/信号/资金门槛变化后误点。
+3. Fatal blocker 存在时页面只显示阻断结果，不调用 `/api/live-once`，避免无意义地进入真实下单接口。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，9 个 one-shot 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，75 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，143 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已烟测首页 HTML，确认包含 `live-once` 按钮和 `live-once-result` 结果面板。
+9. 已执行 `/api/live-once` 烟测；当前缺凭证/目标价/信号时返回 HTTP 409，`live_once.blocked=true`、`submitted=false`，未提交真实订单。
+
+### 已知坑位
+
+1. 当前页面首单按钮只是把现有 one-shot 能力接到 Dashboard；真实首单仍需要真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance、无 fatal blocker 和官方 order id 证据。
+2. 浏览器 prompt 只是前端保护；真正的安全边界仍是服务端 `/api/live-once` 的确认短语、preflight、risk 和 SDK 提交前复查。
+
+### 回滚建议
+
+1. 如需回滚本次 Dashboard 首单入口，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.21 改动。
+
+## 2026-05-29 v3.20
+
+### 已完成
+
+1. `live_preflight` 的 `min_order_size` 阻断项新增结构化字段：`stake`、`min_order_size`、`shortfall`。
+2. `live_doctor` 保留 blocked check 的结构化字段，并新增 `first_order.stake_requirement`，包含当前 stake、官方最小订单、缺口、建议 stake、是否可通过设置修改修复。
+3. Dashboard `首单检查` 结果新增首单金额提示，直观看到 `stake / min`、缺口和建议值。
+4. README 和实盘 runbook 补充 `min_order_size` 阻断处理方式。
+5. 新增测试覆盖 `$2 stake < $5 min_order_size` 时 doctor 的 fatal blocker、next action 和推荐 settings patch。
+
+### 已确认决策
+
+1. 不自动把 `$2` 订单提升到 `$5`，因为这会改变 Lee 配置的真实资金风险；只明确提示并要求人工保存新的 stake。
+2. one-shot 推荐命令仍使用当前真实会下单的 stake，避免命令看起来可执行但和软件账户配置不一致。
+3. `min_order_size` 是官方当前市场返回的门槛，必须按市场实时校验；不能只靠固定默认值判断。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k min_order_size -v`，新增 min order 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，75 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real_pending_order -v`，4 个 pending live order 测试通过；相关测试夹具将 quote age 放宽到 60 秒，避免长跑全套时受机器调度影响。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，143 个核心测试通过。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+9. 已烟测 `/api/live-doctor?refresh=false&include_snapshot=false`，响应包含 `first_order.stake_requirement`；当前仍因缺少 credentials 阻断，未提交真实订单。
+
+### 已知坑位
+
+1. `min_order_size` 会随当前市场和报价状态变化；填好凭证后必须重新运行 doctor/preflight，若 `stake_requirement.meets_min_order_size=false`，需要先提高单笔金额再 one-shot。
+2. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+
+### 回滚建议
+
+1. 如需回滚本次 min order 结构化提示，撤销 `src/polybot2other/live.py`、`src/polybot2other/live_doctor.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.20 改动。
+
+## 2026-05-29 v3.19
+
+### 已完成
+
+1. 新增运行中实盘凭证重载能力：`reload_live_credential_env()` 只重载 live private key、signature type、funder address 和 CLOB API credential env keys。
+2. 新增 `POST /api/live-reload-credentials`，Dashboard 顶部实盘面板新增 `重载凭证` 按钮。
+3. 重载后会清理 `PolymarketLiveClient` 缓存的 SDK client、wallet/open-order/readiness 状态，避免服务启动后编辑 `.env.live` 但进程仍使用旧凭证。
+4. README 和实盘 runbook 补充运行中修改 `.env.live` 后的重载方式。
+5. 单测覆盖 env 文件凭证刷新、非凭证 env 不被运行中重载覆盖、bot 重载时清理 client cache。
+
+### 已确认决策
+
+1. 本次只允许运行中刷新实盘凭证类配置，数据库路径、默认风控配置、基础运行参数仍要求重启或走现有 settings API，避免运行中半切换状态。
+2. 如果某个凭证来自进程环境变量而不是 env 文件，重载不会删除它；进程环境变量继续优先于 `.env.live`。
+3. 重载接口不提交、不取消、不卖出任何官方订单，只刷新本进程读取凭证和 SDK 缓存。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k reload_live -v`，2 个新增重载测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k load_settings -v`，4 个配置加载测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，74 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，142 个核心测试通过。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+9. 已执行 `POST /api/live-reload-credentials`，响应包含 `live_trading.credential_reload`、`.env.live` 状态和 `snapshot`，当前 `enabled=false`。
+10. 已执行 `live_preflight --service-url http://127.0.0.1:8791 --no-refresh --pretty`，预检仍因开关关闭、凭证缺失和当前信号阻断，未提交真实订单。
+
+### 已知坑位
+
+1. 该能力只是让 Lee 填好 `.env.live` 后不用重启服务即可刷新凭证，不代表真实首单已经完成。
+2. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+3. 修改数据库路径、settings 路径、默认下注/风控等非凭证 env 后仍需重启，不能靠 `重载凭证` 生效。
+
+### 回滚建议
+
+1. 如需回滚本次运行中凭证重载，撤销 `src/polybot2other/config.py`、`src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.19 改动。
+
+## 2026-05-29 v3.18
+
+### 已完成
+
+1. `run_live_once` 新增结构化阻断异常 `LiveOnceBlockedError`，one-shot 在提交前被阻断时不再只返回一句错误字符串。
+2. 阻断响应新增 `live_once.blocked=true`、`blocked_keys`、`fatal_blocked_keys`、`waitable_blocked_keys`、`preflight`、`preflight_attempts` 和等待耗时。
+3. `/api/live-once` 对 `LiveOnceBlockedError` 返回 HTTP 409，但 body 保留完整结构化阻断 payload。
+4. `polybot2other.live_once` 本地 CLI 捕获同一结构化阻断 payload，终端输出可直接看到 preflight 阻断细节。
+5. README 和实盘 runbook 补充 one-shot 阻断响应说明。
+
+### 已确认决策
+
+1. 真实首单阻断时必须能从单次响应判断下一步修什么，不能只靠 `one-shot live preflight blocked: credentials, signal` 这种字符串。
+2. `fatal_blocked_keys` 用于人工修复项，`waitable_blocked_keys` 用于可等待项；这和 doctor 的首单判断口径保持一致。
+3. 阻断增强只影响提交前失败路径，不改变真实下单成功路径、风控检查或官方 SDK 下单调用。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，9 个 one-shot 测试通过；新增测试确认 CLI 阻断输出包含结构化 `live_once`。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，72 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，140 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --service-url http://127.0.0.1:8791 --no-refresh --confirm-real-order --acknowledge-compliance --max-stake 2 --wait-ready-seconds 0 --wait-reconcile-seconds 0 --require-submitted --pretty`，返回 code 2，body 包含 `live_once.blocked=true`、`blocked_keys`、`fatal_blocked_keys`、`waitable_blocked_keys` 和完整 `preflight`。
+9. 已执行原始 HTTP `POST /api/live-once` 烟测，HTTP 409 body 顶层包含 `error` 和 `live_once`，其中 `blocked=true` 且 `has_preflight=true`。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+2. 阻断 payload 只说明提交前检查状态；如果订单已提交，仍以 `live_once.evidence`、本地审计 JSON 和官方 order/trade 回查为准。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot 阻断结构化响应，撤销 `src/polybot2other/bot.py`、`src/polybot2other/live_once.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.18 改动。
+
+## 2026-05-29 v3.17
+
+### 已完成
+
+1. `run_live_once` 在真实 one-shot 已提交或已拿到订单 id 时，自动保存一份本地审计 JSON。
+2. 审计文件路径为 `data/live/audit/live-once-*.json`，响应中通过 `live_once.audit.path` 返回。
+3. 审计 JSON 递归剔除 `raw`、`raw_response`、`private_key`、`secret`、`signed_order`、`signature` 等敏感或过细字段，并且不包含完整 dashboard `snapshot`。
+4. 如果审计文件写入失败，`live_once.audit.saved=false` 会返回错误原因，但不会遮蔽真实订单结果。
+5. README 和实盘 runbook 补充 one-shot 审计文件说明。
+
+### 已确认决策
+
+1. 首单后的证据不能只依赖终端输出；真实订单提交后必须尽量持久化一份本机可审计文件。
+2. 审计写入是辅助证据链，不应该成为真实下单路径的硬失败点；订单结果和官方 order id 优先返回给操作者。
+3. 审计文件落在 `data/` 下，沿用当前 gitignore，不进入代码仓库。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，8 个 one-shot 测试通过；新增断言确认审计文件存在、不含 `snapshot`、不含 `raw/raw_response`。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，71 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，139 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --service-url http://127.0.0.1:8791 --pretty`，从运行中服务读取预检成功，当前仍因开关关闭、凭证缺失和当前信号阻断。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --service-url http://127.0.0.1:8791 --no-refresh --confirm-real-order --acknowledge-compliance --max-stake 2 --wait-ready-seconds 0 --wait-reconcile-seconds 0 --require-submitted --pretty`，返回 code 2，阻断为 `credentials, signal`，未提交真实订单。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+2. 审计文件只在 one-shot 结果已提交或包含订单 id 时自动生成；纯预检阻断不会产生文件，避免大量无订单噪音。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot 审计文件，撤销 `src/polybot2other/bot.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.17 改动。
+
+## 2026-05-29 v3.16
+
+### 已完成
+
+1. `live_preflight` CLI 新增 `--service-url` 和 `--service-timeout`，可直接读取运行中 dashboard 服务的 `/api/live-preflight`。
+2. GET `/api/live-preflight` 新增 `include_snapshot=false` 支持，最终预检默认可返回轻量 `live_preflight` 结构。
+3. README 和实盘 runbook 增加 `live_preflight --service-url http://127.0.0.1:8791` 命令，明确最终 arming check 应优先使用同一服务进程。
+4. 增加 `test_live_preflight_cli_can_read_running_service`，覆盖 service URL、轻量输出和 `--require-arming-ready` 退出码。
+
+### 已确认决策
+
+1. 真实首单前的最终预检应尽量使用 dashboard 服务进程，而不是新建 CLI 本地 Bot；这样可以复用页面正在使用的 current market、live settings 和最新行情快照。
+2. `--service-url` 模式仍然只读，只读取 `/api/live-preflight`，不提交、不取消、不卖出任何订单。
+3. GET `/api/live-preflight` 保持默认包含完整 snapshot，只有显式 `include_snapshot=false` 时才裁剪，避免破坏已有调试调用。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_preflight -v`，7 个 live preflight 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，71 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，139 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已烟测 `GET /api/live-preflight?include_snapshot=false`，响应只包含 `live_preflight`，不包含完整 `snapshot`。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --service-url http://127.0.0.1:8791 --pretty`，从运行中服务读取预检成功；当前仍因开关关闭、凭证缺失和当前信号阻断。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+2. service 模式预检依赖 dashboard 服务正在运行；如果服务未启动或端口错误，CLI 会返回机器可读错误，不会退回本地进程以免混淆验证口径。
+
+### 回滚建议
+
+1. 如需仅回滚本次 service-mode preflight，撤销 `src/polybot2other/live_preflight.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.16 改动。
+
+## 2026-05-29 v3.15
+
+### 已完成
+
+1. 对照官方 `POST /order` 和 `GET /data/order/{orderID}` 文档，补齐官方订单状态解析：`ORDER_STATUS_INVALID`、rejected、failed、error 会映射为本地 `REJECTED(已拒绝)`。
+2. 保持 no-fill 分流：canceled、cancelled、expired、unmatched、零成交 terminal/done 会映射为本地 `CANCELED(已取消)`。
+3. 周期对账 `_reconcile_live_orders` 的 BUY 和 SELL pending 订单都使用统一的 terminal no-fill 本地状态映射，避免真实首单后 invalid 状态一直等到本地 pending timeout。
+4. README 和实盘 runbook 补充 evidence 状态解释，说明 invalid/rejected/failed/error 与 canceled/expired/unmatched 的区别。
+
+### 已确认决策
+
+1. 官方 `ORDER_STATUS_INVALID` 属于无成交失败状态，本地应释放 reserved cash 并标记 `REJECTED`，不应该继续显示为 `PENDING`。
+2. `CANCELED` 仍只表示官方或本地确认的 no-fill 取消、过期、未匹配、pending timeout，不混用 invalid 失败。
+
+### 验证记录
+
+1. 已核对官方 `POST /order` 响应字段：`success`、`orderID`、`status`、`makingAmount`、`takingAmount`、`tradeIDs`、`errorMsg`。
+2. 已核对官方 `GET /data/order/{orderID}` 状态枚举：`ORDER_STATUS_LIVE`、`ORDER_STATUS_INVALID`、`ORDER_STATUS_CANCELED_MARKET_RESOLVED`、`ORDER_STATUS_CANCELED`、`ORDER_STATUS_MATCHED`。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_terminal_no_fill -v`，1 个状态映射测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k pending_order_reconciles -v`，4 个 pending 对账测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell_pending_order_reconciles -v`，1 个手动卖出 pending 对账测试通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，70 个 live 相关测试通过。
+8. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，138 个核心测试通过。
+10. 已执行 `rtk proxy git diff --check`，空白检查通过。
+11. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+12. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --service-url http://127.0.0.1:8791 --no-refresh --pretty`，当前仍因 credentials 缺失保持 `BLOCKED`，且 target_price/signal 仍作为 one-shot 可等待阻断输出。
+13. 已执行 `/api/live-evidence?external_order_id=OFFICIAL_ORDER_ID&force=false&include_snapshot=false` 烟测，响应仍为轻量 `live_evidence`。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+2. 真实 CLOB 如果返回 `delayed` 或 `live`，本地仍会先保留 `PENDING(待官方确认)`，直到官方 order/trade 回查确认成交或无成交终态。
+
+### 回滚建议
+
+1. 如需仅回滚本次官方 invalid 状态解析，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.15 改动。
+
+## 2026-05-29 v3.14
+
+### 已完成
+
+1. 对照 Polymarket 官方 CLOB V2 文档重新核对 market order、FAK、signature type、deposit wallet 和 collateral 口径。
+2. README、实盘 runbook、`.env.live.example` 和 `live_once --help` 将实盘资金准备口径从泛称 USDC 修正为 Polymarket CLOB collateral/pUSD，同时保留 SDK 字段名 `user_usdc_balance` 的说明。
+3. `live_doctor` 的 `collateral_wallet` 下一步动作改为提示给 funder 钱包补足 collateral/pUSD 并授权 CLOB allowance。
+4. 修正 `test_live_once_waits_for_transient_preflight_blockers_before_submit` 的时序抖动：模拟 REST fallback 行情每次刷新使用当前时间戳，并把等待窗口调到 3 秒。
+
+### 已确认决策
+
+1. 代码仍通过官方 CLOB `balance/allowance` 检查 collateral，不在本项目内自动创建 deposit wallet 或发起链上 approval；这类资金/授权动作必须由操作者在合规钱包流程里完成。
+2. `user_usdc_balance` 是 SDK 参数名，不代表实盘准备时继续按旧抵押物口径操作；文档统一写成 collateral/pUSD dollar-denominated budget。
+
+### 验证记录
+
+1. 已核对官方文档：market order 的 `price` 是 worst-price limit，`create_market_order` 只本地签名，`post_order` 才提交；FAK 是成交可得部分并取消剩余；新 API 用户推荐 `signature_type=3` deposit wallet。
+2. 已执行本机 SDK 签名审计，确认 `py_clob_client_v2==1.0.1` 的 `ClobClient`、`MarketOrderArgs`、`post_order`、`create_market_order`、`BalanceAllowanceParams` 和 `SignatureTypeV2` 签名满足当前调用路径。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k test_live_once_waits_for_transient_preflight_blockers_before_submit -v`，单个抖动用例通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，8 个 one-shot 测试通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，69 个 live 相关测试通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，136 个核心测试通过。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+10. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+11. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --service-url http://127.0.0.1:8791 --no-refresh --pretty`，当前仍因缺 credentials 保持 `BLOCKED`，但 SDK 兼容和 service 命令输出正常。
+12. 已执行 `/api/live-evidence?external_order_id=OFFICIAL_ORDER_ID&force=false&include_snapshot=false` 烟测，响应仍为轻量 `live_evidence`。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、真实 collateral/pUSD、CLOB allowance 和官方 order id；目标尚未完成。
+2. 如果使用 `signature_type=3` deposit wallet，fund/approve 的对象必须是 deposit wallet/funder，不是只给 owner EOA 打钱或授权。
+
+### 回滚建议
+
+1. 如需仅回滚本次 collateral/pUSD 文档和测试稳定性改动，撤销 `.env.live.example`、`README.md`、`docs/live-trading-runbook.md`、`src/polybot2other/live_doctor.py`、`src/polybot2other/live_once.py`、`tests/test_core.py` 和本进度文档的 v3.14 改动。
+
+## 2026-05-29 v3.13
+
+### 已完成
+
+1. `live_evidence` CLI 新增 `--service-url` 和 `--service-timeout`，可从运行中的 dashboard 服务读取 `/api/live-evidence`。
+2. `live_doctor --service-url` 的 `post_order_evidence` 增加 `standalone_service_cli`，首单后可直接用同一服务进程核验官方订单证据。
+3. `/api/live-evidence` 默认返回轻量结果：`include_snapshot=false` 时只返回 `live_evidence`，避免把完整 dashboard 快照塞进首单后核验响应。
+4. README 和实盘 runbook 改为优先展示 service 模式的 `live_evidence --service-url http://127.0.0.1:8791`。
+
+### 已确认决策
+
+1. 首单后核验证据优先读取同一个 dashboard 服务进程，减少 CLI 新进程和页面实时快照不一致导致的误判。
+2. 证据核验链路保持只读，只读取订单、软件账本、官方 open orders、readiness 和钱包状态，不提交订单、不取消订单、不卖出持仓。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_evidence -v`，3 个 evidence 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor_cli -v`，2 个 doctor CLI 测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell -v`，8 个手动卖出相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，69 个 live 相关测试通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，136 个核心测试通过。
+8. 已执行 `rtk proxy git diff --check`，空白检查通过。
+9. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+10. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --service-url http://127.0.0.1:8791 --no-refresh --pretty`，输出包含 `first_order.recommended_service_cli` 和 `post_order_evidence.standalone_service_cli`。
+11. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_evidence --service-url http://127.0.0.1:8791 --external-order-id OFFICIAL_ORDER_ID --cached-open-orders --pretty`，返回轻量 `live_evidence` 结果，不包含完整 `snapshot`。
+12. 已执行 `rtk proxy curl -s "http://127.0.0.1:8791/api/live-evidence?external_order_id=OFFICIAL_ORDER_ID&force=false&include_snapshot=false"`，接口返回顶层仅包含 `live_evidence`。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、钱包 USDC、CLOB allowance 和官方 order id；目标尚未完成。
+2. 本轮 `-k live` 测试第一次出现过 1 次手动卖出用例抖动，随后单测、相关组合和完整 live 组合重跑均通过；后续如果再次出现，需要单独收敛该用例的 mock 顺序。
+
+### 回滚建议
+
+1. 如需仅回滚 service evidence 链路，撤销 `src/polybot2other/live_evidence.py`、`src/polybot2other/live_doctor.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.13 改动。
+
+## 2026-05-29 v3.12
+
+### 已完成
+
+1. `live_once` CLI 新增 `--service-url` 和 `--service-timeout`，可直接 POST 到运行中 dashboard 服务的 `/api/live-once`。
+2. 首单推荐路径改为优先通过运行中服务提交 one-shot，复用同一进程的当前市场、live settings 和浏览器/REST 行情快照。
+3. `live_doctor --service-url` 输出的 `first_order` 增加 `recommended_service_cli`，可直接复制运行中服务的一次性下单命令。
+4. 修正 one-shot 阻断报错口径：`enabled=false` 是 one-shot 首单的正常前置状态，不再出现在真实阻断列表中。
+5. README 和实盘 runbook 改为优先展示 `live_once --service-url http://127.0.0.1:8791`。
+
+### 已确认决策
+
+1. 首单最终执行推荐链路是：先运行 dashboard 服务，再用 `live_doctor --service-url` 做只读最终检查，最后用 doctor 输出的 `recommended_service_cli` 做 one-shot 真实首单。
+2. `--service-url` 只是把 CLI 请求转发到本机 dashboard API；真正下单仍由服务端原有 `run_live_once`、preflight、风控、process lock 和官方 SDK 路径执行。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，8 个 one-shot 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor_cli -v`，2 个 doctor CLI 测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，68 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，135 个核心测试通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --service-url http://127.0.0.1:8791 --no-refresh --pretty`，输出包含 `recommended_service_cli`。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --service-url http://127.0.0.1:8791 --no-refresh --confirm-real-order --acknowledge-compliance --max-stake 2 --wait-ready-seconds 0 --wait-reconcile-seconds 0 --require-submitted --pretty`，返回 code 2，阻断为 `credentials, signal`，未提交真实订单，且不再误报 `enabled`。
+
+### 已知坑位
+
+1. 当前仍缺真实 `.env.live` 凭证、钱包 USDC、CLOB allowance 和官方 order id；目标尚未完成。
+2. 当前 `signal` 是 waitable 瞬时阻断；填完凭证和钱包授权后，可用 `--wait-ready-seconds 180` 等待策略信号窗口。
+
+### 回滚建议
+
+1. 如需仅回滚 service one-shot CLI，撤销 `src/polybot2other/live_once.py`、`src/polybot2other/live_doctor.py`、`src/polybot2other/bot.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.12 改动。
+
+## 2026-05-29 v3.11
+
+### 已完成
+
+1. `live_doctor` CLI 新增 `--service-url` 和 `--service-timeout`。
+2. `--service-url` 模式会读取运行中 dashboard 服务的 `/api/live-doctor`，复用同一进程内的当前市场、live settings 和浏览器/REST 行情快照。
+3. README 和实盘 runbook 增加基于运行中服务执行最终首单检查的命令。
+
+### 已确认决策
+
+1. 真实首单前的最终 doctor 推荐优先使用 `--service-url http://127.0.0.1:8791`，避免新 CLI 进程因为没有 dashboard 内存快照而误报 market unavailable。
+2. `--service-url` 仍然只读，不提交订单、不取消订单、不卖出订单。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，5 个 doctor 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，67 个 live 相关测试通过。
+5. 首次全量 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v` 出现 1 次 pending reconcile 用例抖动；该用例单独运行通过，相邻 pending 组合运行通过。
+6. 已再次执行全量 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，134 个核心测试通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`HEAD /` 返回 200。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --service-url http://127.0.0.1:8791 --no-refresh --require-one-shot-ready --pretty`，返回 code 2，输出来自运行中服务，包含当前市场、SDK 兼容、缺失凭证和 waitable signal 阻断。
+
+### 已知坑位
+
+1. 本机 `.env.live` 仍未填写真实 private key、signature type、funder address；没有真实凭证、钱包 USDC、allowance 和官方 order id 前，不能标记目标完成。
+2. 真实首单前应保持 dashboard 服务运行，并用 `live_doctor --service-url http://127.0.0.1:8791 --require-one-shot-ready` 做最终只读检查。
+
+### 回滚建议
+
+1. 如需仅回滚服务模式 doctor，撤销 `src/polybot2other/live_doctor.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.11 改动。
+
+## 2026-05-29 v3.10
+
+### 已完成
+
+1. `live_doctor` 将 SDK 包名、版本和兼容性状态提升到顶层字段：`sdk`、`sdk_version`、`sdk_status`。
+2. Dashboard `首单检查` 结果区新增 SDK 状态展示，能直接看到当前 `py_clob_client_v2` 是否兼容真实下单路径。
+3. README 和实盘 runbook 补充 doctor 会返回 SDK compatibility。
+
+### 已确认决策
+
+1. SDK 状态只展示包名、版本、兼容性和错误列表，不展示签名订单、私钥或 API credential。
+2. 这次只增强首单前可验证信息，不改变真实下单、预检、one-shot 或风控逻辑。
+
+### 验证记录
+
+1. 已核对 Polymarket 官方文档：CLOB 使用 `py-clob-client-v2`，新 API 用户推荐 `signature_type=3` deposit wallet；market order 的 `price` 是最差成交价保护；`FAK` 是部分成交后取消剩余。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，4 个 doctor 测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，66 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，133 个核心测试通过。
+7. 已重启服务 `http://127.0.0.1:8791`，烟测 `/api/live-doctor?refresh=false` 返回 `sdk_version=1.0.1`、`sdk_status.compatible=true`，当前仍因 credentials 为空保持 `BLOCKED`。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_doctor --no-refresh --require-one-shot-ready --pretty`，返回 code 2，输出包含顶层 `sdk_status.compatible=true` 和缺失凭证字段。
+
+### 已知坑位
+
+1. 本机 `.env.live` 仍未填写真实 private key、signature type、funder address；还没有钱包 USDC、allowance 和官方 order id 证据，不能标记目标完成。
+2. `--no-refresh` CLI 使用新 bot 本地快照时可能没有当前 market；真实首单前应优先用运行中服务的 `/api/live-doctor?refresh=true` 或等待服务已有实时市场快照。
+
+### 回滚建议
+
+1. 如需仅回滚 SDK 顶层展示，撤销 `src/polybot2other/live_doctor.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.10 改动。
+
+## 2026-05-29 v3.09
+
+### 已完成
+
+1. `live_doctor` 增加 `credential_setup` 区块，明确列出必填凭证、可选 API 凭证、缺失字段、空字段、已加载字段、API credential 模式和 env 文件权限状态。
+2. Dashboard 的 `首单检查` 结果区会直接展示缺失凭证、空凭证字段和下一步动作，避免只看到 `credentials` 阻断但不知道应该填写哪些字段。
+3. README 和实盘 runbook 补充 `/api/live-doctor` 会返回凭证配置状态。
+
+### 已确认决策
+
+1. doctor 仍保持只读，不提交订单、不取消订单、不卖出订单。
+2. 页面只展示字段名和状态，不展示 private key、API secret、passphrase、签名 payload 或 raw response。
+3. 当前 `.env.live` 空模板可以保留；空字段会出现在 `empty_keys`，但不会被当成有效凭证。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，4 个 doctor 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，66 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，133 个核心测试通过。
+
+### 已知坑位
+
+1. 本机 `.env.live` 仍未填写真实 private key、signature type、funder address；没有真实凭证、资金、allowance 和官方 order id 前，不能声明实盘首单完成。
+
+### 回滚建议
+
+1. 如需仅回滚本次 doctor 凭证引导，撤销 `src/polybot2other/live_doctor.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.09 改动。
+
+## 2026-05-29 v3.08
+
+### 已完成
+
+1. env loader 调整空值语义：env 文件中的空值会记录到 `empty_keys`，但不会写入进程环境变量。
+2. 空 `.env.live` 模板不会再遮蔽后续 `.env.local`、`.env` 或进程环境中的真实 live 凭证。
+3. `sensitive_keys_present` 只记录非空的敏感字段，避免把未填写的模板误判为含真实密钥。
+4. README 和实盘 runbook 补充空值不会加载、不会遮蔽后续文件的说明。
+
+### 已确认决策
+
+1. 对实盘凭证来说，空值不是有效配置；保留空模板是为了引导填写，不应该覆盖后续更具体的真实配置。
+2. 权限检查只针对非空敏感字段；空模板的权限仍建议 `0o600`，但不会因为未填密钥而触发 secret file 权限阻断。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k load_settings -v`，4 个配置加载测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_readiness -v`，6 个 readiness 测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，66 个 live 相关测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，133 个核心测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，烟测 `/api/live-doctor?refresh=false` 返回 `.env.live` 的非空运行配置在 `loaded_keys`，空凭证字段在 `empty_keys`，`sensitive_keys_present=[]`，当前仍因 credentials 为空保持 `BLOCKED`。
+
+### 已知坑位
+
+1. 本机 `.env.live` 仍未填写真实 private key、signature type、funder address；真实 one-shot 首单仍需等凭证、钱包 USDC、allowance 和当前策略信号全部通过。
+
+### 回滚建议
+
+1. 如需仅回滚空值不覆盖语义，撤销 `src/polybot2other/config.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.08 改动。
+
+## 2026-05-29 v3.07
+
+### 已完成
+
+1. 本地生成 `.env.live` 空模板，并设置权限为 `0o600`；该文件已被 `.gitignore` 忽略，不会进入版本库。
+2. env loader 增加密钥文件权限元数据：`mode`、`secure_permissions`、`sensitive_keys_present`。
+3. live readiness 增加密钥 env 文件权限闸门：如果载入的 env 文件包含 live 私钥/API credential 字段但不是 owner-only 权限，会阻断实盘开启和真实下单。
+4. README、`.env.live.example` 和实盘 runbook 补充 `chmod 600 .env.live` 要求。
+
+### 已确认决策
+
+1. `.env.live` 可以在本机落地空模板，但不能提交真实密钥；实盘私钥文件必须只允许当前用户读写。
+2. 权限检查只暴露字段名、路径、mode 和布尔状态，不暴露 private key、API secret 或 passphrase。
+
+### 验证记录
+
+1. 已执行 `rtk proxy ls -l .env.live .env.live.example`，确认 `.env.live` 为 `-rw-------`。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k load_settings -v`，3 个配置加载测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_readiness -v`，5 个 readiness 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，65 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，131 个核心测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，烟测 `/api/live-doctor?refresh=false` 返回 `env_path=.env.live`、`env_mode=0o600`、`env_secure=true`，当前仍因 credentials 为空保持 `BLOCKED`。
+
+### 已知坑位
+
+1. `.env.live` 已存在但仍是空模板；必须填入真实 private key、signature type、funder address，并确保钱包 USDC 和 allowance 通过后，才能执行真实 one-shot 首单。
+
+### 回滚建议
+
+1. 如需仅回滚权限检查，撤销 `src/polybot2other/config.py`、`src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`.env.live.example`、`docs/live-trading-runbook.md` 和本进度文档的 v3.07 改动。
+2. 如需删除本地空模板，确认没有填入真实密钥后删除 `.env.live`。
+
+## 2026-05-29 v3.06
+
+### 已完成
+
+1. `live_doctor` 的首单推荐命令不再硬编码 `--max-stake 2`，改为按当前 live preflight 的实际本次 stake 动态生成。
+2. 如果当前市场已有 live 持仓并锁定了旧 stake，doctor 推荐的 one-shot `max_stake_dollars` 会使用这个锁定 stake；否则使用当前配置的 `stake_dollars`。
+3. README 和实盘 runbook 补充说明：首单前优先复制 doctor 输出里的命令，避免使用过期的固定下注金额。
+
+### 已确认决策
+
+1. one-shot 的 `max-stake` 是安全上限，必须和下一笔真实订单实际会使用的 stake 保持一致；否则会造成误阻断或误导操作者。
+2. 页面仍然只展示 doctor 输出，不直接提供真实下单按钮。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，4 个 doctor 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，64 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，130 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已重启服务 `http://127.0.0.1:8791`，烟测 `GET /api/live-doctor?refresh=false` 返回 `max_stake_dollars=2.0`、推荐命令 `--max-stake 2`、`fatal_one_shot_blockers=["credentials"]`，且默认不带完整 snapshot。
+
+### 已知坑位
+
+1. 当前机器仍没有 `.env.live` 私钥/signature/funder 配置，也没有可验证的钱包余额/allowance，所以还不能完成官方真实 order id 验收。
+
+### 回滚建议
+
+1. 如需仅回滚动态首单 stake 推荐，撤销 `src/polybot2other/live_doctor.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.06 改动。
+
+## 2026-05-29 v3.05
+
+### 已完成
+
+1. Dashboard 实盘面板新增只读 `首单检查` 按钮，调用 `/api/live-doctor?refresh=true`。
+2. 页面新增 `live-doctor-result` 展示 doctor 状态、one-shot 是否可执行、fatal/waitable 阻断、下一步动作和推荐 one-shot 命令。
+3. `/api/live-doctor` 默认小响应的设计保持不变；页面只在 doctor 结果区局部渲染，不刷新订单/交易大表，避免影响列表选择和性能。
+
+### 已确认决策
+
+1. 页面只增加只读检查入口，不增加直接真实下单按钮；真实首单仍走带确认短语和 max stake cap 的 one-shot CLI/API。
+2. doctor 结果不自动触发 live_once，不会因为误点首单检查而提交真实订单。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，3 个 doctor 测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，63 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，129 个核心测试通过。
+7. 已重启服务 `http://127.0.0.1:8791`，首页返回 `live-doctor` 按钮和 `v=20260529-v2-84` 静态资源版本。
+8. 已烟测 `GET /api/live-doctor?refresh=false`，响应约 4473 bytes，返回 `live_doctor.status=BLOCKED`、`fatal_one_shot_blockers=["credentials"]`，且默认不带完整 snapshot。
+
+### 已知坑位
+
+1. 页面 doctor 只能展示当前阻断和命令；当前机器仍缺真实实盘凭证、钱包余额/allowance 和官方 order id 验收。
+
+### 回滚建议
+
+1. 如需仅回滚页面 doctor 入口，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档的 v3.05 改动。
+
+## 2026-05-29 v3.04
+
+### 已完成
+
+1. 新增只读实盘 doctor：`polybot2other.live_doctor` / `polybot2other-live-doctor` / `GET /api/live-doctor`。
+2. doctor 汇总 live settings 与 live preflight，输出 `status`、`ready_for_one_shot_now`、`can_wait_for_one_shot`、`fatal_one_shot_blockers`、`waitable_one_shot_blockers`、`next_actions`、推荐 one-shot 首单命令和首单后证据核对清单。
+3. doctor 将 `enabled` 视为 one-shot 首单的正常关闭态；如果只有 `enabled` 阻断，则标记为 `READY_FOR_ONE_SHOT_NOW`，因为 one-shot 本来要求实盘开关先关闭。
+4. `/api/live-doctor` 默认不返回完整 snapshot，避免首单前轮询返回过大；需要调试全量快照时显式加 `include_snapshot=true`。
+5. README 和实盘 runbook 增加 doctor CLI/API 说明，作为填完 `.env.live` 后、执行真实首单前的最后只读检查。
+
+### 已确认决策
+
+1. doctor 只做只读聚合，不提交订单、不取消订单、不卖出订单；它可以触发与 preflight 相同的官方只读检查和签名预检，但不调用 `post_order`。
+2. 首单仍推荐使用 one-shot 命令，而不是常驻打开实盘 loop；doctor 的输出用于判断 one-shot 是“现在可执行”“可等待短暂阻断后执行”还是“存在 fatal 阻断”。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_doctor -v`，3 个 doctor 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，63 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，129 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已执行 `rtk proxy .venv/bin/python -m pip install -e .`，刷新本地 venv console scripts。
+8. 已执行 `rtk proxy .venv/bin/polybot2other-live-doctor --no-refresh --require-one-shot-ready --pretty`，当前缺凭证环境返回 code 2，`fatal_one_shot_blockers=["credentials"]`。
+9. 已重启服务 `http://127.0.0.1:8791`，`HEAD /api/live-doctor` 返回 HTTP 200 且 `Content-Length=4450`，确认默认不再返回完整 snapshot。
+10. 已烟测 `GET /api/live-doctor?refresh=false`，返回 `live_doctor.status=BLOCKED`、`fatal_one_shot_blockers=["credentials"]`、`sdk_status.compatible=true` 和推荐 one-shot 命令。
+
+### 已知坑位
+
+1. doctor 能把实盘首单阻断项和下一步动作讲清楚，但当前机器仍缺真实凭证、钱包余额/allowance 和真实 order id 验收。
+
+### 回滚建议
+
+1. 如需仅回滚 doctor，删除 `src/polybot2other/live_doctor.py`，撤销 `pyproject.toml`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.04 改动。
+
+## 2026-05-29 v3.03
+
+### 已完成
+
+1. 实盘 readiness 增加 `sdk_version` 和 `sdk_status`，直接暴露当前 `py_clob_client_v2` 包版本、兼容性结果和具体 SDK 兼容性错误。
+2. README 和实盘 runbook 补充说明：预检不只看凭证，也会检查官方 SDK 包版本和本项目真实下单路径需要的类、枚举、方法。
+
+### 已确认决策
+
+1. 实盘下单前必须把 SDK 兼容性作为硬门槛；如果官方 SDK 包版本或接口漂移，readiness 应该先阻断实盘开启，而不是等到真实 `post_order` 阶段失败。
+2. `sdk_status` 只暴露包名、版本和兼容性错误，不暴露私钥、API secret、passphrase 或签名 payload。
+
+### 验证记录
+
+1. 已通过本机 SDK introspection 确认当前安装 `py_clob_client_v2==1.0.1`，`ClobClient.create_market_order`、`post_order`、`MarketOrderArgsV2`、`PartialCreateOrderOptions`、`OrderType.FAK` 等本项目实盘路径使用的签名仍存在。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --pretty --require-arming-ready`，当前返回 code 2；市场、官方目标价、geoblock、软件账户通过，仍因缺少实盘凭证和当前无策略信号阻断。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_readiness -v`，4 个 readiness 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_sdk -v`，3 个 SDK 兼容性测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，60 个 live 相关测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，126 个核心测试通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+8. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+10. 已重启服务 `http://127.0.0.1:8791`，`GET /api/live-settings` 返回 `readiness.sdk_version=1.0.1`、`readiness.sdk_status.compatible=true`，同时继续因缺少实盘凭证保持 `enabled=false`。
+11. 已烟测 `POST /api/live-once` 携带 `include_evidence=true` 和 `wait_ready_seconds=3`，当前缺凭证环境返回 HTTP 409，错误为 `enabled, credentials, signal`，未进入真实下单。
+
+### 已知坑位
+
+1. 当前机器仍缺真实实盘凭证和资金/allowance，因此还不能验证真实 `post_order` 返回的官方 order id。
+
+### 回滚建议
+
+1. 如需仅回滚 SDK 状态暴露，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.03 改动。
+
+## 2026-05-29 v3.02
+
+### 已完成
+
+1. one-shot live 成功路径默认把只读证据包合并到同一份返回里，字段为 `live_once.evidence`。
+2. 证据包会根据本次返回的官方订单 id 自动查询本地 live 账本、软件账户、readiness/wallet、官方 open orders、open trades、pending orders 和近期订单/交易。
+3. CLI 增加 `--no-evidence`，API 增加 `include_evidence=false`，仅用于需要压缩输出时关闭自动证据包。
+4. README 和实盘 runbook 补充自动证据包开关说明，明确正常首单无需再额外执行证据命令。
+
+### 已确认决策
+
+1. 首笔真实订单继续推荐走 one-shot；同一份输出同时保留提交结果、短轮询 reconcile 结果和脱敏证据包，便于人工核对后再决定是否开启常驻实盘。
+2. 证据包仍是只读路径，不会提交、取消或卖出订单，也不会输出私钥、API secret、passphrase、签名 payload 或本地 `raw_response`。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，7 个 one-shot 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，60 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，126 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --max-stake 2 --wait-ready-seconds 3 --ready-poll-seconds 0.25 --pretty`，未传确认短语时立即返回机器可读错误，不进入等待或下单。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --confirm-real-order --acknowledge-compliance --max-stake 2 --wait-ready-seconds 3 --ready-poll-seconds 0.25 --pretty`，当前缺凭证环境立即返回 `enabled, credentials, signal` 阻断，不下单。
+9. 已重启服务 `http://127.0.0.1:8791`，烟测 `POST /api/live-once` 携带 `include_evidence=true` 和 `wait_ready_seconds=3` 在当前缺凭证环境返回 HTTP 409，错误为 `enabled, credentials, signal`，未进入真实下单。
+
+### 已知坑位
+
+1. 当前机器仍缺真实实盘凭证和资金/allowance，自动证据包只能验证本地路径，不能替代真实 order id 验收。
+
+### 回滚建议
+
+1. 如需仅回滚 one-shot 自动证据包，撤销 `src/polybot2other/bot.py`、`src/polybot2other/live_once.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.02 改动。
+
+## 2026-05-29 v3.01
+
+### 已完成
+
+1. one-shot live 增加受控等待参数：CLI `--wait-ready-seconds` / `--ready-poll-seconds`，API `wait_ready_seconds` / `ready_poll_seconds`。
+2. 等待只覆盖短暂型阻断：`market`、`target_price`、`signal`、`orderbook_depth` 以及 one-shot 允许忽略的 `enabled`。
+3. 凭证、风险确认、钱包余额/allowance、软件账户现金、geoblock、官方 open orders、SDK 签名等非短暂阻断会立即失败，不会在真实资金路径里无意义等待。
+4. one-shot 返回增加 `preflight_attempts`、`wait_ready_seconds`、`waited_ready_seconds`，便于首单后复盘它等了多久、预检了几次。
+5. README 和实盘 runbook 更新首单推荐命令，默认示例增加 `--wait-ready-seconds 180` 和 API 对应参数。
+
+### 已确认决策
+
+1. 首笔真实订单推荐继续使用 one-shot，而不是长期开启 live loop；等待能力只用于减少市场刚切换、官方目标价短暂未传播、临时 `NO_TRADE` 或盘口薄导致的手动重试。
+2. 等待期间仍要求显式确认短语和 `max_stake` 上限；不会绕过任何实盘风控或凭证检查。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，7 个 one-shot 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，60 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，126 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --max-stake 2 --wait-ready-seconds 3 --ready-poll-seconds 0.25 --pretty`，未传确认短语时立即返回机器可读错误，不进入等待或下单。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --confirm-real-order --acknowledge-compliance --max-stake 2 --wait-ready-seconds 3 --ready-poll-seconds 0.25 --pretty`，当前缺凭证环境立即返回 credentials 阻断，不等待、不下单。
+9. 已重启服务 `http://127.0.0.1:8791`，烟测 `POST /api/live-once` 携带 `wait_ready_seconds=3` 在当前缺凭证环境返回 HTTP 409，错误为 `enabled, credentials, signal`，未进入真实下单。
+
+### 已知坑位
+
+1. `wait_ready_seconds` 不是交易信号生成器；如果一直没有 Up/Down 信号或官方目标价，命令会超时失败。
+2. 当前机器仍缺真实实盘凭证和资金/allowance，不能完成真实 order id 验收。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot 等待能力，撤销 `src/polybot2other/bot.py`、`src/polybot2other/live_once.py`、`src/polybot2other/web.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.01 改动。
+
+## 2026-05-29 v3.00
+
+### 已完成
+
+1. `readiness` 增加 `credential_addresses`，展示实盘私钥推导出的 signer address、配置的 funder address、短地址摘要和两者是否匹配。
+2. 对 `POLYBOT2OTHER_LIVE_SIGNATURE_TYPE=0` 增加强校验：EOA 模式下 funder 必须等于私钥 signer address，否则 readiness 阻断实盘开启和真实下单。
+3. proxy wallet、Gnosis Safe、deposit wallet 模式不强制 signer/funder 相等，只展示摘要供人工核对，避免误拦截正常代理/托管资金地址。
+4. 前端 live readiness 状态栏展示 signer/funder 短地址和 match 状态，便于实盘前人工确认。
+5. `.env.live.example`、README 和实盘 runbook 补充签名类型和 funder 地址关系说明。
+
+### 已确认决策
+
+1. Polymarket 官方文档要求初始化交易客户端时提供 signature type 和 funder address；其中 EOA 类型的 funder 是 EOA 钱包地址，deposit wallet 新用户建议使用 `signature_type=3`。
+2. 地址校验只暴露公开地址和短地址摘要，不暴露私钥、API secret 或 passphrase。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_readiness -v`，4 个 readiness 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，58 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，124 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --pretty`，当前能刷新到市场，但仍因缺少实盘凭证、风险确认未勾选、官方 target_price 暂不可用和当前信号不下单而阻断。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_evidence --external-order-id smoke-order --pretty`，无凭证环境返回 `credential_addresses` 空摘要且不进入下单路径。
+
+### 已知坑位
+
+1. 当前机器仍没有真实 `.env.live` 凭证，因此无法验证真实资金钱包余额、allowance、官方 open orders，也不能完成首单真实 order id 验收。
+2. 刚刷到的当前市场官方 `target_price=0`，策略会继续阻断真实下单；需要等官方 market target 出现且策略信号为 Up/Down。
+
+### 回滚建议
+
+1. 如需仅回滚本次凭证地址校验，撤销 `src/polybot2other/live.py`、`src/polybot2other/static/app.js`、`.env.live.example`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v3.00 改动。
+
+## 2026-05-29 v2.99
+
+### 已完成
+
+1. 新增只读实盘证据包 `LiveStrategyRunner.evidence_payload()`，集中输出 `SINGLE_FAK_REAL` 本地账本、软件账户、readiness/wallet、官方 open orders、open trades、pending orders、recent orders/trades，以及指定官方订单 id 对应的本地订单行。
+2. 新增 `PaperTradingBot.live_evidence()`、`GET/HEAD /api/live-evidence` 和 CLI `polybot2other.live_evidence` / `polybot2other-live-evidence`。
+3. evidence 输出复用公开化订单结构，避免暴露本地 `raw_response`、私钥、API secret 或签名 payload。
+4. README 和实盘 runbook 增加首单后证据采集命令，便于核对官方订单 id、本地订单状态、官方挂单和软件隔离账户。
+
+### 已确认决策
+
+1. evidence 是只读核验入口，不提交订单、不卖出、不取消订单；真实资金动作仍只通过 one-shot、live loop、manual sell、emergency stop 的原有受控入口。
+2. 首单验收时优先用 `external_order_id` 定位本地 live order，配合官方 open orders 和 wallet/readiness 判断本地账本与官方状态是否一致。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_evidence -v`，2 个 evidence 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，56 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，122 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_evidence --external-order-id smoke-order --pretty`，无凭证环境返回机器可读 evidence，不进入下单路径。
+8. 已重启服务 `http://127.0.0.1:8791`，烟测 `GET /api/live-evidence?external_order_id=smoke-order&force=true` 返回 `live_evidence` 和 `snapshot`，`requested_external_order_id=smoke-order`，`raw_response` 未暴露；`HEAD /api/live-evidence` 返回 HTTP 200。
+
+### 已知坑位
+
+1. evidence 会读取官方 open orders 和 readiness；缺少凭证时会返回明确阻断信息，但不会尝试下单。
+2. 首单如果仍是 `PENDING(待官方确认)`，evidence 只负责呈现当前状态，最终收口仍依赖 live order reconciliation。
+
+### 回滚建议
+
+1. 如需仅回滚本次 evidence 入口，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/live_evidence.py`、`pyproject.toml`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.99 改动。
+
+## 2026-05-29 v2.98
+
+### 已完成
+
+1. 将 one-shot live 提交后的官方对账等待移入 `LiveStrategyRunner.run_once_from_state()` 内部。
+2. one-shot 的 `--wait-reconcile-seconds` / `reconcile_wait_seconds` 现在会在 live runner 运行锁和 live process lock 仍持有时执行，等待结束后才按 `disable_after=true` 关闭 live 并释放锁。
+3. 删除外层 `PaperTradingBot.run_live_once()` 提交后再调用对账的流程，避免首单 pending 对账期间进程锁已经释放。
+4. 测试增加对账等待期间锁状态断言：官方 order/trade 回查时 `process_lock.locked=true` 且 `config.enabled=true`，返回后才关闭 live 并释放锁。
+5. README 和实盘 runbook 更新说明：等待窗口是在 one-shot 释放 live process lock 前执行。
+
+### 已确认决策
+
+1. 首笔真实订单验收期间，pending 对账也属于 one-shot 临界区，应该继续持有 live process lock，避免另一个服务进程抢先启用同一 live settings path。
+2. 对账等待不提交新订单，只推进已有 official order id 的本地状态收口；因此放在 runner 锁内不会改变下单策略，只提升并发安全。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，5 个 one-shot live 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，54 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，120 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --max-stake 2 --wait-reconcile-seconds 1 --pretty`，未传确认短语时返回机器可读错误，不进入下单路径。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用等阻断。
+8. 已执行 `rtk proxy git diff --check`，空白检查通过。
+9. 已重启服务 `http://127.0.0.1:8791`。
+10. 已烟测 `/api/live-once`：未传确认短语返回 HTTP 400；传确认和 `reconcile_wait_seconds` 但当前环境阻断时返回 HTTP 409 且不下单。
+
+### 已知坑位
+
+1. 如果 `reconcile_wait_seconds` 设置很长，one-shot 会在持锁状态下等待更久；建议首单用 20 到 30 秒，不要无脑拉到上限。
+2. 如果等待窗口结束仍是 `PENDING(待官方确认)`，仍需要启动 dashboard 服务继续常规对账。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot 锁内对账调整，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.98 改动。
+
+## 2026-05-29 v2.97
+
+### 已完成
+
+1. one-shot live 入口增加提交后的短窗口官方对账等待：CLI 参数 `--wait-reconcile-seconds` / `--reconcile-poll-seconds`，API 参数 `reconcile_wait_seconds` / `reconcile_poll_seconds`。
+2. 新增 `LiveStrategyRunner.wait_for_order_reconciliation()`，提交后可强制触发 `_reconcile_live_orders()`，并返回本地 live order 状态、open trades 摘要和等待次数。
+3. 新增 `TradeStore.live_order_by_external_id()`，用于按官方 `external_order_id` 读取本地 live 订单状态，供 one-shot 输出审计证据。
+4. one-shot 输出新增 `reconcile` 字段；如果官方 order/trade 在等待窗口内收口，会显示 `FILLED` / `CANCELED` / `REJECTED` 等本地状态，否则仍显示 `PENDING`。
+5. README 和实盘 runbook 更新首笔实盘命令，建议首单使用 `--wait-reconcile-seconds 20` / `reconcile_wait_seconds=20`，减少拿到 order id 但本地状态未收口的人工不确定性。
+
+### 已确认决策
+
+1. 对账等待不绕过原有 pending-first 规则；它只是主动轮询已有 pending order，不会提交第二笔订单。
+2. 等待窗口最大限制在 120 秒，轮询间隔限制在 0.1 到 10 秒，避免 API 请求长时间挂住或高频打官方接口。
+3. CLI 进程退出后无法继续长期对账；如果等待窗口后仍是 `PENDING(待官方确认)`，仍应启动 dashboard 服务继续常规官方对账。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，5 个 one-shot live 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，54 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，120 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --max-stake 2 --wait-reconcile-seconds 1 --pretty`，未传确认短语时返回机器可读错误，不进入下单路径。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用等阻断。
+8. 已执行 `rtk proxy git diff --check`，空白检查通过。
+9. 已重启服务 `http://127.0.0.1:8791`。
+10. 已烟测 `/api/live-once` 新对账参数：未传确认短语返回 HTTP 400；传确认和 `reconcile_wait_seconds` 但当前环境阻断时返回 HTTP 409 且不下单。
+
+### 已知坑位
+
+1. one-shot 等待窗口只能提高首单验收便利性，不能保证官方一定在窗口内返回最终成交状态。
+2. 如果官方 CLOB 已收到订单但本地数据库不可写，仍会触发已有 accounting failure 停机保护；等待窗口不能替代人工按官方 order id 核对。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot 对账等待，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/live_once.py`、`src/polybot2other/web.py`、`src/polybot2other/storage.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.97 改动。
+
+## 2026-05-29 v2.96
+
+### 已完成
+
+1. 新增受控首笔实盘入口 `polybot2other.live_once` / `polybot2other-live-once`，用于在不长期打开 live 循环的情况下执行一次 `SINGLE_FAK_REAL` live run。
+2. 新增服务端 `POST /api/live-once`，与 CLI 共用同一后端能力，便于通过运行中的 dashboard 服务执行首笔真实订单验收。
+3. one-shot 入口必须传确认短语 `PLACE_REAL_ORDER`，CLI 必须使用 `--confirm-real-order`；否则不会刷新市场，也不会触发任何真实下单路径。
+4. one-shot 入口必须传 `max_stake_dollars` / `--max-stake`，实际本次 stake 超过该上限时直接拒绝，不调用官方下单。
+5. one-shot 入口要求开始前普通 live switch 处于关闭状态，执行时由后端持有 live runner 运行锁，临时开启、跑一次策略，默认再关闭 live 并释放进程锁，避免后台 tick 抢先提交或后续持续自动交易。
+6. README 和实盘 runbook 增加首笔实盘 one-shot CLI/API 流程、curl 示例和 `disable_after=true` 的上线建议。
+
+### 已确认决策
+
+1. 首笔真实资金验证优先使用 one-shot，而不是直接把 dashboard live switch 长期开启；这样可以先拿到一个官方 order id 后再决定是否进入持续运行。
+2. one-shot 不绕过任何现有硬闸门：market target、信号、软件预算、钱包 balance/allowance、geoblock、官方 open orders、process lock、SDK readiness 和 pending 保护都沿用同一条 live runner。
+3. one-shot 默认执行后关闭 live；只有明确传 `--leave-enabled` 或 `disable_after=false` 才允许继续保持普通 live 循环。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_once -v`，4 个 one-shot live 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，53 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，119 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境 `geo_access=PASS`，但仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用等阻断。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --max-stake 2 --pretty`，未传确认短语时返回机器可读错误 `confirm must be PLACE_REAL_ORDER`，不会进入下单路径。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_once --no-refresh --confirm-real-order --max-stake 2 --pretty`，确认短语存在但没有本地市场快照时返回 `current market unavailable for one-shot live run`，不会下单。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+10. 已重启服务 `http://127.0.0.1:8791`。
+11. 已烟测 `/api/status` 和 `/api/live-once`：当前缺少实盘凭证，`/api/live-once` 未传确认短语返回 HTTP 400，传确认但环境阻断时返回 HTTP 409 且不下单。
+
+### 已知坑位
+
+1. one-shot 是“当前时刻尝试一次”，不是等待信号机器人；如果当前没有可下单信号或市场快照不可用，会拒绝而不是挂起等待。
+2. CLI 直连模式执行后进程会退出；如果订单进入 `PENDING(待官方确认)`，需要启动 dashboard 服务或再次运行现有轮询路径继续官方对账。
+3. 当前环境仍缺真实凭证和真实余额，因此 one-shot 入口已验证保护逻辑，但尚未验证真实 CLOB order id。
+
+### 回滚建议
+
+1. 如需仅回滚本次 one-shot live 入口，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/live_once.py`、`src/polybot2other/web.py`、`pyproject.toml`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.96 改动。
+
+## 2026-05-29 v2.95
+
+### 已完成
+
+1. 新增进程级实盘硬开关 `POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED`，默认 `true`；设置为 `false` 时服务不创建 live runner，实盘设置、预检、卖出和急停写操作都无法从该进程触发真实订单。
+2. `.env.live.example`、README 和实盘 runbook 补充该硬开关，明确它比页面 live switch 更外层，适合 Paper-only 运行、上线前隔离和紧急维护。
+3. 加严 SDK 兼容性自检：`ClobClient` 构造参数、`MarketOrderArgs` 的 `price` / `order_type` / `user_usdc_balance`，以及 `BalanceAllowanceParams.signature_type` 都纳入 readiness 检查。
+4. 本机 `py_clob_client_v2` 实际签名已确认支持当前真实下单路径需要的 market order、FAK、funder、signature type、balance/allowance、order/trade/open-orders 等方法和参数。
+5. 新增回归测试覆盖：环境变量关闭 live runtime 时不会创建 live runner；缺少 market-order 预算参数时 SDK 兼容性检查会阻断。
+
+### 已确认决策
+
+1. 页面 live switch 负责日常开关；`POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED=false` 负责进程级隔离，避免某个服务进程具备任何 live runner 能力。
+2. 对真实资金路径，SDK 兼容性不能只检查类和方法名，还必须检查会影响预算和滑点边界的关键参数。
+3. `user_usdc_balance` 是 BUY 单笔预算保护的重要参数；如果 SDK 不支持该参数，readiness 必须在开启实盘前失败。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k disabled_live_runtime -v`，1 个 runtime 硬关闭测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_runtime -v`，2 个 runtime 配置测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k sdk_compatibility -v`，3 个 SDK 兼容性测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，49 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，115 个核心测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+7. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境 `geo_access=PASS`，但仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用等阻断。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+10. 已重启服务 `http://127.0.0.1:8791`。
+11. 已烟测 `/api/status`、`/api/live-preflight` 和 `/api/live-settings`，当前 `geo.blocked=false`、`country=KR`、`region=11`，实盘仍为 `enabled=false`，readiness 因缺少实盘凭证而阻断。
+
+### 已知坑位
+
+1. 该硬开关是进程级能力隔离，不会取消其他正在运行且已启用 live runner 的服务进程；同一 live settings path 仍依赖已有进程锁阻止多进程同时交易。
+2. SDK 兼容性检查只能证明本机包接口满足当前调用方式，不能替代真实私钥、真实余额/allowance、官方 open orders 为 0 和真实 CLOB order id 的验收。
+
+### 回滚建议
+
+1. 如需仅回滚本次 runtime 硬开关和 SDK 参数兼容性加严，撤销 `src/polybot2other/config.py`、`src/polybot2other/live.py`、`tests/test_core.py`、`.env.live.example`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.95 改动。
+
+## 2026-05-29 v2.94
+
+### 已完成
+
+1. 调整 live 手动 SELL 的本地落库顺序：只要官方返回 `order_id`，先写入本地 `PENDING(待官方确认)` 平仓订单，再做官方成交金额回查和本地持仓关闭。
+2. 如果官方卖出响应带 matched/filled 语义但缺少可核对金额，并且立即回查仍无法拿到官方金额，本地订单保持 `PENDING`，不再用本地估算金额直接关闭持仓。
+3. 如果官方卖出已经可能提交到 CLOB，但本地后续 accounting、pending 更新或持仓关闭失败，runner 会立即保存 `enabled=false`、释放实盘进程锁，并把错误写入 critical last_error。
+4. pending 手动 SELL 会阻止同一 live 持仓再次提交卖出，避免“官方已卖出、本地没记上”时重复真实卖单。
+5. 新增回归测试覆盖：官方 SELL matched 但金额回查失败时保持 pending；官方 SELL 后本地 accounting 失败时关闭实盘并保留 pending 阻断重复卖出。
+6. README 和实盘 runbook 补充手动卖出的 pending-first、异常停机和人工核对规则。
+
+### 已确认决策
+
+1. 手动 SELL 与自动 BUY 使用同一类实盘安全边界：官方 `order_id` 优先于本地最终记账结果，必须先成为本地防重复证据。
+2. 对真实卖出，宁可让软件账户短时间多保留一个 pending 平仓单，也不能在缺少官方成交金额时直接按估算关闭持仓。
+3. 本地 accounting 失败后的处理是关闭实盘，而不是继续运行；真实资金场景下，重复卖出或账本与官方状态分叉的风险更高。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell -v`，8 个手动实盘卖出相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，46 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，112 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境 `geo_access=PASS`，但仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用等阻断。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`。
+9. 已烟测 `/api/live-preflight` 和 `/api/live-settings`，当前 `geo.blocked=false`、`country=KR`、`region=11`，实盘仍为 `enabled=false`，readiness 因缺少实盘凭证而阻断。
+
+### 已知坑位
+
+1. 如果官方 SELL 已成交但本地数据库完全不可写，程序只能关闭实盘并保留 last_error；人工仍需要用官方 order id、official trades、wallet/token balance 和持仓列表核对。
+2. pending SELL 会保守阻止重复卖出；如果官方最终确认没有成交，需要等待官方回查或人工核对后再恢复实盘。
+
+### 回滚建议
+
+1. 如需仅回滚本次手动 SELL pending-first 和本地 accounting failure 保护，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.94 改动。
+
+## 2026-05-29 v2.93
+
+### 已完成
+
+1. 调整 live BUY 成功返回官方 `order_id` 后的本地落库顺序：先写入本地 `PENDING(待官方确认)` 订单并预留本次 stake，再做官方 order/trade 金额回查和本地持仓开仓。
+2. 如果官方返回 matched/filled 语义但没有 matched amounts，且立即回查失败或仍没有官方金额，本地订单保持 `PENDING`，不再用下单前 orderbook sweep 估算直接创建 live 持仓。
+3. 如果官方订单可能已经提交到 CLOB，但本地后续记账、平仓或 pending 更新失败，runner 会立即保存 `enabled=false`、释放实盘进程锁，并写入 critical last_error，防止下一轮按同一信号重复真实下单。
+4. pending-first 后仍保持已有对账路径：后续官方 order/trade 回查能把 pending BUY 转成 FILLED 或 CANCELED，并释放/调整软件预算。
+5. 新增回归测试覆盖：matched 无金额且立即回查失败时保持 PENDING；官方 BUY 后本地 accounting 失败时自动关闭实盘且不会重复 BUY。
+6. README 和实盘 runbook 补充 pending-first、matched 无金额处理和 accounting failure 后的人工核对步骤。
+
+### 已确认决策
+
+1. 对真实 BUY，官方 `order_id` 是本地防重复的第一优先级证据；只要拿到 `order_id`，就先写本地 PENDING，避免后续异常导致没有任何本地阻断记录。
+2. matched/filled 但没有官方金额时不再信任本地盘口估算直接开仓；必须等待官方 order/trade 给出可核对金额。
+3. 本地记账失败后选择关闭实盘，而不是继续运行；真实资金场景下，漏记一笔官方订单比少下一笔单更危险。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k accounting_fails -v`，1 个本地记账失败保护测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k matched_response_amount_recheck_fails -v`，1 个 matched 无金额回查失败测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，13 个 SINGLE_FAK_REAL 测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，44 个 live 相关测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，110 个核心测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+7. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境 `geo_access=PASS`，但仍因缺少实盘凭证和市场不可用等阻断。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+10. 已重启服务 `http://127.0.0.1:8791`。
+11. 已烟测 `/api/live-preflight` 和 `/api/live-settings`，当前 `geo.blocked=false`、`country=KR`、`region=11`，实盘仍为 `enabled=false`，readiness 因缺少实盘凭证而阻断。
+
+### 已知坑位
+
+1. 如果官方 CLOB 已成交但本地数据库完全不可写，程序只能关闭实盘并保留 last_error；人工仍需要用官方 order id、open orders、wallet/token balance 和订单流水核对。
+2. 如果 matched 无金额长时间无法回查到官方 fill，订单会保持 PENDING 直到 timeout/no-fill 逻辑收口；这会保守占用软件预算，但避免错误开仓。
+
+### 回滚建议
+
+1. 如需仅回滚本次 pending-first 和本地 accounting failure 保护，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.93 改动。
+
+## 2026-05-29 v2.92
+
+### 已完成
+
+1. 新增 Polymarket 主站 geoblock 状态检查，来源为 `https://polymarket.com/api/geoblock`。
+2. 实盘开启、`/api/live-preflight` 和真实 BUY 前最后检查都会确认 `geo_access` 通过；如果返回 `blocked=true` 或无法确认地区访问状态，会阻断实盘开启和新 BUY。
+3. `readiness.geo_check` 暴露 `blocked`、`country`、`region` 和检查时间，不暴露公网 IP、私钥、API secret 或 passphrase。
+4. 前端实盘状态栏增加 `geo ok/blocked` 摘要，并把风险确认文案改为“确认地区/账户合规且承担真实资金风险”。
+5. SDK client 增加凭证指纹缓存保护：private key、signature type、funder、API key/secret/passphrase、host 或 chain_id 变化后，会丢弃旧 authenticated client、wallet/token/open-orders 缓存并重建，避免同一进程误用旧钱包状态。
+6. README 和实盘 runbook 补充 geoblock 检查、地区合规和凭证缓存保护边界。
+
+### 已确认决策
+
+1. geoblock 是硬门槛，不是绕过机制；如果 Polymarket 报告当前运行地区受限，程序停止开启实盘和新 BUY。
+2. geoblock 检查的是服务运行环境，不替代用户对账户、居住地、实际操作地和当地法律的合规判断。
+3. geoblock 不阻止手动刷新、急停和已有订单/持仓的对账；它只阻止开启实盘和新增 live BUY。
+4. 凭证指纹只在内存中用于判断是否重建 SDK client，不向前端输出。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k geoblock -v`，3 个 geoblock 阻断测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k credential -v`，4 个凭证/缺凭证测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，43 个 live 相关测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，108 个核心测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+6. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出包含 `geo_access=PASS`、`country=KR`、`region=11`，当前仍因开关关闭、风险确认未勾选、缺少实盘凭证和市场不可用而阻断。
+8. 已执行 `rtk proxy git diff --check`，空白检查通过。
+9. 已重启服务 `http://127.0.0.1:8791`。
+10. 已烟测 `/api/live-preflight`，返回 `geo_access=PASS`、`geo_check.blocked=false`、`country=KR`、`region=11`；`/api/live-settings` readiness 同步暴露 `geo_check`，当前仍因缺少实盘凭证而 `readiness_ready=false`。
+
+### 已知坑位
+
+1. 当前 geoblock 检查只能证明服务运行环境没有被该接口标记为 blocked，不能证明用户本人、账户主体、居住地或所有适用法律均允许交易。
+2. 如果官方 geoblock 接口不可用，程序会保守阻断开启实盘和新增 BUY；这是有意设计，不应改成失败放行。
+3. 当前项目仍接的是国际站 `clob.polymarket.com`；如果后续要支持 `polymarket.us`，需要单独确认 API、认证、市场、合规和订单模型，不能直接复用国际站下单链路。
+
+### 回滚建议
+
+1. 如需仅回滚本次 geoblock 和凭证缓存保护，撤销 `src/polybot2other/live.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.92 改动。
+
+## 2026-05-29 v2.91
+
+### 已完成
+
+1. 将官方 CLOB open orders 从只读监控升级为实盘硬门槛。
+2. 开启实盘时会强制读取官方 open orders；只要官方账户还有开放订单，`enabled` 会保持 `false`。
+3. `/api/live-preflight` 增加 `official_open_orders_clear` 阻断项；有官方挂单时 `arming_ready=false`，并且不会执行 SDK 签名预检。
+4. 真实 BUY 提交前最后阶段会强制刷新官方 open orders；如果出现官方挂单，跳过 `place_market_buy`，不提交真实订单。
+5. 调整 fake live client 默认状态为官方 open orders 为空，只在专门测试中显式构造官方挂单。
+6. README 和实盘 runbook 补充官方 open orders 必须为 0 的上线前置规则。
+
+### 已确认决策
+
+1. 官方 open orders 的硬门槛只拦截自动 live BUY 和开启实盘，不阻止手动 `刷新挂单`、急停 cancel-all 和已有 pending 订单的官方回查。
+2. 普通仪表盘轮询仍使用短缓存保护性能；开启实盘、预检和真实 BUY 前置检查使用强制刷新，避免缓存把外部挂单漏掉。
+3. 有官方 open orders 时先处理官方账户状态，再继续实盘；这比让本地账本和官方挂单同时存在更可控。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k open_orders -v`，6 个 open orders 相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，40 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，104 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常，当前环境阻断项为实盘开关关闭、风险确认未勾选、缺少实盘凭证和当前市场不可用。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，烟测 `/api/live-preflight` 返回 `ready=false`、`arming_ready=false`，阻断项包含 `enabled`、`compliance_acknowledged`、`credentials` 和当前信号；`/api/live-open-orders` 在缺凭证环境返回 `ready=false`、`skipped=true`、`count=0`。
+
+### 已知坑位
+
+1. 当前环境缺真实 private key、signature type、funder 和真实账户授权，因此仍不能验证官方 CLOB 实盘账户下 open orders 为 0 时的真实下单结果。
+2. 如果用户在 BUY 前最后一次 open orders 检查通过后，又在外部账户立刻创建新挂单，软件无法阻止那个外部动作；这属于同一钱包多入口操作风险，实盘时应避免并行手动交易。
+3. 官方 open orders 为 0 不代表 pending 订单一定已经完成本地结算；本地 pending 仍依赖 order/trade 回查收口。
+
+### 回滚建议
+
+1. 如需仅回滚本次官方 open orders 硬门槛，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.91 改动。
+
+## 2026-05-29 v2.90
+
+### 已完成
+
+1. 修复实盘 stake 修改的生效边界：当前 market 已有 live 持仓时，同 market 后续反向腿继续沿用该持仓的原始 stake。
+2. 新配置的 `stake_dollars` 会从下一场新 market 开始生效，符合“当前有持仓时使用修改前金额直到下一场”的要求。
+3. `live_preflight.software_account` 增加 `configured_stake`、`stake_source` 和 `stake_locked_to_current_market`，用于区分预算来自当前配置还是当前市场持仓锁定。
+4. 前端预检结果显示 `可开启实盘` / `可真实下单`，并在 stake 被当前市场锁定时显示 `当前市场锁定`。
+5. 新增回归测试覆盖：先用 5 USDC 开当前 market，再把配置改为 9 USDC，同 market 反向腿仍用 5 USDC，下一场新 market 使用 9 USDC。
+6. README 和实盘 runbook 补充 stake 修改的当前市场锁定规则。
+
+### 已确认决策
+
+1. stake 锁定粒度是 live market/round，而不是全账户；只有同一 market 已有 live open trade 时才沿用旧 stake。
+2. 如果软件账户现金不足以覆盖旧 stake，仍以当前可用 cash 为上限，避免软件预算被透支。
+3. 这只控制自动 BUY 入场预算；手动 SELL 按实际持仓 shares 卖出，不受新的 `stake_dollars` 影响。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k stake_change_applies_next_market -v`，1 个 stake 生效边界测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，38 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，101 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 预检输出正常。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，`/api/live-preflight` 返回 `software_account.stake_source=config`、`configured_stake=2.0`、`stake_locked_to_current_market=false`。
+
+### 已知坑位
+
+1. 已平仓或已结算的旧 market 不会继续锁定 stake；新 market 使用当前最新配置。
+2. 如果同一 market 多个 open trade 的 stake 不一致，后续反向腿沿用最早 open trade 的 stake；当前正常路径下同 market stake 会保持一致。
+
+### 回滚建议
+
+1. 如需仅回滚本次 stake 生效边界修复，撤销 `src/polybot2other/live.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.90 改动。
+
+## 2026-05-29 v2.89
+
+### 已完成
+
+1. 实盘预检结果新增 `arming_ready`、`can_enable_live` 和 `blocked_checks`。
+2. `arming_ready=true` 表示除 `enabled` 开关本身外，其余真实下单前置检查均已通过，解决“先预检再打开实盘”时 `ready=false` 不够清晰的问题。
+3. 新增 `PaperTradingBot.refresh_live_preflight()`，可只刷新当前市场、REST 盘口和价格，不启动交易循环、不提交订单。
+4. 新增命令式预检入口 `polybot2other.live_preflight` 和脚本 `polybot2other-live-preflight`，支持 `--pretty`、`--no-refresh`、`--require-ready`、`--require-arming-ready`。
+5. CLI 默认只输出 `live_preflight`，避免把完整 dashboard snapshot 打到终端；需要完整状态时可加 `--include-snapshot`。
+6. README 和实盘 runbook 补充 CLI 预检、`arming_ready`、`blocked_checks` 和退出码说明。
+
+### 已确认决策
+
+1. CLI 预检复用现有 `PaperTradingBot` 和 `LiveStrategyRunner.preflight`，避免页面预检和命令预检口径分叉。
+2. CLI 默认会做一次 REST 刷新以获取当前市场、盘口和价格；`--no-refresh` 只用于本地快照/测试。
+3. `ready` 保持严格语义：只有实盘开关已经开启且所有条件通过才为 true；打开前判断用 `arming_ready`。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k "preflight" -v`，4 个预检相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，38 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，100 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.live_preflight --no-refresh --pretty`，CLI 输出精简 JSON，当前阻断项为开关关闭、风险确认未勾选、缺少实盘凭证和当前市场不可用。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已重启服务 `http://127.0.0.1:8791`，`/api/live-preflight` 返回新增字段 `ready=false`、`arming_ready=false`、`can_enable_live=false`、`can_place_next_order=false` 和 `blocked_checks`。
+
+### 已知坑位
+
+1. CLI 的 `--pretty` 默认刷新会访问 Polymarket/公开 BTC 价格接口；网络失败会以 JSON error 输出并返回退出码 1。
+2. `arming_ready=true` 仍不等于已经下单成功；真实验收还需要打开实盘后观察 order id、订单流水和官方 CLOB 状态。
+
+### 回滚建议
+
+1. 如需仅回滚本次命令式预检入口，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/live_preflight.py`、`pyproject.toml`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.89 改动。
+
+## 2026-05-29 v2.88
+
+### 已完成
+
+1. 新增实盘 SDK 兼容性自检：readiness 会检查 `py_clob_client_v2` 是否导出实盘链路依赖的类、枚举和关键方法。
+2. 检查范围覆盖签名/下单、balance/allowance 同步和读取、order/trades 回查、open orders 和 cancel-all。
+3. 兼容性失败会进入 readiness errors，阻止 `enabled=true` 保存，避免到真实下单阶段才发现 SDK 包版本不兼容。
+4. 新增当前安装包兼容测试和缺失方法回归测试。
+5. README 和实盘 runbook 补充 SDK 兼容性自检说明。
+
+### 已确认决策
+
+1. SDK 兼容性检查放在 readiness，而不是下单时临时发现；这是实盘开关的前置硬闸门。
+2. 检查采用本机安装包的真实导出和方法签名作为依据，不依赖 fake client 或文档猜测。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k sdk_compatibility -v`，2 个 SDK 兼容性测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，36 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，98 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`/api/status` 返回 `running=true`、`enabled=false`、`sdk=py_clob_client_v2`，当前仅因缺少 `POLYBOT2OTHER_LIVE_PRIVATE_KEY` 保持未就绪。
+
+### 已知坑位
+
+1. 兼容性自检只能证明 SDK 表面 API 可调用，不能替代真实私钥、API credentials、余额、allowance 和 CLOB 下单验收。
+2. 如果 Polymarket 服务端语义变化但 SDK 表面签名不变，仍需要真实预检和小金额实盘订单验证。
+
+### 回滚建议
+
+1. 如需仅回滚本次 SDK 兼容性自检，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.88 改动。
+
+## 2026-05-29 v2.87
+
+### 已完成
+
+1. 新增 `LiveProcessLock`：同一个 `live-settings.json` 会对应一个 sibling `.lock` 文件，实盘开启后必须持有该锁。
+2. `SINGLE_FAK_REAL` 启用阶段接入进程锁；如果另一个服务进程或同进程 runner 已经持有同一路径锁，服务端会保持 `enabled=false` 并写入阻断原因。
+3. 关闭实盘和 `实盘急停` 会释放进程锁；真实 BUY 前也会再次确认锁仍被当前 runner 持有。
+4. 手动 `/api/live-sell` 在实盘开关关闭时会临时获取同一进程锁，避免多服务进程同时对同一 live 持仓提交重复 SELL。
+5. `/api/status`、`/api/live-settings` 和 `/api/live-preflight` 增加 `process_lock_path` / `process_lock_acquired` 信息，便于排查多进程冲突。
+6. README 和实盘 runbook 补充单实例运行、锁文件和手动卖出锁保护说明。
+
+### 已确认决策
+
+1. 锁粒度绑定 live settings path，而不是端口或主 Paper DB；这样同一个实盘账户/实盘库只能被一个 live-enabled runner 操作。
+2. 进程锁不阻塞 Paper 采样；只有开启真实交易或手动真实卖出时才参与。
+3. 手动 SELL 不强制要求 `enabled=true`，但必须拿到同一实盘锁；这样关闭自动买入后仍可减仓，同时防止重复卖出。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k process_lock -v`，1 个进程锁测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，34 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，96 个核心测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启服务 `http://127.0.0.1:8791`，`/api/status` 返回 `running=true`、`enabled=false`、`process_lock_acquired=false`、`process_lock_path=data/live/live-settings.json.lock`。
+
+### 已知坑位
+
+1. 这是本机文件锁，不是分布式锁；如果未来把同一实盘账户部署到多台机器，需要外部数据库锁或交易所级幂等键。
+2. 如果进程被强杀，OS 会释放文件锁，但 `.lock` 文件内容可能保留旧 pid；判断是否锁住以 `process_lock_acquired` 和实际获取结果为准，不要只看文件存在。
+3. 当前环境仍缺真实凭证和真实资金，不能完成真实 CLOB 下单验收。
+
+### 回滚建议
+
+1. 如需仅回滚本次实盘进程锁，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.87 改动。
+
+## 2026-05-29 v2.86
+
+### 已完成
+
+1. 新增官方 BUY 提交前的二次开关检查：wallet/depth 检查完成后、调用 `place_market_buy` 之前，会再次确认 `enabled=true` 且风险确认仍然存在。
+2. 如果用户在 live run 前置检查过程中关闭实盘，本次 run 会停止在官方下单前，不再提交真实订单。
+3. 新增竞态测试：live run 卡在 wallet 检查时关闭实盘，放行后不会调用 `place_market_buy`，也不会写入 live order。
+4. README 和实盘 runbook 补充下单前二次开关检查说明。
+
+### 已确认决策
+
+1. 二次检查放在官方 BUY 提交前最后一刻；这样不会影响正常预检，但能覆盖关闭开关与下单之间的主要竞态窗口。
+2. 手动 SELL 不使用这个入场开关阻断，因为关闭风险通常需要允许用户减仓；SELL 仍有 token allowance、pending、重复提交保护。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k rechecks_enabled -v`，1 个关闭开关竞态测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，33 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+
+### 已知坑位
+
+1. 如果官方 BUY 已经进入 SDK `post_order` 调用，再关闭开关不能撤回已经提交的请求；此时应使用 `实盘急停` 和官方 open orders 核对。
+2. 当前仍缺真实凭证，不能用真实 CLOB 延迟场景验证该竞态。
+
+### 回滚建议
+
+1. 如需仅回滚本次下单前二次开关检查，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.86 改动。
+
+## 2026-05-29 v2.85
+
+### 已完成
+
+1. 新增 live runner 并发互斥：`LiveStrategyRunner.run_from_state()` 使用非阻塞运行锁，重叠进入时直接跳过第二个 live run。
+2. 新增 `overlap_skip_count` 运行态计数，便于从 `/api/status` 看是否发生过重叠 live run 跳过。
+3. 新增并发测试：第一条 live BUY 卡在官方下单中时，第二次 run 不会触发第二次 `place_market_buy`。
+4. README 和实盘 runbook 补充重叠 tick 的处理规则。
+
+### 已确认决策
+
+1. 重叠 live run 选择跳过而不是等待；这样可以避免过时的同一信号排队后再次提交真实订单。
+2. 互斥只保护 live runner，不阻塞 Paper 采样和页面状态读取。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k overlapping_live_run -v`，1 个并发互斥测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，33 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+
+### 已知坑位
+
+1. 如果频繁看到 `overlap_skip_count` 增加，说明 tick 周期、手动同步或官方 API 延迟已经让 live run 重叠，需要降低手动操作频率或拉长 tick interval。
+2. 这个互斥是单进程内保护；如果未来部署多进程/多实例，还需要引入跨进程锁或外部幂等机制。
+
+### 回滚建议
+
+1. 如需仅回滚本次 live runner 并发互斥，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.85 改动。
+
+## 2026-05-29 v2.84
+
+### 已完成
+
+1. 新增 pending BUY 期间的同市场入场阻断：同一市场只要存在活动中的 live buy entry order，就不会再提交另一方向或同方向的新 live buy。
+2. `SINGLE_FAK_REAL` 仍保留 legacy 反向双边逻辑，但前提是当前市场没有 `PENDING(待官方确认)` 的实盘买入订单。
+3. 新增测试覆盖：Up 买入进入 `PENDING` 后，市场反向产生 Down 信号，不会提交第二笔 live buy。
+4. README 和实盘 runbook 补充 pending BUY 期间不允许同市场新入场的规则。
+
+### 已确认决策
+
+1. Paper FAK 可以立即知道成交/取消，但实盘 pending BUY 无法确认官方状态前，不应按 Paper 的反向逻辑继续下第二笔单。
+2. 阻断范围限定为同一 market 的 live buy entry order，不用 pending SELL 作为 entry blocker；pending SELL 已有独立重复卖出保护。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k blocks_opposite_entry -v`，1 个 pending BUY 反向阻断测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k pending_order -v`，4 个 pending order 对账测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+
+### 已知坑位
+
+1. 如果官方 pending BUY 长时间无终态，同一市场新入场会被阻断；这是为了避免状态未知时重复暴露风险。
+2. 当前环境仍缺真实凭证，无法用真实 CLOB pending buy 订单验证官方返回格式。
+
+### 回滚建议
+
+1. 如需仅回滚本次 pending BUY 入场阻断，撤销 `src/polybot2other/live.py`、`src/polybot2other/storage.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.84 改动。
+
+## 2026-05-29 v2.83
+
+### 已完成
+
+1. 新增 pending SELL 重复提交保护：同一笔 live trade 如果已有活动中的 `FAK_SELL + PENDING` 退出订单，后端会拒绝再次 `/api/live-sell`。
+2. live open trades 出参新增 `pending_live_sell_order_id`、`pending_live_sell_external_order_id` 和 `pending_live_sell_status`，用于前端识别该持仓正在等待官方卖出确认。
+3. 前端持仓表在 pending SELL 期间把按钮显示为 `卖出确认中` 并禁用，避免重复点击触发重复 SELL。
+4. 静态资源版本号更新到 `20260529-v2-83`，避免浏览器缓存旧按钮逻辑。
+5. README 和实盘 runbook 补充 pending SELL 重复提交保护说明。
+
+### 已确认决策
+
+1. pending SELL 期间本地持仓仍显示 open，但不能再次卖出同一 trade；这样既不提前平仓，也不重复提交官方订单。
+2. 重复卖出阻断在服务端执行，前端禁用按钮只是体验增强，不能作为唯一保护。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell_pending_order_reconciles_to_official_fill -v`，1 个 pending SELL 对账与重复提交保护测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell -v`，6 个手动实盘卖出测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+
+### 已知坑位
+
+1. 如果官方 pending SELL 长时间没有终态，按钮会一直显示 `卖出确认中`；此时应先用 `刷新挂单` 和订单流水确认官方状态，而不是重复点击卖出。
+
+### 回滚建议
+
+1. 如需仅回滚本次重复卖出保护，撤销 `src/polybot2other/live.py`、`src/polybot2other/storage.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.83 改动。
+
+## 2026-05-29 v2.82
+
+### 已完成
+
+1. 修复手动实盘 SELL 的状态未知缺口：如果官方返回订单 ID 但没有确认成交，本地退出订单现在记录为 `PENDING(待官方确认)`，不会误记为取消。
+2. `PENDING` 的 FAK_SELL 会进入 live order reconcile；回查官方 order/trades 时使用 `side=SELL`，避免按 BUY 方向解析成交金额。
+3. 官方回查确认 SELL 成交后，才调用本地 `close_trade_shares` 平仓；确认无成交时才把退出订单改为 `CANCELED(已取消)`。
+4. 新增 `fill_external_pending_exit_order`，用于把 pending live exit order 与本地持仓平仓动作绑定。
+5. README 和实盘 runbook 补充手动卖出 pending 对账规则。
+
+### 已确认决策
+
+1. 手动 SELL 状态未知时，本地持仓继续保持 open；这是保守处理，避免官方可能已成交但本地误判导致账本提前变化。
+2. 只有官方成交金额明确时才平仓；缺成交金额时继续等待后续回查。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell -v`，6 个手动实盘卖出测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，32 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+
+### 已知坑位
+
+1. 如果官方长时间无法确认 SELL 状态，本地持仓会继续显示 open，并保留 PENDING 退出订单；这会更保守，但可能短时间内看起来像“卖出按钮没平仓”。
+2. 当前环境缺真实凭证，尚不能用真实 CLOB 订单验证 pending SELL 的官方回查返回格式。
+
+### 回滚建议
+
+1. 如需仅回滚本次 SELL pending 对账，撤销 `src/polybot2other/live.py`、`src/polybot2other/storage.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.82 改动。
+
+## 2026-05-29 v2.81
+
+### 已完成
+
+1. 新增实盘启动重启保护：如果 `data/live/live-settings.json` 上次保存了 `enabled=true`，新进程启动时会立刻保存回 `enabled=false`。
+2. 实盘运行态新增 `startup_rearmed` 标记，`last_error` 会显示 `服务启动后实盘开关已自动关闭，需要人工重新预检并开启`。
+3. 补充测试覆盖“保存 enabled=true 后重启不会自动恢复真实下单”。
+4. README 和实盘 runbook 补充启动重启保护说明。
+
+### 已确认决策
+
+1. 实盘开关不跨进程自动延续；每次服务启动后都必须人工重新预检并打开开关。
+2. 保留其他 live 配置，例如初始金额、单笔金额、风控阈值和风险确认，只重置 `enabled`，避免用户配置丢失。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k startup_rearms -v`，1 个启动重启保护测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，31 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+
+### 已知坑位
+
+1. 这个保护会让自动重启后的实盘保持关闭，需要人工重新打开；这是刻意的安全取舍，不适合无人值守恢复交易。
+2. 当前环境仍缺真实凭证，因此不能验证重启后再手动启用的真实 CLOB 下单链路。
+
+### 回滚建议
+
+1. 如需仅回滚本次启动重启保护，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.81 改动。
+
+## 2026-05-29 v2.80
+
+### 已完成
+
+1. 新增官方 open orders 只读状态闭环：实盘快照、实盘设置和前端实盘面板都会暴露官方 CLOB 当前 open orders 数量。
+2. 新增 `/api/live-open-orders` GET/HEAD 接口，GET 会强制刷新官方 `get_open_orders`；普通仪表盘轮询使用短缓存，避免频繁打官方 API。
+3. 缺少实盘凭证时，open orders 查询返回 `skipped=true` 和明确阻断原因，不再每轮状态刷新都尝试官方认证读取。
+4. 前端实盘面板新增 `刷新挂单` 按钮，用于手动核对官方 CLOB 仍有多少开放挂单。
+5. README 和实盘 runbook 补充 open orders 接口、按钮和上线后核对步骤。
+6. 静态资源版本号更新为 `20260529-v2-80`，避免浏览器缓存旧 `app.js`。
+
+### 已确认决策
+
+1. 当时官方 open orders 先作为监控/核对能力接入；从 v2.91 起已升级为实盘开启、预检和真实 BUY 前的硬门槛。
+2. 普通轮询只用短缓存，手动按钮和接口强制刷新；这样兼顾上线可见性和性能。
+3. 缺凭证时直接跳过官方读取；否则用户还没有进入实盘准备阶段，频繁认证失败没有业务价值。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k open_orders -v`，3 个 open orders 测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，30 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，90 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启本地服务 `http://127.0.0.1:8791`，`GET /api/live-open-orders` 在当前缺凭证环境返回 `ready=false`、`skipped=true`、`count=0` 和明确缺失凭证错误；`GET /api/live-settings` 同步暴露 `open_orders.skipped=true`。
+8. 已请求首页 HTML，确认包含 `live-open-orders-refresh` 和 `20260529-v2-80` 静态资源版本。
+
+### 已知坑位
+
+1. 当前环境缺真实 private key、signature type 和 funder，因此只能验证 open orders 的缺凭证阻断和页面/API 出参，不能验证官方 CLOB 在真实账户下返回的 open orders 内容。
+2. open orders 只说明官方仍有开放订单，不等于本地账本已完成结算；本地 `PENDING(待官方确认)` 仍要依赖 order/trade 回查或 pending timeout 收口。
+
+### 回滚建议
+
+1. 如需仅回滚本次官方挂单可见性，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.80 改动。
+
+## 2026-05-29 v2.79
+
+### 已完成
+
+1. 审计本地 `py_clob_client_v2`，确认 SDK 提供 `get_open_orders`、`cancel_order`、`cancel_orders`、`cancel_all` 和 `cancel_market_orders`。
+2. 新增实盘急停能力：`LiveStrategyRunner.emergency_stop()` 会先保存 `enabled=false`，再通过官方 SDK 调用 `cancel_all` 请求取消 CLOB 全部挂单。
+3. 新增 `/api/live-emergency-stop` POST 接口，返回急停前后 open orders 采样、官方 cancel response、错误和重试信息。
+4. 前端实盘面板新增 `实盘急停` 按钮，点击后关闭实盘并请求官方 cancel-all。
+5. 急停不会直接把本地 `PENDING(待官方确认)` 改成 canceled；这些订单继续通过官方 order/trade 回查或 FAK pending timeout 释放预算，避免可能已成交订单被本地误释放。
+6. README 和实盘 runbook 补充急停接口和命令行调用方式。
+
+### 已确认决策
+
+1. 实盘急停的第一步必须是保存 `enabled=false`，确保后续 tick 不再提交新订单。
+2. 官方 cancel-all 和本地 PENDING 对账拆开处理；cancel-all 是控制风险，PENDING 对账是资金账本一致性，不能混为一条本地状态更新。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k emergency_stop -v`，1 个实盘急停测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，27 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，87 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启本地服务 `http://127.0.0.1:8791`，并执行 `POST /api/live-emergency-stop` 烟测；当前无真实 private key，接口返回 `enabled=false`，官方 cancel-all 被认证缺失明确阻断。
+
+### 已知坑位
+
+1. 当前环境缺真实凭证，因此接口烟测只能验证服务正确阻断，不能验证官方 CLOB cancel-all 的真实响应。
+2. FAK 理论上应立即成交或取消；如果出现 `POST_STATUS_UNKNOWN` 或本地 PENDING，急停后仍需等待官方回查或本地 pending timeout 完成账本收口。
+
+### 回滚建议
+
+1. 如需仅回滚本次实盘急停能力，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.79 改动。
+
+## 2026-05-29 v2.78
+
+### 已完成
+
+1. 审计当前 8791 运行态实盘预检阻断点：当前市场已经拿到官方 `target_price=73205.342`，此前 target 缺失属于市场切换时详情尚未补齐的瞬时状态。
+2. 审计已安装 `py_clob_client_v2` 的 `MarketOrderArgsV2`：BUY 订单的 `amount` 是买入 USDC 金额，`user_usdc_balance` 会被 SDK 用于费用边界调整。
+3. 实盘 BUY 下单和签名预检现在都会把本次 stake 传给 SDK `user_usdc_balance`，让 SDK 在费用边界下按本次软件预算缩小签名订单金额，而不是签出可能超过单笔预算的订单。
+4. 签名预检返回的输入摘要新增 `user_usdc_balance`，用于确认当前预检和真实下单都带着单笔预算上限。
+5. README 和实盘 runbook 补充说明：`user_usdc_balance` 是 SDK 费用调整边界，不是链上硬限制。
+
+### 已确认决策
+
+1. `user_usdc_balance` 使用本次 stake，而不使用钱包真实余额；这样更符合 Lee 的“按配置初始金额/单笔金额约束，而不是按钱包全部余额下注”的要求。
+2. SELL 订单不传 `user_usdc_balance`，因为 SDK 文档和源码中该字段用于 BUY 费用调整。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k sign_market_order -v`，1 个签名预检测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live -v`，26 个 live 相关测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，86 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启本地服务 `http://127.0.0.1:8791`，`/api/live-settings` 返回 stake `2.0`，仍因缺少真实 private key、signature type、funder 而保持 `readiness.ready=false`；`/api/live-preflight` 当前拿到官方 target，但因开关、风险确认、凭证和当前策略信号阻断，未进入签名预检。
+
+### 已知坑位
+
+1. `user_usdc_balance` 只能影响 SDK 构造订单的金额边界；真实钱包仍必须使用低余额隔离钱包，防止外部手动操作或其他程序绕过本 bot 的软件预算。
+2. 当前环境仍没有真实凭证和 allowance，不能实际验证 SDK 费用调整后的真实 CLOB 成交。
+
+### 回滚建议
+
+1. 如需仅回滚本次 SDK 预算边界增强，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.78 改动。
+
+## 2026-05-29 v2.77
+
+### 已完成
+
+1. 实盘官方 API 的配置化快速重试范围从 create/post 下单扩展到 collateral balance/allowance 同步、conditional token balance/allowance 同步、官方 order 回查和官方 trades 回查。
+2. `readiness`、实盘预检、启用硬闸门、真实开仓前 wallet 检查、手动卖出前 token 检查、成交金额后验和 PENDING 订单轮询都使用当前 live 配置里的 `retry_count` / `retry_delay_ms`。
+3. 重试只覆盖 timeout/network/429/5xx 等暂时性失败；非重试类官方错误仍快速失败，避免把参数错误、权限错误或余额不足伪装成可恢复问题。
+4. 官方回查成功但经历过重试时，会在 raw response 里记录 `order_retry_reasons`、`trades_retry_reasons`、`sync_retry_reasons` 或 `read_retry_reasons`，方便后续排查真实 API 抖动。
+5. README 和实盘 runbook 补充重试配置的覆盖范围。
+
+### 已确认决策
+
+1. 重试次数继续沿用 UI/配置中的 live 参数，不额外引入另一套隐藏配置。
+2. 下单 post 阶段仍只重发同一份签名订单；读/同步类 API 可以重新调用，因为不会创建重复真实订单。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k retry`，3 个重试相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m py_compile src/polybot2other/live.py tests/test_core.py`，语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，86 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启本地服务 `http://127.0.0.1:8791`，`/api/live-settings` 返回当前 live retry 配置 `retry_count=2`、`retry_delay_ms=250`；因未配置真实 private key、signature type、funder，readiness 正确保持 `false`。
+
+### 已知坑位
+
+1. 重试不能解决永久性配置错误，例如错误 signature type、错误 funder、余额不足、allowance 不足、token_id 失效或市场不可交易。
+2. 当前运行环境仍没有真实凭证和资金，不能验证真实官方 API 抖动下的实际成交闭环。
+
+### 回滚建议
+
+1. 如需仅回滚本次读/同步类 API 重试扩展，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.77 改动。
+
+## 2026-05-29 v2.76
+
+### 已完成
+
+1. 实盘预检新增 `sign_market_order` 检查：当开关、风险确认、凭证、市场、目标价、策略信号、软件资金、策略风控、最小订单、盘口深度和 collateral wallet 都通过后，调用官方 SDK 构造并签名当前 FAK 订单参数。
+2. 签名预检只执行 `create_market_order`，不调用 `post_order`，不会提交到 CLOB，也不会把可提交的签名订单 payload 返回给前端。
+3. 实盘买入和签名预检共用 `_market_order_args`，确保 token、amount、side、price、tick_size、neg_risk 和 FAK order type 与真实下单路径一致。
+4. 预检返回 `signing.submitted_to_clob=false`、`status=SIGNED`、可审计的 `signed_order_hash` 和输入摘要，用于开实盘前发现签名类型、funder、token、tick size、negative risk 等 SDK 参数问题。
+5. README 和实盘 runbook 补充签名预检说明，避免把预检误解为真实下单。
+
+### 已确认决策
+
+1. 签名预检只在前置条件全部满足时执行；如果凭证或钱包未就绪，不额外触发 SDK 签名，避免干扰主阻断原因。
+2. 不返回签名订单原文，因为签名后的订单 payload 具备被提交风险；页面只展示非敏感审计摘要。
+3. 签名预检通过不等于真实成交，只代表 SDK 可以按当前快照构造并签名 FAK 参数；真实 tick 下单前仍会重新检查行情、钱包和风控。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_preflight`，2 个预检测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k sign_market_order`，1 个签名预检测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，84 个测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+5. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+6. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+7. 已重启本地服务 `http://127.0.0.1:8791`，`/api/live-settings` 返回 `enabled=false`、`readiness.ready=false`，明确阻断缺少 private key、signature type、funder。
+8. 已执行 `/api/live-preflight` 烟测；当前因开关、风险确认、凭证和信号未满足而 `can_place_next_order=false`，未进入签名预检，符合无真实凭证环境的预期。
+
+### 已知坑位
+
+1. 当前运行环境仍缺真实私钥、signature type、funder、钱包资金和 allowance，因此接口烟测会在凭证阶段阻断，不会进入真实 SDK 签名。
+2. 签名预检本身不会检测 CLOB 最终撮合结果；post 阶段网络异常和撮合状态仍按 PENDING/官方回查链路处理。
+
+### 回滚建议
+
+1. 如需仅回滚本次签名预检，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.76 改动。
+
+## 2026-05-29 v2.75
+
+### 已完成
+
+1. `load_settings()` 的本地 env 文件加载结果 now 暴露为 `env_file_status()`，包含加载文件路径、加载的 `POLYBOT2OTHER_*` 键、被现有环境变量跳过的键和被忽略的非项目前缀数量。
+2. live readiness 新增 `env_files` 和 `credential_presence`，用于确认服务是否实际读取 `.env.live`，以及 private key、signature type、funder、API creds 是否存在。
+3. 前端实盘 readiness 区域显示凭证存在状态和 env 文件路径，但不显示任何私钥或 secret 值。
+4. README 和实盘 runbook 补充 readiness 的 env 文件/凭证存在状态说明。
+5. 新增测试确认 readiness 不泄露私钥值，并确认 env 文件状态记录 loaded/skipped/ignored 信息。
+
+### 已确认决策
+
+1. readiness 只暴露布尔存在状态，不暴露任何密钥、secret、passphrase、私钥或 funder 以外的敏感值。
+2. env 文件路径和键名用于排障，密钥内容仍只存在本机环境变量。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k settings`，2 个设置相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k readiness`，3 个 readiness 相关测试通过。
+
+### 已知坑位
+
+1. 修改 `.env.live` 后仍需重启服务进程，readiness 会显示当前进程实际加载到的状态。
+
+### 回滚建议
+
+1. 如需仅回滚本次 readiness/env 可见性增强，撤销 `src/polybot2other/config.py`、`src/polybot2other/live.py`、`src/polybot2other/static/app.js`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.75 改动。
+
+## 2026-05-29 v2.74
+
+### 已完成
+
+1. `load_settings()` 增加本地 env 文件自动加载，默认按 `.env.live`、`.env.local`、`.env` 顺序读取 `POLYBOT2OTHER_*` 键。
+2. 新增 `POLYBOT2OTHER_ENV_FILE` 支持，可显式指定本机 env 文件路径。
+3. env 文件加载不会覆盖进程里已有环境变量，也不会加载非 `POLYBOT2OTHER_` 前缀的键，降低密钥误污染和误覆盖风险。
+4. README 和实盘 runbook 更新启动方式：不再需要手动 `set -a; . ./.env.live`。
+5. 新增测试覆盖 `.env.live` 自动加载、显式 env 文件加载、进程环境变量优先级和非项目前缀忽略。
+
+### 已确认决策
+
+1. 继续允许真实私钥只存在本机 `.env.live` 或真实环境变量中；`.env.live` 已在 `.gitignore` 中忽略。
+2. 现有环境变量优先于 env 文件，便于系统服务、容器或临时命令覆盖本地文件。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k load_settings`，2 个配置加载测试通过。
+
+### 已知坑位
+
+1. `.env.live` 自动加载只发生在服务进程当前工作目录；如果从其他目录启动，需要设置 `POLYBOT2OTHER_ENV_FILE` 指向绝对路径。
+
+### 回滚建议
+
+1. 如需仅回滚本次 env 自动加载，撤销 `src/polybot2other/config.py`、`tests/test_core.py`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.74 改动。
+
+## 2026-05-29 v2.73
+
+### 已完成
+
+1. 实盘 post_order 阶段在提交前尝试从 SDK builder 推导签名订单 hash，写入 raw response 作为 `signed_order_hash`。
+2. 如果 post_order 最终失败且最后错误属于网络/超时/5xx 等可重试类别，并且已经有签名订单 hash，则返回 `POST_STATUS_UNKNOWN`，把该 hash 作为 `external_order_id` 进入 PENDING 对账路径。
+3. 这样真实请求“可能已经到达 CLOB 但本地没有收到响应”时，不会立即按 REJECTED 释放软件预算，也不会创建本地持仓；后续通过官方 order/trades 回查修正。
+4. FAK PENDING 增加 120 秒本地最大等待；超过等待时间仍没有官方成交/无成交证据时，转为 `CANCELED` 并释放软件预算。
+5. `POST_STATUS_UNKNOWN` 后如果立即回查遇到 `RECONCILE_ERROR`，保留原 PENDING 状态，不用一次回查失败覆盖成 REJECTED。
+6. 新增测试覆盖同一签名订单连续超时后保留 signed order hash 并返回 `POST_STATUS_UNKNOWN`，以及 PENDING 超时释放软件预算。
+
+### 已确认决策
+
+1. 对提交状态未知的真实订单，优先保守记为 PENDING，而不是 REJECTED。
+2. 只有可重试/不确定类异常才进入 `POST_STATUS_UNKNOWN`；非重试类错误仍按拒单处理。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k retry`，3 个 retry 相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live`，21 个 live 相关测试通过。
+
+### 已知坑位
+
+1. signed order hash 是否等同官方 get_order 可查 id 依赖 Polymarket CLOB 当前实现；已按 SDK builder 生成的 EIP712 order hash 处理。
+2. 120 秒超时后如果官方后续才出现成交，本地不会自动恢复该订单；因为 FAK 应立即成交/取消，这里选择优先释放小资金实盘的软件预算。
+
+### 回滚建议
+
+1. 如需仅回滚本次未知提交状态追踪，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档的 v2.73 改动。
+
+## 2026-05-29 v2.72
+
+### 已完成
+
+1. 实盘买入响应如果是 `matched/filled` 但缺少官方成交金额，会先使用 `external_order_id` 回查官方 order/trades；只有回查没有可用成交金额时才退回盘口 sweep 估算。
+2. 手动实盘卖出响应如果是 `matched/filled` 但缺少官方成交金额，也会先回查官方 order/trades，再按官方金额决定实际平仓份额。
+3. 新增 `_response_has_fill_amounts`，把“有成交状态”和“有可用于本地账本的成交金额”拆开判断。
+4. 新增测试覆盖：买入 matched 但无金额时回查官方成交金额；手动卖出 matched 但无金额时回查官方成交金额。
+
+### 已确认决策
+
+1. `matched/filled` 状态可以作为成交证据，但本地账本金额优先使用官方回查到的 shares/notional/avg price。
+2. 若官方响应和回查都没有成交金额，才允许退回下单前 orderbook sweep 估算，避免实盘账本过早依赖预估。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live`，20 个 live 相关测试通过。
+
+### 已知坑位
+
+1. 当前环境仍缺真实凭证和真实钱包授权，不能执行真实成交验证。
+2. 若官方 order/trades 接口短时不可用，但 post 响应已经明确 matched，本地仍可能退回盘口 sweep 估算；后续可继续增加成交后异步金额校正。
+
+### 回滚建议
+
+1. 如需仅回滚本次官方金额回查增强，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档的 v2.72 改动。
+
+## 2026-05-29 v2.71
+
+### 已完成
+
+1. 实盘开关从普通配置位升级为 armed-state 硬闸门：启用时必须通过风险确认、软件隔离资金、SDK 凭证、真实 collateral balance 和 allowance 检查。
+2. readiness 不通过时，服务端会把 `enabled` 自动保存回 `false`，并把阻断原因写入 `last_error`，避免页面显示“实盘开启”但实际 tick 才阻断。
+3. 新增测试覆盖：缺少私钥时 `set_live_enabled(true)` 保持关闭；collateral allowance 不足时启用阶段即阻断。
+4. live 相关单测中的部分入场动作改为直接调用 `LiveStrategyRunner.run_from_state`，减少与主 Paper 路径的时间耦合，避免盘口时间戳在测试中意外过期。
+5. 实盘 runbook 补充：开关是 armed-state 控制，不是普通 UI 标记。
+
+### 已确认决策
+
+1. 允许保存实盘参数和风险确认，但不允许在 readiness 失败时保存 `enabled=true`。
+2. 当前硬闸门只检查进入待下单状态所必需的内容；具体策略信号、当前盘口深度、最小订单量仍在预检和每次 tick 下单前再次检查。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live`，19 个 live 相关测试通过。
+
+### 已知坑位
+
+1. 当前环境仍缺真实私钥、signature type、funder、钱包资金和 allowance，因此服务会正确保持 `enabled=false`。
+
+### 回滚建议
+
+1. 如需仅回滚本次实盘开关硬闸门，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`docs/live-trading-runbook.md` 和本进度文档的 v2.71 改动。
+
+## 2026-05-29 v2.70
+
+### 已完成
+
+1. 实盘 collateral 和 conditional token 预检改为先调用 Polymarket CLOB `update_balance_allowance` 同步缓存，再读取 `get_balance_allowance`，降低刚充值或刚授权后读取到旧 allowance 的风险。
+2. 下单前的 `create_market_order` 阶段也接入配置化快速重试；如果该阶段失败，订单还没有提交到 CLOB，返回 `CREATE_ERROR` 且不会记为已成交。
+3. 继续保持 post 阶段重试只重发同一份签名订单，避免网络异常时生成多张不同签名订单。
+4. 不再把缺少成交金额、成交记录或 matched/filled 状态的 `OK` 响应当成本地成交；有 order id 但未确认成交时进入 `PENDING(待官方确认)`。
+5. 新增 `.env.live.example` 和 `docs/live-trading-runbook.md`，把实盘密钥、signature type、funder、启动、预检、开启、订单后验和回滚步骤写清楚。
+6. `.gitignore` 增加 `.env`、`.env.live`、`.env.local`，防止真实密钥文件误提交。
+
+### 已确认决策
+
+1. 密钥仍只允许本机环境变量或本机忽略文件承载，不进入数据库、页面配置或仓库。
+2. `initial_balance` 继续作为软件预算，不伪装成链上硬限制；真实风控仍建议使用低余额隔离钱包。
+3. 没有官方成交证据时，本地账本不创建 live 持仓，优先进入 PENDING 或 no-fill 状态等待后验。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live`，18 个 live 相关测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+
+### 已知坑位
+
+1. 代码侧已经具备真实下单路径，但当前运行环境仍缺真实私钥、signature type、funder、钱包资金和 allowance，不能验证真实成交。
+2. `update_balance_allowance` 依赖官方 CLOB API 可用；若官方接口短时失败，实盘开仓/卖出会被预检阻断。
+
+### 回滚建议
+
+1. 如需仅回滚本次实盘强化，撤销 `src/polybot2other/live.py`、`tests/test_core.py`、`.gitignore`、`.env.live.example`、`README.md`、`docs/live-trading-runbook.md` 和本进度文档的 v2.70 改动。
+
+## 2026-05-29 v2.69
+
+### 已完成
+
+1. 新增实盘预检链路：`LiveStrategyRunner.preflight` 汇总开关、风险确认、凭证、当前市场、官方目标价、策略信号、软件隔离资金、策略风控、最小订单、盘口深度和真实 collateral wallet balance/allowance。
+2. 新增 `/api/live-preflight` GET/HEAD/POST 接口；预检只读，不会触发真实下单。
+3. 前端实盘面板新增“预检”按钮和结果区，展示是否可真实下单、当前信号、预算和阻断原因。
+4. 新增单测覆盖缺少真实凭证时预检阻断，以及 fake wallet/盘口满足时预检通过。
+
+### 已确认决策
+
+1. 预检不会自动保存页面正在编辑但未点击“保存”的参数，避免误把开关或资金参数写入运行配置。
+2. 预检返回的 `can_place_next_order=true` 只代表当前快照具备下单条件；真实下单仍以 tick 到达时的最新市场、盘口、钱包和风控检查为准。
+3. 缺少 private key、signature type、funder address 等凭证时，不继续检查真实 wallet，避免误导为链上余额问题。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_preflight`，2 个新增预检测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，73 个测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+5. 已执行 `rtk proxy git diff --check`，未发现空白错误。
+
+### 已知坑位
+
+1. 当前仍未提供真实密钥、funder 地址、钱包余额和 allowance，无法验证真实成交。
+2. 预检是某一时刻的只读快照，市场切换、盘口过期、钱包余额变化都可能让下一次 tick 的真实下单条件发生变化。
+
+### 回滚建议
+
+1. 如需仅回滚本次预检入口，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档的 v2.69 改动。
+
+## 2026-05-29 v2.68
+
+### 已完成
+
+1. 实盘 readiness 增加 `POLYBOT2OTHER_LIVE_SIGNATURE_TYPE` 和 `POLYBOT2OTHER_LIVE_FUNDER_ADDRESS` 强校验，API key/secret/passphrase 只能同时配置或全部留空由 SDK 派生。
+2. 实盘 FAK 下单改为把当前 CLOB quote 的 `tick_size` 和 `neg_risk` 传给官方 SDK，避免固定 `0.01` tick size 在特殊市场被拒单。
+3. 官方下单响应包含 `makingAmount` / `takingAmount` 时，live 持仓优先按官方 matched amount 记录 shares、notional 和 entry price；只有响应缺少金额时才退回下单前盘口 sweep 估算。
+4. 手动卖出只有在官方响应确认成交后才本地平仓；如果 FAK sell 只返回 live/delayed/unmatched，会记录取消/未成交订单并保留持仓。
+5. 手动卖出如官方返回部分成交金额，只按实际成交份额部分平仓，剩余份额继续保留为 OPEN。
+6. 盘口 REST 深度兜底不再用空 REST quote 覆盖已有 best ask/ask size，避免短暂 REST 空响应导致策略跳过。
+7. 新建本地 `.venv` 并安装项目依赖，确认 `py_clob_client_v2` 在项目运行环境可导入。
+8. 新增 live `PENDING` 订单状态：FAK 返回 order id 但未确认成交时先锁定软件预算，并通过官方 order/trades 查询回查；确认成交后转 FILLED，确认无成交后转 CANCELED 并释放预算。
+9. 若响应没有 order id，则不会进入 `PENDING`，避免无法回查的订单永久占用软件预算。
+10. 新增真实 Polymarket collateral `balance` / `allowance` 预检；开仓前要求两者都覆盖本次实际 stake，避免只靠软件预算导致实盘下单才失败。
+11. 前端实盘 readiness 展示 wallet balance、allowance 和 required cash，便于开关前确认真实钱包准备情况。
+12. 新增手动卖出前 conditional token `balance` / `allowance` 预检；真实 token 余额或授权不足时不发卖单，并在订单流水写入 `TOKEN_PRECHECK_FAILED`。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，71 个测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall src`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+4. 已执行 `rtk git diff --check`，未发现空白错误。
+5. 已启动 venv 最新服务 `http://127.0.0.1:8791`，`/api/live-settings` 确认 SDK 可用，当前仅缺真实 `PRIVATE_KEY`、`SIGNATURE_TYPE`、`FUNDER_ADDRESS`。
+
+### 已知坑位
+
+1. 当前仍未配置真实私钥/API 凭证，也未执行真实订单；不能把 SDK readiness 通过等同于真实下单完成。
+2. 当前已对有 order id 的 delayed/unmatched/live 状态做轮询回查；没有 order id 的网络超时仍无法证明是否到达 CLOB，后续可继续研究 SDK 是否能稳定暴露签名订单 hash。
+
+## 2026-05-29 v2.67
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_REAL` 实盘组合，默认关闭，策略行为沿用当前 `SINGLE_FAK`：FAK taker 入场，保留 legacy 反转双边买入行为。
+2. 新增独立实盘库 `data/live/single_fak_real.sqlite3` 和实盘配置文件 `data/live/live-settings.json`，Paper 主库和策略实验库继续独立运行。
+3. 接入 `py_clob_client_v2` 官方 CLOB SDK 适配层，实盘密钥只从 `POLYBOT2OTHER_LIVE_*` 环境变量读取。
+4. 实盘配置支持页面调整：开关、初始金额、单笔金额、最大持仓、单日亏损停止、总回撤停止、API 快速重试次数和重试间隔。
+5. 实盘使用软件隔离预算：以配置的 `initial_balance` 作为 bot 内部风控本金，不直接按钱包全余额下注。
+6. 新增实盘持仓手动卖出按钮，按当前同方向 bid 发起 FAK sell，并把提前退出写为 `early_exit`。
+7. 持仓、订单流水、交易记录的数据范围下拉扩展为主账户、策略实验全部、单个 Paper 组合和 `SINGLE_FAK_REAL`。
+8. 订单流水增加 live 外部订单字段：`execution_mode`、`external_order_id`、`client_order_id`、`external_status`、`raw_response`。
+9. 实盘结算沿用官方结果优先、Chainlink 兜底、后续官方重查修正的现有结算链路。
+
+### 已确认决策
+
+1. Paper 采集不因实盘开关而停止，方便后续对比 Paper 与 Live 差异。
+2. `SINGLE_FAK_REAL` 暂不使用 `STRICT`、`REVERSAL`、`STOP_AND_FLIP` 新变体，而是完全复刻当前 `SINGLE_FAK` 基线。
+3. 当前版本先做单实盘组合的可扩展结构，后续新增 live 组合时继续复用独立 store + variant payload。
+4. API 重试按配置快速重试；真实下单会先生成一份签名 FAK 订单，异常时重发同一份签名订单，避免每次重试生成不同订单。
+
+### 待办和后期优化
+
+1. 接入 Polymarket user/order websocket 或定时订单查询，补齐 delayed/unmatched/请求超时后的官方最终订单状态对账。
+2. 增加 live 专用审计日志和密钥启动自检页，避免密钥缺失时只在 readiness 文案中提示。
+3. 后续接入 `SINGLE_FAK_STRICT_REAL`、`SINGLE_FAK_REVERSAL_REAL`、`SINGLE_FAK_STOP_AND_FLIP_REAL` 时，需要继续保持独立库和独立风控。
+4. 增加 FAK 下单超时后的官方订单查询确认，把“请求失败但订单可能已到达 CLOB”的状态自动修正。
+
+### 已知坑位
+
+1. `initial_balance` 是 bot 内的软件预算，不是钱包链上限制；实盘必须使用低余额隔离钱包。
+2. Polymarket 市场存在最小订单量，若配置单笔金额低于 CLOB `min_order_size`，实盘会跳过下单。
+3. 当前 matched 响应已有官方金额优先记录；如果官方返回 delayed/unmatched 或请求超时，需要后续订单同步模块修正最终状态。
+4. 美国等受限地区可能不能合法使用 Polymarket，实盘前必须自行确认所在地合规性。
+
+### 验证记录
+
+1. 已执行 `rtk proxy python3 -m compileall src`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src python3 -m unittest tests.test_core`，当前测试总数更新为 64。
+4. 新增测试覆盖：实盘关闭不下单、`SINGLE_FAK_REAL` fake SDK 成交、live scope 查询、手动卖出关闭 live 持仓、官方 fixed-math 成交金额解析、tick/neg risk 传参、signature/funder readiness 校验。
+5. 已补充同一签名订单重试测试，确认网络异常后不会重新生成另一张订单再提交。
+
+### 回滚建议
+
+1. 如需回滚实盘接入，撤销 `pyproject.toml`、`src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/config.py`、`src/polybot2other/storage.py`、`src/polybot2other/polymarket.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py`、`README.md` 和本进度文档的 v2.67 改动。
+2. 如只需清空实盘数据，停止服务后删除 `data/live/single_fak_real.sqlite3`、对应 WAL/SHM 文件和 `data/live/live-settings.json`。
+
 ## 2026-05-29 v2.66
 
 ### 已完成

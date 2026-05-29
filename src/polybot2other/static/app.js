@@ -3,6 +3,31 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 
 const ids = {
   runtime: document.getElementById("runtime-pill"),
+  liveEnabled: document.getElementById("live-enabled"),
+  liveStatus: document.getElementById("live-status"),
+  liveInitialBalance: document.getElementById("live-initial-balance"),
+  liveStakeDollars: document.getElementById("live-stake-dollars"),
+  liveMaxOpenTrades: document.getElementById("live-max-open-trades"),
+  liveMaxEntryPrice: document.getElementById("live-max-entry-price"),
+  liveMaxDailyLoss: document.getElementById("live-max-daily-loss"),
+  liveMaxTotalDrawdown: document.getElementById("live-max-total-drawdown"),
+  liveRetryCount: document.getElementById("live-retry-count"),
+  liveRetryDelayMs: document.getElementById("live-retry-delay-ms"),
+  liveComplianceAck: document.getElementById("live-compliance-ack"),
+  liveSettingsToggle: document.getElementById("live-settings-toggle"),
+  liveSettingsPanel: document.getElementById("live-settings-panel"),
+  liveSaveSettings: document.getElementById("live-save-settings"),
+  liveReloadCredentials: document.getElementById("live-reload-credentials"),
+  livePreflight: document.getElementById("live-preflight"),
+  liveDoctor: document.getElementById("live-doctor"),
+  liveOnce: document.getElementById("live-once"),
+  liveOpenOrdersRefresh: document.getElementById("live-open-orders-refresh"),
+  liveEmergencyStop: document.getElementById("live-emergency-stop"),
+  liveReadiness: document.getElementById("live-readiness"),
+  livePreflightResult: document.getElementById("live-preflight-result"),
+  liveDoctorResult: document.getElementById("live-doctor-result"),
+  liveOnceResult: document.getElementById("live-once-result"),
+  liveTerminalLines: document.getElementById("live-terminal-lines"),
   accountScopeSelect: document.getElementById("account-scope-select"),
   accountScopeLabel: document.getElementById("account-scope-label"),
   accountScopeSource: document.getElementById("account-scope-source"),
@@ -66,6 +91,7 @@ const EQUITY_CURVE_MAX_POINTS = 1200;
 const EQUITY_CURVE_REFRESH_MS = 30_000;
 const METRIC_ANIMATION_MS = 360;
 const RECENT_SKELETON_ROWS = 8;
+const LIVE_LOG_LIMIT = 80;
 const SNAPSHOT_LEADER_KEY = "polybot2other:snapshot-leader";
 const SNAPSHOT_LEADER_TTL_MS = 2_500;
 const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -75,6 +101,7 @@ const FIELD_STORAGE_KEYS = {
   recent: "polybot2other:recent-trade-fields",
 };
 const ORDER_STATUS_LABELS = {
+  PENDING: "待官方确认",
   RESTING: "挂单中",
   PARTIAL_RESTING: "部分成交挂单",
   FILLED: "完全成交",
@@ -94,6 +121,12 @@ let priceWsStatus = "waiting";
 let lastSnapshotPostMs = 0;
 let snapshotInFlight = false;
 let latestStatus = null;
+let livePreflight = null;
+let liveDoctor = null;
+let liveOnce = null;
+let liveLogRows = [];
+const liveLogLastByKey = new Map();
+let liveSettingsOpen = false;
 let recentRows = [];
 let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
 let recentSummary = null;
@@ -104,6 +137,7 @@ let orderDataScope = "main";
 let recentDataScope = "main";
 let accountScope = "main";
 let accountScopeOptionsKey = "";
+let tableScopeOptionsKey = "";
 let strategyTables = null;
 let strategyTablesLoading = false;
 let lastStrategyTablesFetchMs = 0;
@@ -153,6 +187,7 @@ let priceState = {
 };
 
 const openTradeFields = [
+  { key: "live_sell_action", label: "操作", render: (row) => liveSellButton(row) },
   { key: "strategy_type", label: "策略", render: (row) => safe(row.strategy_type) },
   { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
   { key: "stake", label: "本金", render: (row) => fmtMoneyCell(row.stake) },
@@ -240,9 +275,12 @@ const experimentOrderFields = [
   comboField,
   ...recentOrderFields.filter((field) => !["detail_toggle", "cancel_action"].includes(field.key)),
 ];
+const scopedOrderFields = [comboField, ...recentOrderFields.filter((field) => field.key !== "cancel_action")];
+const scopedOpenFields = [comboField, ...openTradeFields];
+const scopedRecentFields = [comboField, ...recentTradeFields];
 
 const defaultOpenFieldKeys = [
-  "strategy_type", "side", "stake", "entry_price", "shares", "current_bid", "current_ask",
+  "live_sell_action", "strategy_type", "side", "stake", "entry_price", "shares", "current_bid", "current_ask",
   "exit_value", "unrealized_pnl", "unrealized_roi_pct", "max_payout",
   "max_profit", "target_price", "current_price", "current_distance_bps",
   "left", "reason",
@@ -261,7 +299,8 @@ const defaultOrderFieldKeys = [
 
 function experimentFieldKeys(kind) {
   const base = selectedFields[kind] || [];
-  return ["combo", ...base.filter((key) => !["detail_toggle", "cancel_action"].includes(key))];
+  const extra = kind === "open" ? ["live_sell_action"] : [];
+  return ["combo", ...extra, ...base.filter((key) => !["detail_toggle", "cancel_action", "live_sell_action"].includes(key))];
 }
 
 let selectedFields = {
@@ -293,6 +332,73 @@ function fmtTime(seconds) {
 function fmtMs(ms) {
   if (!ms) return "-";
   return new Date(ms).toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function setLiveSettingsOpen(open) {
+  liveSettingsOpen = Boolean(open);
+  if (ids.liveSettingsPanel) ids.liveSettingsPanel.hidden = !liveSettingsOpen;
+  if (ids.liveSettingsToggle) ids.liveSettingsToggle.setAttribute("aria-expanded", liveSettingsOpen ? "true" : "false");
+}
+
+function toggleLiveSettingsPanel() {
+  setLiveSettingsOpen(!liveSettingsOpen);
+}
+
+function appendLiveLog({ key = "", level = "info", title = "", message = "", details = [], code = "" } = {}) {
+  if (!ids.liveTerminalLines) return;
+  const normalizedDetails = Array.isArray(details) ? details.filter(Boolean).map((item) => String(item)) : [];
+  const normalized = {
+    level: String(level || "info"),
+    title: String(title || "实盘日志"),
+    message: String(message || ""),
+    details: normalizedDetails,
+    code: String(code || ""),
+  };
+  const signature = JSON.stringify(normalized);
+  if (key) {
+    const previous = liveLogLastByKey.get(key);
+    if (previous === signature) return;
+    liveLogLastByKey.set(key, signature);
+  }
+  liveLogRows.unshift({ ...normalized, at_ms: Date.now() });
+  liveLogRows = liveLogRows.slice(0, LIVE_LOG_LIMIT);
+  renderLiveTerminal();
+}
+
+function renderLiveTerminal() {
+  if (!ids.liveTerminalLines) return;
+  if (!liveLogRows.length) {
+    ids.liveTerminalLines.innerHTML = `<div class="live-terminal-empty">等待实盘事件</div>`;
+    return;
+  }
+  ids.liveTerminalLines.innerHTML = liveLogRows.map((row) => {
+    const details = row.details.length
+      ? `<div class="live-log-details">${row.details.map((item) => `<div>${safe(item)}</div>`).join("")}</div>`
+      : "";
+    const code = row.code ? `<pre class="live-log-code">${safe(row.code)}</pre>` : "";
+    return `<div class="live-log-entry ${safe(row.level)}">` +
+      `<div class="live-log-main">` +
+        `<span class="live-log-time">${safe(fmtMs(row.at_ms))}</span>` +
+        `<span class="live-log-title">${safe(row.title)}</span>` +
+        `${row.message ? `<span class="live-log-message">${safe(row.message)}</span>` : ""}` +
+      `</div>${details}${code}</div>`;
+  }).join("");
+}
+
+async function withButtonLoading(button, task, after = null) {
+  if (!button) return task();
+  const wasDisabled = button.disabled;
+  button.disabled = true;
+  button.classList.add("is-loading");
+  button.setAttribute("aria-busy", "true");
+  try {
+    return await task();
+  } finally {
+    button.classList.remove("is-loading");
+    button.removeAttribute("aria-busy");
+    button.disabled = wasDisabled;
+    if (typeof after === "function") after();
+  }
 }
 
 function fmtLeft(endsAt) {
@@ -386,17 +492,53 @@ function renderAccountScope(data = latestStatus) {
   const current = accountScopeMeta(data);
   if (ids.accountScopeLabel) ids.accountScopeLabel.textContent = current.label;
   if (ids.accountScopeSource) ids.accountScopeSource.textContent = current.source;
-  if (ids.paperOnly) ids.paperOnly.textContent = `${current.label} · Paper Only`;
+  if (ids.paperOnly) ids.paperOnly.textContent = parseAccountScope(accountScope).scope === "live" ? `${current.label} · Live` : `${current.label} · Paper`;
+  renderDataScopeOptions(data);
+}
+
+function renderDataScopeOptions(data = latestStatus) {
+  const options = tableScopeOptions(data);
+  const optionsKey = options.map((option) => `${option.value}:${option.label}`).join("|");
+  if (optionsKey === tableScopeOptionsKey) return;
+  tableScopeOptionsKey = optionsKey;
+  for (const [select, current] of [
+    [ids.openDataScope, openDataScope],
+    [ids.orderDataScope, orderDataScope],
+    [ids.recentDataScope, recentDataScope],
+  ]) {
+    if (!select) continue;
+    select.innerHTML = options.map((option) => `<option value="${safe(option.value)}">${safe(option.label)}</option>`).join("");
+    select.value = options.some((option) => option.value === current) ? current : "main";
+  }
+  if (!options.some((option) => option.value === openDataScope)) openDataScope = "main";
+  if (!options.some((option) => option.value === orderDataScope)) orderDataScope = "main";
+  if (!options.some((option) => option.value === recentDataScope)) recentDataScope = "main";
 }
 
 function accountScopeOptions(data = latestStatus) {
   const variants = strategyExperimentVariants(data);
+  const live = liveVariant(data);
   return [
     { value: "main", label: "主账户" },
     ...variants.map((row) => ({
       value: `experiment:${row.variant_id}`,
       label: row.combo || row.variant_id,
     })),
+    ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
+  ];
+}
+
+function tableScopeOptions(data = latestStatus) {
+  const variants = strategyExperimentVariants(data);
+  const live = liveVariant(data);
+  return [
+    { value: "main", label: "主账户" },
+    { value: "experiment", label: "策略实验全部" },
+    ...variants.map((row) => ({
+      value: `experiment:${row.variant_id}`,
+      label: row.combo || row.variant_id,
+    })),
+    ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
   ];
 }
 
@@ -405,8 +547,14 @@ function strategyExperimentVariants(data = latestStatus) {
   return Array.isArray(variants) ? variants : [];
 }
 
+function liveVariant(data = latestStatus) {
+  const variant = data?.runtime?.live_trading?.variant;
+  return variant && typeof variant === "object" ? variant : null;
+}
+
 function selectedAccountVariant(data = latestStatus) {
   const selection = parseAccountScope(accountScope);
+  if (selection.scope === "live") return liveVariant(data);
   if (selection.scope !== "experiment") return null;
   return strategyExperimentVariants(data).find((row) => row.variant_id === selection.variantId) || null;
 }
@@ -420,6 +568,12 @@ function selectedAccountMetrics(data = latestStatus) {
 function accountScopeMeta(data = latestStatus) {
   const variant = selectedAccountVariant(data);
   if (variant) {
+    if (variant.account_scope === "live" || parseAccountScope(accountScope).scope === "live") {
+      return {
+        label: variant.combo || variant.variant_id,
+        source: `实盘隔离账户 · ${variant.variant_id}`,
+      };
+    }
     return {
       label: variant.combo || variant.variant_id,
       source: `策略实验隔离账户 · ${variant.variant_id}`,
@@ -433,7 +587,52 @@ function parseAccountScope(value) {
   if (text.startsWith("experiment:")) {
     return { scope: "experiment", variantId: text.slice("experiment:".length).toUpperCase() };
   }
+  if (text === "experiment") {
+    return { scope: "experiment_all", variantId: null };
+  }
+  if (text.startsWith("live:") || text === "live") {
+    const variantId = text.includes(":") ? text.slice("live:".length).toUpperCase() : "SINGLE_FAK_REAL";
+    return { scope: "live", variantId };
+  }
   return { scope: "main", variantId: null };
+}
+
+function isExperimentAggregateScope(value) {
+  return parseAccountScope(value).scope === "experiment_all";
+}
+
+function isExperimentVariantScope(value) {
+  return parseAccountScope(value).scope === "experiment";
+}
+
+function isLiveScope(value) {
+  return parseAccountScope(value).scope === "live";
+}
+
+function isMainScope(value) {
+  return parseAccountScope(value).scope === "main";
+}
+
+function scopeLabel(value) {
+  const parsed = parseAccountScope(value);
+  if (parsed.scope === "main") return "主账户";
+  if (parsed.scope === "experiment_all") return "策略实验";
+  if (parsed.scope === "live") return liveVariant()?.combo || "SINGLE_FAK_REAL";
+  const variant = strategyExperimentVariants().find((row) => row.variant_id === parsed.variantId);
+  return variant?.combo || parsed.variantId || "策略实验";
+}
+
+function appendScopeParams(params, value) {
+  const parsed = parseAccountScope(value);
+  if (parsed.scope === "live") {
+    params.set("account_scope", "live");
+  } else if (parsed.scope === "experiment") {
+    params.set("account_scope", "strategy_experiment");
+    params.set("variant_id", parsed.variantId);
+  } else {
+    params.set("account_scope", "main");
+  }
+  return params;
 }
 
 function renderRuntime(runtime) {
@@ -442,6 +641,241 @@ function renderRuntime(runtime) {
   ids.runtime.textContent = hasError ? "异常" : stalePrice ? "等待实时价" : "实时运行";
   ids.runtime.classList.toggle("error", hasError || stalePrice);
   ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus}`;
+}
+
+function renderLivePanel(data = latestStatus) {
+  const live = data?.runtime?.live_trading || {};
+  const settings = live.settings || data?.settings?.live_trading || {};
+  const readiness = live.readiness || settings.readiness || {};
+  if (ids.liveEnabled) ids.liveEnabled.checked = Boolean(settings.enabled ?? live.enabled);
+  if (ids.liveComplianceAck) ids.liveComplianceAck.checked = Boolean(settings.compliance_acknowledged);
+  setInputIfIdle(ids.liveInitialBalance, settings.initial_balance);
+  setInputIfIdle(ids.liveStakeDollars, settings.stake_dollars);
+  setInputIfIdle(ids.liveMaxOpenTrades, settings.max_open_trades);
+  setInputIfIdle(ids.liveMaxEntryPrice, settings.max_entry_price);
+  setInputIfIdle(ids.liveMaxDailyLoss, settings.max_daily_loss);
+  setInputIfIdle(ids.liveMaxTotalDrawdown, settings.max_total_drawdown);
+  setInputIfIdle(ids.liveRetryCount, settings.retry_count);
+  setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms);
+  const enabled = Boolean(settings.enabled ?? live.enabled);
+  const ready = Boolean(readiness.ready);
+  if (ids.liveStatus) {
+    const lastError = live.last_error;
+    ids.liveStatus.textContent = enabled
+      ? ready ? "实盘开启" : "实盘开启但未就绪"
+      : "实盘关闭";
+    if (lastError) ids.liveStatus.textContent = `${ids.liveStatus.textContent} · ${lastError}`;
+  }
+  if (ids.liveReadiness) {
+    const errors = Array.isArray(readiness.errors) ? readiness.errors : [];
+    const wallet = readiness.wallet || {};
+    const walletText = wallet.checked_at
+      ? `wallet ${fmtNumberCell(wallet.balance, 4)} / allowance ${fmtNumberCell(wallet.allowance, 4)} / required ${fmtNumberCell(wallet.required_cash, 4)}`
+      : "";
+    const openOrders = live.open_orders || settings.open_orders || {};
+    const openOrdersText = openOrders.ready
+      ? `official open ${fmtNumberCell(openOrders.count, 0)}`
+      : openOrders.skipped
+        ? "official open skipped"
+        : (openOrders.errors || []).length
+        ? `official open error`
+        : "";
+    const presence = readiness.credential_presence || {};
+    const credentialText = [
+      `pk:${presence.private_key ? "yes" : "no"}`,
+      `sig:${presence.signature_type ? "yes" : "no"}`,
+      `funder:${presence.funder_address ? "yes" : "no"}`,
+      `api:${presence.api_creds_complete ? "env" : presence.api_creds_partial ? "partial" : "derive"}`,
+    ].join(" ");
+    const addresses = readiness.credential_addresses || {};
+    const addressText = [
+      addresses.signer_address_masked ? `signer:${addresses.signer_address_masked}` : "",
+      addresses.funder_address_masked ? `funder:${addresses.funder_address_masked}` : "",
+      typeof addresses.signer_matches_funder === "boolean"
+        ? `match:${addresses.signer_matches_funder ? "yes" : "no"}`
+        : "",
+    ].filter(Boolean).join(" ");
+    const envFiles = Array.isArray(readiness.env_files) ? readiness.env_files : [];
+    const envFileText = envFiles.length
+      ? `env ${envFiles.map((item) => item.path || "-").join(",")}`
+      : "env none";
+    const geo = readiness.geo_check || {};
+    const geoText = geo.ready
+      ? `geo ${geo.blocked ? "blocked" : "ok"} ${geo.country || "-"}${geo.region ? `/${geo.region}` : ""}`
+      : (geo.errors || []).length
+        ? "geo error"
+        : "";
+    const readinessMessage = errors.length
+      ? errors.join("；")
+      : [
+          `SDK ${readiness.sdk || "py_clob_client_v2"} · ${readiness.host || "-"} · chain ${readiness.chain_id || "-"}`,
+          credentialText,
+          addressText,
+          envFileText,
+          geoText,
+          walletText,
+          openOrdersText,
+        ].filter(Boolean).join(" · ");
+    ids.liveReadiness.textContent = readinessMessage;
+    ids.liveReadiness.classList.toggle("ready", ready);
+    ids.liveReadiness.classList.toggle("error", !ready);
+    appendLiveLog({
+      key: "readiness",
+      level: ready ? "pass" : errors.length ? "error" : "warn",
+      title: ready ? "实盘就绪" : "实盘未就绪",
+      message: readinessMessage,
+      details: [
+        `switch:${enabled ? "ON" : "OFF"}`,
+        credentialText,
+        addressText,
+        envFileText,
+        geoText,
+        walletText,
+        openOrdersText,
+        live.last_error ? `runner:${live.last_error}` : "",
+      ],
+    });
+  }
+  renderLivePreflightResult();
+  renderLiveDoctorResult();
+  renderLiveOnceResult();
+}
+
+function renderLivePreflightResult() {
+  if (!ids.livePreflightResult) return;
+  ids.livePreflightResult.hidden = true;
+  ids.livePreflightResult.innerHTML = "";
+  if (!livePreflight) {
+    return;
+  }
+  const checks = Array.isArray(livePreflight.checks) ? livePreflight.checks : [];
+  const blocked = Array.isArray(livePreflight.blocked_checks)
+    ? livePreflight.blocked_checks
+    : checks.filter((check) => check.status !== "PASS");
+  const statusText = livePreflight.can_place_next_order
+    ? "可真实下单"
+    : livePreflight.arming_ready
+      ? "可开启实盘"
+      : "不可下单";
+  const signal = livePreflight.signal || {};
+  const entry = livePreflight.entry || {};
+  const softwareAccount = livePreflight.software_account || {};
+  const stakeSource = softwareAccount.stake_locked_to_current_market ? "当前市场锁定" : "配置";
+  appendLiveLog({
+    key: "preflight",
+    level: livePreflight.can_place_next_order ? "pass" : livePreflight.arming_ready ? "warn" : "error",
+    title: `预检 ${statusText}`,
+    message: blocked.length
+      ? blocked.map((check) => check.message || check.key).filter(Boolean).join("；")
+      : "全部检查通过",
+    details: [
+      `time:${fmtTime(livePreflight.checked_at)}`,
+      `signal:${signal.side || "-"} budget:${fmtNumberCell(entry.stake ?? softwareAccount.stake, 4)} source:${stakeSource}`,
+      checks.map((check) => `${check.key}:${check.status}`).join(" · "),
+    ],
+  });
+}
+
+function renderLiveDoctorResult() {
+  if (!ids.liveDoctorResult) return;
+  ids.liveDoctorResult.hidden = true;
+  ids.liveDoctorResult.innerHTML = "";
+  if (!liveDoctor) {
+    updateLiveOnceButtonState();
+    return;
+  }
+  const status = liveDoctor.status || "UNKNOWN";
+  const fatal = Array.isArray(liveDoctor.fatal_one_shot_blockers) ? liveDoctor.fatal_one_shot_blockers : [];
+  const waitable = Array.isArray(liveDoctor.waitable_one_shot_blockers) ? liveDoctor.waitable_one_shot_blockers : [];
+  const actions = Array.isArray(liveDoctor.next_actions) ? liveDoctor.next_actions : [];
+  const firstOrder = liveDoctor.first_order || {};
+  const stakeRequirement = firstOrder.stake_requirement || {};
+  const credentials = liveDoctor.credential_setup || {};
+  const sdkStatus = liveDoctor.sdk_status || {};
+  const missingCredentials = Array.isArray(credentials.missing_required_keys) ? credentials.missing_required_keys : [];
+  const emptyKeys = Array.isArray(credentials.empty_keys) ? credentials.empty_keys : [];
+  const command = firstOrder.recommended_cli || "";
+  const statusClass = status === "BLOCKED" ? "block" : status === "READY_FOR_LIVE_LOOP" ? "pass" : "warn";
+  const sdkClass = sdkStatus.compatible === false ? "block" : sdkStatus.compatible === true ? "pass" : "warn";
+  const sdkLabel = sdkStatus.package || liveDoctor.sdk || "SDK";
+  const sdkVersion = liveDoctor.sdk_version || sdkStatus.version || "-";
+  appendLiveLog({
+    key: "doctor",
+    level: status === "BLOCKED" ? "error" : status === "READY_FOR_LIVE_LOOP" ? "pass" : "warn",
+    title: `首单检查 ${status}`,
+    message: fatal.length || waitable.length
+      ? `${fatal.length ? `fatal ${fatal.join(", ")}` : ""}${fatal.length && waitable.length ? " · " : ""}${waitable.length ? `wait ${waitable.join(", ")}` : ""}`
+      : "one-shot 阻断为空",
+    details: [
+      `one-shot:${liveDoctor.ready_for_one_shot_now ? "now" : liveDoctor.can_wait_for_one_shot ? "wait" : "blocked"}`,
+      `SDK:${sdkLabel} ${sdkVersion} ${sdkClass}`,
+      missingCredentials.length ? `缺凭证:${missingCredentials.join(", ")}` : "",
+      emptyKeys.length ? `空凭证:${emptyKeys.slice(0, 4).join(", ")}${emptyKeys.length > 4 ? "..." : ""}` : "",
+      stakeRequirement.min_order_size !== undefined && stakeRequirement.min_order_size !== null
+        ? `stake:${fmtNumberCell(stakeRequirement.stake_dollars, 2)} min:${fmtNumberCell(stakeRequirement.min_order_size, 2)} shortfall:${fmtNumberCell(stakeRequirement.shortfall, 2)}`
+        : "",
+      credentials.next_step || "",
+      ...actions.slice(0, 4).map((row) => `${row.key || "-"}: ${row.action || ""}`),
+    ],
+    code: command,
+  });
+  updateLiveOnceButtonState();
+}
+
+function updateLiveOnceButtonState() {
+  if (!ids.liveOnce) return;
+  const fatal = Array.isArray(liveDoctor?.fatal_one_shot_blockers) ? liveDoctor.fatal_one_shot_blockers : [];
+  const canRun = Boolean(liveDoctor && (liveDoctor.ready_for_one_shot_now || liveDoctor.can_wait_for_one_shot));
+  const running = liveOnce?.local_status === "RUNNING";
+  ids.liveOnce.disabled = running || !canRun || fatal.length > 0;
+}
+
+function renderLiveOnceResult() {
+  if (!ids.liveOnceResult) return;
+  ids.liveOnceResult.hidden = true;
+  ids.liveOnceResult.innerHTML = "";
+  if (!liveOnce) {
+    updateLiveOnceButtonState();
+    return;
+  }
+  const status = liveOnce.local_status || (liveOnce.submitted ? "SUBMITTED" : liveOnce.blocked ? "BLOCKED" : "READY");
+  const statusClass = liveOnce.submitted ? "pass" : liveOnce.blocked || liveOnce.error ? "block" : "warn";
+  const fatal = Array.isArray(liveOnce.fatal_blocked_keys) ? liveOnce.fatal_blocked_keys : [];
+  const waitable = Array.isArray(liveOnce.waitable_blocked_keys) ? liveOnce.waitable_blocked_keys : [];
+  const blocked = Array.isArray(liveOnce.blocked_keys) ? liveOnce.blocked_keys : [];
+  const evidence = liveOnce.evidence || {};
+  const evidenceOrder = evidence.order || {};
+  const lastOrder = liveOnce.last_order || {};
+  const reconcile = liveOnce.reconcile || {};
+  const audit = liveOnce.audit || {};
+  const orderId = lastOrder.order_id || lastOrder.external_order_id || reconcile.external_order_id || evidenceOrder.external_order_id || null;
+  const localStatus = evidenceOrder.status || lastOrder.status || reconcile.local_status || null;
+  const errors = [
+    liveOnce.error,
+    ...(Array.isArray(liveOnce.errors) ? liveOnce.errors : []),
+  ].filter(Boolean);
+  appendLiveLog({
+    key: "live-once",
+    level: liveOnce.submitted ? "pass" : liveOnce.blocked || liveOnce.error ? "error" : "warn",
+    title: `one-shot 首单 ${status}`,
+    message: errors.length ? errors.join("；") : liveOnce.message || (orderId ? `官方订单 id ${orderId}` : ""),
+    details: [
+      liveOnce.checked_at ? `time:${fmtTime(liveOnce.checked_at)}` : "",
+      orderId ? `official_order:${orderId}` : "",
+      localStatus ? `local_status:${localStatus}` : "",
+      blocked.length ? `blocked:${blocked.join(", ")}` : "",
+      fatal.length ? `fatal:${fatal.join(", ")}` : "",
+      waitable.length ? `wait:${waitable.join(", ")}` : "",
+      audit.path ? `audit:${audit.path}` : "",
+    ],
+  });
+  updateLiveOnceButtonState();
+}
+
+function setInputIfIdle(input, value) {
+  if (!input || document.activeElement === input) return;
+  if (value === undefined || value === null) return;
+  input.value = String(value);
 }
 
 function renderStrategyExperiments(runtime = {}) {
@@ -784,24 +1218,24 @@ function quoteText(row) {
 }
 
 function renderOpenTrades(rows, scope = openDataScope) {
-  if (scope === "experiment" && strategyTablesLoading && !strategyTables) {
+  if ((isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)) && strategyTablesLoading && !strategyTables) {
     ids.openCount.textContent = "加载中";
     renderTradeTable("open", [], experimentOpenFields, ids.openTradesHead, ids.openTrades, experimentFieldKeys("open"));
     return;
   }
-  ids.openCount.textContent = scope === "experiment" ? `${rows.length} / 8组` : rows.length;
-  const fields = scope === "experiment" ? experimentOpenFields : openTradeFields;
-  const selected = scope === "experiment" ? experimentFieldKeys("open") : selectedFields.open;
+  ids.openCount.textContent = isExperimentAggregateScope(scope) ? `${rows.length} / ${strategyExperimentVariants().length}组` : rows.length;
+  const fields = isMainScope(scope) ? openTradeFields : scopedOpenFields;
+  const selected = isMainScope(scope) ? selectedFields.open : experimentFieldKeys("open");
   renderTradeTable("open", rows, fields, ids.openTradesHead, ids.openTrades, selected);
 }
 
 function renderRecentOrders(rows, options = {}) {
   const scope = options.scope || orderDataScope;
-  const meta = options.meta || (scope === "experiment" ? strategyTables?.recent_orders_meta || {} : orderMeta);
+  const meta = options.meta || (isExperimentAggregateScope(scope) ? strategyTables?.recent_orders_meta || {} : orderMeta);
   const total = Number(meta.total || rows.length || 0);
   const loaded = rows.length;
   ids.orderCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
-  ids.orderPageInfo.textContent = `${scope === "experiment" ? "策略实验" : "主账户"} · ${total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`}`;
+  ids.orderPageInfo.textContent = `${scopeLabel(scope)} · ${total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`}`;
   ids.loadMoreOrders.hidden = !meta.has_more;
   ids.loadMoreOrders.disabled = false;
   updateOrderActionButtons(rows);
@@ -816,8 +1250,8 @@ function renderRecentOrders(rows, options = {}) {
   const tableWrap = orderTableWrap();
   const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
-  const fields = scope === "experiment" ? experimentOrderFields : recentOrderFields;
-  const selected = scope === "experiment" ? experimentFieldKeys("order") : selectedFields.order;
+  const fields = isMainScope(scope) ? recentOrderFields : scopedOrderFields;
+  const selected = isMainScope(scope) ? selectedFields.order : experimentFieldKeys("order");
   renderTradeTable("order", rows, fields, ids.recentOrdersHead, ids.recentOrders, selected);
   if (tableWrap) {
     tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
@@ -827,8 +1261,8 @@ function renderRecentOrders(rows, options = {}) {
 
 function renderRecentTrades(rows, options = {}) {
   const scope = options.scope || recentDataScope;
-  const meta = options.meta || (scope === "experiment" ? strategyTables?.recent_trades_meta || {} : recentMeta);
-  const summary = options.summary || (scope === "experiment" ? strategyTables?.recent_trades_summary || {} : recentSummary);
+  const meta = options.meta || (isExperimentAggregateScope(scope) ? strategyTables?.recent_trades_meta || {} : recentMeta);
+  const summary = options.summary || (isExperimentAggregateScope(scope) ? strategyTables?.recent_trades_summary || {} : recentSummary);
   if (recentLoading) {
     renderRecentSkeleton();
     return;
@@ -838,16 +1272,16 @@ function renderRecentTrades(rows, options = {}) {
   const filtered = recentFilterActive();
   ids.tradeCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
   ids.recentPageInfo.textContent = total > loaded
-    ? `${scope === "experiment" ? "策略实验" : "主账户"} · ${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
-    : `${scope === "experiment" ? "策略实验" : "主账户"} · ${filtered ? "范围" : "最近"} ${loaded} 条`;
+    ? `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
+    : `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} ${loaded} 条`;
   ids.loadMoreRecent.hidden = !meta.has_more;
   ids.loadMoreRecent.disabled = false;
   renderRecentSummary(summary, scope);
   const renderKey = recentRenderKey(rows, scope, meta, summary);
   if (renderKey === lastRecentRenderKey) return;
   lastRecentRenderKey = renderKey;
-  const fields = scope === "experiment" ? experimentRecentFields : recentTradeFields;
-  const selected = scope === "experiment" ? experimentFieldKeys("recent") : selectedFields.recent;
+  const fields = isMainScope(scope) ? recentTradeFields : scopedRecentFields;
+  const selected = isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent");
   renderTradeTable("recent", rows, fields, ids.recentTradesHead, ids.recentTrades, selected);
   applyRecentContentTransition();
 }
@@ -918,7 +1352,7 @@ function renderRecentSummary(summary, scope = recentDataScope) {
   const data = summary || {};
   const sourceText = `官 ${Number(data.official_count || 0)} / 兜 ${Number(data.chainlink_count || 0)} / 平 ${Number(data.early_exit_count || 0)}`;
   const items = [
-    ["范围", scope === "experiment" ? "策略实验" : "主账户"],
+    ["范围", scopeLabel(scope)],
     ["交易", `${Number(data.total_count || 0)} 笔`],
     ["已结算", `${Number(data.settled_count || 0)} 笔`],
     ["总盈亏", fmtSignedMoneyCell(data.total_pnl)],
@@ -941,7 +1375,7 @@ function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summa
   return [
     scope,
     idsKey,
-    (scope === "experiment" ? experimentFieldKeys("recent") : selectedFields.recent).join(","),
+    (isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent")).join(","),
     meta.loaded,
     meta.total,
     meta.has_more,
@@ -969,7 +1403,7 @@ function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
   return [
     scope,
     rowsKey,
-    (scope === "experiment" ? experimentFieldKeys("order") : selectedFields.order).join(","),
+    (isMainScope(scope) ? selectedFields.order : experimentFieldKeys("order")).join(","),
     meta.loaded,
     meta.total,
     meta.has_more,
@@ -1009,7 +1443,7 @@ function isOrderInteractionActive() {
 }
 
 function currentOrderRows() {
-  if (orderDataScope === "experiment") return strategyTables?.recent_orders || [];
+  if (isExperimentAggregateScope(orderDataScope)) return strategyTables?.recent_orders || [];
   if (orderRows.length) return orderRows;
   return latestStatus?.recent_orders || [];
 }
@@ -1027,8 +1461,16 @@ function orderToggleText(row) {
 }
 
 function canCancelOrder(row) {
-  if (row?.account_scope === "strategy_experiment") return false;
+  if (row?.account_scope === "strategy_experiment" || row?.account_scope === "live") return false;
   return row?.status === "RESTING" || row?.status === "PARTIAL_RESTING";
+}
+
+function liveSellButton(row) {
+  if (row?.account_scope !== "live" || row?.status !== "OPEN") return "-";
+  if (row?.pending_live_sell_order_id) {
+    return `<button class="table-action live-sell-button" type="button" disabled title="等待官方确认卖出订单">卖出确认中</button>`;
+  }
+  return `<button class="table-action live-sell-button" type="button" data-live-sell-trade-id="${safe(row.id)}">卖出</button>`;
 }
 
 function orderStatusText(status) {
@@ -1050,7 +1492,7 @@ function cancelableOrderCount(rows, scope) {
 }
 
 function updateOrderActionButtons(rows) {
-  if (orderDataScope === "experiment") {
+  if (!isMainScope(orderDataScope)) {
     ids.cancelCurrentOrders.disabled = true;
     ids.cancelAllOrders.disabled = true;
     return;
@@ -1482,14 +1924,21 @@ async function loadStatus(manual = false) {
   if (data.runtime.latest_price && !priceState.chainlink && !priceState.binance) {
     priceState = { ...priceState, ...data.runtime.latest_price };
   }
-  if (recentFilterActive()) {
+  if (!isMainScope(recentDataScope)) {
+    data.recent_trades = recentRows;
+    data.recent_trades_meta = recentMeta;
+    data.recent_trades_summary = recentSummary;
+  } else if (recentFilterActive()) {
     data.recent_trades = recentRows;
     data.recent_trades_meta = recentMeta;
     data.recent_trades_summary = recentSummary;
   } else {
     applyRecentPage(data.recent_trades, data.recent_trades_meta, data.recent_trades_summary);
   }
-  if (orderStatusFilter === "all") {
+  if (!isMainScope(orderDataScope)) {
+    data.recent_orders = orderRows;
+    data.recent_orders_meta = orderMeta;
+  } else if (orderStatusFilter === "all") {
     applyOrderPage(data.recent_orders, data.recent_orders_meta);
   } else {
     data.recent_orders = orderRows;
@@ -1520,6 +1969,9 @@ async function loadEquityCurve(force = false) {
     });
     if (selection.scope === "experiment") {
       params.set("account_scope", "strategy_experiment");
+      params.set("variant_id", selection.variantId);
+    } else if (selection.scope === "live") {
+      params.set("account_scope", "live");
       params.set("variant_id", selection.variantId);
     } else {
       params.set("account_scope", "main");
@@ -1599,7 +2051,9 @@ function applyOrderPage(rows = [], meta = {}, options = {}) {
 }
 
 function strategyExperimentViewActive() {
-  return openDataScope === "experiment" || orderDataScope === "experiment" || recentDataScope === "experiment";
+  return [openDataScope, orderDataScope, recentDataScope].some((scope) => (
+    isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)
+  ));
 }
 
 async function loadStrategyExperimentTables(options = {}) {
@@ -1630,12 +2084,13 @@ async function loadStrategyExperimentTables(options = {}) {
 }
 
 async function loadOrders(force = false) {
-  if (orderDataScope === "experiment") {
+  if (isExperimentAggregateScope(orderDataScope)) {
     await loadStrategyExperimentTables({ force, orderLimit: strategyOrderLimit });
     return;
   }
-  if (!force && orderRows.length && orderMeta.status_filter === orderStatusFilter) return;
+  if (!force && isMainScope(orderDataScope) && orderRows.length && orderMeta.status_filter === orderStatusFilter) return;
   const params = new URLSearchParams({ limit: String(ORDER_PAGE_SIZE), offset: "0", status: orderStatusFilter });
+  appendScopeParams(params, orderDataScope);
   const res = await fetch(`/api/orders?${params.toString()}`);
   if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
   const page = await res.json();
@@ -1646,7 +2101,7 @@ async function loadOrders(force = false) {
 async function loadMoreOrders() {
   ids.loadMoreOrders.disabled = true;
   try {
-    if (orderDataScope === "experiment") {
+    if (isExperimentAggregateScope(orderDataScope)) {
       strategyOrderLimit = Math.min(200, Number(strategyTables?.recent_orders_meta?.loaded || 0) + ORDER_PAGE_SIZE);
       await loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit });
       return;
@@ -1656,6 +2111,7 @@ async function loadMoreOrders() {
       offset: String(orderRows.length),
       status: orderStatusFilter,
     });
+    appendScopeParams(params, orderDataScope);
     const res = await fetch(`/api/orders?${params.toString()}`);
     if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
     const page = await res.json();
@@ -1694,6 +2150,7 @@ async function toggleOrderFills(orderId) {
     renderRecentOrders(orderRows, { force: true });
     try {
       const params = new URLSearchParams({ order_id: String(orderId) });
+      appendScopeParams(params, orderDataScope);
       const res = await fetch(`/api/order-fills?${params.toString()}`);
       if (!res.ok) throw new Error(`order fills HTTP ${res.status}`);
       const payload = await res.json();
@@ -1767,6 +2224,25 @@ async function cancelOrders(scope) {
   renderRecentOrders(orderRows, { force: true });
 }
 
+async function sellLiveTrade(tradeId) {
+  if (!tradeId) return;
+  const res = await fetch("/api/live-sell", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trade_id: tradeId }),
+  });
+  if (!res.ok) throw new Error(`live sell HTTP ${res.status}`);
+  await loadStatus(true);
+  if (isLiveScope(openDataScope) || isLiveScope(orderDataScope) || isLiveScope(recentDataScope)) {
+    await loadOrders(true);
+    await loadRecentTradesPage(true);
+  }
+}
+
+function confirmLiveSell(tradeId) {
+  return window.confirm(`确认实盘卖出持仓 ${tradeId}？`);
+}
+
 function handleOrderStatusFilterChange() {
   orderStatusFilter = ids.orderStatusFilter.value || "all";
   expandedOrderId = null;
@@ -1778,7 +2254,7 @@ function handleOrderStatusFilterChange() {
     latestStatus.recent_orders_meta = orderMeta;
   }
   renderRecentOrders(orderRows, { force: true });
-  if (orderDataScope === "experiment") {
+  if (isExperimentAggregateScope(orderDataScope)) {
     strategyOrderLimit = ORDER_PAGE_SIZE;
     loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit }).catch(showError);
   } else {
@@ -1787,7 +2263,7 @@ function handleOrderStatusFilterChange() {
 }
 
 function handleDataScopeChange(kind, value) {
-  const normalized = value === "experiment" ? "experiment" : "main";
+  const normalized = value || "main";
   if (kind === "open") openDataScope = normalized;
   if (kind === "order") {
     orderDataScope = normalized;
@@ -1798,15 +2274,29 @@ function handleDataScopeChange(kind, value) {
   if (kind === "recent") {
     recentDataScope = normalized;
     lastRecentRenderKey = "";
-    if (normalized === "experiment") recentLoading = false;
-    else if (!recentRows.length) recentLoading = true;
+    recentRows = [];
+    recentSummary = null;
+    recentMeta = {
+      limit: RECENT_PAGE_SIZE,
+      offset: 0,
+      loaded: 0,
+      total: 0,
+      has_more: false,
+      start_at: recentFilters.start_at,
+      end_at: recentFilters.end_at,
+    };
+    if (isExperimentAggregateScope(normalized)) recentLoading = false;
+    else recentLoading = true;
   }
   renderAll(latestStatus, { force: true, forceOrder: true });
-  if (normalized === "experiment") {
+  if (isExperimentAggregateScope(normalized) || isExperimentVariantScope(normalized)) {
     if (kind === "order") strategyOrderLimit = ORDER_PAGE_SIZE;
     if (kind === "recent") strategyTradeLimit = RECENT_PAGE_SIZE;
     loadStrategyExperimentTables({ force: true }).catch(showError);
-  } else if (kind === "order") {
+  }
+  if (kind === "order") {
+    orderRows = [];
+    orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
     loadOrders(true).catch(showError);
   } else if (kind === "recent" && !recentRows.length) {
     loadRecentTradesPage(true).catch(showError);
@@ -1847,11 +2337,12 @@ function recentTradeQueryParams(offset) {
   });
   if (recentFilters.start_at !== null) params.set("start_at", String(recentFilters.start_at));
   if (recentFilters.end_at !== null) params.set("end_at", String(recentFilters.end_at));
+  appendScopeParams(params, recentDataScope);
   return params;
 }
 
 async function loadRecentTradesPage(replace = false) {
-  if (recentDataScope === "experiment") {
+  if (isExperimentAggregateScope(recentDataScope)) {
     strategyTradeLimit = replace ? RECENT_PAGE_SIZE : Math.min(500, Number(strategyTables?.recent_trades_meta?.loaded || 0) + RECENT_PAGE_SIZE);
     await loadStrategyExperimentTables({ force: true, tradeLimit: strategyTradeLimit });
     return;
@@ -1920,6 +2411,236 @@ async function resetRecentTradeFilter() {
   await loadRecentTradesPage(true);
 }
 
+function liveSettingsPayload(overrides = {}) {
+  return {
+    enabled: ids.liveEnabled?.checked || false,
+    initial_balance: toNumber(ids.liveInitialBalance?.value) ?? 20,
+    stake_dollars: toNumber(ids.liveStakeDollars?.value) ?? 2,
+    max_open_trades: Math.max(1, Math.round(toNumber(ids.liveMaxOpenTrades?.value) ?? 2)),
+    max_entry_price: Math.max(0.01, Math.min(0.99, toNumber(ids.liveMaxEntryPrice?.value) ?? 0.72)),
+    max_daily_loss: toNumber(ids.liveMaxDailyLoss?.value) ?? 6,
+    max_total_drawdown: toNumber(ids.liveMaxTotalDrawdown?.value) ?? 12,
+    retry_count: Math.max(0, Math.round(toNumber(ids.liveRetryCount?.value) ?? 2)),
+    retry_delay_ms: Math.max(0, Math.round(toNumber(ids.liveRetryDelayMs?.value) ?? 250)),
+    compliance_acknowledged: ids.liveComplianceAck?.checked || false,
+    ...overrides,
+  };
+}
+
+async function saveLiveSettings(overrides = {}) {
+  return withButtonLoading(ids.liveSaveSettings, async () => {
+    appendLiveLog({ level: "info", title: "保存实盘配置", message: "请求已发送，等待返回" });
+    try {
+      const res = await fetch("/api/live-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(liveSettingsPayload(overrides)),
+      });
+      if (!res.ok) throw new Error(`live settings HTTP ${res.status}`);
+      const payload = await res.json();
+      latestStatus = payload.snapshot || latestStatus;
+      if (!Object.keys(overrides || {}).length) setLiveSettingsOpen(false);
+      appendLiveLog({ level: "pass", title: "保存实盘配置", message: "已保存" });
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "保存实盘配置", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
+async function toggleLiveEnabled(enabled) {
+  const res = await fetch("/api/live-toggle", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(`live toggle HTTP ${res.status}`);
+  const payload = await res.json();
+  latestStatus = payload.snapshot || latestStatus;
+  renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+}
+
+async function runLivePreflight() {
+  return withButtonLoading(ids.livePreflight, async () => {
+    appendLiveLog({ level: "info", title: "预检", message: "请求已发送，等待返回" });
+    try {
+      const res = await fetch("/api/live-preflight", { method: "POST" });
+      if (!res.ok) throw new Error(`live preflight HTTP ${res.status}`);
+      const payload = await res.json();
+      livePreflight = payload.live_preflight || null;
+      latestStatus = payload.snapshot || latestStatus;
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "预检", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
+async function reloadLiveCredentials() {
+  return withButtonLoading(ids.liveReloadCredentials, async () => {
+    appendLiveLog({ level: "info", title: "重载凭证", message: "请求已发送，等待返回" });
+    try {
+      const res = await fetch("/api/live-reload-credentials", { method: "POST" });
+      if (!res.ok) throw new Error(`live reload credentials HTTP ${res.status}`);
+      const payload = await res.json();
+      latestStatus = payload.snapshot || latestStatus;
+      livePreflight = null;
+      liveDoctor = null;
+      appendLiveLog({ level: "pass", title: "重载凭证", message: "已刷新本进程凭证缓存" });
+      renderAll(latestStatus, { force: true, forceChart: false, forceOrder: false });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "重载凭证", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
+async function runLiveDoctor() {
+  return withButtonLoading(ids.liveDoctor, async () => {
+    appendLiveLog({ level: "info", title: "首单检查", message: "请求已发送，等待返回" });
+    try {
+      const res = await fetch("/api/live-doctor?refresh=true");
+      if (!res.ok) throw new Error(`live doctor HTTP ${res.status}`);
+      const payload = await res.json();
+      liveDoctor = payload.live_doctor || null;
+      if (payload.snapshot) latestStatus = payload.snapshot;
+      renderAll(latestStatus, { force: true, forceChart: false, forceOrder: false });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "首单检查", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
+async function fetchLiveDoctor(refresh = true) {
+  const res = await fetch(`/api/live-doctor?refresh=${refresh ? "true" : "false"}`);
+  if (!res.ok) throw new Error(`live doctor HTTP ${res.status}`);
+  const payload = await res.json();
+  liveDoctor = payload.live_doctor || null;
+  if (payload.snapshot) latestStatus = payload.snapshot;
+  return liveDoctor;
+}
+
+function liveOnceBodyFromDoctor(doctor) {
+  const firstOrder = doctor?.first_order || {};
+  const api = firstOrder.recommended_api || {};
+  const body = { ...(api.body || {}) };
+  body.confirm = "PLACE_REAL_ORDER";
+  body.acknowledge_compliance = true;
+  body.disable_after = body.disable_after !== false;
+  body.wait_ready_seconds = toNumber(body.wait_ready_seconds) ?? 180;
+  body.ready_poll_seconds = toNumber(body.ready_poll_seconds) ?? 2;
+  body.reconcile_wait_seconds = toNumber(body.reconcile_wait_seconds) ?? 20;
+  body.include_evidence = body.include_evidence !== false;
+  body.max_stake_dollars = toNumber(body.max_stake_dollars ?? firstOrder.max_stake_dollars) ?? 2;
+  return body;
+}
+
+async function runLiveOnce() {
+  return withButtonLoading(ids.liveOnce, async () => {
+    liveOnce = { local_status: "RUNNING", message: "刷新首单检查中" };
+    renderLiveOnceResult();
+    try {
+      const doctor = await fetchLiveDoctor(true);
+      renderAll(latestStatus, { force: true, forceChart: false, forceOrder: false });
+      const fatal = Array.isArray(doctor?.fatal_one_shot_blockers) ? doctor.fatal_one_shot_blockers : [];
+      const canRun = Boolean(doctor && (doctor.ready_for_one_shot_now || doctor.can_wait_for_one_shot));
+      if (!canRun || fatal.length) {
+        liveOnce = {
+          local_status: "BLOCKED",
+          blocked: true,
+          message: "首单检查未通过，未调用 /api/live-once",
+          fatal_blocked_keys: fatal,
+          blocked_keys: Array.isArray(doctor?.one_shot_blockers) ? doctor.one_shot_blockers : [],
+          checked_at: doctor?.checked_at,
+        };
+        renderLiveOnceResult();
+        return;
+      }
+      const body = liveOnceBodyFromDoctor(doctor);
+      const typed = prompt(`输入 PLACE_REAL_ORDER 执行 one-shot 首单，max stake ${fmtNumberCell(body.max_stake_dollars, 2)} USDC`);
+      if (typed !== "PLACE_REAL_ORDER") {
+        liveOnce = {
+          local_status: "ABORTED",
+          message: "确认短语不匹配，未提交真实订单请求",
+          checked_at: Date.now() / 1000,
+        };
+        renderLiveOnceResult();
+        return;
+      }
+      liveOnce = { local_status: "RUNNING", message: "已发送 one-shot 请求，等待官方返回" };
+      renderLiveOnceResult();
+      const res = await fetch("/api/live-once", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await res.json().catch(() => ({ error: `live once HTTP ${res.status}` }));
+      if (payload.snapshot) latestStatus = payload.snapshot;
+      liveOnce = payload.live_once || {
+        local_status: res.ok ? "DONE" : "BLOCKED",
+        blocked: !res.ok,
+        error: payload.error || `live once HTTP ${res.status}`,
+      };
+      if (liveOnce.preflight) livePreflight = liveOnce.preflight;
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+      if (!res.ok && !payload.live_once) throw new Error(payload.error || `live once HTTP ${res.status}`);
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "one-shot 首单", message: error.message || String(error) });
+      throw error;
+    } finally {
+      updateLiveOnceButtonState();
+    }
+  }, updateLiveOnceButtonState);
+}
+
+async function liveEmergencyStop() {
+  if (!confirm("确认关闭实盘并请求取消官方 CLOB 全部挂单？")) return;
+  return withButtonLoading(ids.liveEmergencyStop, async () => {
+    appendLiveLog({ level: "warn", title: "实盘急停", message: "请求已发送，等待取消挂单结果" });
+    try {
+      const res = await fetch("/api/live-emergency-stop", { method: "POST" });
+      if (!res.ok) throw new Error(`live emergency stop HTTP ${res.status}`);
+      const payload = await res.json();
+      latestStatus = payload.snapshot || latestStatus;
+      livePreflight = null;
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+      const errors = payload.cancel_all?.errors || [];
+      if (errors.length) throw new Error(errors[0]);
+      appendLiveLog({ level: "pass", title: "实盘急停", message: "实盘已关闭，取消挂单请求已完成" });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "实盘急停", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
+async function refreshLiveOpenOrders() {
+  return withButtonLoading(ids.liveOpenOrdersRefresh, async () => {
+    appendLiveLog({ level: "info", title: "刷新挂单", message: "请求已发送，等待官方 open orders 返回" });
+    try {
+      const res = await fetch("/api/live-open-orders");
+      if (!res.ok) throw new Error(`live open orders HTTP ${res.status}`);
+      const payload = await res.json();
+      latestStatus = payload.snapshot || latestStatus;
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+      const openOrders = payload.live_open_orders?.open_orders || {};
+      const errors = openOrders.errors || [];
+      if (errors.length && !openOrders.skipped) throw new Error(errors[0]);
+      appendLiveLog({
+        level: openOrders.skipped ? "warn" : "pass",
+        title: "刷新挂单",
+        message: openOrders.skipped ? "凭证未就绪，已跳过官方挂单读取" : `官方 open orders: ${fmtNumberCell(openOrders.count, 0)}`,
+      });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "刷新挂单", message: error.message || String(error) });
+      throw error;
+    }
+  });
+}
+
 async function loadMoreRecentTrades() {
   ids.loadMoreRecent.disabled = true;
   try {
@@ -1952,6 +2673,7 @@ function renderAll(data = latestStatus, options = {}) {
 function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   renderRuntime(data.runtime);
+  renderLivePanel(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));
   renderMarket(data.runtime);
@@ -1959,23 +2681,23 @@ function renderAllNow(data = latestStatus, options = {}) {
   if (strategyExperimentViewActive() && !strategyTablesLoading) {
     loadStrategyExperimentTables(false).catch(showError);
   }
-  const openRows = openDataScope === "experiment" ? strategyTables?.open_trades || [] : data.open_trades || [];
+  const openRows = scopedOpenRows(openDataScope, data);
   renderOpenTrades(openRows, openDataScope);
-  const visibleOrderRows = orderDataScope === "experiment"
+  const visibleOrderRows = isExperimentAggregateScope(orderDataScope)
     ? strategyTables?.recent_orders || []
     : orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
   renderRecentOrders(visibleOrderRows, {
     force: Boolean(options.force || options.forceOrder),
     scope: orderDataScope,
-    meta: orderDataScope === "experiment" ? strategyTables?.recent_orders_meta || {} : orderMeta,
+    meta: isExperimentAggregateScope(orderDataScope) ? strategyTables?.recent_orders_meta || {} : orderMeta,
   });
-  const visibleRecentRows = recentDataScope === "experiment"
+  const visibleRecentRows = isExperimentAggregateScope(recentDataScope)
     ? strategyTables?.recent_trades || []
     : recentRows.length ? recentRows : data.recent_trades;
   renderRecentTrades(visibleRecentRows || [], {
     scope: recentDataScope,
-    meta: recentDataScope === "experiment" ? strategyTables?.recent_trades_meta || {} : recentMeta,
-    summary: recentDataScope === "experiment" ? strategyTables?.recent_trades_summary || {} : recentSummary,
+    meta: isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta,
+    summary: isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_summary || {} : recentSummary,
   });
   const now = Date.now();
   if (options.forceChart || now - lastChartRenderMs >= CHART_RENDER_INTERVAL_MS) {
@@ -1984,6 +2706,20 @@ function renderAllNow(data = latestStatus, options = {}) {
     drawChart(currentChartRows);
     lastChartRenderMs = now;
   }
+}
+
+function scopedOpenRows(scope, data = latestStatus) {
+  if (isLiveScope(scope)) {
+    return data?.runtime?.live_trading?.open_trades || [];
+  }
+  if (isExperimentAggregateScope(scope)) {
+    return strategyTables?.open_trades || [];
+  }
+  if (isExperimentVariantScope(scope)) {
+    const variantId = parseAccountScope(scope).variantId;
+    return (strategyTables?.open_trades || []).filter((row) => row.variant_id === variantId);
+  }
+  return data?.open_trades || [];
 }
 
 function applyMarket(market) {
@@ -2352,6 +3088,25 @@ function queueChartHoverDraw() {
 }
 
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
+ids.liveSettingsToggle?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleLiveSettingsPanel();
+});
+ids.liveSettingsPanel?.addEventListener("click", (event) => event.stopPropagation());
+ids.liveSaveSettings?.addEventListener("click", () => saveLiveSettings().catch(showError));
+ids.liveReloadCredentials?.addEventListener("click", () => reloadLiveCredentials().catch(showError));
+ids.livePreflight?.addEventListener("click", () => runLivePreflight().catch(showError));
+ids.liveDoctor?.addEventListener("click", () => runLiveDoctor().catch(showError));
+ids.liveOnce?.addEventListener("click", () => runLiveOnce().catch(showError));
+ids.liveOpenOrdersRefresh?.addEventListener("click", () => refreshLiveOpenOrders().catch(showError));
+ids.liveEmergencyStop?.addEventListener("click", () => liveEmergencyStop().catch(showError));
+document.addEventListener("click", () => {
+  if (liveSettingsOpen) setLiveSettingsOpen(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && liveSettingsOpen) setLiveSettingsOpen(false);
+});
 ids.accountScopeSelect.addEventListener("change", handleAccountScopeChange);
 ids.strategyExperiments.addEventListener("click", (event) => {
   const button = event.target.closest("[data-experiment-id]");
@@ -2373,6 +3128,18 @@ ids.recentOrders.addEventListener("click", (event) => {
   const row = event.target.closest("tr[data-order-id]");
   if (!row) return;
   toggleOrderFills(Number(row.dataset.orderId)).catch(showError);
+});
+ids.openTrades.addEventListener("click", (event) => {
+  const sellButton = event.target.closest("[data-live-sell-trade-id]");
+  if (!sellButton) return;
+  event.stopPropagation();
+  const tradeId = Number(sellButton.dataset.liveSellTradeId);
+  if (!confirmLiveSell(tradeId)) return;
+  sellButton.disabled = true;
+  sellLiveTrade(tradeId).catch((error) => {
+    sellButton.disabled = false;
+    showError(error);
+  });
 });
 ids.loadMoreOrders.addEventListener("click", () => loadMoreOrders().catch(showError));
 ids.orderStatusFilter.addEventListener("change", handleOrderStatusFilterChange);

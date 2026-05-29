@@ -4,20 +4,76 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260528-v2-63">
+    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-86">
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
         <div>
-          <div class="eyebrow">Paper Trading</div>
-          <h1>Polymarket BTC 5m Paper Bot</h1>
+          <div class="eyebrow">Paper + Live Trading</div>
+          <h1>Polymarket BTC 5m Bot</h1>
         </div>
         <div class="top-actions">
+          <label class="live-toggle">
+            <input id="live-enabled" type="checkbox">
+            <span></span>
+            实盘
+          </label>
           <span id="runtime-pill" class="pill">连接中</span>
           <button id="tick-button" type="button" title="立即同步">同步</button>
         </div>
       </header>
+
+      <section class="panel live-panel">
+        <div class="panel-head live-head">
+          <div class="live-title">
+            <h2>SINGLE_FAK_REAL</h2>
+            <span id="live-status">实盘关闭</span>
+          </div>
+          <div class="panel-head-actions live-head-actions">
+            <div class="live-action-group">
+              <button id="live-reload-credentials" type="button">重载凭证</button>
+              <button id="live-preflight" type="button">预检</button>
+              <button id="live-doctor" type="button">首单检查</button>
+              <button id="live-open-orders-refresh" type="button">刷新挂单</button>
+            </div>
+            <div class="live-action-group live-danger-actions">
+              <button id="live-once" class="danger-button" type="button" disabled>执行首单</button>
+              <button id="live-emergency-stop" class="danger-button" type="button">实盘急停</button>
+            </div>
+            <button id="live-settings-toggle" class="icon-button live-settings-toggle" type="button" title="实盘配置" aria-label="实盘配置" aria-expanded="false">&#9881;</button>
+          </div>
+        </div>
+        <div id="live-settings-panel" class="live-settings-panel" hidden>
+          <div class="live-actions">
+            <label><span>初始金额</span><input id="live-initial-balance" type="number" min="1" step="0.01"></label>
+            <label><span>单笔金额</span><input id="live-stake-dollars" type="number" min="0.1" step="0.01"></label>
+            <label><span>最大持仓</span><input id="live-max-open-trades" type="number" min="1" step="1"></label>
+            <label><span>最高买价</span><input id="live-max-entry-price" type="number" min="0.01" max="0.99" step="0.01"></label>
+            <label><span>日亏停止</span><input id="live-max-daily-loss" type="number" min="0" step="0.01"></label>
+            <label><span>总回撤停止</span><input id="live-max-total-drawdown" type="number" min="0" step="0.01"></label>
+            <label><span>重试次数</span><input id="live-retry-count" type="number" min="0" max="10" step="1"></label>
+            <label><span>重试间隔ms</span><input id="live-retry-delay-ms" type="number" min="0" step="50"></label>
+          </div>
+          <div class="live-settings-footer">
+            <label class="live-ack"><input id="live-compliance-ack" type="checkbox">确认地区/账户合规且承担真实资金风险</label>
+            <button id="live-save-settings" type="button">保存配置</button>
+          </div>
+        </div>
+        <div id="live-terminal" class="live-terminal" aria-live="polite">
+          <div class="live-terminal-head">
+            <strong>Live Terminal</strong>
+            <span>最新日志在上</span>
+          </div>
+          <div id="live-terminal-lines" class="live-terminal-lines">
+            <div class="live-terminal-empty">等待实盘事件</div>
+          </div>
+        </div>
+        <div id="live-readiness" class="live-readiness live-result-source" hidden></div>
+        <div id="live-preflight-result" class="live-preflight-result live-result-source" hidden></div>
+        <div id="live-doctor-result" class="live-doctor-result live-result-source" hidden></div>
+        <div id="live-once-result" class="live-once-result live-result-source" hidden></div>
+      </section>
 
       <section class="metric-grid" aria-label="账户指标">
         <div class="account-scope-card">
@@ -137,7 +193,6 @@
                 数据范围
                 <select id="open-data-scope" aria-label="持仓数据范围">
                   <option value="main">主账户</option>
-                  <option value="experiment">策略实验</option>
                 </select>
               </label>
               <details class="field-menu">
@@ -165,7 +220,6 @@
                 数据范围
                 <select id="order-data-scope" aria-label="订单数据范围">
                   <option value="main">主账户</option>
-                  <option value="experiment">策略实验</option>
                 </select>
               </label>
               <div class="panel-actions order-actions">
@@ -209,7 +263,6 @@
                 数据范围
                 <select id="recent-data-scope" aria-label="交易数据范围">
                   <option value="main">主账户</option>
-                  <option value="experiment">策略实验</option>
                 </select>
               </label>
               <div class="panel-actions recent-actions">
@@ -245,6 +298,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js?v=20260528-v2-63"></script>
+    <script src="/static/app.js?v=20260529-v2-86"></script>
   </body>
 </html>

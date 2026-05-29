@@ -10,8 +10,8 @@ from typing import Any, Callable
 from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 6
-ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING")
+SCHEMA_VERSION = 7
+ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
 PAPER_MIN_OPEN_TRADE_STAKE = 0.01
@@ -138,6 +138,11 @@ class TradeStore:
                 fee REAL NOT NULL DEFAULT 0,
                 cash_spent REAL NOT NULL DEFAULT 0,
                 trade_id INTEGER,
+                execution_mode TEXT NOT NULL DEFAULT 'PAPER',
+                external_order_id TEXT,
+                client_order_id TEXT,
+                external_status TEXT,
+                raw_response TEXT,
                 confidence REAL NOT NULL DEFAULT 0,
                 move_bps REAL NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL,
@@ -204,6 +209,11 @@ class TradeStore:
         self._ensure_column("paper_orders", "expires_at", "REAL")
         self._ensure_column("paper_orders", "reserved_cash", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("paper_orders", "remaining_cash", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("paper_orders", "execution_mode", "TEXT NOT NULL DEFAULT 'PAPER'")
+        self._ensure_column("paper_orders", "external_order_id", "TEXT")
+        self._ensure_column("paper_orders", "client_order_id", "TEXT")
+        self._ensure_column("paper_orders", "external_status", "TEXT")
+        self._ensure_column("paper_orders", "raw_response", "TEXT")
         self._ensure_column("paper_orders", "confidence", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("paper_orders", "move_bps", "REAL NOT NULL DEFAULT 0")
         self.conn.commit()
@@ -368,6 +378,23 @@ class TradeStore:
         return row is not None
 
     @_locked
+    def active_live_entry_order_exists_for_round(self, round_id: str) -> bool:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        row = self.conn.execute(
+            f"""
+            SELECT id
+            FROM paper_orders
+            WHERE execution_mode = 'LIVE'
+              AND round_id = ?
+              AND order_type != 'FAK_SELL'
+              AND status IN ({placeholders})
+            LIMIT 1
+            """,
+            (round_id, *ACTIVE_ORDER_STATUSES),
+        ).fetchone()
+        return row is not None
+
+    @_locked
     def open_trade_count(self, symbol: str | None = None) -> int:
         if symbol:
             row = self.conn.execute(
@@ -398,6 +425,33 @@ class TradeStore:
         if row is None:
             raise RuntimeError("account was not initialized")
         return dict(row)
+
+    @_locked
+    def rebase_initial_balance(self, initial_balance: float) -> dict[str, Any]:
+        """调整隔离账户本金口径；保留已有盈亏并按差额调整可用资金。"""
+
+        next_initial = round(float(initial_balance), 2)
+        if next_initial <= 0:
+            raise ValueError("initial balance must be positive")
+        account = self.account()
+        previous_initial = round(float(account["initial_balance"]), 2)
+        if abs(previous_initial - next_initial) < 0.000001:
+            return account
+        delta = round(next_initial - previous_initial, 6)
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE account
+                SET initial_balance = ?,
+                    cash_balance = MAX(0, cash_balance + ?),
+                    updated_at = ?
+                WHERE id = 1
+                """,
+                (next_initial, delta, now),
+            )
+        self.record_equity()
+        return self.account()
 
     @_locked
     def reserved_cash(self) -> float:
@@ -502,6 +556,11 @@ class TradeStore:
         reason: str,
         expires_at: float | None = None,
         post_only: bool = False,
+        execution_mode: str = "PAPER",
+        external_order_id: str | None = None,
+        client_order_id: str | None = None,
+        external_status: str | None = None,
+        raw_response: str | None = None,
     ) -> int:
         now = time.time()
         should_reserve = status in ACTIVE_ORDER_STATUSES
@@ -535,12 +594,469 @@ class TradeStore:
                 fee=0.0,
                 cash_spent=0.0,
                 trade_id=None,
+                execution_mode=execution_mode,
+                external_order_id=external_order_id,
+                client_order_id=client_order_id,
+                external_status=external_status,
+                raw_response=raw_response,
                 confidence=intent.signal.confidence,
                 move_bps=intent.signal.move_bps,
                 reason=reason,
                 now=now,
             )
         self.record_equity()
+        return order_id
+
+    @_locked
+    def record_external_order_rejection(
+        self,
+        intent: TradeIntent,
+        *,
+        order_type: str,
+        status: str,
+        side: str,
+        limit_price: float | None,
+        requested_cash: float,
+        reason: str,
+        external_order_id: str | None,
+        client_order_id: str | None,
+        external_status: str | None,
+        raw_response: str | None,
+    ) -> int:
+        return self.record_paper_order(
+            intent,
+            order_type=order_type,
+            status=status,
+            side=side,
+            limit_price=limit_price,
+            requested_cash=requested_cash,
+            reason=reason,
+            execution_mode="LIVE",
+            external_order_id=external_order_id,
+            client_order_id=client_order_id,
+            external_status=external_status,
+            raw_response=raw_response,
+        )
+
+    @_locked
+    def place_external_fill(
+        self,
+        fill: PaperFill,
+        *,
+        external_order_id: str | None,
+        client_order_id: str | None,
+        external_status: str | None,
+        raw_response: str | None,
+        reason_suffix: str = "",
+    ) -> int:
+        account = self.account()
+        total_cash_spent = round(float(fill.cash_spent), 6)
+        if total_cash_spent <= 0 or fill.shares <= 0:
+            raise ValueError("external fill must have positive shares and cash spent")
+        if account["cash_balance"] + 1e-9 < total_cash_spent:
+            raise ValueError("insufficient live account cash")
+        now = time.time()
+        reason = _append_reason(_append_reason(fill.signal.reason, fill.reason), reason_suffix)
+        with self.conn:
+            self.conn.execute(
+                "UPDATE account SET cash_balance = cash_balance - ?, updated_at = ? WHERE id = 1",
+                (total_cash_spent, now),
+            )
+            cur = self.conn.execute(
+                """
+                INSERT INTO trades(
+                    round_id, symbol, side, stake, entry_price, shares, confidence,
+                    move_bps, status, opened_at, reason
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """,
+                (
+                    fill.market.round_id,
+                    fill.market.symbol,
+                    _normalize_side(fill.side),
+                    total_cash_spent,
+                    max(0.01, min(0.99, round(float(fill.fill_price), 4))),
+                    round(float(fill.shares), 6),
+                    fill.signal.confidence,
+                    fill.signal.move_bps,
+                    now,
+                    reason,
+                ),
+            )
+            trade_id = int(cur.lastrowid)
+            self._insert_paper_order_for_fill(
+                fill,
+                trade_id,
+                reason,
+                now,
+                execution_mode="LIVE",
+                external_order_id=external_order_id,
+                client_order_id=client_order_id,
+                external_status=external_status,
+                raw_response=raw_response,
+            )
+        self.record_equity()
+        return trade_id
+
+    @_locked
+    def fill_external_pending_order(
+        self,
+        order_id: int,
+        fill: PaperFill,
+        *,
+        external_status: str | None,
+        raw_response: str | None,
+        reason_suffix: str = "",
+    ) -> dict[str, Any] | None:
+        current = self.conn.execute(
+            "SELECT * FROM paper_orders WHERE id = ? AND execution_mode = 'LIVE' AND status = 'PENDING'",
+            (int(order_id),),
+        ).fetchone()
+        if current is None:
+            return None
+        if fill.cash_spent <= 0 or fill.shares <= 0:
+            raise ValueError("external pending fill must have positive shares and cash spent")
+        now = time.time()
+        reserved_cash = round(float(current["remaining_cash"] or current["reserved_cash"] or 0.0), 6)
+        total_cash_spent = round(float(fill.cash_spent), 6)
+        cash_delta = round(reserved_cash - total_cash_spent, 6)
+        reason = _append_reason(_append_reason(str(current["reason"] or ""), fill.reason), reason_suffix)
+        with self.conn:
+            if abs(cash_delta) > 0.000001:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                    (cash_delta, now),
+                )
+            cur = self.conn.execute(
+                """
+                INSERT INTO trades(
+                    round_id, symbol, side, stake, entry_price, shares, confidence,
+                    move_bps, status, opened_at, reason
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                """,
+                (
+                    current["round_id"],
+                    current["symbol"],
+                    _normalize_side(fill.side),
+                    total_cash_spent,
+                    max(0.01, min(0.99, round(float(fill.fill_price), 4))),
+                    round(float(fill.shares), 6),
+                    float(current["confidence"] or fill.signal.confidence or 0.0),
+                    float(current["move_bps"] or fill.signal.move_bps or 0.0),
+                    now,
+                    reason,
+                ),
+            )
+            trade_id = int(cur.lastrowid)
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = 'FILLED',
+                    remaining_cash = 0,
+                    filled_shares = ?,
+                    avg_fill_price = ?,
+                    notional = ?,
+                    fee = ?,
+                    cash_spent = ?,
+                    trade_id = ?,
+                    external_status = ?,
+                    raw_response = ?,
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    round(float(fill.shares), 6),
+                    max(0.01, min(0.99, round(float(fill.fill_price), 4))),
+                    round(float(fill.notional), 6),
+                    round(float(fill.fee), 6),
+                    total_cash_spent,
+                    trade_id,
+                    external_status,
+                    raw_response,
+                    reason,
+                    now,
+                    int(order_id),
+                ),
+            )
+            self._insert_paper_fill_levels(int(order_id), trade_id, fill, now)
+        self.record_equity()
+        return {
+            **dict(current),
+            "status": "FILLED",
+            "remaining_cash": 0.0,
+            "filled_shares": round(float(fill.shares), 6),
+            "avg_fill_price": max(0.01, min(0.99, round(float(fill.fill_price), 4))),
+            "notional": round(float(fill.notional), 6),
+            "fee": round(float(fill.fee), 6),
+            "cash_spent": total_cash_spent,
+            "trade_id": trade_id,
+            "external_status": external_status,
+            "raw_response": raw_response,
+            "reason": reason,
+            "updated_at": now,
+        }
+
+    @_locked
+    def update_external_pending_order(
+        self,
+        order_id: int,
+        *,
+        status: str,
+        external_status: str | None,
+        raw_response: str | None,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        current = self.conn.execute(
+            "SELECT * FROM paper_orders WHERE id = ? AND execution_mode = 'LIVE' AND status = 'PENDING'",
+            (int(order_id),),
+        ).fetchone()
+        if current is None:
+            return None
+        now = time.time()
+        next_status = str(status or "PENDING")
+        next_reason = _append_reason(str(current["reason"] or ""), reason)
+        release_cash = 0.0
+        if next_status != "PENDING":
+            release_cash = round(float(current["remaining_cash"] or 0.0), 6)
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = ?,
+                    remaining_cash = ?,
+                    external_status = ?,
+                    raw_response = ?,
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    0.0 if next_status != "PENDING" else float(current["remaining_cash"] or 0.0),
+                    external_status,
+                    raw_response,
+                    next_reason,
+                    now,
+                    int(order_id),
+                ),
+            )
+            if release_cash > 0:
+                self.conn.execute(
+                    "UPDATE account SET cash_balance = cash_balance + ?, updated_at = ? WHERE id = 1",
+                    (release_cash, now),
+                )
+        self.record_equity()
+        return {
+            **dict(current),
+            "status": next_status,
+            "remaining_cash": 0.0 if next_status != "PENDING" else float(current["remaining_cash"] or 0.0),
+            "released_cash": release_cash,
+            "external_status": external_status,
+            "raw_response": raw_response,
+            "reason": next_reason,
+            "updated_at": now,
+        }
+
+    @_locked
+    def fill_external_pending_exit_order(
+        self,
+        order_id: int,
+        *,
+        shares: float,
+        exit_price: float,
+        notional: float,
+        fee: float,
+        external_status: str | None,
+        raw_response: str | None,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        current = self.conn.execute(
+            "SELECT * FROM paper_orders WHERE id = ? AND execution_mode = 'LIVE' AND status = 'PENDING'",
+            (int(order_id),),
+        ).fetchone()
+        if current is None:
+            return None
+        if str(current["order_type"] or "") != "FAK_SELL":
+            raise ValueError("pending order is not a live exit order")
+        trade_id = int(current["trade_id"] or 0)
+        if trade_id <= 0:
+            raise ValueError("pending exit order has no trade id")
+        close_shares = round(max(0.0, float(shares or 0.0)), 6)
+        close_price = max(0.01, min(0.99, round(float(exit_price or 0.0), 6)))
+        close_notional = round(max(0.0, float(notional or 0.0)), 6)
+        close_fee = round(max(0.0, float(fee or 0.0)), 6)
+        if close_shares <= 0 or close_notional <= 0:
+            raise ValueError("external pending exit fill must have positive shares and notional")
+        next_reason = _append_reason(str(current["reason"] or ""), reason)
+        closed = self.close_trade_shares(
+            trade_id,
+            close_shares,
+            close_price,
+            time.time(),
+            next_reason,
+            fee=close_fee,
+        )
+        if closed is None:
+            return None
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE paper_orders
+                SET status = 'FILLED',
+                    filled_shares = ?,
+                    avg_fill_price = ?,
+                    notional = ?,
+                    fee = ?,
+                    trade_id = ?,
+                    external_status = ?,
+                    raw_response = ?,
+                    reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    close_shares,
+                    close_price,
+                    close_notional,
+                    close_fee,
+                    int(closed["id"]),
+                    external_status,
+                    raw_response,
+                    next_reason,
+                    now,
+                    int(order_id),
+                ),
+            )
+        self.record_equity()
+        return {
+            **dict(current),
+            "status": "FILLED",
+            "filled_shares": close_shares,
+            "avg_fill_price": close_price,
+            "notional": close_notional,
+            "fee": close_fee,
+            "trade_id": int(closed["id"]),
+            "external_status": external_status,
+            "raw_response": raw_response,
+            "reason": next_reason,
+            "updated_at": now,
+            "closed_trade": closed,
+        }
+
+    @_locked
+    def pending_external_orders(self, limit: int = 20, symbol: str | None = None) -> list[dict[str, Any]]:
+        limit = max(1, min(200, int(limit)))
+        conditions = ["o.execution_mode = 'LIVE'", "o.status = 'PENDING'"]
+        params: list[Any] = []
+        if symbol:
+            conditions.append("o.symbol = ?")
+            params.append(symbol)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                o.*,
+                r.started_at,
+                r.ends_at,
+                r.target_price,
+                r.question,
+                r.condition_id,
+                r.up_token,
+                r.down_token,
+                r.url
+            FROM paper_orders o
+            JOIN market_rounds r ON r.round_id = o.round_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY o.created_at ASC, o.id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def live_order_by_external_id(self, external_order_id: str) -> dict[str, Any] | None:
+        order_id = str(external_order_id or "").strip()
+        if not order_id:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT
+                o.*,
+                r.started_at,
+                r.ends_at,
+                r.target_price,
+                r.question,
+                r.condition_id,
+                r.up_token,
+                r.down_token,
+                r.url,
+                COALESCE(f.fill_count, 0) AS fill_count
+            FROM paper_orders o
+            JOIN market_rounds r ON r.round_id = o.round_id
+            LEFT JOIN (
+                SELECT order_id, COUNT(*) AS fill_count
+                FROM paper_fills
+                GROUP BY order_id
+            ) f ON f.order_id = o.id
+            WHERE o.execution_mode = 'LIVE' AND o.external_order_id = ?
+            ORDER BY o.id DESC
+            LIMIT 1
+            """,
+            (order_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
+    def record_external_exit_order(
+        self,
+        market: MarketRound,
+        *,
+        trade_id: int,
+        side: str,
+        status: str,
+        limit_price: float | None,
+        shares: float,
+        notional: float,
+        fee: float,
+        reason: str,
+        external_order_id: str | None,
+        client_order_id: str | None,
+        external_status: str | None,
+        raw_response: str | None,
+    ) -> int:
+        now = time.time()
+        order_id = self._insert_paper_order(
+            market=market,
+            side=side,
+            order_type="FAK_SELL",
+            status=status,
+            limit_price=limit_price,
+            post_only=False,
+            expires_at=None,
+            requested_cash=0.0,
+            reserved_cash=0.0,
+            remaining_cash=0.0,
+            filled_shares=shares,
+            avg_fill_price=limit_price,
+            notional=notional,
+            fee=fee,
+            cash_spent=0.0,
+            trade_id=trade_id,
+            execution_mode="LIVE",
+            external_order_id=external_order_id,
+            client_order_id=client_order_id,
+            external_status=external_status,
+            raw_response=raw_response,
+            confidence=0.0,
+            move_bps=0.0,
+            reason=reason,
+            now=now,
+        )
+        self.conn.commit()
         return order_id
 
     @_locked
@@ -587,7 +1103,19 @@ class TradeStore:
         self.record_equity()
         return trade_ids
 
-    def _insert_paper_order_for_fill(self, fill: PaperFill, trade_id: int, reason: str, now: float) -> int:
+    def _insert_paper_order_for_fill(
+        self,
+        fill: PaperFill,
+        trade_id: int,
+        reason: str,
+        now: float,
+        *,
+        execution_mode: str = "PAPER",
+        external_order_id: str | None = None,
+        client_order_id: str | None = None,
+        external_status: str | None = None,
+        raw_response: str | None = None,
+    ) -> int:
         order_id = self._insert_paper_order(
             market=fill.market,
             side=fill.side,
@@ -605,6 +1133,11 @@ class TradeStore:
             fee=fill.fee,
             cash_spent=fill.cash_spent,
             trade_id=trade_id,
+            execution_mode=execution_mode,
+            external_order_id=external_order_id,
+            client_order_id=client_order_id,
+            external_status=external_status,
+            raw_response=raw_response,
             confidence=fill.signal.confidence,
             move_bps=fill.signal.move_bps,
             reason=reason,
@@ -636,16 +1169,22 @@ class TradeStore:
         move_bps: float,
         reason: str,
         now: float,
+        execution_mode: str = "PAPER",
+        external_order_id: str | None = None,
+        client_order_id: str | None = None,
+        external_status: str | None = None,
+        raw_response: str | None = None,
     ) -> int:
         cur = self.conn.execute(
             """
             INSERT INTO paper_orders(
                 round_id, symbol, side, order_type, status, limit_price, post_only,
                 expires_at, requested_cash, reserved_cash, remaining_cash, filled_shares,
-                avg_fill_price, notional, fee, cash_spent, trade_id, confidence,
-                move_bps, reason, created_at, updated_at
+                avg_fill_price, notional, fee, cash_spent, trade_id, execution_mode,
+                external_order_id, client_order_id, external_status, raw_response,
+                confidence, move_bps, reason, created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 market.round_id,
@@ -665,6 +1204,11 @@ class TradeStore:
                 round(float(fee or 0.0), 6),
                 round(float(cash_spent or 0.0), 6),
                 trade_id,
+                str(execution_mode or "PAPER"),
+                external_order_id,
+                client_order_id,
+                external_status,
+                raw_response,
                 round(float(confidence or 0.0), 6),
                 round(float(move_bps or 0.0), 6),
                 str(reason or ""),
@@ -1172,6 +1716,7 @@ class TradeStore:
             SELECT
                 t.*,
                 r.target_price,
+                r.started_at,
                 r.ends_at,
                 r.question,
                 r.condition_id,
@@ -1223,6 +1768,7 @@ class TradeStore:
                 COALESCE(t.settlement_source, r.settlement_source) AS settlement_source,
                 t.settlement_source AS trade_settlement_source,
                 r.target_price,
+                r.started_at,
                 r.final_price,
                 r.outcome,
                 r.settlement_source AS market_settlement_source,
@@ -1592,6 +2138,41 @@ class TradeStore:
             tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    @_locked
+    def active_live_exit_orders(self, symbol: str = "BTC") -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM paper_orders
+            WHERE execution_mode = 'LIVE'
+              AND order_type = 'FAK_SELL'
+              AND symbol = ?
+              AND status IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            (symbol, *ACTIVE_ORDER_STATUSES),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def active_live_exit_order_for_trade(self, trade_id: int) -> dict[str, Any] | None:
+        placeholders = ",".join("?" for _ in ACTIVE_ORDER_STATUSES)
+        row = self.conn.execute(
+            f"""
+            SELECT *
+            FROM paper_orders
+            WHERE execution_mode = 'LIVE'
+              AND order_type = 'FAK_SELL'
+              AND trade_id = ?
+              AND status IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """,
+            (int(trade_id), *ACTIVE_ORDER_STATUSES),
+        ).fetchone()
+        return dict(row) if row else None
 
     @_locked
     def expire_resting_orders(self, now: float) -> list[dict[str, Any]]:

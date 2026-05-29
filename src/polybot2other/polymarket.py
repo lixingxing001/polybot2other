@@ -28,6 +28,9 @@ class PolymarketQuote:
     ask_size: float | None = None
     bids: list[dict[str, float]] = field(default_factory=list)
     asks: list[dict[str, float]] = field(default_factory=list)
+    min_order_size: float | None = None
+    tick_size: str | None = None
+    neg_risk: bool | None = None
     updated_at_ms: int | None = None
     source: str = "rest"
 
@@ -94,6 +97,9 @@ class PolymarketClient:
             ask_size=_level_float(best_ask, "size"),
             bids=bids,
             asks=asks,
+            min_order_size=_maybe_float(book.get("min_order_size")),
+            tick_size=str(book.get("tick_size") or "") or None,
+            neg_risk=bool(book.get("neg_risk")) if book.get("neg_risk") is not None else None,
             updated_at_ms=int(time.time() * 1000),
             source="rest",
         )

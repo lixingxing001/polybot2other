@@ -3,11 +3,32 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+
+ENV_FILE_NAME = "POLYBOT2OTHER_ENV_FILE"
+ENV_KEY_PREFIX = "POLYBOT2OTHER_"
+DEFAULT_ENV_FILES = (".env.live", ".env.local", ".env")
+SENSITIVE_ENV_KEYS = {
+    "POLYBOT2OTHER_LIVE_PRIVATE_KEY",
+    "POLYBOT2OTHER_LIVE_API_KEY",
+    "POLYBOT2OTHER_LIVE_API_SECRET",
+    "POLYBOT2OTHER_LIVE_API_PASSPHRASE",
+}
+LIVE_CREDENTIAL_ENV_KEYS = {
+    "POLYBOT2OTHER_LIVE_PRIVATE_KEY",
+    "POLYBOT2OTHER_LIVE_SIGNATURE_TYPE",
+    "POLYBOT2OTHER_LIVE_FUNDER_ADDRESS",
+    "POLYBOT2OTHER_LIVE_API_KEY",
+    "POLYBOT2OTHER_LIVE_API_SECRET",
+    "POLYBOT2OTHER_LIVE_API_PASSPHRASE",
+}
+_LOADED_ENV_FILES: list[dict[str, Any]] = []
 
 
 @dataclass(frozen=True)
 class Settings:
-    """运行配置；当前版本只允许纸交易，不包含实盘密钥。"""
+    """运行配置；实盘密钥只允许从环境变量读取，禁止写入代码仓库。"""
 
     initial_balance: float = 100.0
     db_path: Path = Path("data/polybot2other-real-btc.sqlite3")
@@ -35,6 +56,16 @@ class Settings:
     strategy_experiments_enabled: bool = False
     strategy_experiments_db_dir: Path = Path("data/strategy-experiments")
     strategy_experiments_variants: str = ""
+    live_trading_db_path: Path = Path("data/live/single_fak_real.sqlite3")
+    live_trading_settings_path: Path = Path("data/live/live-settings.json")
+    live_trading_chain_id: int = 137
+    live_trading_default_initial_balance: float = 20.0
+    live_trading_default_stake_dollars: float = 2.0
+    live_trading_default_max_daily_loss: float = 6.0
+    live_trading_default_max_total_drawdown: float = 12.0
+    live_trading_default_retry_count: int = 2
+    live_trading_default_retry_delay_ms: int = 250
+    live_trading_runtime_enabled: bool = True
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
 
@@ -77,7 +108,109 @@ def _bool_env(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def _load_env_files() -> None:
+    global _LOADED_ENV_FILES
+    _LOADED_ENV_FILES = []
+    explicit = os.environ.get(ENV_FILE_NAME, "").strip()
+    paths = [Path(explicit)] if explicit else [Path(name) for name in DEFAULT_ENV_FILES]
+    for path in paths:
+        if path.exists() and path.is_file():
+            _LOADED_ENV_FILES.append(_load_env_file(path))
+
+
+def _load_env_file(path: Path) -> dict[str, Any]:
+    loaded_keys: list[str] = []
+    skipped_existing: list[str] = []
+    empty_keys: list[str] = []
+    sensitive_keys_present: list[str] = []
+    ignored_keys = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {
+            "path": str(path),
+            "loaded_keys": [],
+            "skipped_existing": [],
+            "empty_keys": [],
+            "ignored_keys": 0,
+            "sensitive_keys_present": [],
+            "mode": None,
+            "secure_permissions": None,
+            "error": "read_failed",
+        }
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+        if "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key.startswith(ENV_KEY_PREFIX):
+            ignored_keys += 1
+            continue
+        value = _env_file_value(raw_value)
+        if key in SENSITIVE_ENV_KEYS and value and key not in sensitive_keys_present:
+            sensitive_keys_present.append(key)
+        if key in os.environ:
+            skipped_existing.append(key)
+            continue
+        if value == "":
+            empty_keys.append(key)
+            continue
+        os.environ[key] = value
+        loaded_keys.append(key)
+    security = _env_file_security(path)
+    return {
+        "path": str(path),
+        "loaded_keys": loaded_keys,
+        "skipped_existing": skipped_existing,
+        "empty_keys": empty_keys,
+        "ignored_keys": ignored_keys,
+        "sensitive_keys_present": sensitive_keys_present,
+        **security,
+    }
+
+
+def _env_file_security(path: Path) -> dict[str, Any]:
+    try:
+        mode_int = path.stat().st_mode & 0o777
+    except OSError:
+        return {"mode": None, "secure_permissions": None}
+    return {
+        "mode": oct(mode_int),
+        "secure_permissions": (mode_int & 0o077) == 0,
+    }
+
+
+def _env_file_value(raw_value: str) -> str:
+    value = raw_value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value
+
+
+def env_file_status() -> list[dict[str, Any]]:
+    return [dict(item) for item in _LOADED_ENV_FILES]
+
+
+def reload_live_credential_env() -> list[dict[str, Any]]:
+    loaded_keys = {
+        str(key)
+        for item in _LOADED_ENV_FILES
+        for key in (item.get("loaded_keys") or [])
+        if isinstance(key, str)
+    }
+    for key in sorted(LIVE_CREDENTIAL_ENV_KEYS & loaded_keys):
+        os.environ.pop(key, None)
+    _load_env_files()
+    return env_file_status()
+
+
 def load_settings() -> Settings:
+    _load_env_files()
     return Settings(
         initial_balance=_float_env("POLYBOT2OTHER_INITIAL_BALANCE", 100.0, 1.0),
         db_path=Path(os.environ.get("POLYBOT2OTHER_DB_PATH", "data/polybot2other-real-btc.sqlite3")),
@@ -105,6 +238,20 @@ def load_settings() -> Settings:
             os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_DB_DIR", "data/strategy-experiments")
         ),
         strategy_experiments_variants=os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS", ""),
+        live_trading_db_path=Path(
+            os.environ.get("POLYBOT2OTHER_LIVE_TRADING_DB_PATH", "data/live/single_fak_real.sqlite3")
+        ),
+        live_trading_settings_path=Path(
+            os.environ.get("POLYBOT2OTHER_LIVE_TRADING_SETTINGS_PATH", "data/live/live-settings.json")
+        ),
+        live_trading_chain_id=_int_env("POLYBOT2OTHER_LIVE_CHAIN_ID", 137, 1),
+        live_trading_default_initial_balance=_float_env("POLYBOT2OTHER_LIVE_DEFAULT_INITIAL_BALANCE", 20.0, 1.0),
+        live_trading_default_stake_dollars=_float_env("POLYBOT2OTHER_LIVE_DEFAULT_STAKE_DOLLARS", 2.0, 0.1),
+        live_trading_default_max_daily_loss=_float_env("POLYBOT2OTHER_LIVE_DEFAULT_MAX_DAILY_LOSS", 6.0, 0.0),
+        live_trading_default_max_total_drawdown=_float_env("POLYBOT2OTHER_LIVE_DEFAULT_MAX_TOTAL_DRAWDOWN", 12.0, 0.0),
+        live_trading_default_retry_count=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_COUNT", 2, 0),
+        live_trading_default_retry_delay_ms=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_DELAY_MS", 250, 0),
+        live_trading_runtime_enabled=_bool_env("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", True),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
     )

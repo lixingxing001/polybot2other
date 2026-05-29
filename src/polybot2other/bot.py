@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import replace
 from typing import Any
 
-from .config import Settings
+from .config import Settings, reload_live_credential_env
 from .execution import (
     ORDER_TYPE_GTC,
     ORDER_TYPE_GTD,
@@ -30,6 +31,7 @@ from .experiments import (
     StrategyVariant,
     selected_strategy_variants,
 )
+from .live import LIVE_COMBO, LIVE_VARIANT_ID, LiveStrategyRunner
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
 from .polymarket import PolymarketClient, market_to_payload
@@ -77,6 +79,26 @@ POST_ONLY_CROSS_BUFFER = 0.005
 POST_ONLY_QUEUE_INITIAL_FILL_RATIO = 0.25
 POST_ONLY_QUEUE_MAX_FILL_RATIO = 0.75
 POST_ONLY_QUEUE_FULL_SECONDS = 90.0
+LIVE_ONCE_CONFIRM_PHRASE = "PLACE_REAL_ORDER"
+LIVE_ONCE_WAITABLE_BLOCKERS = {"enabled", "market", "target_price", "signal", "orderbook_depth"}
+LIVE_ONCE_AUDIT_DIR_NAME = "audit"
+LIVE_ONCE_AUDIT_SENSITIVE_KEYS = {
+    "authorization",
+    "cookie",
+    "private_key",
+    "raw",
+    "raw_response",
+    "secret",
+    "signed_order",
+    "signature",
+}
+
+
+class LiveOnceBlockedError(RuntimeError):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        message = str(payload.get("error") or "one-shot live run blocked")
+        super().__init__(message)
+        self.payload = payload
 
 
 class PaperTradingBot:
@@ -113,6 +135,7 @@ class PaperTradingBot:
             if settings.strategy_experiments_enabled
             else None
         )
+        self.live_trading = LiveStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -156,6 +179,8 @@ class PaperTradingBot:
             self._backfill_official_final_prices(now)
             self._run_strategy_from_state()
             self.store.record_equity()
+            if self.live_trading is not None:
+                self.live_trading.store.record_equity()
             with self._lock:
                 self.last_error = None
                 self.last_tick_at = now
@@ -439,15 +464,22 @@ class PaperTradingBot:
         final_price: float | None = None,
         target_price: float | None = None,
     ) -> None:
-        if self.strategy_experiments is None:
-            return
-        self.strategy_experiments.apply_official_resolution(
-            round_id,
-            outcome,
-            now,
-            final_price=final_price,
-            target_price=target_price,
-        )
+        if self.strategy_experiments is not None:
+            self.strategy_experiments.apply_official_resolution(
+                round_id,
+                outcome,
+                now,
+                final_price=final_price,
+                target_price=target_price,
+            )
+        if self.live_trading is not None:
+            self.live_trading.apply_official_resolution(
+                round_id,
+                outcome,
+                now,
+                final_price=final_price,
+                target_price=target_price,
+            )
 
     def _run_strategy_from_state(self) -> None:
         with self._lock:
@@ -461,6 +493,7 @@ class PaperTradingBot:
         if pair_enabled:
             self._run_pair_strategy_from_state(market, price, quotes)
             self._run_strategy_experiments(market, price, quotes)
+            self._run_live_strategy(market, price, quotes)
             return
         payload = {"price": price, "quotes": quotes}
         signal = self.strategy.signal(input_from_snapshot(market, payload))
@@ -475,6 +508,7 @@ class PaperTradingBot:
             }
         self._maybe_place_trade(market, signal)
         self._run_strategy_experiments(market, price, quotes)
+        self._run_live_strategy(market, price, quotes)
 
     def _run_strategy_experiments(
         self,
@@ -485,6 +519,19 @@ class PaperTradingBot:
         if self.strategy_experiments is None:
             return
         self.strategy_experiments.run_from_state(market, price, quotes)
+
+    def _run_live_strategy(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        try:
+            if self.live_trading is not None:
+                self.live_trading.run_from_state(market, price, quotes)
+        except Exception as exc:  # noqa: BLE001 - 实盘错误必须暴露但不能阻塞 Paper 采样。
+            if self.live_trading is not None:
+                self.live_trading.last_error = f"{type(exc).__name__}: {exc}"
 
     def _maybe_place_trade(self, market, signal) -> None:
         if signal.side not in {"Up", "Down"}:
@@ -1126,11 +1173,13 @@ class PaperTradingBot:
         merged = dict(quotes)
         for side, fresh in fresh_quotes.items():
             row = merged.get(side) if isinstance(merged.get(side), dict) else {}
-            if not row.get("asks"):
+            if not row.get("asks") and fresh.get("asks"):
                 merged[side] = fresh
         with self._lock:
             latest = dict(self.latest_quotes)
-            latest.update(fresh_quotes)
+            for side, fresh in fresh_quotes.items():
+                if fresh.get("asks"):
+                    latest[side] = fresh
             self.latest_quotes = latest
         return merged
 
@@ -1191,6 +1240,7 @@ class PaperTradingBot:
 
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
+            live_snapshot = self.live_trading.snapshot() if self.live_trading is not None else _disabled_live_snapshot()
             runtime = {
                 "paper_only": True,
                 "running": bool(self._thread and self._thread.is_alive()),
@@ -1203,7 +1253,10 @@ class PaperTradingBot:
                 "ws_status": dict(self.ws_status),
                 "pair_strategy": self._pair_strategy_runtime_locked(),
                 "strategy_experiments": self.strategy_experiments_snapshot(),
+                "live_trading": live_snapshot,
             }
+        if self.live_trading is not None:
+            live_snapshot["open_trades"] = self._decorate_open_trades(self.live_trading.open_trades(), runtime)
         open_trades = self._decorate_open_trades(
             [row for row in self.store.open_trades() if row["symbol"] == "BTC"],
             runtime,
@@ -1231,6 +1284,7 @@ class PaperTradingBot:
                     "db_dir": str(self.settings.strategy_experiments_db_dir),
                     "variants": self.settings.strategy_experiments_variants,
                 },
+                "live_trading": self.live_trading.settings_payload() if self.live_trading is not None else _disabled_live_settings(),
                 "pair_strategy": {
                     "entry_cost_threshold": PAIR_ENTRY_COST_THRESHOLD,
                     "exit_bid_threshold": PAIR_EXIT_BID_THRESHOLD,
@@ -1242,7 +1296,7 @@ class PaperTradingBot:
                     "daily_loss_note": PAIR_DAILY_LOSS_NOTE,
                     "stop_streak_limit": PAIR_STOP_STREAK_LIMIT,
                 },
-                "paper_only": True,
+                "paper_only": not (self.live_trading and self.live_trading.config.enabled),
                 "market_source": "Polymarket Gamma + CLOB market WebSocket + RTDS WebSocket",
             },
             "metrics": metrics,
@@ -1272,6 +1326,230 @@ class PaperTradingBot:
         if self.strategy_experiments is None:
             return {"enabled": False, "variant": None, "recent_trades": [], "recent_orders": []}
         return self.strategy_experiments.detail(variant_id, trade_limit, order_limit)
+
+    def live_settings(self) -> dict[str, Any]:
+        if self.live_trading is None:
+            return _disabled_live_settings()
+        return self.live_trading.settings_payload()
+
+    def update_live_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        settings_payload = self.live_trading.update_settings(payload)
+        return {"live_trading": settings_payload, "snapshot": self.snapshot()}
+
+    def reload_live_credentials(self) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        env_files = reload_live_credential_env()
+        self.live_trading.client.clear_cached_credentials()
+        settings_payload = self.live_trading.settings_payload()
+        settings_payload["credential_reload"] = {
+            "reloaded_at": time.time(),
+            "env_files": env_files,
+        }
+        return {"live_trading": settings_payload, "snapshot": self.snapshot()}
+
+    def set_live_enabled(self, enabled: bool) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        settings_payload = self.live_trading.set_enabled(enabled)
+        return {"live_trading": settings_payload, "snapshot": self.snapshot()}
+
+    def live_emergency_stop(self) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        result = self.live_trading.emergency_stop()
+        result["snapshot"] = self.snapshot()
+        return result
+
+    def live_open_orders(self, *, force: bool = True) -> dict[str, Any]:
+        if self.live_trading is None:
+            return {
+                "live_open_orders": _disabled_live_open_orders(),
+                "snapshot": self.snapshot(),
+            }
+        result = self.live_trading.open_orders_payload(force=force)
+        return {"live_open_orders": result, "snapshot": self.snapshot()}
+
+    def live_evidence(self, external_order_id: str | None = None, *, force: bool = True) -> dict[str, Any]:
+        if self.live_trading is None:
+            return {
+                "live_evidence": _disabled_live_evidence(external_order_id),
+                "snapshot": self.snapshot(),
+            }
+        result = self.live_trading.evidence_payload(external_order_id, force=force)
+        return {"live_evidence": result, "snapshot": self.snapshot()}
+
+    def live_preflight(self) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        with self._lock:
+            market = self.current_market
+            price = dict(self.latest_price)
+            quotes = _copy_quotes(self.latest_quotes)
+        return {
+            "live_preflight": self.live_trading.preflight(market, price, quotes),
+            "snapshot": self.snapshot(),
+        }
+
+    def refresh_live_preflight(self) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        market = self._refresh_market()
+        if market is not None:
+            self._rest_fallback_snapshot(market)
+        return self.live_preflight()
+
+    def run_live_once(
+        self,
+        *,
+        confirm: str,
+        max_stake_dollars: float,
+        acknowledge_compliance: bool = False,
+        disable_after: bool = True,
+        refresh: bool = True,
+        reconcile_wait_seconds: float = 0.0,
+        reconcile_poll_seconds: float = 1.0,
+        wait_ready_seconds: float = 0.0,
+        ready_poll_seconds: float = 2.0,
+        include_evidence: bool = True,
+    ) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        if str(confirm or "").strip() != LIVE_ONCE_CONFIRM_PHRASE:
+            raise ValueError(f"confirm must be {LIVE_ONCE_CONFIRM_PHRASE}")
+        try:
+            max_stake = float(max_stake_dollars)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_stake_dollars must be a number") from exc
+        if max_stake <= 0:
+            raise ValueError("max_stake_dollars must be positive")
+        if self.live_trading.config.enabled:
+            raise RuntimeError("one-shot live run requires the live switch to be off before starting")
+        if acknowledge_compliance:
+            self.live_trading.update_settings({"compliance_acknowledged": True})
+        max_wait = max(0.0, min(1800.0, float(wait_ready_seconds or 0.0)))
+        poll_seconds = max(0.25, min(30.0, float(ready_poll_seconds or 2.0)))
+        deadline = time.time() + max_wait
+        preflight_attempts = 0
+        ready_wait_started_at = time.time()
+        preflight: dict[str, Any] | None = None
+        while True:
+            preflight_attempts += 1
+            if refresh:
+                market = self._refresh_market()
+                if market is not None:
+                    self._rest_fallback_snapshot(market)
+            with self._lock:
+                market = self.current_market
+                price = dict(self.latest_price)
+                quotes = _copy_quotes(self.latest_quotes)
+            if market is None:
+                if max_wait <= 0 or time.time() >= deadline:
+                    message = "current market unavailable for one-shot live run"
+                    raise LiveOnceBlockedError(
+                        _live_once_blocked_payload(
+                            message,
+                            blocked_keys=["market"],
+                            fatal_keys=[],
+                            waitable_keys=["market"],
+                            preflight=None,
+                            preflight_attempts=preflight_attempts,
+                            wait_ready_seconds=max_wait,
+                            ready_wait_started_at=ready_wait_started_at,
+                        )
+                    )
+                time.sleep(min(poll_seconds, max(0.0, deadline - time.time())))
+                continue
+            preflight = self.live_trading.preflight(market, price, quotes)
+            if preflight.get("ready") or preflight.get("arming_ready"):
+                break
+            blocked_keys = [str(row.get("key") or "") for row in preflight.get("blocked_checks") or []]
+            one_shot_blocked_keys = [key for key in blocked_keys if key != "enabled"]
+            fatal_keys = [key for key in one_shot_blocked_keys if key not in LIVE_ONCE_WAITABLE_BLOCKERS]
+            if max_wait <= 0 or fatal_keys or time.time() >= deadline:
+                blocked = ", ".join(one_shot_blocked_keys or blocked_keys)
+                message = f"one-shot live preflight blocked: {blocked or 'unknown'}"
+                waitable_keys = [key for key in one_shot_blocked_keys if key in LIVE_ONCE_WAITABLE_BLOCKERS]
+                raise LiveOnceBlockedError(
+                    _live_once_blocked_payload(
+                        message,
+                        blocked_keys=one_shot_blocked_keys or blocked_keys,
+                        fatal_keys=fatal_keys,
+                        waitable_keys=waitable_keys,
+                        preflight=preflight,
+                        preflight_attempts=preflight_attempts,
+                        wait_ready_seconds=max_wait,
+                        ready_wait_started_at=ready_wait_started_at,
+                    )
+                )
+            time.sleep(min(poll_seconds, max(0.0, deadline - time.time())))
+        result = self.live_trading.run_once_from_state(
+            market,
+            price,
+            quotes,
+            max_stake_dollars=max_stake,
+            disable_after=disable_after,
+            reconcile_wait_seconds=reconcile_wait_seconds,
+            reconcile_poll_seconds=reconcile_poll_seconds,
+        )
+        result["preflight"] = preflight
+        result["preflight_attempts"] = preflight_attempts
+        result["wait_ready_seconds"] = round(max_wait, 3)
+        result["waited_ready_seconds"] = round(max(0.0, time.time() - ready_wait_started_at), 3)
+        if include_evidence:
+            order_id = None
+            if isinstance(result.get("last_order"), dict):
+                order_id = result["last_order"].get("order_id")
+            if not order_id and isinstance(result.get("reconcile"), dict):
+                order_id = result["reconcile"].get("external_order_id")
+            result["evidence"] = self.live_trading.evidence_payload(str(order_id or ""), force=True)
+        try:
+            audit_path = self._save_live_once_audit(result)
+            if audit_path:
+                result["audit"] = {
+                    "saved": True,
+                    "path": audit_path,
+                    "sanitized": True,
+                }
+        except Exception as exc:  # noqa: BLE001 - 不能因为本地审计文件写入失败遮蔽真实订单结果。
+            result["audit"] = {
+                "saved": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "sanitized": True,
+            }
+        result["snapshot"] = self.snapshot()
+        return {"live_once": result}
+
+    def _save_live_once_audit(self, result: dict[str, Any]) -> str | None:
+        if not isinstance(result, dict):
+            return None
+        last_order = result.get("last_order") if isinstance(result.get("last_order"), dict) else {}
+        order_id = str((last_order or {}).get("order_id") or "").strip()
+        if not result.get("submitted") and not order_id:
+            return None
+        audit_dir = self.settings.live_trading_db_path.parent / LIVE_ONCE_AUDIT_DIR_NAME
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        created_at = time.time()
+        created_tag = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created_at))
+        order_tag = _audit_filename_part(order_id or "no-order-id")
+        path = audit_dir / f"live-once-{created_tag}-{int(created_at * 1000)}-{order_tag}.json"
+        result["audit"] = {
+            "saved": True,
+            "path": str(path),
+            "sanitized": True,
+        }
+        payload = {
+            "created_at": created_at,
+            "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_at)),
+            "purpose": "SINGLE_FAK_REAL live one-shot audit",
+            "live_once": _sanitize_live_audit_payload(result),
+        }
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(path)
+        return str(path)
 
     def strategy_experiments_retrospective(
         self,
@@ -1318,11 +1596,26 @@ class PaperTradingBot:
         offset: int = 0,
         start_at: float | None = None,
         end_at: float | None = None,
+        account_scope: str = "main",
+        variant_id: str | None = None,
     ) -> dict[str, Any]:
         limit = max(1, min(RECENT_TRADES_MAX_LIMIT, int(limit)))
         offset = max(0, int(offset))
         if start_at is not None and end_at is not None and end_at < start_at:
             raise ValueError("end_at must be greater than or equal to start_at")
+        scope = str(account_scope or "main").strip().lower().replace("-", "_")
+        if scope == "live":
+            if self.live_trading is None:
+                raise ValueError("live trading is disabled in this runtime")
+            page = self.live_trading.recent_trades_page(limit, offset, start_at, end_at)
+            page["recent_trades"] = self._decorate_recent_trades(page["recent_trades"])
+            return page
+        if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
+            if not variant_id:
+                raise ValueError("variant_id is required for strategy_experiment scope")
+            if self.strategy_experiments is None:
+                raise ValueError("strategy experiments are not enabled")
+            return self.strategy_experiments.recent_trades_page(variant_id, limit, offset, start_at, end_at)
         total = self.store.recent_trade_count("BTC", start_at, end_at)
         rows = self._decorate_recent_trades(self.store.recent_trades(limit, offset, "BTC", start_at, end_at))
         summary = self.store.recent_trade_summary("BTC", start_at, end_at)
@@ -1341,10 +1634,28 @@ class PaperTradingBot:
             },
         }
 
-    def orders_page(self, limit: int = ORDERS_DEFAULT_LIMIT, offset: int = 0, status_filter: str = "all") -> dict[str, Any]:
+    def orders_page(
+        self,
+        limit: int = ORDERS_DEFAULT_LIMIT,
+        offset: int = 0,
+        status_filter: str = "all",
+        account_scope: str = "main",
+        variant_id: str | None = None,
+    ) -> dict[str, Any]:
         limit = max(1, min(ORDERS_MAX_LIMIT, int(limit)))
         offset = max(0, int(offset))
         status_key = normalize_paper_order_status_filter(status_filter)
+        scope = str(account_scope or "main").strip().lower().replace("-", "_")
+        if scope == "live":
+            if self.live_trading is None:
+                raise ValueError("live trading is disabled in this runtime")
+            return self.live_trading.orders_page(limit, offset, status_key)
+        if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
+            if not variant_id:
+                raise ValueError("variant_id is required for strategy_experiment scope")
+            if self.strategy_experiments is None:
+                raise ValueError("strategy experiments are not enabled")
+            return self.strategy_experiments.orders_page(variant_id, limit, offset, status_key)
         total = self.store.paper_order_count("BTC", status_key)
         rows = self.store.recent_paper_orders(limit, offset, "BTC", status_key)
         loaded = min(total, offset + len(rows))
@@ -1360,12 +1671,35 @@ class PaperTradingBot:
             },
         }
 
-    def order_fills(self, order_id: int) -> dict[str, Any]:
+    def order_fills(self, order_id: int, account_scope: str = "main", variant_id: str | None = None) -> dict[str, Any]:
         order_id = max(1, int(order_id))
+        scope = str(account_scope or "main").strip().lower().replace("-", "_")
+        if scope == "live":
+            if self.live_trading is None:
+                raise ValueError("live trading is disabled in this runtime")
+            return {
+                "order_id": order_id,
+                "fills": self.live_trading.store.paper_order_fills(order_id),
+            }
+        if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
+            if not variant_id:
+                raise ValueError("variant_id is required for strategy_experiment scope")
+            if self.strategy_experiments is None:
+                raise ValueError("strategy experiments are not enabled")
+            return self.strategy_experiments.order_fills(variant_id, order_id)
         return {
             "order_id": order_id,
             "fills": self.store.paper_order_fills(order_id),
         }
+
+    def sell_live_trade(self, trade_id: int) -> dict[str, Any]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        with self._lock:
+            quotes = _copy_quotes(self.latest_quotes)
+        result = self.live_trading.sell_trade(max(1, int(trade_id)), quotes)
+        result["snapshot"] = self.snapshot()
+        return result
 
     def cancel_order(self, order_id: int) -> dict[str, Any]:
         result = self.store.cancel_paper_order(max(1, int(order_id)), "manual")
@@ -1426,7 +1760,11 @@ class PaperTradingBot:
             if self.strategy_experiments is None:
                 raise ValueError("strategy experiments are not enabled")
             return self.strategy_experiments.equity_curve_window(variant_id, days, max_points)
-        raise ValueError("account_scope must be main or strategy_experiment")
+        if normalized_scope == "live":
+            if self.live_trading is None:
+                raise ValueError("live trading is disabled in this runtime")
+            return self.live_trading.equity_curve_window(days, max_points)
+        raise ValueError("account_scope must be main, strategy_experiment, or live")
 
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
         state = _pair_quote_state(self.latest_quotes, time.time())
@@ -1550,6 +1888,7 @@ class StrategyExperimentRunner:
             max_open_trades=max_open_trades,
             strategy_experiments_enabled=False,
             strategy_experiments_variants="",
+            live_trading_runtime_enabled=False,
         )
 
     def run_from_state(
@@ -1620,13 +1959,7 @@ class StrategyExperimentRunner:
         }
 
     def detail(self, variant_id: str, trade_limit: int = 50, order_limit: int = 50) -> dict[str, Any]:
-        normalized = str(variant_id or "").strip().upper().replace("-", "_")
-        by_id = {variant.variant_id: variant for variant in self.variants}
-        variant = by_id.get(normalized)
-        if variant is None:
-            allowed = ", ".join(sorted(by_id))
-            raise ValueError(f"variant_id must be one of {allowed}")
-        bot = self._bots[variant.variant_id]
+        variant, bot = self._variant_bot(variant_id)
         with self._lock:
             last_error = self._errors.get(variant.variant_id)
             official_broadcast_error = self._official_broadcast_errors.get(variant.variant_id)
@@ -1645,14 +1978,75 @@ class StrategyExperimentRunner:
             "recent_orders_page": bot.orders_page(order_limit, 0),
         }
 
-    def equity_curve_window(self, variant_id: str | None, days: int, max_points: int) -> dict[str, Any]:
+    def _variant_bot(self, variant_id: str) -> tuple[StrategyVariant, "PaperTradingBot"]:
         normalized = str(variant_id or "").strip().upper().replace("-", "_")
         by_id = {variant.variant_id: variant for variant in self.variants}
         variant = by_id.get(normalized)
         if variant is None:
             allowed = ", ".join(sorted(by_id))
             raise ValueError(f"variant_id must be one of {allowed}")
-        rows = self._bots[variant.variant_id].store.equity_curve_window(days, max_points)
+        return variant, self._bots[variant.variant_id]
+
+    def recent_trades_page(
+        self,
+        variant_id: str,
+        limit: int,
+        offset: int,
+        start_at: float | None = None,
+        end_at: float | None = None,
+    ) -> dict[str, Any]:
+        variant, bot = self._variant_bot(variant_id)
+        total = bot.store.recent_trade_count("BTC", start_at, end_at)
+        rows = _tag_variant_rows(
+            bot._decorate_recent_trades(bot.store.recent_trades(limit, offset, "BTC", start_at, end_at)),
+            _variant_tags(variant),
+        )
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_trades": rows,
+            "recent_trades_summary": bot.store.recent_trade_summary("BTC", start_at, end_at),
+            "recent_trades_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        }
+
+    def orders_page(self, variant_id: str, limit: int, offset: int, status_filter: str = "all") -> dict[str, Any]:
+        variant, bot = self._variant_bot(variant_id)
+        status_key = normalize_paper_order_status_filter(status_filter)
+        total = bot.store.paper_order_count("BTC", status_key)
+        rows = _tag_variant_rows(
+            bot.store.recent_paper_orders(limit, offset, "BTC", status_key),
+            _variant_tags(variant),
+        )
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_orders": rows,
+            "recent_orders_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "status_filter": status_key,
+            },
+        }
+
+    def order_fills(self, variant_id: str, order_id: int) -> dict[str, Any]:
+        _, bot = self._variant_bot(variant_id)
+        return {
+            "order_id": max(1, int(order_id)),
+            "fills": bot.store.paper_order_fills(max(1, int(order_id))),
+        }
+
+    def equity_curve_window(self, variant_id: str | None, days: int, max_points: int) -> dict[str, Any]:
+        variant, bot = self._variant_bot(variant_id or "")
+        rows = bot.store.equity_curve_window(days, max_points)
         return {
             "equity_curve": rows,
             "equity_curve_meta": {
@@ -1663,7 +2057,7 @@ class StrategyExperimentRunner:
                 "days": days,
                 "max_points": max_points,
                 "points": len(rows),
-                "initial_balance": self._bots[variant.variant_id].settings.initial_balance,
+                "initial_balance": bot.settings.initial_balance,
             },
         }
 
@@ -1914,6 +2308,74 @@ def _copy_quotes(quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]
                 item[key] = [dict(level) for level in levels if isinstance(level, dict)]
         copied[str(side)] = item
     return copied
+
+
+def _disabled_live_settings() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "variant_id": LIVE_VARIANT_ID,
+        "combo": LIVE_COMBO,
+        "readiness": {"ready": False, "errors": ["live trading disabled in this runtime"]},
+        "open_orders": _disabled_live_open_orders()["open_orders"],
+    }
+
+
+def _disabled_live_snapshot() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "variant_id": LIVE_VARIANT_ID,
+        "combo": LIVE_COMBO,
+        "execution_mode": "LIVE",
+        "last_signal": {},
+        "last_error": "live trading disabled in this runtime",
+        "open_trades": [],
+        "readiness": {"ready": False, "errors": ["live trading disabled in this runtime"]},
+        "open_orders": _disabled_live_open_orders()["open_orders"],
+        "settings": {"enabled": False},
+        "variants": [],
+    }
+
+
+def _disabled_live_open_orders() -> dict[str, Any]:
+    return {
+        "execution_mode": "LIVE",
+        "variant_id": LIVE_VARIANT_ID,
+        "combo": LIVE_COMBO,
+        "open_orders": {
+            "ready": False,
+            "skipped": True,
+            "errors": ["live trading disabled in this runtime"],
+            "orders": [],
+            "count": 0,
+            "checked_at": time.time(),
+        },
+    }
+
+
+def _disabled_live_evidence(external_order_id: str | None = None) -> dict[str, Any]:
+    return {
+        "checked_at": time.time(),
+        "execution_mode": "LIVE",
+        "variant_id": LIVE_VARIANT_ID,
+        "combo": LIVE_COMBO,
+        "enabled": False,
+        "last_signal": {},
+        "last_error": "live trading disabled in this runtime",
+        "settings": {"enabled": False},
+        "software_account": {},
+        "readiness": {"ready": False, "errors": ["live trading disabled in this runtime"]},
+        "wallet": None,
+        "official_open_orders": _disabled_live_open_orders()["open_orders"],
+        "open_trades": [],
+        "pending_orders": [],
+        "recent_orders": [],
+        "recent_orders_meta": {"limit": 20, "offset": 0, "loaded": 0, "total": 0, "has_more": False, "status_filter": "all"},
+        "recent_trades": [],
+        "recent_trades_summary": {},
+        "recent_trades_meta": {"limit": 20, "offset": 0, "loaded": 0, "total": 0, "has_more": False},
+        "order": None,
+        "requested_external_order_id": str(external_order_id or "").strip() or None,
+    }
 
 
 def _append_reason_text(existing: str, addition: str) -> str:
@@ -2428,6 +2890,70 @@ def _price_confirms_residual(side: str, price: dict[str, Any], target_price: flo
     if side == "Down":
         return chainlink <= target_price
     return False
+
+
+def _live_once_blocked_payload(
+    message: str,
+    *,
+    blocked_keys: list[str],
+    fatal_keys: list[str],
+    waitable_keys: list[str],
+    preflight: dict[str, Any] | None,
+    preflight_attempts: int,
+    wait_ready_seconds: float,
+    ready_wait_started_at: float,
+) -> dict[str, Any]:
+    return {
+        "error": message,
+        "live_once": {
+            "execution_mode": "LIVE",
+            "variant_id": LIVE_VARIANT_ID,
+            "combo": LIVE_COMBO,
+            "submitted": False,
+            "blocked": True,
+            "blocked_keys": _unique_strings(blocked_keys),
+            "fatal_blocked_keys": _unique_strings(fatal_keys),
+            "waitable_blocked_keys": _unique_strings(waitable_keys),
+            "preflight": preflight,
+            "preflight_attempts": int(preflight_attempts),
+            "wait_ready_seconds": round(max(0.0, float(wait_ready_seconds or 0.0)), 3),
+            "waited_ready_seconds": round(max(0.0, time.time() - ready_wait_started_at), 3),
+        },
+    }
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _sanitize_live_audit_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key or "").strip().lower()
+            if normalized in LIVE_ONCE_AUDIT_SENSITIVE_KEYS:
+                continue
+            sanitized[str(key)] = _sanitize_live_audit_payload(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_live_audit_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_live_audit_payload(item) for item in value]
+    return value
+
+
+def _audit_filename_part(value: Any) -> str:
+    text = str(value or "unknown").strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in text)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return (cleaned or "unknown")[:80]
 
 
 def _maybe_float(value: Any) -> float | None:

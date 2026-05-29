@@ -15,8 +15,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .bot import PaperTradingBot
+from .bot import LiveOnceBlockedError, PaperTradingBot
 from .config import Settings, load_settings
+from .live_doctor import build_live_doctor_from_bot
 from .storage import PAPER_ORDER_STATUS_FILTERS, TradeStore
 
 
@@ -48,6 +49,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/orders":
             self._send_json(self.server.bot.orders_page(), include_body=False)
+            return
+        if path == "/api/live-settings":
+            self._send_json(self.server.bot.live_settings(), include_body=False)
+            return
+        if path == "/api/live-preflight":
+            self._send_json(self.server.bot.live_preflight(), include_body=False)
+            return
+        if path == "/api/live-open-orders":
+            self._send_json(self.server.bot.live_open_orders(force=False), include_body=False)
+            return
+        if path == "/api/live-evidence":
+            self._send_json(self.server.bot.live_evidence(force=False), include_body=False)
+            return
+        if path == "/api/live-doctor":
+            payload = build_live_doctor_from_bot(self.server.bot, refresh=False)
+            self._send_json({"live_doctor": payload.get("live_doctor")}, include_body=False)
             return
         if path == "/api/strategy-experiments":
             self._send_json(self.server.bot.strategy_experiments_snapshot(), include_body=False)
@@ -88,7 +105,18 @@ class Handler(BaseHTTPRequestHandler):
                 offset = _query_int(query, "offset", 0, 0, 100_000)
                 start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
                 end_at = _query_float_optional(query, "end_at", 0, 4_102_444_800)
-                self._send_json(self.server.bot.recent_trades_page(limit, offset, start_at, end_at))
+                account_scope = _query_str_optional(query, "account_scope") or "main"
+                variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                self._send_json(
+                    self.server.bot.recent_trades_page(
+                        limit,
+                        offset,
+                        start_at,
+                        end_at,
+                        account_scope=account_scope,
+                        variant_id=variant_id,
+                    )
+                )
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -97,13 +125,28 @@ class Handler(BaseHTTPRequestHandler):
                 limit = _query_int(query, "limit", 20, 1, 200)
                 offset = _query_int(query, "offset", 0, 0, 100_000)
                 status_filter = _query_choice(query, "status", set(PAPER_ORDER_STATUS_FILTERS), "all")
-                self._send_json(self.server.bot.orders_page(limit, offset, status_filter))
+                account_scope = _query_str_optional(query, "account_scope") or "main"
+                variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                self._send_json(
+                    self.server.bot.orders_page(
+                        limit,
+                        offset,
+                        status_filter,
+                        account_scope=account_scope,
+                        variant_id=variant_id,
+                    )
+                )
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/order-fills":
-            order_id = _query_int(query, "order_id", 0, 1, 1_000_000_000)
-            self._send_json(self.server.bot.order_fills(order_id))
+            try:
+                order_id = _query_int(query, "order_id", 0, 1, 1_000_000_000)
+                account_scope = _query_str_optional(query, "account_scope") or "main"
+                variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                self._send_json(self.server.bot.order_fills(order_id, account_scope, variant_id))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/equity-curve":
             try:
@@ -170,6 +213,45 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if path == "/api/live-settings":
+            self._send_json(self.server.bot.live_settings())
+            return
+        if path == "/api/live-preflight":
+            try:
+                include_snapshot = _query_bool_optional(query, "include_snapshot", True)
+                payload = self.server.bot.live_preflight()
+                if not include_snapshot:
+                    payload = {"live_preflight": payload.get("live_preflight")}
+                self._send_json(payload)
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/live-open-orders":
+            self._send_json(self.server.bot.live_open_orders(force=True))
+            return
+        if path == "/api/live-evidence":
+            try:
+                external_order_id = _query_str_optional(query, "external_order_id")
+                force = _query_bool_optional(query, "force", True)
+                include_snapshot = _query_bool_optional(query, "include_snapshot", False)
+                payload = self.server.bot.live_evidence(external_order_id, force=force)
+                if not include_snapshot:
+                    payload = {"live_evidence": payload.get("live_evidence")}
+                self._send_json(payload)
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/live-doctor":
+            try:
+                refresh = _query_bool_optional(query, "refresh", True)
+                include_snapshot = _query_bool_optional(query, "include_snapshot", False)
+                payload = build_live_doctor_from_bot(self.server.bot, refresh=refresh)
+                if not include_snapshot:
+                    payload = {"live_doctor": payload.get("live_doctor")}
+                self._send_json(payload)
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if path == "/api/current-market":
             self.server.bot.tick()
             self._send_json(self.server.bot.snapshot())
@@ -200,6 +282,97 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self.server.bot.set_pair_strategy_enabled(enabled))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-settings":
+            try:
+                payload = self._read_json_body()
+                self._send_json(self.server.bot.update_live_settings(payload))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-reload-credentials":
+            try:
+                self._send_json(self.server.bot.reload_live_credentials())
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-toggle":
+            try:
+                payload = self._read_json_body()
+                enabled = _read_bool(payload, "enabled")
+                self._send_json(self.server.bot.set_live_enabled(enabled))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-preflight":
+            try:
+                self._send_json(self.server.bot.live_preflight())
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-once":
+            try:
+                payload = self._read_json_body()
+                self._send_json(
+                    self.server.bot.run_live_once(
+                        confirm=str(payload.get("confirm") or ""),
+                        max_stake_dollars=_body_float(payload, "max_stake_dollars", 0.01, 1_000_000.0),
+                        acknowledge_compliance=_body_bool_optional(payload, "acknowledge_compliance", False),
+                        disable_after=_body_bool_optional(payload, "disable_after", True),
+                        refresh=_body_bool_optional(payload, "refresh", True),
+                        reconcile_wait_seconds=_body_float_optional(
+                            payload,
+                            "reconcile_wait_seconds",
+                            0.0,
+                            120.0,
+                            0.0,
+                        ),
+                        reconcile_poll_seconds=_body_float_optional(
+                            payload,
+                            "reconcile_poll_seconds",
+                            0.1,
+                            10.0,
+                            1.0,
+                        ),
+                        wait_ready_seconds=_body_float_optional(
+                            payload,
+                            "wait_ready_seconds",
+                            0.0,
+                            1800.0,
+                            0.0,
+                        ),
+                        ready_poll_seconds=_body_float_optional(
+                            payload,
+                            "ready_poll_seconds",
+                            0.25,
+                            30.0,
+                            2.0,
+                        ),
+                        include_evidence=_body_bool_optional(payload, "include_evidence", True),
+                    )
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except LiveOnceBlockedError as exc:
+                self._send_json_status(HTTPStatus.CONFLICT, exc.payload)
+            except RuntimeError as exc:
+                self._send_error_json(HTTPStatus.CONFLICT, str(exc))
+            return
+        if self.path == "/api/live-emergency-stop":
+            try:
+                self._send_json(self.server.bot.live_emergency_stop())
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/live-sell":
+            try:
+                payload = self._read_json_body()
+                trade_id = _body_int(payload, "trade_id", 1, 1_000_000_000)
+                self._send_json(self.server.bot.sell_live_trade(trade_id))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except RuntimeError as exc:
+                self._send_error_json(HTTPStatus.CONFLICT, str(exc))
             return
         if self.path == "/api/cancel-order":
             try:
@@ -232,6 +405,19 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict[str, Any], include_body: bool = True) -> None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if include_body:
+            try:
+                self.wfile.write(data)
+            except BrokenPipeError:
+                return
+
+    def _send_json_status(self, status: HTTPStatus, payload: dict[str, Any], include_body: bool = True) -> None:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
@@ -603,6 +789,18 @@ def _query_str_optional(query: dict[str, list[str]], key: str) -> str | None:
     return value or None
 
 
+def _query_bool_optional(query: dict[str, list[str]], key: str, default: bool) -> bool:
+    raw = query.get(key, [None])[0]
+    if raw in (None, ""):
+        return default
+    value = str(raw).strip().lower()
+    if value in {"true", "1", "yes", "on"}:
+        return True
+    if value in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean")
+
+
 def _body_int(payload: dict[str, Any], key: str, minimum: int, maximum: int) -> int:
     if key not in payload:
         raise ValueError(f"{key} is required")
@@ -613,6 +811,45 @@ def _body_int(payload: dict[str, Any], key: str, minimum: int, maximum: int) -> 
     if value < minimum or value > maximum:
         raise ValueError(f"{key} must be between {minimum} and {maximum}")
     return value
+
+
+def _body_float(payload: dict[str, Any], key: str, minimum: float, maximum: float) -> float:
+    if key not in payload:
+        raise ValueError(f"{key} is required")
+    try:
+        value = float(payload[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+    if value < minimum or value > maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
+def _body_float_optional(
+    payload: dict[str, Any],
+    key: str,
+    minimum: float,
+    maximum: float,
+    default: float,
+) -> float:
+    if key not in payload:
+        return default
+    return _body_float(payload, key, minimum, maximum)
+
+
+def _body_bool_optional(payload: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in payload:
+        return default
+    value = payload[key]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{key} must be a boolean")
 
 
 def _body_choice(payload: dict[str, Any], key: str, choices: set[str], default: str) -> str:
