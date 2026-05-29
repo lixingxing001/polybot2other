@@ -1,6 +1,8 @@
-# polybot2other
+# EdgePulse
 
 Real Polymarket BTC 5-minute Up/Down paper and live-trading dashboard.
+
+The runtime package and existing data paths still use `polybot2other` for command and database compatibility.
 
 The default mode still runs Paper trading continuously. Live trading is opt-in and disabled until the dashboard setting is explicitly enabled:
 
@@ -14,7 +16,7 @@ The default mode still runs Paper trading continuously. Live trading is opt-in a
 - GTC/GTD/POST_ONLY are simulated as resting maker orders. GTC can rest until market end, GTD expires after `POLYBOT2OTHER_PAPER_GTD_SECONDS`, and POST_ONLY additionally requires queue time, price-through-limit movement, and partial queue fills.
 - Resting maker partial fills from the same paper order are aggregated into one open position. Tiny resting fills below `$0.01` are ignored, and residual reserved cash at or below `$0.05` is released as dust instead of creating `$0.00` open positions.
 - Paper order attempts and per-level paper fills are stored separately from positions for execution-quality review.
-- Strategy experiments can run 11 isolated Paper combinations: the original `SINGLE/PAIR + FAK/GTC/GTD/POST_ONLY` set plus `SINGLE_FAK_STRICT`, `SINGLE_FAK_REVERSAL`, and `SINGLE_FAK_STOP_AND_FLIP`.
+- Strategy experiments can run 18 isolated Paper combinations. See `docs/strategy-combinations-guide.html` for the account-scope and variant guide.
 - `SINGLE_FAK_REAL` uses a separate live SQLite database and follows the current `SINGLE_FAK` paper strategy behavior: FAK taker entry and legacy same-market opposite-side reversal allowed after any pending live buy for that market has settled.
 - Live trading uses a configured soft budget cap (`initial_balance`) instead of trusting the full wallet balance. This is a software guard, not an on-chain limit.
 - If `stake_dollars` is changed while the current market already has a live position, that current market keeps using the original position stake for any same-market reversal leg. The new configured stake applies to the next market.

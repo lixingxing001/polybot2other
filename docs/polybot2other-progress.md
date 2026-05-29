@@ -1,5 +1,412 @@
 # polybot2other-progress
 
+## 2026-05-29 v3.65
+
+### 已完成
+
+1. 将地址修正概率刷新周期从 15 秒缩短到 5 秒，提升 Data API 近实时观察频率。
+2. 将后端 `ACTOR_ANALYSIS_CACHE_SECONDS` 从 8 秒缩短到 4.5 秒，避免前端 5 秒刷新仍长期命中旧缓存。
+3. 分析页顶部新增“实时盘口流”展示开关，默认开启；关闭后整张实时盘口流卡片隐藏。
+4. 实时盘口流开关状态保存到浏览器 localStorage，刷新页面后保留用户选择。
+5. 静态资源版本提升到 `20260529-v2-94`。
+
+### 已确认决策
+
+1. 关闭实时盘口流卡片只影响页面展示，不断开 WebSocket，因为实时方向概率和 Bot 页面仍需要这些实时流。
+2. 地址修正概率仍是 Data API 近实时，不标记为毫秒级实时。
+3. 本轮不修改策略 signal、Paper、实盘下单、卖出、撤单或后端交易接口。
+
+### 待办和后期优化
+
+1. 如果 5 秒刷新导致 Data API 偶发 `PARTIAL` 增多，可后续拆分为 trades 5 秒、holders/positions 15 秒。
+2. 后续可在页面展示 Data API 最近一次成功刷新时间和失败次数，帮助判断地址修正概率是否 stale。
+
+### 已知坑位
+
+1. Data API 本身可能有上游延迟或限流，即使前端 5 秒刷新，也不保证每次都有新地址画像。
+2. 关闭实时盘口流卡片后，实时方向概率仍会更新；这是设计选择，不是开关失效。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已执行静态文件检查，确认首页引用 `20260529-v2-94`，包含 `analysis-realtime-toggle` 与 `analysis-realtime-card`，脚本包含 5 秒刷新和实时盘口流可见性逻辑。
+5. 已请求 `http://127.0.0.1:8791/`，HTTP 200，确认返回 HTML 包含 `20260529-v2-94` 和实时盘口流开关。
+6. 已请求 `/static/app.js?v=20260529-v2-94`，HTTP 200，确认包含 `ACTOR_ANALYSIS_REFRESH_MS = 5_000` 和可见性保存逻辑。
+7. 已请求 `/api/actor-analysis?refresh=true`，HTTP 200，返回 `status=READY`、`analysis_only=true`、`affects_trading=false`。
+
+### 回滚建议
+
+1. 如需回滚本次刷新频率和实时盘口流开关，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档的 v3.65 记录。
+
+## 2026-05-29 v3.62
+
+### 已完成
+
+1. “方向概率”卡片新增实时方向概率，直接基于前端 WebSocket 状态重算，不再只依赖 `/api/actor-analysis` 的 15 秒轮询。
+2. 实时方向概率使用盘口隐含 Up、目标价距离模型、最近 10 秒成交压力、OKX/Binance 相对 Chainlink 外部领先偏差做加权展示。
+3. 原 Data API 返回的综合概率改为“地址修正概率”，明确这是慢速近实时数据，用于和 WebSocket 实时概率分层对比。
+4. 将“刷新分析”按钮从分析页顶部移动到“方向概率”卡片右侧；按钮仍只刷新 Data API 地址画像和地址修正概率，不影响实时 WebSocket 概率。
+5. 静态资源版本提升到 `20260529-v2-93`。
+
+### 已确认决策
+
+1. 本轮仍然只改分析页展示，不修改任何策略 signal、Paper 下单、实盘下单、卖出、撤单或后端交易接口。
+2. 实时方向概率是观察指标，不作为交易信号；地址修正概率继续保留 Data API 的真实刷新边界。
+3. 不把 holders / positions 强行毫秒级轮询，避免上游压力和语义误导。
+
+### 待办和后期优化
+
+1. 后续可以把实时概率的组成权重配置化，用于对比不同实时指标权重是否更贴近结算结果。
+2. 后续可把实时概率快照按秒落库，复盘它和 SINGLE/PAIR 组合结果之间的相关性。
+
+### 已知坑位
+
+1. 实时方向概率依赖浏览器 WebSocket 收到的事件，如果浏览器后台挂起或断线，延迟会变大。
+2. 地址修正概率仍然可能慢于盘口变化，这是 Data API 数据边界，不是前端刷新问题。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已执行静态文件检查，确认首页引用 `20260529-v2-93`，方向概率卡片包含 `analysis-card-action`，脚本包含 `realtimeDirectionProbability` 与 `probabilityBarHtml`。
+4. 已请求 `http://127.0.0.1:8791/`，HTTP 200，确认返回 HTML 包含 `20260529-v2-93` 与方向概率卡片按钮。
+5. 已请求 `/static/app.js?v=20260529-v2-93`，HTTP 200，确认包含实时方向概率和地址修正概率渲染逻辑。
+
+### 回滚建议
+
+1. 如需回滚本次方向概率实时化，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档的 v3.62 记录。
+
+## 2026-05-29 v3.59
+
+### 已完成
+
+1. 分析页新增“实时盘口流”卡片，直接消费现有 Polymarket market WebSocket、RTDS、OKX WebSocket、Binance WebSocket 的前端事件。
+2. 新增实时状态聚合：盘口事件数、价格事件数、最新事件延迟、最新成交、10 秒成交压力、Up/Down 买卖一、spread、外部价格相对 Chainlink/目标价偏差。
+3. 新增实时事件流列表，展示最新 book、best_bid_ask、price_change、last_trade_price、price_tick 等事件，最新事件在上方。
+4. 补充 `last_trade_price` 事件处理，作为分析页成交压力和事件流输入；该数据只用于展示，不写入下单逻辑。
+5. 静态资源版本提升到 `20260529-v2-92`，避免浏览器继续加载旧前端。
+
+### 已确认决策
+
+1. 本轮只做分析页 WebSocket 实时展示，不修改策略 signal、Paper 下单、实盘下单、卖出、撤单或 `/api/live-snapshot` 契约。
+2. 毫秒级部分只覆盖公开 WebSocket 能提供的盘口、成交和价格流；地址画像仍由 Data API 近实时补全，不能伪装成毫秒级。
+3. 事件流在前端内存保留最近 80 条，避免长时间运行导致页面内存持续增长。
+
+### 待办和后期优化
+
+1. 采样后可把实时盘口特征持久化，用于复盘“盘口压力是否领先结果”。
+2. 如需进一步判断机器人行为，需要增加跨市场地址历史、盘口撤单速率、成交方向连续性等维度。
+3. 如果分析页事件过密导致渲染压力，可增加前端采样节流或只渲染聚合指标。
+
+### 已知坑位
+
+1. market WebSocket 仍不返回当前挂单 maker 地址，因此实时盘口流不能直接识别挂单背后的钱包。
+2. `last_trade_price` 是成交事件，不等于完整成交双方地址；地址仍需等待 Data API trades 补全。
+3. 页面展示的是浏览器收到事件后的延迟，不能代表 Polymarket 内部撮合到公开推送的完整链路延迟。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已执行静态文件检查，确认首页引用 `20260529-v2-92`，包含 `analysis-realtime`，脚本包含 `last_trade_price` 与 `recordRealtimeMarketEvent`。
+4. 已请求 `http://127.0.0.1:8791/`，HTTP 200，确认返回 HTML 包含 `20260529-v2-92` 与 `analysis-realtime`。
+5. 已请求 `/static/app.js?v=20260529-v2-92`，HTTP 200，确认包含 `recordRealtimeMarketEvent`、`last_trade_price` 和 `renderRealtimeAnalysis`。
+
+### 回滚建议
+
+1. 如需回滚本次 WebSocket 实时分析展示，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css` 和本进度文档的 v3.59 记录。
+
+## 2026-05-29 v3.58
+
+### 已完成
+
+1. 新增只读 `actor_analysis` 模块，接入 Polymarket Data API 的 holders、market-positions、trades 三类公开数据。
+2. 新增 `/api/actor-analysis` 接口，返回 `analysis_only=true`、`affects_trading=false`、`can_identify_orderbook_addresses=false`，明确不进入任何下单链路。
+3. 分析页从占位状态升级为真实数据展示：当前市场地址、地址画像、方向概率、风险标签，并提供独立刷新按钮和 15 秒页面内刷新节奏。
+4. 新增 `POLYBOT2OTHER_DATA_API_URL` 配置，默认值为 `https://data-api.polymarket.com`，用于只读 Data API endpoint 覆盖。
+5. 分析结果做短缓存，默认 8 秒，避免切换页面或短时间刷新时重复打 Data API。
+
+### 已确认决策
+
+1. 分析功能是旁路观察能力，不修改 `SINGLE_FAK`、`SINGLE_FAK_REAL`、Paper 采样、实盘下单、卖出、撤单或预检逻辑。
+2. 当前只能识别 holders、positions、trades 中出现的钱包地址；公开订单簿快照不返回 maker 地址，不能把当前挂单直接归因到具体钱包。
+3. 方向概率是展示型综合视图，混合盘口隐含概率、目标价距离模型和已识别地址敞口，不作为交易信号。
+
+### 待办和后期优化
+
+1. 采样一段时间后再评估地址标签是否有预测价值，例如大额地址集中、活跃地址偏向、成交压力是否与结果相关。
+2. 若要识别更细的机器人/做市地址，需要增加跨市场历史画像、交易频率、盈亏曲线和订单簿变化序列，不应在 5 分钟实时热路径调用 LLM。
+3. 后续可为分析页增加地址详情抽屉，按钱包查看当前市场与历史市场行为。
+
+### 已知坑位
+
+1. Data API 异常、限流或地区访问失败时接口会返回 `PARTIAL`，页面保留已成功来源，不阻塞 Bot 页面。
+2. 当前地址画像是规则聚合，不等于真实身份识别；“大额地址”“活跃地址”只能表示公开数据行为特征。
+3. `POLYBOT2OTHER_DATA_API_URL` 修改后需要重启后端服务生效。
+
+### 验证记录
+
+1. 已补充 `build_actor_analysis` 单元测试，覆盖只读标记、地址聚合、方向概率、公开订单簿地址不可见标记和 Data API 单源失败降级。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+4. 已执行 `rtk proxy git diff --check`，空白检查通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k actor_analysis -v`，2 个定向测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，150 个核心测试通过。
+7. 已重启 `http://127.0.0.1:8791/`，首页 HTTP 200，确认加载静态版本 `20260529-v2-91`。
+8. 已请求 `/api/actor-analysis?refresh=true`，HTTP 200，返回 `status=READY`、`analysis_only=true`、`affects_trading=false`、`can_identify_orderbook_addresses=false`，并包含 holders、positions、trades 三个来源。
+
+### 回滚建议
+
+1. 如需回滚本次分析数据接入，撤销 `src/polybot2other/actor_analysis.py`、`src/polybot2other/bot.py`、`src/polybot2other/config.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档的 v3.58 记录。
+
+## 2026-05-29 v3.57
+
+### 已完成
+
+1. 顶部新增页面导航：`Bot` 与 `分析` 两个入口。
+2. 新增轻量 hash 路由：`#bot` / `#analysis`，切换页面不刷新浏览器，不重建 WebSocket，不影响实时采集循环。
+3. 现有交易看板整体归入 `Bot` 页面；新增 `分析` 页面空壳，用于后续市场参与者、地址画像和方向概率分析。
+4. 分析页面明确标注 `analysis_only=true` 与只读状态，当前不接入任何 Paper/Live 下单流程。
+5. 导航按钮增加 hover 动效、active 下划线和页面 opacity/位移动画；静态资源版本提升到 `20260529-v2-90`。
+
+### 已确认决策
+
+1. 本轮只是页面分区和导航壳，不实现地址识别、概率模型和 LLM 分析。
+2. 分析页是旁路观察入口，不参与 `SINGLE_FAK_REAL`、`SINGLE_FAK` 或任何策略实验组合的 signal / order / sell / cancel。
+3. 保持现有 Bot 页面 DOM 与接口调用链路，降低对实时采集和交易面板的影响。
+
+### 待办和后期优化
+
+1. 后续新增只读接口 `/api/actor-analysis`，再把分析页面从空壳接入真实数据。
+2. 后续可为分析页增加独立刷新节奏，避免大数据地址画像影响 Bot 页面轮询。
+3. 若分析页需要 LLM，只允许用于复盘解释和旁路摘要，不进入实时下单热路径。
+
+### 已知坑位
+
+1. 当前 `分析` 页展示的是占位状态，不能据此判断真实市场参与者。
+2. Bot 页面隐藏时实时轮询仍继续，这是为了保证采集不断流；后续若分析页很重，需要继续隔离渲染成本。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 HTML 解析和静态资源版本检查，确认包含 `nav-bot`、`nav-analysis`、`bot-page`、`analysis-page` 和 `20260529-v2-90`，且不再包含 `20260529-v2-89`。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已请求 `http://127.0.0.1:8791/`，首页 HTTP 200，并确认返回 HTML 包含顶部导航和 v90 静态资源。
+5. 已请求 `/static/app.js?v=20260529-v2-90`，确认包含 `setActiveAppPage`、`locationAppPage` 和 `data-nav-page` 路由逻辑。
+
+### 回滚建议
+
+1. 如需回滚顶部导航和分析页空壳，撤销 `src/polybot2other/static/index.html`、`src/polybot2other/static/styles.css`、`src/polybot2other/static/app.js` 和本进度文档的 v3.57 记录。
+
+## 2026-05-29 v3.52
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_ANTI_BOT_GUARD` Paper 实验组合，基于 `SINGLE_FAK_CHAINLINK_ONLY`：订单类型仍为 FAK，价格源固定为 Chainlink-only。
+2. 新增 `anti_bot_guard_mode` 策略维度，当前支持 `NONE` 与 `ANTI_BOT_GUARD`，并在策略实验快照、详情、持仓、订单和交易行标签中透出。
+3. `ANTI_BOT_GUARD` 只过滤本来已经通过 Chainlink-only、盘口、置信度和 edge 检查的候选单，不做反手，不尝试操纵底层现货。
+4. 第一版 guard 覆盖三类防守信号：OKX/Binance 外部价格与候选方向明显相反、合约 ask 明显偏贵但 Chainlink 锚定距离偏弱、薄盘口且候选方向价格偏贵。
+5. 通过原因追加 `anti_bot_guard ANTI_BOT_GUARD:PASS`，被过滤原因以 `ANTI_BOT_GUARD ...` 开头，便于后续按原因复盘。
+
+### 已确认决策
+
+1. 本组合只用于 Paper 采样，不接入 `SINGLE_FAK_REAL` 实盘。
+2. 本轮是防守过滤，不做文章里那类“主动诱导/推动现货”的策略。
+3. 基线选择 `SINGLE_FAK_CHAINLINK_ONLY`，避免 fallback 噪音影响 guard 复盘。
+
+### 待办和后期优化
+
+1. 采样后对比 `SINGLE_FAK_CHAINLINK_ONLY` 与 `SINGLE_FAK_ANTI_BOT_GUARD`：少下了多少单、过滤掉的单原本盈亏、PnL 和回撤是否改善。
+2. 如果 guard 过滤过多盈利单，需要下调 rich/near-settle/thin-book 规则或拆成更细的实验组合。
+3. 后续可增加订单簿时间序列特征，例如短时间内概率跳变、深度突然抽走、Up/Down 价差异常扩大。
+
+### 已知坑位
+
+1. 当前 guard 只基于快照特征，不识别连续扫单路径；因此它是初版防守采样，不是完整 bot-trap 检测器。
+2. 外部价格背离使用 OKX/Binance 相对目标价和基差残差，短时数据源抖动可能导致误过滤，需要采样后复盘。
+3. 组合标签会显示为 `SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD`，用于明确它的价格源基础。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k anti_bot -v`，anti-bot guard 定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_variants -v`，策略组合覆盖测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k run_all_variants -v`，18 个隔离账户实验组合运行测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，完整核心测试 148 个通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启 `http://127.0.0.1:8791/`，首页 HTTP 200。
+8. 已请求 `/api/status`，确认返回 18 个策略实验组合，`SINGLE_FAK_ANTI_BOT_GUARD` 带有 `price_source_mode=CHAINLINK_ONLY` 与 `anti_bot_guard_mode=ANTI_BOT_GUARD`。
+
+### 回滚建议
+
+1. 如需回滚本次 anti-bot guard 采样组合，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/strategy.py`、`src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档的 v3.52 记录。
+
+## 2026-05-29 v3.49
+
+### 已完成
+
+1. 持仓列表新增渲染指纹，数据未变化时不再被实时轮询重复替换 DOM。
+2. 持仓列表新增复制/选中/焦点保护：用户正在选中文字、复制、点击卖出按钮或焦点停留在持仓面板时，延迟表格 DOM 刷新。
+3. 订单流水现有保护升级：新增鼠标按下和拖选阶段的短暂保护窗口，避免选区还没形成时就被实时刷新打断。
+4. 保护期内后端数据仍正常拉取，只缓存前端表格重绘；用户交互结束或选区清空后自动补渲染最新数据。
+5. 静态资源版本提升到 `20260529-v2-89`，避免浏览器继续加载旧 `app.js`。
+
+### 已确认决策
+
+1. 本轮只保护“持仓”和“订单流水”两块高频复制区域，不暂停策略、行情、资金指标和交易记录刷新。
+2. 不降低全局刷新频率，因为降频只能缓解，不能解决 DOM 替换导致选区丢失的根因。
+3. 手动操作导致的强制刷新仍允许立即更新，自动实时刷新才进入交互保护。
+
+### 待办和后期优化
+
+1. 如果后续交易记录也出现复制被打断，可以复用同一套 table interaction guard 扩展到最近交易列表。
+2. 若未来引入虚拟滚动，需要把保护逻辑下沉到虚拟列表层，避免滚动窗口重建节点。
+
+### 已知坑位
+
+1. 用户选中文本不释放时，持仓和订单流水会暂停重绘，直到选区清空或焦点离开；这是为了保证复制稳定。
+2. 保护期间页面顶部资金、市场和策略状态仍会更新，所以短时间内表格和顶部指标可能有轻微时间差。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已重启 `http://127.0.0.1:8791/`，首页 HTTP 200。
+4. 已请求首页 HTML，确认包含 `20260529-v2-89` 且不再包含 `20260529-v2-88`。
+5. 已请求 `/static/app.js?v=20260529-v2-89`，确认包含 `bindProtectedTableInteraction`、`openRenderKey` 和 `TABLE_INTERACTION_HOLD_MS`。
+6. 已请求 `/api/status`，确认服务正常返回运行状态、持仓和订单数据。
+
+### 回滚建议
+
+1. 如需回滚本次列表交互保护，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/static/index.html` 和本进度文档的 v3.49 记录。
+
+## 2026-05-29 v3.48
+
+### 已完成
+
+1. 在 `SINGLE_FAK` 基线外新增两个 Paper 价格源对照组合：`SINGLE_FAK_CHAINLINK_ONLY` 与 `SINGLE_FAK_FALLBACK_ONLY`。
+2. 新增 `price_source_mode` 策略维度：`MIXED`、`CHAINLINK_ONLY`、`FALLBACK_ONLY`，与 OKX/Binance 的 `market_data_mode` 分离。
+3. `CHAINLINK_ONLY` 只允许使用新鲜 Chainlink 当前价；缺少或过期时不 fallback 开仓。
+4. `FALLBACK_ONLY` 只在没有新鲜 Chainlink 时采样 fallback 当前价；有新鲜 Chainlink 时主动不交易。
+5. 策略实验快照、详情、持仓、订单和交易行标签透出 `price_source_mode`，方便后续按价格源单独复盘。
+
+### 已确认决策
+
+1. 原 `SINGLE_FAK` 保持 `MIXED` 价格源模式，作为历史基线继续采样。
+2. `SINGLE_FAK_FALLBACK_ONLY` 只用于 Paper 负面对照和归因，不作为实盘候选。
+3. fallback 价格源问题先用新增组合隔离验证，不直接删除基线逻辑，避免丢失连续对照数据。
+
+### 待办和后期优化
+
+1. 采样一段时间后，对比 `SINGLE_FAK`、`SINGLE_FAK_CHAINLINK_ONLY`、`SINGLE_FAK_FALLBACK_ONLY` 的胜率、PnL、回撤和下单次数。
+2. 如 `CHAINLINK_ONLY` 显著改善，再考虑把实盘候选从 `SINGLE_FAK` 收紧到 Chainlink-only 配置。
+3. 如果 fallback 仍需要保留，建议后续单独增加 fallback 来源明细统计，例如 Polymarket RTDS Binance、浏览器 Binance、OKX、REST。
+
+### 已知坑位
+
+1. `FALLBACK_ONLY` 不代表推荐策略，它是为了验证 fallback 是否拖累收益的对照组。
+2. 当前实盘 `SINGLE_FAK_REAL` 未接入该价格源模式；实盘切换前必须另行确认风控和行情来源。
+3. `MIXED` 基线仍优先使用 Chainlink，只有没有可用 Chainlink 时才走 fallback。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k price_source -v`，价格源模式门禁测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_variants -v`，策略组合列表测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k run_all_variants -v`，17 个隔离账户 runner 测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，147 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已重启 `http://127.0.0.1:8791/` 并请求 `/api/status`，确认策略实验返回 17 个组合，`SINGLE_FAK_CHAINLINK_ONLY` 与 `SINGLE_FAK_FALLBACK_ONLY` 均带有正确 `price_source_mode`。
+
+### 回滚建议
+
+1. 如需回滚本次价格源对照组合，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/strategy.py`、`src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档的 v3.48 记录。
+
+## 2026-05-29 v3.40
+
+### 已完成
+
+1. Dashboard 对外品牌名从 `Polymarket BTC 5m Bot` 改为 `EdgePulse`。
+2. 页面 `<title>` 改为 `EdgePulse`，并新增 SVG favicon。
+3. 新增 `src/polybot2other/static/edgepulse.svg`，图形使用脉冲线和 edge 走势元素，匹配当前深色交易面板。
+4. 首页顶部增加品牌图标和 `EdgePulse` 字标，保留 `Paper + Live Trading` 作为业务定位。
+5. README 标题改为 `EdgePulse`，同时说明运行包名和数据路径仍保留 `polybot2other` 以兼容现有命令和历史数据库。
+6. 静态资源版本提升到 `20260529-v2-88`。
+
+### 已确认决策
+
+1. 本轮只改展示品牌，不改 Python 包名、CLI 命令、数据库路径和 API 路径。
+2. 图标使用本地 SVG 矢量资源，不引入图片生成依赖、不依赖外部 CDN。
+
+### 待办和后期优化
+
+1. 后续如果要完整品牌化，可以再统一报告标题、复盘 HTML 和 CLI 输出中的 `polybot2other` 展示名。
+2. 后续如需要 App 图标，可基于当前 SVG 导出 PNG/ICO 多尺寸资源。
+
+### 已知坑位
+
+1. 历史文档和旧报告里的 `polybot2other` 不会自动改名，避免影响审计记录。
+2. 运行命令仍使用 `python -m polybot2other...`，这是兼容性设计，不是漏改。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 Python XML 解析检查 `src/polybot2other/static/edgepulse.svg`，SVG 可正常解析。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已请求 `http://127.0.0.1:8791/`，确认返回 HTML 包含 `<title>EdgePulse</title>`、`<h1>EdgePulse</h1>` 和 `/static/edgepulse.svg`，且不再包含旧标题 `Polymarket BTC 5m Bot`。
+5. 已请求 `http://127.0.0.1:8791/static/edgepulse.svg`，确认 HTTP 200 且 `Content-Type=image/svg+xml`。
+
+### 回滚建议
+
+1. 如需回滚本次品牌改名，撤销 `README.md`、`src/polybot2other/static/index.html`、`src/polybot2other/static/styles.css`、删除 `src/polybot2other/static/edgepulse.svg`，并移除本进度文档的 v3.40 记录。
+
+## 2026-05-29 v3.38
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_MULTI_CONFIRM`、`SINGLE_FAK_MULTI_LEAD`、`PAIR_FAK_MULTI_CONFIRM`、`PAIR_FAK_MULTI_LEAD` 四个 Paper 实验组合；原 `SINGLE_FAK`、`PAIR_FAK` 基线逻辑保持不变。
+2. 增加 `market_data_mode` 策略维度：`BASE`、`MULTI_CONFIRM`、`MULTI_LEAD`，并在策略实验返回、隔离账户行标签和详情 payload 中透出。
+3. 前端新增 OKX `BTC-USDT` spot ticker WebSocket 和 Binance `btcusdt@ticker` market WebSocket；快照会携带 `okx`、`binance_market` 及更新时间。
+4. 后端增加短窗基差跟踪：以 Chainlink 为锚，记录 OKX/Binance 相对 Chainlink 的滚动中位数，策略只使用当前基差减滚动中位数后的残差。
+5. `SINGLE_FAK_MULTI_CONFIRM` 会在 OKX/Binance 残差与候选方向明显相反时过滤信号；`SINGLE_FAK_MULTI_LEAD` 会用残差对置信度做小幅修正。
+6. `PAIR_*_MULTI_*` 不硬造方向信号：仍按配对成本开双边仓，OKX/Binance 只作为入场采样门槛和残余库存方向确认，避免把中性配对策略错误改成方向策略。
+7. 后端 REST 兜底价格源补充 OKX，并新增 `fetch_sources`，用于 fallback 场景同时拿 Coinbase/Binance/OKX 中可用来源。
+8. 静态资源版本提升到 `20260529-v2-87`。
+
+### 已确认决策
+
+1. 本次只做 Paper A/B 实验，不把 OKX/Binance 逻辑接入 `SINGLE_FAK_REAL` 实盘组合。
+2. 不能用 `OKX > Chainlink` 这种绝对价差直接下单；必须先扣除滚动正常基差，只看残差。
+3. 多源实验必须有 Chainlink 锚定价；只有 OKX/Binance 而没有 Chainlink 时不交易。
+4. PAIR 策略的 OKX/Binance 维度只用于数据质量和残余库存管理，不改变“配对买双边”的核心职责。
+
+### 待办和后期优化
+
+1. 采样一段时间后，单独复盘 `MULTI_CONFIRM` 与 `MULTI_LEAD` 的胜率、PnL、回撤、过滤次数和残差贡献。
+2. 如确认有效，再考虑配置化残差阈值、样本窗口和置信度修正上限。
+3. 若后续要进入实盘，必须先把多源行情采集迁到后端常驻进程，不能依赖浏览器页面长期打开。
+
+### 已知坑位
+
+1. OKX/Binance WebSocket 当前在浏览器侧运行；页面关闭时仍会回到后端 REST 兜底，实时性低于浏览器 WebSocket。
+2. 滚动中位数是内存态，重启后需要重新 warm up；新实验组合会先显示等待基差样本。
+3. Binance 维度优先使用新增的 Binance market WebSocket；若不可用，才使用原 Polymarket RTDS `crypto_prices` 中的 `binance` 字段。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_variants -v`，策略组合测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k multi_modes -v`，多源残差策略测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，146 个核心测试通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+
+### 回滚建议
+
+1. 如需回滚本次多源 Paper 实验，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/strategy.py`、`src/polybot2other/bot.py`、`src/polybot2other/market.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py` 和本进度文档的 v3.38 改动。
+
 ## 2026-05-29 v3.31
 
 ### 已完成

@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from .actor_analysis import PolymarketDataClient, build_actor_analysis
 from .config import Settings, reload_live_credential_env
 from .execution import (
     ORDER_TYPE_GTC,
@@ -23,6 +24,11 @@ from .execution import (
     taker_fee,
 )
 from .experiments import (
+    ANTI_BOT_GUARD_MODE_NONE,
+    MARKET_DATA_MODE_BASE,
+    MARKET_DATA_MODE_MULTI_CONFIRM,
+    MARKET_DATA_MODE_MULTI_LEAD,
+    PRICE_SOURCE_MODE_MIXED,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
@@ -42,7 +48,7 @@ from .storage import (
     TradeStore,
     normalize_paper_order_status_filter,
 )
-from .strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
+from .strategy import MULTI_SOURCE_KEYS, RealBtcFiveMinuteStrategy, input_from_snapshot, multi_source_price_context
 
 
 LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
@@ -71,9 +77,11 @@ PAIR_DAILY_LOSS_PCT = 10.0
 PAIR_DAILY_LOSS_NOTE = "Paper采样阈值，实盘不得沿用"
 PAIR_STOP_STREAK_LIMIT = 3
 PAIR_EPSILON = 0.000001
+PAIR_MULTI_READY_MARKER = "PAIR_MULTI"
 SINGLE_STRICT_MARKER = "SINGLE_STRICT"
 SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
 SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
+PRICE_BASIS_MAX_SAMPLES = 180
 POST_ONLY_MIN_REST_SECONDS = 8.0
 POST_ONLY_CROSS_BUFFER = 0.005
 POST_ONLY_QUEUE_INITIAL_FILL_RATIO = 0.25
@@ -82,6 +90,7 @@ POST_ONLY_QUEUE_FULL_SECONDS = 90.0
 LIVE_ONCE_CONFIRM_PHRASE = "PLACE_REAL_ORDER"
 LIVE_ONCE_WAITABLE_BLOCKERS = {"enabled", "market", "target_price", "signal", "orderbook_depth"}
 LIVE_ONCE_AUDIT_DIR_NAME = "audit"
+ACTOR_ANALYSIS_CACHE_SECONDS = 4.5
 LIVE_ONCE_AUDIT_SENSITIVE_KEYS = {
     "authorization",
     "cookie",
@@ -101,11 +110,49 @@ class LiveOnceBlockedError(RuntimeError):
         self.payload = payload
 
 
+class PriceBasisTracker:
+    """跟踪 OKX/Binance 相对 Chainlink 的短窗基差；只用于 Paper 实验。"""
+
+    def __init__(self, max_samples: int = PRICE_BASIS_MAX_SAMPLES) -> None:
+        self.max_samples = max(10, int(max_samples))
+        self._basis: dict[str, list[float]] = {source: [] for source in MULTI_SOURCE_KEYS}
+
+    def enrich(self, price: dict[str, Any], now_ms: int | None = None) -> dict[str, Any]:
+        enriched = dict(price)
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        chainlink = _maybe_float(enriched.get("chainlink"))
+        if chainlink and chainlink > 0:
+            for source in MULTI_SOURCE_KEYS:
+                source_price = _multi_source_price_for_basis(enriched, source)
+                updated_ms = _multi_source_updated_ms_for_basis(enriched, source)
+                samples = self._basis.setdefault(source, [])
+                if samples:
+                    enriched[f"{source}_basis_median_bps"] = _median(samples)
+                    enriched[f"{source}_basis_samples"] = len(samples)
+                if not source_price or not updated_ms:
+                    continue
+                age_ms = max(0, now_ms - updated_ms)
+                if age_ms > self.settings_max_age_ms:
+                    continue
+                basis_bps = (source_price - chainlink) / chainlink * 10_000.0
+                samples.append(basis_bps)
+                if len(samples) > self.max_samples:
+                    del samples[: len(samples) - self.max_samples]
+                enriched[f"{source}_basis_latest_bps"] = basis_bps
+        enriched["multi_context"] = multi_source_price_context(enriched, now_ms)
+        return enriched
+
+    @property
+    def settings_max_age_ms(self) -> int:
+        return 3_000
+
+
 class PaperTradingBot:
     def __init__(self, settings: Settings, store: TradeStore) -> None:
         self.settings = settings
         self.store = store
         self.polymarket = PolymarketClient(settings.gamma_url, settings.clob_url, settings.request_timeout_seconds)
+        self.actor_data = PolymarketDataClient(settings.data_api_url, settings.request_timeout_seconds)
         self.price_fallback = PublicPriceClient(settings.request_timeout_seconds)
         self.strategy = RealBtcFiveMinuteStrategy(settings)
         self._lock = threading.Lock()
@@ -124,6 +171,13 @@ class PaperTradingBot:
         self.pair_stop_loss_streak = 0
         self.last_pair_event: dict[str, Any] | None = None
         self.single_entry_mode = SINGLE_ENTRY_MODE_LEGACY
+        self.market_data_mode = MARKET_DATA_MODE_BASE
+        self.price_source_mode = PRICE_SOURCE_MODE_MIXED
+        self.anti_bot_guard_mode = ANTI_BOT_GUARD_MODE_NONE
+        self.price_basis_tracker = PriceBasisTracker()
+        self._actor_analysis_cache: dict[str, Any] | None = None
+        self._actor_analysis_cache_key: str | None = None
+        self._actor_analysis_cache_until = 0.0
         self.ws_status: dict[str, Any] = {
             "market": "waiting",
             "price": "waiting",
@@ -233,10 +287,13 @@ class PaperTradingBot:
         cleaned_quotes = _clean_quotes(quotes)
         chainlink_price = _maybe_float(price.get("chainlink"))
         binance_price = _maybe_float(price.get("binance"))
+        okx_price = _maybe_float(price.get("okx"))
         if chainlink_price:
             self.store.save_price_tick("BTC", chainlink_price, "polymarket-rtds-chainlink", now)
         elif binance_price:
             self.store.save_price_tick("BTC", binance_price, "polymarket-rtds-binance", now)
+        elif okx_price:
+            self.store.save_price_tick("BTC", okx_price, "okx-browser-ws", now)
         self.store.upsert_round(market)
         with self._lock:
             self.current_market = market
@@ -295,13 +352,18 @@ class PaperTradingBot:
     def _rest_fallback_snapshot(self, market) -> None:
         quotes = self.polymarket.get_quotes(market)
         now = time.time()
-        tick = self.price_fallback.fetch_symbol("BTC", now)
+        ticks = self.price_fallback.fetch_sources("BTC", now)
+        fallback_tick = ticks.get("coinbase") or ticks.get("binance") or ticks.get("okx")
+        if fallback_tick is None:
+            fallback_tick = self.price_fallback.fetch_symbol("BTC", now)
         now_ms = int(time.time() * 1000)
         price = {
             "chainlink": None,
-            "binance": tick.price,
+            "binance": ticks.get("binance").price if ticks.get("binance") else fallback_tick.price,
             "binance_updated_ms": now_ms,
-            "source": f"{tick.source}-rest-fallback",
+            "okx": ticks.get("okx").price if ticks.get("okx") else None,
+            "okx_updated_ms": now_ms if ticks.get("okx") else None,
+            "source": f"{fallback_tick.source}-rest-fallback",
         }
         if market.target_price > 0:
             price["target_price"] = market.target_price
@@ -317,7 +379,7 @@ class PaperTradingBot:
                 self.ws_status["price"] = "rest-fallback"
             else:
                 self.ws_status["price"] = "rest-fallback"
-        self.store.save_price_tick("BTC", tick.price, tick.source, time.time())
+        self.store.save_price_tick("BTC", fallback_tick.price, fallback_tick.source, time.time())
 
     def _live_feed_stale(self, now: float) -> bool:
         with self._lock:
@@ -489,6 +551,9 @@ class PaperTradingBot:
             pair_enabled = self.pair_strategy_enabled
         if market is None:
             return
+        price = self.price_basis_tracker.enrich(price)
+        with self._lock:
+            self.latest_price = dict(price)
         self._manage_resting_orders(market, quotes)
         if pair_enabled:
             self._run_pair_strategy_from_state(market, price, quotes)
@@ -496,7 +561,12 @@ class PaperTradingBot:
             self._run_live_strategy(market, price, quotes)
             return
         payload = {"price": price, "quotes": quotes}
-        signal = self.strategy.signal(input_from_snapshot(market, payload))
+        signal = self.strategy.signal(
+            input_from_snapshot(market, payload),
+            self.market_data_mode,
+            self.price_source_mode,
+            self.anti_bot_guard_mode,
+        )
         with self._lock:
             self.last_signal = {
                 "symbol": signal.symbol,
@@ -685,6 +755,9 @@ class PaperTradingBot:
         now = time.time()
         quotes = self._quotes_with_depth(market, quotes)
         state = _pair_quote_state(quotes, now)
+        multi_note = _pair_multi_note(self.market_data_mode, price)
+        if multi_note:
+            state["multi_note"] = multi_note
         managed = self._manage_pair_positions(market, price, state, now)
         if managed:
             reason = str(self.last_pair_event.get("message")) if self.last_pair_event else "配对策略持仓管理中"
@@ -695,6 +768,10 @@ class PaperTradingBot:
             self._set_last_pair_signal("PAIR_MANAGE", state, "配对策略持仓管理中")
             return
 
+        multi_block = _pair_multi_entry_block_reason(self.market_data_mode, price)
+        if multi_block:
+            self._set_last_pair_signal("PAIR_WAIT", state, multi_block)
+            return
         reason = self._pair_entry_block_reason(market, state, now)
         if reason:
             self._set_last_pair_signal("PAIR_WAIT", state, reason)
@@ -793,6 +870,8 @@ class PaperTradingBot:
             f"fee {up_sweep.fee + down_sweep.fee:.6f}, edge {edge:.4f}, shares {shares:.6f}, "
             f"levels_up {up_sweep.levels_used}, levels_down {down_sweep.levels_used}"
         )
+        if state.get("multi_note"):
+            reason = _append_reason_text(reason, str(state["multi_note"]))
         confidence = round(max(0.0, min(1.0, edge)), 4)
         up_signal = Signal("BTC", "Up", confidence, up_sweep.avg_price, 0.0, reason)
         down_signal = Signal("BTC", "Down", confidence, down_sweep.avg_price, 0.0, reason)
@@ -883,6 +962,8 @@ class PaperTradingBot:
             f"limit_cost {pair_limit_cost:.4f}, top_cost {state.get('pair_cost') or 0.0:.4f}, "
             f"edge {edge:.4f}, shares {shares:.6f}"
         )
+        if state.get("multi_note"):
+            reason = _append_reason_text(reason, str(state["multi_note"]))
         up_signal = Signal("BTC", "Up", confidence, up_limit, 0.0, reason)
         down_signal = Signal("BTC", "Down", confidence, down_limit, 0.0, reason)
         up_intent = TradeIntent(market, up_signal, up_cash)
@@ -1046,7 +1127,7 @@ class PaperTradingBot:
         side = str(residual["side"])
         shares = float(residual["shares"])
         roi_pct = _maybe_float(residual.get("roi_pct"))
-        confirmed = _price_confirms_residual(side, price, market.target_price)
+        confirmed = _price_confirms_residual(side, price, market.target_price, self.market_data_mode)
         if time_left <= PAIR_RESIDUAL_REDUCE_SECONDS_LEFT:
             closed = self._close_side_shares(rows, side, shares, exit_price, now, "PAIR_TIME_STOP 残余库存时间止损")
             if closed:
@@ -1311,6 +1392,30 @@ class PaperTradingBot:
         if extra:
             payload.update(extra)
         return payload
+
+    def actor_analysis(self, force: bool = False) -> dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            market = self.current_market
+            price = dict(self.latest_price)
+            quotes = _copy_quotes(self.latest_quotes)
+            cache_key = f"{market.round_id}:{market.condition_id}" if market is not None else "NO_MARKET"
+            if (
+                not force
+                and self._actor_analysis_cache is not None
+                and self._actor_analysis_cache_key == cache_key
+                and now < self._actor_analysis_cache_until
+            ):
+                cached = dict(self._actor_analysis_cache)
+                cached["cached"] = True
+                return {"actor_analysis": cached}
+
+        analysis = build_actor_analysis(market, price, quotes, self.actor_data, now=now)
+        with self._lock:
+            self._actor_analysis_cache = dict(analysis)
+            self._actor_analysis_cache_key = cache_key
+            self._actor_analysis_cache_until = now + ACTOR_ANALYSIS_CACHE_SECONDS
+        return {"actor_analysis": analysis}
 
     def strategy_experiments_snapshot(self) -> dict[str, Any]:
         if self.strategy_experiments is None:
@@ -1874,6 +1979,9 @@ class StrategyExperimentRunner:
             bot.price_fallback = price_fallback
             bot.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
             bot.single_entry_mode = variant.single_entry_mode
+            bot.market_data_mode = variant.market_data_mode
+            bot.price_source_mode = variant.price_source_mode
+            bot.anti_bot_guard_mode = variant.anti_bot_guard_mode
             self._bots[variant.variant_id] = bot
             self._errors[variant.variant_id] = None
             self._official_broadcast_errors[variant.variant_id] = None
@@ -2212,6 +2320,9 @@ class StrategyExperimentRunner:
             "strategy_family": variant.strategy_family,
             "order_type": variant.order_type,
             "single_entry_mode": variant.single_entry_mode,
+            "market_data_mode": variant.market_data_mode,
+            "price_source_mode": variant.price_source_mode,
+            "anti_bot_guard_mode": variant.anti_bot_guard_mode,
             "target_code_completion": variant.target_code_completion,
             "target_report_alignment": variant.target_report_alignment,
             "role": variant.role,
@@ -2386,6 +2497,28 @@ def _append_reason_text(existing: str, addition: str) -> str:
     return existing_text or addition_text
 
 
+def _median(values: list[float]) -> float:
+    cleaned = sorted(value for value in values if isinstance(value, (int, float)))
+    if not cleaned:
+        return 0.0
+    middle = len(cleaned) // 2
+    if len(cleaned) % 2:
+        return float(cleaned[middle])
+    return float((cleaned[middle - 1] + cleaned[middle]) / 2.0)
+
+
+def _multi_source_price_for_basis(price: dict[str, Any], source: str) -> float | None:
+    if source == "binance":
+        return _maybe_float(price.get("binance_market")) or _maybe_float(price.get("binance"))
+    return _maybe_float(price.get(source))
+
+
+def _multi_source_updated_ms_for_basis(price: dict[str, Any], source: str) -> int | None:
+    if source == "binance":
+        return _maybe_int(price.get("binance_market_updated_ms")) or _maybe_int(price.get("binance_updated_ms"))
+    return _maybe_int(price.get(f"{source}_updated_ms"))
+
+
 def _side_list_text(sides: Any) -> str:
     values = sorted({str(side) for side in sides if str(side or "") in {"Up", "Down"}})
     return ",".join(values) if values else "-"
@@ -2398,6 +2531,9 @@ def _variant_tags(variant: StrategyVariant) -> dict[str, Any]:
         "strategy_family": variant.strategy_family,
         "experiment_order_type": variant.order_type,
         "single_entry_mode": variant.single_entry_mode,
+        "market_data_mode": variant.market_data_mode,
+        "price_source_mode": variant.price_source_mode,
+        "anti_bot_guard_mode": variant.anti_bot_guard_mode,
         "account_scope": "strategy_experiment",
     }
 
@@ -2881,15 +3017,71 @@ def _residual_inventory(rows: list[dict[str, Any]], state: dict[str, Any]) -> di
     }
 
 
-def _price_confirms_residual(side: str, price: dict[str, Any], target_price: float) -> bool:
+def _price_confirms_residual(
+    side: str,
+    price: dict[str, Any],
+    target_price: float,
+    market_data_mode: str = MARKET_DATA_MODE_BASE,
+) -> bool:
     chainlink = _maybe_float(price.get("chainlink"))
     if chainlink is None or target_price <= 0:
         return False
+    if market_data_mode in {MARKET_DATA_MODE_MULTI_CONFIRM, MARKET_DATA_MODE_MULTI_LEAD}:
+        multi_block = _pair_multi_entry_block_reason(market_data_mode, price)
+        if multi_block:
+            return False
+        if _pair_multi_directional_blocked(side, price):
+            return False
     if side == "Up":
         return chainlink >= target_price
     if side == "Down":
         return chainlink <= target_price
     return False
+
+
+def _pair_multi_entry_block_reason(market_data_mode: str, price: dict[str, Any]) -> str | None:
+    if market_data_mode not in {MARKET_DATA_MODE_MULTI_CONFIRM, MARKET_DATA_MODE_MULTI_LEAD}:
+        return None
+    context = price.get("multi_context") if isinstance(price.get("multi_context"), dict) else {}
+    if not context.get("ready"):
+        return f"{PAIR_MULTI_READY_MARKER} 等待 OKX/Binance 基差样本，配对实验暂不开仓"
+    return None
+
+
+def _pair_multi_note(market_data_mode: str, price: dict[str, Any]) -> str:
+    if market_data_mode not in {MARKET_DATA_MODE_MULTI_CONFIRM, MARKET_DATA_MODE_MULTI_LEAD}:
+        return ""
+    rows = _pair_multi_ready_rows(price)
+    if not rows:
+        return ""
+    detail = ", ".join(f"{name}:{value:+.2f}bps" for name, value in rows)
+    return f"{PAIR_MULTI_READY_MARKER} {market_data_mode} OKX/Binance 残差采样 {detail}"
+
+
+def _pair_multi_directional_blocked(side: str, price: dict[str, Any]) -> bool:
+    rows = _pair_multi_ready_rows(price)
+    if not rows:
+        return True
+    for _, residual in rows:
+        directional = residual if side == "Up" else -residual
+        if directional < -1.5:
+            return True
+    return False
+
+
+def _pair_multi_ready_rows(price: dict[str, Any]) -> list[tuple[str, float]]:
+    context = price.get("multi_context") if isinstance(price.get("multi_context"), dict) else {}
+    sources = context.get("sources") if isinstance(context.get("sources"), dict) else {}
+    rows: list[tuple[str, float]] = []
+    for source in MULTI_SOURCE_KEYS:
+        item = sources.get(source)
+        if not isinstance(item, dict) or not item.get("ready"):
+            continue
+        residual = _maybe_float(item.get("residual_bps"))
+        if residual is None:
+            continue
+        rows.append((source, residual))
+    return rows
 
 
 def _live_once_blocked_payload(

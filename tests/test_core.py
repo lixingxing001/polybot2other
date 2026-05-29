@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from polybot2other.actor_analysis import build_actor_analysis
 from polybot2other.config import Settings, env_file_status, load_settings, reload_live_credential_env
 from polybot2other.bot import (
     LiveOnceBlockedError,
@@ -30,6 +31,11 @@ from polybot2other.execution import (
     taker_fee,
 )
 from polybot2other.experiments import (
+    ANTI_BOT_GUARD_MODE_ENABLED,
+    MARKET_DATA_MODE_MULTI_CONFIRM,
+    MARKET_DATA_MODE_MULTI_LEAD,
+    PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+    PRICE_SOURCE_MODE_FALLBACK_ONLY,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
@@ -220,7 +226,137 @@ class FakeLiveClient:
         self.clear_cached_credentials_calls += 1
 
 
+class FakeActorDataClient:
+    def __init__(self, fail_positions: bool = False) -> None:
+        self.fail_positions = fail_positions
+        self.wallet_a = "0x" + "a" * 40
+        self.wallet_b = "0x" + "b" * 40
+
+    def get_market_holders(self, condition_id: str, limit: int = 20) -> list[dict]:
+        return [
+            {"proxyWallet": self.wallet_a, "asset": "up-token", "amount": 40, "outcome": "Up", "name": "Alpha"},
+            {"proxyWallet": self.wallet_b, "asset": "down-token", "amount": 20, "outcome": "Down", "name": "Beta"},
+        ]
+
+    def get_market_positions(self, condition_id: str, limit: int = 80) -> list[dict]:
+        if self.fail_positions:
+            raise RuntimeError("positions unavailable")
+        return [
+            {
+                "proxyWallet": self.wallet_a,
+                "asset": "up-token",
+                "outcome": "Up",
+                "size": 160,
+                "currPrice": 0.62,
+                "currentValue": 99.2,
+                "totalPnl": 8.5,
+            },
+            {
+                "proxyWallet": self.wallet_b,
+                "asset": "down-token",
+                "outcome": "Down",
+                "size": 30,
+                "currPrice": 0.38,
+                "currentValue": 11.4,
+                "totalPnl": -1.2,
+            },
+        ]
+
+    def get_market_trades(self, condition_id: str, limit: int = 100) -> list[dict]:
+        return [
+            {
+                "proxyWallet": self.wallet_a,
+                "asset": "up-token",
+                "outcome": "Up",
+                "side": "BUY",
+                "size": 10,
+                "price": 0.58,
+                "timestamp": 1_780_000_001,
+            },
+            {
+                "proxyWallet": self.wallet_a,
+                "asset": "up-token",
+                "outcome": "Up",
+                "side": "BUY",
+                "size": 11,
+                "price": 0.6,
+                "timestamp": 1_780_000_002,
+            },
+            {
+                "proxyWallet": self.wallet_a,
+                "asset": "up-token",
+                "outcome": "Up",
+                "side": "BUY",
+                "size": 12,
+                "price": 0.61,
+                "timestamp": 1_780_000_003,
+            },
+        ]
+
+
 class TradingCoreTest(unittest.TestCase):
+    def test_actor_analysis_is_read_only_and_scores_wallets(self) -> None:
+        market = MarketRound(
+            "btc-updown-5m-1780000000",
+            "BTC",
+            1_780_000_000,
+            1_780_000_300,
+            100_000.0,
+            condition_id="0x" + "1" * 64,
+            up_token="up-token",
+            down_token="down-token",
+        )
+        analysis = build_actor_analysis(
+            market,
+            {"chainlink": 100_060.0},
+            {
+                "Up": {"best_bid": 0.61, "best_ask": 0.63},
+                "Down": {"best_bid": 0.37, "best_ask": 0.39},
+            },
+            FakeActorDataClient(),
+            now=1_780_000_120,
+        )
+
+        self.assertTrue(analysis["analysis_only"])
+        self.assertFalse(analysis["affects_trading"])
+        self.assertFalse(analysis["can_identify_orderbook_addresses"])
+        self.assertEqual(analysis["status"], "READY")
+        self.assertGreaterEqual(analysis["summary"]["wallet_count"], 2)
+        self.assertGreater(analysis["probability"]["combined_up"], 0.5)
+        top_wallet = analysis["wallets"][0]
+        self.assertEqual(top_wallet["bias"], "Up")
+        self.assertIn("ACTIVE_CURRENT_MARKET", top_wallet["tags"])
+        self.assertTrue(
+            any(tag["code"] == "PUBLIC_ORDERBOOK_ADDRESS_UNAVAILABLE" for tag in analysis["risk_tags"])
+        )
+
+    def test_actor_analysis_degrades_when_data_api_source_fails(self) -> None:
+        market = MarketRound(
+            "btc-updown-5m-1780000000",
+            "BTC",
+            1_780_000_000,
+            1_780_000_300,
+            100_000.0,
+            condition_id="0x" + "1" * 64,
+            up_token="up-token",
+            down_token="down-token",
+        )
+        analysis = build_actor_analysis(
+            market,
+            {"chainlink": 99_980.0},
+            {
+                "Up": {"best_bid": 0.48, "best_ask": 0.5},
+                "Down": {"best_bid": 0.5, "best_ask": 0.52},
+            },
+            FakeActorDataClient(fail_positions=True),
+            now=1_780_000_120,
+        )
+
+        self.assertEqual(analysis["status"], "PARTIAL")
+        self.assertFalse(analysis["sources"]["positions"]["ok"])
+        self.assertIn("positions unavailable", analysis["sources"]["positions"]["error"])
+        self.assertTrue(any(tag["code"] == "DATA_PARTIAL" for tag in analysis["risk_tags"]))
+
     def test_load_settings_reads_local_env_live_without_overriding_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env.live"
@@ -1938,6 +2074,11 @@ class TradingCoreTest(unittest.TestCase):
             combos,
             [
                 "SINGLE + FAK",
+                "SINGLE + FAK CHAINLINK_ONLY",
+                "SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD",
+                "SINGLE + FAK FALLBACK_ONLY",
+                "SINGLE + FAK MULTI_CONFIRM",
+                "SINGLE + FAK MULTI_LEAD",
                 "SINGLE + FAK STRICT",
                 "SINGLE + FAK REVERSAL",
                 "SINGLE + FAK STOP_AND_FLIP",
@@ -1945,6 +2086,8 @@ class TradingCoreTest(unittest.TestCase):
                 "SINGLE + GTD",
                 "SINGLE + POST_ONLY",
                 "PAIR + FAK",
+                "PAIR + FAK MULTI_CONFIRM",
+                "PAIR + FAK MULTI_LEAD",
                 "PAIR + GTC",
                 "PAIR + GTD",
                 "PAIR + POST_ONLY",
@@ -2107,7 +2250,7 @@ class TradingCoreTest(unittest.TestCase):
 
             snapshot = bot.strategy_experiments_snapshot()
             variants = {row["variant_id"]: row for row in snapshot["variants"]}
-            self.assertEqual(len(variants), 11)
+            self.assertEqual(len(variants), 18)
             self.assertEqual(snapshot["run_count"], 1)
             self.assertIn("profit_summary", snapshot)
             self.assertEqual(snapshot["profit_summary"]["status"], "WAITING_FOR_SAMPLE")
@@ -2115,7 +2258,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertFalse(snapshot["decision_summary"]["comparison_ready"])
             self.assertEqual(snapshot["decision_summary"]["status"], "WAITING_FOR_SAMPLE")
             self.assertEqual(snapshot["decision_summary"]["ready_count"], 0)
-            self.assertEqual(snapshot["decision_summary"]["total_count"], 11)
+            self.assertEqual(snapshot["decision_summary"]["total_count"], 18)
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
@@ -2127,6 +2270,16 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variants["SINGLE_FAK_STRICT"]["single_entry_mode"], "STRICT")
             self.assertEqual(variants["SINGLE_FAK_REVERSAL"]["single_entry_mode"], "REVERSAL")
             self.assertEqual(variants["SINGLE_FAK_STOP_AND_FLIP"]["single_entry_mode"], "STOP_AND_FLIP")
+            self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["price_source_mode"], "CHAINLINK_ONLY")
+            self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["price_source_mode"], "CHAINLINK_ONLY")
+            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["anti_bot_guard_mode"], "ANTI_BOT_GUARD")
+            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["price_source_mode"], "FALLBACK_ONLY")
+            self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["side"], "NO_TRADE")
+            self.assertIn("当前有新鲜 Chainlink", variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["reason"])
+            self.assertEqual(variants["SINGLE_FAK_MULTI_CONFIRM"]["market_data_mode"], "MULTI_CONFIRM")
+            self.assertEqual(variants["SINGLE_FAK_MULTI_LEAD"]["market_data_mode"], "MULTI_LEAD")
             self.assertEqual(variants["PAIR_FAK"]["metrics"]["open_trades"], 2)
             self.assertEqual(variants["PAIR_GTD"]["active_orders"], 2)
             self.assertEqual(variants["PAIR_POST_ONLY"]["active_orders"], 2)
@@ -2144,8 +2297,8 @@ class TradingCoreTest(unittest.TestCase):
 
             retrospective = bot.strategy_experiments_retrospective()
             self.assertTrue(retrospective["enabled"])
-            self.assertEqual(len(retrospective["variants"]), 11)
-            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 11)
+            self.assertEqual(len(retrospective["variants"]), 18)
+            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 18)
             self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
 
             tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)
@@ -2452,6 +2605,224 @@ class TradingCoreTest(unittest.TestCase):
         signal = strategy.signal(input_from_snapshot(market, payload))
         self.assertEqual(signal.side, "Up")
         self.assertEqual(signal.entry_price, 0.54)
+
+    def test_real_strategy_price_source_modes_gate_chainlink_and_fallback(self) -> None:
+        settings = Settings(min_confidence=0.55, min_edge=0.0, max_entry_price=0.8)
+        strategy = RealBtcFiveMinuteStrategy(settings)
+        now = time.time()
+        now_ms = int(now * 1000)
+        market = MarketRound(
+            round_id="btc-updown-5m-price-source",
+            symbol="BTC",
+            started_at=now - 60,
+            ends_at=now + 180,
+            target_price=100.0,
+        )
+        quotes = {
+            "Up": {"best_bid": 0.52, "best_ask": 0.54, "ask_size": 20, "updated_at_ms": now_ms},
+            "Down": {"best_bid": 0.45, "best_ask": 0.47, "ask_size": 20, "updated_at_ms": now_ms},
+        }
+        chainlink_payload = {
+            "price": {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": now_ms,
+                "binance": 102.0,
+                "binance_updated_ms": now_ms,
+            },
+            "quotes": quotes,
+        }
+
+        chainlink_signal = strategy.signal(
+            input_from_snapshot(market, chainlink_payload),
+            price_source_mode=PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+        )
+        fallback_blocked = strategy.signal(
+            input_from_snapshot(market, chainlink_payload),
+            price_source_mode=PRICE_SOURCE_MODE_FALLBACK_ONLY,
+        )
+
+        self.assertEqual(chainlink_signal.side, "Up")
+        self.assertIn("Chainlink", chainlink_signal.reason)
+        self.assertEqual(fallback_blocked.side, "NO_TRADE")
+        self.assertIn("当前有新鲜 Chainlink", fallback_blocked.reason)
+
+        fallback_payload = {
+            "price": {
+                "binance": 101.0,
+                "binance_updated_ms": now_ms,
+            },
+            "quotes": quotes,
+        }
+        chainlink_missing = strategy.signal(
+            input_from_snapshot(market, fallback_payload),
+            price_source_mode=PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+        )
+        fallback_signal = strategy.signal(
+            input_from_snapshot(market, fallback_payload),
+            price_source_mode=PRICE_SOURCE_MODE_FALLBACK_ONLY,
+        )
+
+        self.assertEqual(chainlink_missing.side, "NO_TRADE")
+        self.assertIn("缺少 Chainlink", chainlink_missing.reason)
+        self.assertEqual(fallback_signal.side, "Up")
+        self.assertIn("fallback", fallback_signal.reason)
+        self.assertIn("price_source_mode FALLBACK_ONLY", fallback_signal.reason)
+
+        stale_payload = {
+            "price": {
+                "binance": 101.0,
+                "binance_updated_ms": now_ms - settings.max_quote_age_ms - 1_000,
+            },
+            "quotes": quotes,
+        }
+        stale_signal = strategy.signal(
+            input_from_snapshot(market, stale_payload),
+            price_source_mode=PRICE_SOURCE_MODE_FALLBACK_ONLY,
+        )
+
+        self.assertEqual(stale_signal.side, "NO_TRADE")
+        self.assertIn("fallback 价格过期", stale_signal.reason)
+
+    def test_real_strategy_anti_bot_guard_filters_external_and_rich_contract_anomalies(self) -> None:
+        settings = Settings(min_confidence=0.55, min_edge=0.0, max_entry_price=0.8)
+        strategy = RealBtcFiveMinuteStrategy(settings)
+        now = time.time()
+        now_ms = int(now * 1000)
+        market = MarketRound(
+            round_id="btc-updown-5m-anti-bot",
+            symbol="BTC",
+            started_at=now - 60,
+            ends_at=now + 180,
+            target_price=100.0,
+        )
+        quotes = {
+            "Up": {"best_bid": 0.52, "best_ask": 0.54, "ask_size": 20, "updated_at_ms": now_ms},
+            "Down": {"best_bid": 0.45, "best_ask": 0.47, "ask_size": 20, "updated_at_ms": now_ms},
+        }
+        aligned_payload = {
+            "price": {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 101.03,
+                "binance_market_updated_ms": now_ms,
+                "okx": 101.02,
+                "okx_updated_ms": now_ms,
+            },
+            "quotes": quotes,
+        }
+        aligned_signal = strategy.signal(
+            input_from_snapshot(market, aligned_payload),
+            price_source_mode=PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+            anti_bot_guard_mode=ANTI_BOT_GUARD_MODE_ENABLED,
+        )
+
+        self.assertEqual(aligned_signal.side, "Up")
+        self.assertIn("anti_bot_guard ANTI_BOT_GUARD:PASS", aligned_signal.reason)
+
+        opposing_payload = {
+            "price": {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 99.95,
+                "binance_market_updated_ms": now_ms,
+                "okx": 99.96,
+                "okx_updated_ms": now_ms,
+            },
+            "quotes": quotes,
+        }
+        external_blocked = strategy.signal(
+            input_from_snapshot(market, opposing_payload),
+            price_source_mode=PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+            anti_bot_guard_mode=ANTI_BOT_GUARD_MODE_ENABLED,
+        )
+
+        self.assertEqual(external_blocked.side, "NO_TRADE")
+        self.assertIn("ANTI_BOT_GUARD external_price_disagree", external_blocked.reason)
+
+        rich_quotes = {
+            "Up": {"best_bid": 0.65, "best_ask": 0.68, "ask_size": 20, "updated_at_ms": now_ms},
+            "Down": {"best_bid": 0.29, "best_ask": 0.34, "ask_size": 20, "updated_at_ms": now_ms},
+        }
+        rich_payload = {
+            "price": {
+                "chainlink": 100.05,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.06,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.06,
+                "okx_updated_ms": now_ms,
+            },
+            "quotes": rich_quotes,
+        }
+        rich_blocked = strategy.signal(
+            input_from_snapshot(market, rich_payload),
+            price_source_mode=PRICE_SOURCE_MODE_CHAINLINK_ONLY,
+            anti_bot_guard_mode=ANTI_BOT_GUARD_MODE_ENABLED,
+        )
+
+        self.assertEqual(rich_blocked.side, "NO_TRADE")
+        self.assertIn("rich_contract_weak_anchor", rich_blocked.reason)
+
+    def test_real_strategy_multi_modes_use_basis_residuals(self) -> None:
+        settings = Settings(min_confidence=0.55, min_edge=0.0, max_entry_price=0.8)
+        strategy = RealBtcFiveMinuteStrategy(settings)
+        now = time.time()
+        market = MarketRound(
+            round_id="btc-updown-5m-multi",
+            symbol="BTC",
+            started_at=now - 60,
+            ends_at=now + 180,
+            target_price=100.0,
+        )
+        quotes = {
+            "Up": {"best_bid": 0.52, "best_ask": 0.54, "ask_size": 20, "updated_at_ms": int(now * 1000)},
+            "Down": {"best_bid": 0.45, "best_ask": 0.47, "ask_size": 20, "updated_at_ms": int(now * 1000)},
+        }
+        aligned_payload = {
+            "price": {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": int(now * 1000),
+                "binance_market": 101.04,
+                "binance_market_updated_ms": int(now * 1000),
+                "binance_basis_median_bps": 0.0,
+                "binance_basis_samples": 5,
+                "okx": 101.03,
+                "okx_updated_ms": int(now * 1000),
+                "okx_basis_median_bps": 0.0,
+                "okx_basis_samples": 5,
+            },
+            "quotes": quotes,
+        }
+        aligned_input = input_from_snapshot(market, aligned_payload)
+
+        confirm_signal = strategy.signal(aligned_input, MARKET_DATA_MODE_MULTI_CONFIRM)
+        lead_signal = strategy.signal(aligned_input, MARKET_DATA_MODE_MULTI_LEAD)
+
+        self.assertEqual(confirm_signal.side, "Up")
+        self.assertIn("multi_confirm", confirm_signal.reason)
+        self.assertEqual(lead_signal.side, "Up")
+        self.assertIn("multi_lead", lead_signal.reason)
+
+        opposing_payload = {
+            "price": {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": int(now * 1000),
+                "binance_market": 100.96,
+                "binance_market_updated_ms": int(now * 1000),
+                "binance_basis_median_bps": 0.0,
+                "binance_basis_samples": 5,
+                "okx": 100.95,
+                "okx_updated_ms": int(now * 1000),
+                "okx_basis_median_bps": 0.0,
+                "okx_basis_samples": 5,
+            },
+            "quotes": quotes,
+        }
+
+        blocked = strategy.signal(input_from_snapshot(market, opposing_payload), MARKET_DATA_MODE_MULTI_CONFIRM)
+
+        self.assertEqual(blocked.side, "NO_TRADE")
+        self.assertIn("MULTI_CONFIRM", blocked.reason)
 
     def test_parse_real_btc_5m_market(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")

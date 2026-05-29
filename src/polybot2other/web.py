@@ -44,6 +44,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             self._send_json(self.server.bot.snapshot(), include_body=False)
             return
+        if path == "/api/actor-analysis":
+            self._send_json(self.server.bot.actor_analysis(force=False), include_body=False)
+            return
         if path == "/api/equity-curve":
             self._send_json(self.server.bot.equity_curve_window(), include_body=False)
             return
@@ -98,6 +101,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.bot.snapshot())
+            return
+        if path == "/api/actor-analysis":
+            try:
+                refresh = _query_bool_optional(query, "refresh", False)
+                self._send_json(self.server.bot.actor_analysis(force=refresh))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/recent-trades":
             try:

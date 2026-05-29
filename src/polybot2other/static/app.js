@@ -2,6 +2,21 @@ const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 
 const ids = {
+  navItems: Array.from(document.querySelectorAll("[data-nav-page]")),
+  botPage: document.getElementById("bot-page"),
+  analysisPage: document.getElementById("analysis-page"),
+  analysisRefresh: document.getElementById("analysis-refresh"),
+  analysisStatus: document.getElementById("analysis-status"),
+  analysisAffectsTrading: document.getElementById("analysis-affects-trading"),
+  analysisDataScope: document.getElementById("analysis-data-scope"),
+  analysisLlmPath: document.getElementById("analysis-llm-path"),
+  analysisWallets: document.getElementById("analysis-wallets"),
+  analysisSummary: document.getElementById("analysis-summary"),
+  analysisProbability: document.getElementById("analysis-probability"),
+  analysisRiskTags: document.getElementById("analysis-risk-tags"),
+  analysisRealtimeCard: document.getElementById("analysis-realtime-card"),
+  analysisRealtime: document.getElementById("analysis-realtime"),
+  analysisRealtimeToggle: document.getElementById("analysis-realtime-toggle"),
   runtime: document.getElementById("runtime-pill"),
   liveEnabled: document.getElementById("live-enabled"),
   liveStatus: document.getElementById("live-status"),
@@ -79,8 +94,11 @@ const ids = {
 
 const MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const RTDS_WS = "wss://ws-live-data.polymarket.com";
+const OKX_WS = "wss://ws.okx.com:8443/ws/v5/public";
+const BINANCE_MARKET_WS = "wss://stream.binance.com:9443/ws/btcusdt@ticker";
 const MARKET_PING_MS = 10_000;
 const RTDS_PING_MS = 5_000;
+const OKX_PING_MS = 20_000;
 const SNAPSHOT_POST_MS = 1_000;
 const STATUS_POLL_MS = 2_000;
 const RECENT_PAGE_SIZE = 100;
@@ -89,9 +107,14 @@ const CHART_RENDER_INTERVAL_MS = 5_000;
 const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
 const EQUITY_CURVE_REFRESH_MS = 30_000;
+const ACTOR_ANALYSIS_REFRESH_MS = 5_000;
 const METRIC_ANIMATION_MS = 360;
 const RECENT_SKELETON_ROWS = 8;
 const LIVE_LOG_LIMIT = 80;
+const ANALYSIS_REALTIME_EVENT_LIMIT = 80;
+const ANALYSIS_RECENT_WINDOW_MS = 10_000;
+const TABLE_INTERACTION_HOLD_MS = 500;
+const ANALYSIS_REALTIME_VISIBILITY_KEY = "polybot2other:analysis-realtime-visible";
 const SNAPSHOT_LEADER_KEY = "polybot2other:snapshot-leader";
 const SNAPSHOT_LEADER_TTL_MS = 2_500;
 const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -100,6 +123,7 @@ const FIELD_STORAGE_KEYS = {
   order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
 };
+const APP_PAGE_KEYS = new Set(["bot", "analysis"]);
 const ORDER_STATUS_LABELS = {
   PENDING: "待官方确认",
   RESTING: "挂单中",
@@ -112,12 +136,18 @@ const ORDER_STATUS_LABELS = {
 };
 
 let activeMarket = null;
+let activeAppPage = "bot";
 let marketSocket = null;
 let priceSocket = null;
+let okxSocket = null;
+let binanceMarketSocket = null;
 let marketPing = null;
 let pricePing = null;
+let okxPing = null;
 let marketWsStatus = "waiting";
 let priceWsStatus = "waiting";
+let okxWsStatus = "waiting";
+let binanceMarketWsStatus = "waiting";
 let lastSnapshotPostMs = 0;
 let snapshotInFlight = false;
 let latestStatus = null;
@@ -143,6 +173,13 @@ let strategyTablesLoading = false;
 let lastStrategyTablesFetchMs = 0;
 let strategyOrderLimit = ORDER_PAGE_SIZE;
 let strategyTradeLimit = RECENT_PAGE_SIZE;
+let actorAnalysis = null;
+let actorAnalysisLoading = false;
+let actorAnalysisError = "";
+let lastActorAnalysisFetchMs = 0;
+let analysisRealtime = createRealtimeAnalysisState();
+let analysisRealtimeRenderQueued = false;
+let analysisRealtimeVisible = loadAnalysisRealtimeVisible();
 let recentTransitionTimer = null;
 let orderRows = [];
 let orderStatusFilter = "all";
@@ -158,10 +195,13 @@ let renderQueued = false;
 let pendingRenderData = null;
 let pendingRenderOptions = {};
 let lastChartRenderMs = 0;
+let lastOpenRenderKey = "";
 let lastRecentRenderKey = "";
 let lastOrderRenderKey = "";
 let lastExperimentRenderKey = "";
+let pendingOpenRender = false;
 let pendingOrderRender = false;
+const tableInteractionHoldUntil = { open: 0, order: 0 };
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
 let equityCurveMeta = {};
@@ -179,6 +219,10 @@ let priceState = {
   chainlink_updated_ms: null,
   binance: null,
   binance_updated_ms: null,
+  binance_market: null,
+  binance_market_updated_ms: null,
+  okx: null,
+  okx_updated_ms: null,
   target_price: null,
   target_price_source: null,
   target_price_fallback: false,
@@ -462,6 +506,643 @@ function formatMetricValue(formatter, value) {
   return String(value);
 }
 
+function normalizeAppPage(value) {
+  const page = String(value || "").replace(/^#/, "").trim().toLowerCase();
+  return APP_PAGE_KEYS.has(page) ? page : "bot";
+}
+
+function locationAppPage() {
+  return normalizeAppPage(window.location.hash || "bot");
+}
+
+function setActiveAppPage(page, options = {}) {
+  const nextPage = normalizeAppPage(page);
+  activeAppPage = nextPage;
+  for (const button of ids.navItems || []) {
+    const selected = button.dataset.navPage === nextPage;
+    button.classList.toggle("is-active", selected);
+    if (selected) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  for (const [key, element] of [
+    ["bot", ids.botPage],
+    ["analysis", ids.analysisPage],
+  ]) {
+    if (!element) continue;
+    const selected = key === nextPage;
+    element.classList.toggle("is-active", selected);
+    element.classList.toggle("is-hidden", !selected);
+    element.setAttribute("aria-hidden", selected ? "false" : "true");
+  }
+  document.body.dataset.page = nextPage;
+  if (options.syncHash !== false) {
+    const hash = `#${nextPage}`;
+    if (window.location.hash !== hash) {
+      window.history.pushState({ page: nextPage }, "", hash);
+    }
+  }
+  if (nextPage === "bot" && latestStatus) {
+    window.setTimeout(() => renderAll(latestStatus, { force: true, forceChart: true }), 210);
+  }
+  if (nextPage === "analysis") {
+    applyAnalysisRealtimeVisibility();
+    renderActorAnalysis(actorAnalysis);
+    renderRealtimeAnalysis();
+    if (!actorAnalysis || Date.now() - lastActorAnalysisFetchMs > 5_000) {
+      loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
+    }
+  }
+}
+
+function createRealtimeAnalysisState() {
+  return {
+    market_slug: "",
+    started_at_ms: null,
+    last_event_at_ms: null,
+    market_event_count: 0,
+    price_event_count: 0,
+    counts: {
+      book: 0,
+      best_bid_ask: 0,
+      price_change: 0,
+      last_trade_price: 0,
+      market_resolved: 0,
+      price_tick: 0,
+    },
+    last_trade: null,
+    trades: [],
+    events: [],
+    price_ticks: [],
+  };
+}
+
+function loadAnalysisRealtimeVisible() {
+  try {
+    const raw = localStorage.getItem(ANALYSIS_REALTIME_VISIBILITY_KEY);
+    return raw === null ? true : raw !== "false";
+  } catch (_) {
+    return true;
+  }
+}
+
+function setAnalysisRealtimeVisible(visible) {
+  analysisRealtimeVisible = Boolean(visible);
+  try {
+    localStorage.setItem(ANALYSIS_REALTIME_VISIBILITY_KEY, analysisRealtimeVisible ? "true" : "false");
+  } catch (_) {
+    // localStorage may be unavailable in private or restricted contexts.
+  }
+  applyAnalysisRealtimeVisibility();
+  if (analysisRealtimeVisible) renderRealtimeAnalysis();
+}
+
+function applyAnalysisRealtimeVisibility() {
+  if (ids.analysisRealtimeToggle) ids.analysisRealtimeToggle.checked = analysisRealtimeVisible;
+  if (ids.analysisRealtimeCard) {
+    ids.analysisRealtimeCard.hidden = !analysisRealtimeVisible;
+    ids.analysisRealtimeCard.setAttribute("aria-hidden", analysisRealtimeVisible ? "false" : "true");
+  }
+}
+
+function resetRealtimeAnalysisForMarket(market = activeMarket) {
+  analysisRealtime = createRealtimeAnalysisState();
+  analysisRealtime.market_slug = market?.slug || market?.round_id || "";
+  analysisRealtime.started_at_ms = Date.now();
+  queueRealtimeAnalysisRender();
+}
+
+function recordRealtimeMarketEvent(message, details = {}) {
+  if (!message?.event_type) return;
+  if (analysisRealtime.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
+    resetRealtimeAnalysisForMarket(activeMarket);
+  }
+  const now = Date.now();
+  const type = String(message.event_type || "");
+  analysisRealtime.last_event_at_ms = now;
+  analysisRealtime.market_event_count += 1;
+  analysisRealtime.counts[type] = (analysisRealtime.counts[type] || 0) + 1;
+  const side = details.side || tokenSide(message.asset_id) || "";
+  const eventRow = {
+    at_ms: now,
+    type,
+    side,
+    price: details.price ?? message.price ?? message.best_ask ?? message.best_bid ?? null,
+    size: details.size ?? message.size ?? null,
+    action: details.action || message.side || "",
+    source: "polymarket-market-ws",
+  };
+  if (type === "last_trade_price") {
+    const trade = {
+      ...eventRow,
+      price: toNumber(message.price),
+      size: toNumber(message.size),
+      notional: (toNumber(message.price) || 0) * (toNumber(message.size) || 0),
+      action: String(message.side || "").toUpperCase(),
+    };
+    analysisRealtime.last_trade = trade;
+    analysisRealtime.trades.unshift(trade);
+    analysisRealtime.trades = analysisRealtime.trades.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
+    eventRow.price = trade.price;
+    eventRow.size = trade.size;
+    eventRow.action = trade.action;
+  }
+  analysisRealtime.events.unshift(eventRow);
+  analysisRealtime.events = analysisRealtime.events.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
+  queueRealtimeAnalysisRender();
+}
+
+function recordRealtimePriceEvent(source, value, updatedAtMs = Date.now()) {
+  const parsed = toNumber(value);
+  if (parsed == null) return;
+  if (analysisRealtime.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
+    resetRealtimeAnalysisForMarket(activeMarket);
+  }
+  const now = Date.now();
+  const row = {
+    at_ms: now,
+    updated_at_ms: updatedAtMs,
+    type: "price_tick",
+    source,
+    value: parsed,
+  };
+  analysisRealtime.last_event_at_ms = now;
+  analysisRealtime.price_event_count += 1;
+  analysisRealtime.counts.price_tick = (analysisRealtime.counts.price_tick || 0) + 1;
+  analysisRealtime.price_ticks.unshift(row);
+  analysisRealtime.price_ticks = analysisRealtime.price_ticks.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
+  analysisRealtime.events.unshift(row);
+  analysisRealtime.events = analysisRealtime.events.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
+  queueRealtimeAnalysisRender();
+}
+
+function queueRealtimeAnalysisRender() {
+  if (!analysisRealtimeVisible || activeAppPage !== "analysis" || !pageVisible || analysisRealtimeRenderQueued) return;
+  analysisRealtimeRenderQueued = true;
+  window.requestAnimationFrame(() => {
+    analysisRealtimeRenderQueued = false;
+    renderRealtimeAnalysis();
+  });
+}
+
+function renderRealtimeAnalysis() {
+  applyAnalysisRealtimeVisibility();
+  if (!analysisRealtimeVisible) return;
+  if (!ids.analysisRealtime) return;
+  if (!activeMarket) {
+    setAnalysisBlock(ids.analysisRealtime, `<div class="analysis-empty">等待当前市场</div>`, true);
+    return;
+  }
+  const now = Date.now();
+  const up = quotes.Up || {};
+  const down = quotes.Down || {};
+  const pressure = realtimeTradePressure(now);
+  const external = realtimeExternalState();
+  const eventRows = analysisRealtime.events.slice(0, 18).map((row) => realtimeEventHtml(row, now)).join("");
+  const html = `
+    <div class="analysis-body realtime-analysis">
+      <div class="analysis-mini-grid realtime-metrics">
+        ${analysisMetric("Market WS", realtimeStatusText(marketWsStatus, analysisRealtime.last_event_at_ms))}
+        ${analysisMetric("RTDS/OKX/Binance", `${safe(priceWsStatus)} / ${safe(okxWsStatus)} / ${safe(binanceMarketWsStatus)}`)}
+        ${analysisMetric("盘口事件", fmtNumberCell(analysisRealtime.market_event_count, 0))}
+        ${analysisMetric("价格事件", fmtNumberCell(analysisRealtime.price_event_count, 0))}
+        ${analysisMetric("Up 买/卖", `${fmtQuotePrice(up.best_bid)} / ${fmtQuotePrice(up.best_ask)}`)}
+        ${analysisMetric("Down 买/卖", `${fmtQuotePrice(down.best_bid)} / ${fmtQuotePrice(down.best_ask)}`)}
+        ${analysisMetric("Up/Down spread", `${fmtSpread(up)} / ${fmtSpread(down)}`)}
+        ${analysisMetric("成交压力 10s", realtimePressureHtml(pressure))}
+        ${analysisMetric("Chainlink 距目标", fmtSignedBpsCell(external.chainlink_target_bps))}
+        ${analysisMetric("OKX-Chainlink", fmtSignedBpsCell(external.okx_chainlink_bps))}
+        ${analysisMetric("Binance-Chainlink", fmtSignedBpsCell(external.binance_chainlink_bps))}
+        ${analysisMetric("最新成交", realtimeLastTradeText(now))}
+      </div>
+      <div class="analysis-realtime-split">
+        <div class="analysis-realtime-book">
+          ${realtimeBookSideHtml("Up", up)}
+          ${realtimeBookSideHtml("Down", down)}
+        </div>
+        <div class="analysis-event-tape">
+          <div class="analysis-event-title">实时事件流</div>
+          <div class="analysis-event-list">${eventRows || "<div class=\"analysis-event-empty\">等待 WebSocket 事件</div>"}</div>
+        </div>
+      </div>
+    </div>
+  `;
+  setAnalysisBlock(ids.analysisRealtime, html);
+  renderAnalysisProbability((actorAnalysis?.actor_analysis || actorAnalysis || {}).probability || {});
+}
+
+function realtimeStatusText(status, lastAtMs) {
+  const age = lastAtMs ? `${Math.max(0, Date.now() - lastAtMs)}ms` : "-";
+  return `${safe(status || "-")} · ${age}`;
+}
+
+function realtimeTradePressure(now = Date.now()) {
+  const cutoff = now - ANALYSIS_RECENT_WINDOW_MS;
+  let up = 0;
+  let down = 0;
+  for (const trade of analysisRealtime.trades) {
+    if (!trade.at_ms || trade.at_ms < cutoff) continue;
+    const notional = Number(trade.notional || 0);
+    if (!Number.isFinite(notional) || notional <= 0) continue;
+    const action = String(trade.action || "").toUpperCase();
+    if ((trade.side === "Up" && action === "BUY") || (trade.side === "Down" && action === "SELL")) up += notional;
+    if ((trade.side === "Down" && action === "BUY") || (trade.side === "Up" && action === "SELL")) down += notional;
+  }
+  const total = up + down;
+  const score = total > 0 ? (up - down) / total : 0;
+  const direction = score >= 0.2 ? "Up" : score <= -0.2 ? "Down" : "Balanced";
+  return { up, down, total, score, direction };
+}
+
+function realtimeExternalState() {
+  const chainlink = toNumber(priceState.chainlink);
+  const okx = toNumber(priceState.okx);
+  const binance = toNumber(priceState.binance_market) ?? toNumber(priceState.binance);
+  const target = marketTargetPrice(activeMarket) ?? toNumber(priceState.target_price);
+  return {
+    chainlink_target_bps: chainlink != null && target ? ((chainlink - target) / target) * 10_000 : null,
+    okx_chainlink_bps: okx != null && chainlink ? ((okx - chainlink) / chainlink) * 10_000 : null,
+    binance_chainlink_bps: binance != null && chainlink ? ((binance - chainlink) / chainlink) * 10_000 : null,
+  };
+}
+
+function realtimeDirectionProbability(now = Date.now()) {
+  const marketUp = realtimeMarketImpliedUp();
+  const target = marketTargetPrice(activeMarket) ?? toNumber(priceState.target_price);
+  const current = toNumber(priceState.chainlink) ?? toNumber(priceState.binance_market) ?? toNumber(priceState.binance) ?? toNumber(priceState.okx);
+  const secondsLeft = activeMarket?.end_ts ? Math.max(0, activeMarket.end_ts - now / 1000) : null;
+  const distanceBps = current != null && target ? ((current - target) / target) * 10_000 : null;
+  const scale = secondsLeft != null ? Math.max(1.0, 12.0 * Math.sqrt(Math.max(secondsLeft, 1) / 300)) : 8.0;
+  const targetUp = distanceBps == null ? null : logisticProbability(distanceBps, scale);
+  const pressure = realtimeTradePressure(now);
+  const pressureUp = pressure.total > 0 ? clamp01((pressure.score + 1) / 2) : null;
+  const external = realtimeExternalState();
+  const residuals = [external.okx_chainlink_bps, external.binance_chainlink_bps].filter((value) => toNumber(value) != null);
+  const residualAvg = residuals.length ? residuals.reduce((sum, value) => sum + Number(value), 0) / residuals.length : null;
+  const externalLeadUp = residualAvg == null ? null : logisticProbability(residualAvg, 6.0);
+  const combined = weightedProbability([
+    [marketUp, 0.45],
+    [targetUp, 0.35],
+    [pressureUp, 0.15],
+    [externalLeadUp, 0.05],
+  ]);
+  const direction = combined == null ? "Balanced" : combined >= 0.55 ? "Up" : combined <= 0.45 ? "Down" : "Balanced";
+  return {
+    direction,
+    combined_up: combined,
+    combined_down: combined == null ? null : 1 - combined,
+    market_up: marketUp,
+    target_up: targetUp,
+    pressure_up: pressureUp,
+    external_lead_up: externalLeadUp,
+    pressure,
+    current_price: current,
+    target_price: target,
+    distance_bps: distanceBps,
+    seconds_left: secondsLeft,
+    latency_ms: analysisRealtime.last_event_at_ms ? Math.max(0, now - analysisRealtime.last_event_at_ms) : null,
+    updated_at_ms: analysisRealtime.last_event_at_ms,
+  };
+}
+
+function realtimeMarketImpliedUp() {
+  const upMid = quoteMid("Up");
+  if (upMid != null) return upMid;
+  const downMid = quoteMid("Down");
+  return downMid == null ? null : clamp01(1 - downMid);
+}
+
+function quoteMid(side) {
+  const quote = quotes[side] || {};
+  const bid = toNumber(quote.best_bid);
+  const ask = toNumber(quote.best_ask);
+  if (bid != null && ask != null) return clamp01((bid + ask) / 2);
+  if (bid != null) return clamp01(bid);
+  if (ask != null) return clamp01(ask);
+  return null;
+}
+
+function logisticProbability(value, scale) {
+  const normalizedScale = Math.max(0.1, Number(scale) || 1);
+  return clamp01(1 / (1 + Math.exp(-Number(value) / normalizedScale)));
+}
+
+function weightedProbability(rows) {
+  const available = rows.filter(([value, weight]) => toNumber(value) != null && Number(weight) > 0);
+  if (!available.length) return null;
+  const totalWeight = available.reduce((sum, [, weight]) => sum + Number(weight), 0);
+  if (totalWeight <= 0) return null;
+  return clamp01(available.reduce((sum, [value, weight]) => sum + Number(value) * Number(weight), 0) / totalWeight);
+}
+
+function clamp01(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(0, Math.min(1, parsed));
+}
+
+function realtimePressureHtml(pressure) {
+  const clsName = sideClass(pressure.direction);
+  const score = pressure.total > 0 ? `${pressure.score > 0 ? "+" : ""}${number.format(pressure.score * 100)}%` : "-";
+  return `<span class="${clsName}">${safe(pressure.direction)}</span> <span class="muted">${safe(score)}</span>`;
+}
+
+function realtimeLastTradeText(now = Date.now()) {
+  const trade = analysisRealtime.last_trade;
+  if (!trade) return "-";
+  const age = trade.at_ms ? `${Math.max(0, now - trade.at_ms)}ms` : "-";
+  return `${safe(trade.side || "-")} ${safe(trade.action || "")} @ ${fmtQuotePrice(trade.price)} · ${fmtNumberCell(trade.size, 3)} · ${age}`;
+}
+
+function realtimeBookSideHtml(side, quote) {
+  const bids = Array.isArray(quote.bids) ? quote.bids.slice(0, 5) : [];
+  const asks = Array.isArray(quote.asks) ? quote.asks.slice(0, 5) : [];
+  const rows = Array.from({ length: Math.max(bids.length, asks.length, 5) }).map((_, index) => {
+    const bid = bids[index] || {};
+    const ask = asks[index] || {};
+    return `
+      <tr>
+        <td>${fmtQuotePrice(bid.price)}</td>
+        <td>${fmtNumberCell(bid.size, 2)}</td>
+        <td>${fmtQuotePrice(ask.price)}</td>
+        <td>${fmtNumberCell(ask.size, 2)}</td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <div class="analysis-book-side">
+      <div class="analysis-book-title"><span class="${sideClass(side)}">${safe(side)}</span><small>${safe(quote.source || "-")}</small></div>
+      <table class="analysis-book-table">
+        <thead><tr><th>Bid</th><th>Size</th><th>Ask</th><th>Size</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function realtimeEventHtml(row, now = Date.now()) {
+  const age = row.at_ms ? `${Math.max(0, now - row.at_ms)}ms` : "-";
+  let text = row.type;
+  if (row.type === "price_tick") {
+    text = `${row.source} ${fmtNumberCell(row.value, 2)}`;
+  } else if (row.type === "last_trade_price") {
+    text = `${row.side || "-"} ${row.action || ""} @ ${fmtQuotePrice(row.price)} · ${fmtNumberCell(row.size, 3)}`;
+  } else if (row.type === "price_change" || row.type === "best_bid_ask") {
+    text = `${row.side || "-"} ${row.type} @ ${fmtQuotePrice(row.price)}`;
+  } else if (row.type === "book") {
+    text = `${row.side || "-"} book snapshot`;
+  }
+  return `
+    <div class="analysis-event-row">
+      <span>${safe(age)}</span>
+      <strong>${safe(text)}</strong>
+    </div>
+  `;
+}
+
+function fmtQuotePrice(value) {
+  const parsed = toNumber(value);
+  return parsed == null ? "-" : parsed.toFixed(3);
+}
+
+function fmtSpread(quote) {
+  const bid = toNumber(quote.best_bid);
+  const ask = toNumber(quote.best_ask);
+  if (bid == null || ask == null) return "-";
+  return `${number.format((ask - bid) * 100)}c`;
+}
+
+function renderActorAnalysis(payload) {
+  const analysis = payload?.actor_analysis || payload || {};
+  const summary = analysis.summary || {};
+  const probability = analysis.probability || {};
+  const status = analysis.status || (actorAnalysisLoading ? "LOADING" : "EMPTY");
+  if (ids.analysisStatus) ids.analysisStatus.textContent = actorStatusLabel(status);
+  if (ids.analysisAffectsTrading) ids.analysisAffectsTrading.textContent = analysis.affects_trading ? "是" : "否";
+  if (ids.analysisDataScope) {
+    const walletCount = summary.wallet_count ?? 0;
+    const positionCount = summary.position_count ?? 0;
+    const tradeCount = summary.trade_count ?? 0;
+    ids.analysisDataScope.textContent = `${walletCount} 地址 / ${positionCount} 仓位 / ${tradeCount} 成交`;
+  }
+  if (ids.analysisLlmPath) {
+    ids.analysisLlmPath.textContent = analysis.analysis_only === false ? "接入执行链路" : "复盘旁路";
+  }
+  renderAnalysisSummary(analysis, summary);
+  renderAnalysisWallets(analysis.wallets || []);
+  renderAnalysisProbability(probability);
+  renderAnalysisRiskTags(analysis.risk_tags || [], analysis.notes || []);
+}
+
+function renderActorAnalysisError(error) {
+  actorAnalysisError = error?.message || String(error || "分析接口异常");
+  if (ids.analysisStatus) ids.analysisStatus.textContent = "异常";
+  setAnalysisBlock(ids.analysisSummary, `<div class="analysis-alert">${safe(actorAnalysisError)}</div>`);
+  setAnalysisBlock(ids.analysisWallets, `<div class="analysis-empty">暂无地址数据</div>`, true);
+  renderAnalysisProbability((actorAnalysis?.actor_analysis || actorAnalysis || {}).probability || {});
+  setAnalysisBlock(ids.analysisRiskTags, `<div class="analysis-empty">暂无风险标签</div>`, true);
+}
+
+function actorStatusLabel(status) {
+  const labels = {
+    READY: "已接入",
+    PARTIAL: "部分数据",
+    EMPTY: "暂无样本",
+    NO_MARKET: "无当前市场",
+    NO_CONDITION_ID: "缺少市场ID",
+    LOADING: "加载中",
+  };
+  return labels[status] || safe(status || "-");
+}
+
+function renderAnalysisSummary(analysis, summary) {
+  if (!ids.analysisSummary) return;
+  const market = analysis.market || {};
+  const sources = analysis.sources || {};
+  const sourceRows = Object.entries(sources).map(([name, source]) => `
+    <div class="analysis-source ${source.ok ? "is-ok" : "is-error"}">
+      <span>${safe(name)}</span>
+      <strong>${source.ok ? "OK" : "ERR"} · ${safe(source.count ?? 0)}</strong>
+    </div>
+  `).join("");
+  const html = `
+    <div class="analysis-body">
+      <div class="analysis-mini-grid">
+        ${analysisMetric("市场", market.slug || market.round_id || "-")}
+        ${analysisMetric("检查时间", fmtTime(analysis.checked_at))}
+        ${analysisMetric("Top 地址占比", fmtPctLike(summary.top_wallet_share_pct))}
+        ${analysisMetric("活跃地址", summary.active_wallet_count ?? 0)}
+      </div>
+      <div class="analysis-sources">${sourceRows || "<span class=\"muted\">暂无来源</span>"}</div>
+      <div class="analysis-note">订单簿当前挂单地址不可见，本页只用公开持仓、持有人和成交数据做旁路观察。</div>
+    </div>
+  `;
+  setAnalysisBlock(ids.analysisSummary, html);
+}
+
+function renderAnalysisWallets(wallets) {
+  if (!ids.analysisWallets) return;
+  if (!wallets.length) {
+    setAnalysisBlock(ids.analysisWallets, `<div class="analysis-empty">暂无地址数据</div>`, true);
+    return;
+  }
+  const rows = wallets.slice(0, 10).map((row) => `
+    <tr>
+      <td><span class="mono">${safe(row.short_address || row.address)}</span><small>${safe(row.name || "")}</small></td>
+      <td><span class="${sideClass(row.bias)}">${safe(row.bias || "Balanced")}</span></td>
+      <td>${fmtMoneyCell(row.up_value)}</td>
+      <td>${fmtMoneyCell(row.down_value)}</td>
+      <td>${fmtSignedMoneyCell(row.pnl)}</td>
+      <td>${fmtNumberCell(row.trade_count, 0)}</td>
+      <td>${analysisTagsHtml(row.tags || [])}</td>
+    </tr>
+  `).join("");
+  setAnalysisBlock(ids.analysisWallets, `
+    <div class="analysis-table-wrap">
+      <table class="analysis-table">
+        <thead><tr><th>地址</th><th>偏向</th><th>Up</th><th>Down</th><th>PnL</th><th>成交</th><th>标签</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `);
+}
+
+function renderAnalysisProbability(probability) {
+  if (!ids.analysisProbability) return;
+  const actorProbability = probability && Object.keys(probability).length ? probability : {};
+  const realtime = realtimeDirectionProbability();
+  const hasRealtime = Boolean(activeMarket && (
+    realtime.combined_up != null
+    || realtime.market_up != null
+    || realtime.target_up != null
+    || realtime.pressure_up != null
+  ));
+  const hasActorProbability = Object.keys(actorProbability).length > 0;
+  if (!hasRealtime && !hasActorProbability && !actorAnalysisError) {
+    setAnalysisBlock(ids.analysisProbability, `<div class="analysis-empty">暂无概率数据</div>`, true);
+    return;
+  }
+  const actorAnalysisPayload = actorAnalysis?.actor_analysis || actorAnalysis || {};
+  const actorCheckedAt = actorAnalysisPayload.checked_at ? fmtTime(actorAnalysisPayload.checked_at) : "-";
+  const actorCacheLabel = actorAnalysisPayload.cached ? "缓存" : "近实时";
+  const actorHtml = actorAnalysisError
+    ? `<div class="analysis-alert">${safe(actorAnalysisError)}</div>`
+    : hasActorProbability
+      ? `
+        <div class="analysis-probability-main analysis-probability-slow">
+          <span>地址修正概率 <small>Data API ${safe(actorCacheLabel)} · ${safe(actorCheckedAt)}</small></span>
+          <strong class="${sideClass(actorProbability.direction)}">${safe(actorProbability.direction || "Balanced")}</strong>
+          ${probabilityBarHtml(actorProbability.combined_up)}
+        </div>
+        <div class="analysis-mini-grid">
+          ${analysisMetric("地址修正 Up", fmtProb(actorProbability.combined_up))}
+          ${analysisMetric("市场隐含 Up", fmtProb(actorProbability.market_implied_up))}
+          ${analysisMetric("价格模型 Up", fmtProb(actorProbability.price_model_up))}
+          ${analysisMetric("地址敞口 Up", fmtProb(actorProbability.actor_up_ratio))}
+          ${analysisMetric("Data API 当前价", fmtNumberCell(actorProbability.current_price, 2))}
+          ${analysisMetric("Data API 目标价", fmtNumberCell(actorProbability.target_price, 2))}
+          ${analysisMetric("Data API 距离", fmtSignedBpsCell(actorProbability.distance_bps))}
+          ${analysisMetric("Data API 剩余秒", fmtNumberCell(actorProbability.seconds_left, 1))}
+        </div>
+      `
+      : `<div class="analysis-note">地址修正概率等待 Data API 返回；实时方向概率不依赖地址画像。</div>`;
+  const html = `
+    <div class="analysis-body probability-body">
+      <div class="analysis-probability-main analysis-probability-live">
+        <span>实时方向概率 <small>WebSocket · ${safe(realtime.latency_ms == null ? "-" : `${Math.round(realtime.latency_ms)}ms`)}</small></span>
+        <strong class="${sideClass(realtime.direction)}">${safe(realtime.direction || "Balanced")}</strong>
+        ${probabilityBarHtml(realtime.combined_up)}
+      </div>
+      <div class="analysis-mini-grid">
+        ${analysisMetric("实时 Up", fmtProb(realtime.combined_up))}
+        ${analysisMetric("盘口隐含 Up", fmtProb(realtime.market_up))}
+        ${analysisMetric("目标价模型 Up", fmtProb(realtime.target_up))}
+        ${analysisMetric("成交压力 Up", fmtProb(realtime.pressure_up))}
+        ${analysisMetric("外部领先 Up", fmtProb(realtime.external_lead_up))}
+        ${analysisMetric("实时当前价", fmtNumberCell(realtime.current_price, 2))}
+        ${analysisMetric("实时距离", fmtSignedBpsCell(realtime.distance_bps))}
+        ${analysisMetric("实时剩余秒", fmtNumberCell(realtime.seconds_left, 1))}
+      </div>
+      <div class="analysis-probability-divider">地址修正概率</div>
+      ${actorHtml}
+    </div>
+  `;
+  setAnalysisBlock(ids.analysisProbability, html);
+}
+
+function probabilityBarHtml(value) {
+  const parsed = toNumber(value);
+  const pct = parsed == null ? 50 : clamp01(parsed) * 100;
+  return `
+    <div class="analysis-probability-bar" aria-hidden="true">
+      <span style="width: ${pct.toFixed(2)}%"></span>
+    </div>
+  `;
+}
+
+function renderAnalysisRiskTags(tags, notes) {
+  if (!ids.analysisRiskTags) return;
+  const tagHtml = tags.length
+    ? tags.map((tag) => `
+        <div class="analysis-risk ${safe(tag.severity || "info")}">
+          <strong>${safe(tag.label || tag.code)}</strong>
+          <span>${safe(tag.message || "")}</span>
+        </div>
+      `).join("")
+    : `<div class="analysis-empty">暂无风险标签</div>`;
+  const noteHtml = notes.length
+    ? `<div class="analysis-notes">${notes.map((note) => `<p>${safe(note)}</p>`).join("")}</div>`
+    : "";
+  setAnalysisBlock(ids.analysisRiskTags, `<div class="analysis-body">${tagHtml}${noteHtml}</div>`);
+}
+
+function analysisMetric(label, value) {
+  const raw = value === null || value === undefined ? "-" : String(value);
+  const content = raw.startsWith("<span ") ? raw : safe(raw);
+  return `<div class="analysis-metric"><span>${safe(label)}</span><strong>${content}</strong></div>`;
+}
+
+function analysisTagsHtml(tags) {
+  return tags.map((tag) => `<span class="analysis-tag">${safe(tag)}</span>`).join(" ");
+}
+
+function fmtProb(value) {
+  const parsed = toNumber(value);
+  return parsed == null ? "-" : `${number.format(parsed * 100)}%`;
+}
+
+function fmtPctLike(value) {
+  const parsed = toNumber(value);
+  return parsed == null ? "-" : `${number.format(parsed)}%`;
+}
+
+function setAnalysisBlock(element, html, empty = false) {
+  if (!element) return;
+  element.classList.toggle("analysis-empty", empty);
+  element.classList.toggle("analysis-body-wrap", !empty);
+  element.innerHTML = html;
+}
+
+async function loadActorAnalysis({ force = false } = {}) {
+  if (actorAnalysisLoading) return;
+  actorAnalysisLoading = true;
+  ids.analysisRefresh?.classList.add("is-loading");
+  if (ids.analysisRefresh) ids.analysisRefresh.disabled = true;
+  if (!actorAnalysis && ids.analysisStatus) ids.analysisStatus.textContent = "加载中";
+  try {
+    const params = new URLSearchParams({ refresh: force ? "true" : "false" });
+    const res = await fetch(`/api/actor-analysis?${params.toString()}`);
+    if (!res.ok) throw new Error(`actor analysis HTTP ${res.status}`);
+    actorAnalysis = await res.json();
+    actorAnalysisError = "";
+    lastActorAnalysisFetchMs = Date.now();
+    renderActorAnalysis(actorAnalysis);
+  } finally {
+    actorAnalysisLoading = false;
+    ids.analysisRefresh?.classList.remove("is-loading");
+    if (ids.analysisRefresh) ids.analysisRefresh.disabled = false;
+  }
+}
+
 function renderMetrics(metrics = {}) {
   setMetric(ids.totalEquity, metrics.total_equity, money, null);
   setMetric(ids.totalPnl, metrics.total_pnl, signedMoney, cls);
@@ -640,7 +1321,7 @@ function renderRuntime(runtime) {
   const stalePrice = priceState.chainlink_updated_ms ? Date.now() - priceState.chainlink_updated_ms > 5_000 : true;
   ids.runtime.textContent = hasError ? "异常" : stalePrice ? "等待实时价" : "实时运行";
   ids.runtime.classList.toggle("error", hasError || stalePrice);
-  ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus}`;
+  ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus} · okx ${okxWsStatus} · binance ${binanceMarketWsStatus}`;
 }
 
 function renderLivePanel(data = latestStatus) {
@@ -1217,16 +1898,35 @@ function quoteText(row) {
   return `${bid} / ${ask}`;
 }
 
-function renderOpenTrades(rows, scope = openDataScope) {
+function renderOpenTrades(rows, scope = openDataScope, options = {}) {
   if ((isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)) && strategyTablesLoading && !strategyTables) {
     ids.openCount.textContent = "加载中";
+    if (!options.force && isOpenInteractionActive()) {
+      pendingOpenRender = true;
+      return;
+    }
     renderTradeTable("open", [], experimentOpenFields, ids.openTradesHead, ids.openTrades, experimentFieldKeys("open"));
     return;
   }
   ids.openCount.textContent = isExperimentAggregateScope(scope) ? `${rows.length} / ${strategyExperimentVariants().length}组` : rows.length;
+  const renderKey = openRenderKey(rows, scope);
+  if (!options.force && renderKey === lastOpenRenderKey) return;
+  if (!options.force && isOpenInteractionActive()) {
+    pendingOpenRender = true;
+    return;
+  }
+  pendingOpenRender = false;
+  lastOpenRenderKey = renderKey;
+  const tableWrap = openTableWrap();
+  const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
+  const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
   const fields = isMainScope(scope) ? openTradeFields : scopedOpenFields;
   const selected = isMainScope(scope) ? selectedFields.open : experimentFieldKeys("open");
   renderTradeTable("open", rows, fields, ids.openTradesHead, ids.openTrades, selected);
+  if (tableWrap) {
+    tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
+    tableWrap.scrollLeft = Math.min(scrollLeft, Math.max(0, tableWrap.scrollWidth - tableWrap.clientWidth));
+  }
 }
 
 function renderRecentOrders(rows, options = {}) {
@@ -1385,6 +2085,26 @@ function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summa
   ].join("|");
 }
 
+function openRenderKey(rows, scope = openDataScope) {
+  const selected = isMainScope(scope) ? selectedFields.open : experimentFieldKeys("open");
+  const leftBucket = selected.includes("left") ? Math.floor(Date.now() / 1000) : "";
+  const rowsKey = rows.map((row) => [
+    row.variant_id || row.account_scope || "main",
+    row.id,
+    row.status || "",
+    row.side || "",
+    row.shares ?? "",
+    row.current_bid ?? "",
+    row.current_ask ?? "",
+    row.exit_value ?? "",
+    row.unrealized_pnl ?? "",
+    row.unrealized_roi_pct ?? "",
+    row.pending_live_sell_order_id || "",
+    row.reason || "",
+  ].join(":")).join(",");
+  return [scope, rowsKey, selected.join(","), rows.length, leftBucket].join("|");
+}
+
 function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
   const expandedFills = expandedOrderId ? orderFillCache.get(expandedOrderId) || [] : [];
   const rowsKey = rows.map((row) => [
@@ -1414,12 +2134,28 @@ function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
   ].join("|");
 }
 
+function tableRoot(kind) {
+  if (kind === "open") return ids.openTrades.closest(".panel") || ids.openTrades;
+  if (kind === "order") return ids.recentOrders.closest(".panel") || ids.recentOrders;
+  return null;
+}
+
+function tableWrap(kind) {
+  if (kind === "open") return ids.openTrades.closest(".table-wrap");
+  if (kind === "order") return ids.recentOrders.closest(".order-table-wrap") || ids.recentOrders.closest(".table-wrap");
+  return null;
+}
+
 function orderRoot() {
-  return ids.recentOrders.closest(".panel") || ids.recentOrders;
+  return tableRoot("order");
 }
 
 function orderTableWrap() {
-  return ids.recentOrders.closest(".order-table-wrap");
+  return tableWrap("order");
+}
+
+function openTableWrap() {
+  return tableWrap("open");
 }
 
 function nodeInside(root, node) {
@@ -1428,18 +2164,40 @@ function nodeInside(root, node) {
   return Boolean(element && root.contains(element));
 }
 
-function orderSelectionActive() {
+function tableSelectionActive(kind) {
   const selection = window.getSelection ? window.getSelection() : null;
   if (!selection || selection.isCollapsed || !selection.toString().trim()) return false;
-  const root = orderRoot();
+  const root = tableRoot(kind);
   return nodeInside(root, selection.anchorNode) || nodeInside(root, selection.focusNode);
 }
 
-function isOrderInteractionActive() {
-  const root = orderRoot();
+function isTableInteractionActive(kind) {
+  const root = tableRoot(kind);
   const active = document.activeElement;
+  if (Date.now() < (tableInteractionHoldUntil[kind] || 0)) return true;
+  if (!root) return false;
   if (active && active !== document.body && root.contains(active)) return true;
-  return orderSelectionActive();
+  return tableSelectionActive(kind);
+}
+
+function markTableInteraction(kind) {
+  tableInteractionHoldUntil[kind] = Date.now() + TABLE_INTERACTION_HOLD_MS;
+}
+
+function orderSelectionActive() {
+  return tableSelectionActive("order");
+}
+
+function isOrderInteractionActive() {
+  return isTableInteractionActive("order");
+}
+
+function isOpenInteractionActive() {
+  return isTableInteractionActive("open");
+}
+
+function currentOpenRows() {
+  return scopedOpenRows(openDataScope, latestStatus);
 }
 
 function currentOrderRows() {
@@ -1448,9 +2206,38 @@ function currentOrderRows() {
   return latestStatus?.recent_orders || [];
 }
 
+function flushPendingOpenRender() {
+  if (!pendingOpenRender || isOpenInteractionActive()) return;
+  renderOpenTrades(currentOpenRows(), openDataScope, { force: true });
+}
+
 function flushPendingOrderRender() {
   if (!pendingOrderRender || isOrderInteractionActive()) return;
   renderRecentOrders(currentOrderRows(), { force: true });
+}
+
+function flushPendingTableRenders() {
+  flushPendingOpenRender();
+  flushPendingOrderRender();
+}
+
+function scheduleProtectedTableFlush() {
+  window.setTimeout(flushPendingTableRenders, 120);
+  window.setTimeout(flushPendingTableRenders, TABLE_INTERACTION_HOLD_MS + 80);
+}
+
+function bindProtectedTableInteraction(kind) {
+  const root = tableRoot(kind);
+  if (!root) return;
+  const mark = () => markTableInteraction(kind);
+  root.addEventListener("pointerdown", mark, true);
+  root.addEventListener("mousedown", mark, true);
+  root.addEventListener("copy", mark, true);
+  root.addEventListener("keydown", (event) => {
+    if (event.key === "Shift" || event.key.startsWith("Arrow") || event.ctrlKey || event.metaKey) {
+      mark();
+    }
+  }, true);
 }
 
 function orderToggleText(row) {
@@ -1589,9 +2376,10 @@ function renderFieldOptions(kind, fields, container) {
     }
     selectedFields[kind] = fields.filter((field) => next.has(field.key)).map((field) => field.key);
     localStorage.setItem(FIELD_STORAGE_KEYS[kind], JSON.stringify(selectedFields[kind]));
+    if (kind === "open") lastOpenRenderKey = "";
     if (kind === "recent") lastRecentRenderKey = "";
     if (kind === "order") lastOrderRenderKey = "";
-    renderAll(latestStatus, { forceOrder: kind === "order" });
+    renderAll(latestStatus, { forceOpen: kind === "open", forceOrder: kind === "order" });
   });
 }
 
@@ -2655,6 +3443,7 @@ function renderAll(data = latestStatus, options = {}) {
   pendingRenderOptions = {
     force: Boolean(pendingRenderOptions.force || options.force),
     forceChart: Boolean(pendingRenderOptions.forceChart || options.forceChart),
+    forceOpen: Boolean(pendingRenderOptions.forceOpen || options.forceOpen),
     forceOrder: Boolean(pendingRenderOptions.forceOrder || options.forceOrder),
   };
   if (!pageVisible && !pendingRenderOptions.force) return;
@@ -2682,7 +3471,7 @@ function renderAllNow(data = latestStatus, options = {}) {
     loadStrategyExperimentTables(false).catch(showError);
   }
   const openRows = scopedOpenRows(openDataScope, data);
-  renderOpenTrades(openRows, openDataScope);
+  renderOpenTrades(openRows, openDataScope, { force: Boolean(options.force || options.forceOpen) });
   const visibleOrderRows = isExperimentAggregateScope(orderDataScope)
     ? strategyTables?.recent_orders || []
     : orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
@@ -2706,6 +3495,7 @@ function renderAllNow(data = latestStatus, options = {}) {
     drawChart(currentChartRows);
     lastChartRenderMs = now;
   }
+  if (activeAppPage === "analysis") queueRealtimeAnalysisRender();
 }
 
 function scopedOpenRows(scope, data = latestStatus) {
@@ -2754,6 +3544,7 @@ function applyMarket(market) {
 
   if (!sameMarket || tokenChanged) {
     quotes = {};
+    resetRealtimeAnalysisForMarket(activeMarket);
     connectMarketSocket();
   }
 }
@@ -2794,6 +3585,7 @@ function connectMarketSocket() {
         asks: normalizeBookLevels(message.asks, false),
         source: "market-ws-book",
       });
+      recordRealtimeMarketEvent(message, { side });
     } else if (message.event_type === "best_bid_ask") {
       const side = tokenSide(message.asset_id);
       if (side) updateQuote(side, {
@@ -2802,6 +3594,7 @@ function connectMarketSocket() {
         best_ask: message.best_ask,
         source: "market-ws-best",
       });
+      recordRealtimeMarketEvent(message, { side, price: message.best_ask ?? message.best_bid });
     } else if (message.event_type === "price_change") {
       for (const change of message.price_changes || []) {
         const side = tokenSide(change.asset_id);
@@ -2811,8 +3604,15 @@ function connectMarketSocket() {
           best_ask: change.best_ask,
           source: "market-ws-price-change",
         });
+        recordRealtimeMarketEvent(
+          { ...message, asset_id: change.asset_id, event_type: "price_change" },
+          { side, price: change.best_ask ?? change.best_bid },
+        );
       }
+    } else if (message.event_type === "last_trade_price") {
+      recordRealtimeMarketEvent(message, { side: tokenSide(message.asset_id), price: message.price, size: message.size });
     } else if (message.event_type === "market_resolved") {
+      recordRealtimeMarketEvent(message);
       postSnapshotSoon(true);
     }
     renderAll();
@@ -2870,6 +3670,70 @@ function connectPriceSocket() {
   };
 }
 
+function connectOkxSocket() {
+  if (okxSocket && okxSocket.readyState <= 1) return;
+  if (okxPing) clearInterval(okxPing);
+  okxWsStatus = "connecting";
+  const socket = new WebSocket(OKX_WS);
+  okxSocket = socket;
+  socket.onopen = () => {
+    if (socket !== okxSocket) return;
+    okxWsStatus = "connected";
+    socket.send(JSON.stringify({
+      op: "subscribe",
+      args: [{ channel: "tickers", instId: "BTC-USDT" }],
+    }));
+    okxPing = setInterval(() => {
+      if (socket === okxSocket && socket.readyState === WebSocket.OPEN) socket.send("ping");
+    }, OKX_PING_MS);
+  };
+  socket.onmessage = (event) => {
+    if (event.data === "pong") return;
+    const message = parseMessage(event.data);
+    if (!message) return;
+    processOkxMessage(message);
+    renderAll();
+    postSnapshotSoon();
+  };
+  socket.onclose = () => {
+    if (socket !== okxSocket) return;
+    okxWsStatus = "closed";
+    if (okxPing) clearInterval(okxPing);
+    setTimeout(connectOkxSocket, 1500);
+  };
+  socket.onerror = () => {
+    if (socket !== okxSocket) return;
+    okxWsStatus = "error";
+  };
+}
+
+function connectBinanceMarketSocket() {
+  if (binanceMarketSocket && binanceMarketSocket.readyState <= 1) return;
+  binanceMarketWsStatus = "connecting";
+  const socket = new WebSocket(BINANCE_MARKET_WS);
+  binanceMarketSocket = socket;
+  socket.onopen = () => {
+    if (socket !== binanceMarketSocket) return;
+    binanceMarketWsStatus = "connected";
+  };
+  socket.onmessage = (event) => {
+    const message = parseMessage(event.data);
+    if (!message) return;
+    processBinanceMarketMessage(message);
+    renderAll();
+    postSnapshotSoon();
+  };
+  socket.onclose = () => {
+    if (socket !== binanceMarketSocket) return;
+    binanceMarketWsStatus = "closed";
+    setTimeout(connectBinanceMarketSocket, 1500);
+  };
+  socket.onerror = () => {
+    if (socket !== binanceMarketSocket) return;
+    binanceMarketWsStatus = "error";
+  };
+}
+
 function processPriceMessage(message) {
   const payload = message.payload || {};
   const topic = inferPriceTopic(message);
@@ -2884,6 +3748,7 @@ function processPriceMessage(message) {
       priceState.chainlink = value;
       priceState.chainlink_updated_ms = now;
       priceState.source = "polymarket-rtds-chainlink";
+      recordRealtimePriceEvent("chainlink", value, now);
       if (!marketTargetPrice(activeMarket) && !priceState.target_price && activeMarket?.start_ts && Math.abs(ts - activeMarket.start_ts * 1000) <= 20_000) {
         priceState.target_price = value;
         priceState.target_price_source = "rtds-chainlink-fallback";
@@ -2894,8 +3759,30 @@ function processPriceMessage(message) {
       priceState.binance = value;
       priceState.binance_updated_ms = now;
       if (!priceState.source) priceState.source = "polymarket-rtds-binance";
+      recordRealtimePriceEvent("polymarket-binance", value, now);
     }
   }
+}
+
+function processOkxMessage(message) {
+  const rows = Array.isArray(message.data) ? message.data : [];
+  for (const row of rows) {
+    const value = toNumber(row?.last);
+    if (value == null) continue;
+    priceState.okx = value;
+    priceState.okx_updated_ms = normalizeMs(row.ts || Date.now());
+    priceState.okx_source = "okx-spot-ws";
+    recordRealtimePriceEvent("okx", value, priceState.okx_updated_ms);
+  }
+}
+
+function processBinanceMarketMessage(message) {
+  const value = toNumber(message.c || message.lastPrice);
+  if (value == null) return;
+  priceState.binance_market = value;
+  priceState.binance_market_updated_ms = normalizeMs(message.E || Date.now());
+  priceState.binance_market_source = "binance-spot-ws";
+  recordRealtimePriceEvent("binance", value, priceState.binance_market_updated_ms);
 }
 
 function inferPriceTopic(message) {
@@ -3050,6 +3937,9 @@ function handleVisibilityChange() {
   if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer);
   renderAll(latestStatus, { force: true, forceChart: true });
   loadEquityCurve(false).catch(showError);
+  if (activeAppPage === "analysis") {
+    loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
+  }
   foregroundRefreshTimer = setTimeout(() => {
     loadStatus(true).catch(showError);
   }, 150);
@@ -3087,6 +3977,14 @@ function queueChartHoverDraw() {
   });
 }
 
+for (const navItem of ids.navItems || []) {
+  navItem.addEventListener("click", () => setActiveAppPage(navItem.dataset.navPage));
+}
+window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
+window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
+setActiveAppPage(locationAppPage(), { syncHash: false });
+applyAnalysisRealtimeVisibility();
+
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
 ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
 ids.liveSettingsToggle?.addEventListener("click", (event) => {
@@ -3101,6 +3999,8 @@ ids.liveDoctor?.addEventListener("click", () => runLiveDoctor().catch(showError)
 ids.liveOnce?.addEventListener("click", () => runLiveOnce().catch(showError));
 ids.liveOpenOrdersRefresh?.addEventListener("click", () => refreshLiveOpenOrders().catch(showError));
 ids.liveEmergencyStop?.addEventListener("click", () => liveEmergencyStop().catch(showError));
+ids.analysisRefresh?.addEventListener("click", () => loadActorAnalysis({ force: true }).catch(renderActorAnalysisError));
+ids.analysisRealtimeToggle?.addEventListener("change", () => setAnalysisRealtimeVisible(ids.analysisRealtimeToggle.checked));
 document.addEventListener("click", () => {
   if (liveSettingsOpen) setLiveSettingsOpen(false);
 });
@@ -3153,20 +4053,29 @@ ids.applyRecentFilter.addEventListener("click", () => applyRecentTradeFilter().c
 ids.resetRecentFilter.addEventListener("click", () => resetRecentTradeFilter().catch(showError));
 ids.chart.addEventListener("mousemove", handleChartMove);
 ids.chart.addEventListener("mouseleave", handleChartLeave);
-document.addEventListener("selectionchange", () => window.setTimeout(flushPendingOrderRender, 120));
-document.addEventListener("focusout", () => window.setTimeout(flushPendingOrderRender, 120));
-document.addEventListener("mouseup", () => window.setTimeout(flushPendingOrderRender, 120));
+bindProtectedTableInteraction("open");
+bindProtectedTableInteraction("order");
+document.addEventListener("selectionchange", scheduleProtectedTableFlush);
+document.addEventListener("focusout", scheduleProtectedTableFlush);
+document.addEventListener("mouseup", scheduleProtectedTableFlush);
+document.addEventListener("pointerup", scheduleProtectedTableFlush);
 
 initFieldOptions();
 setRecentLoading(true);
 loadStatus(true).then(() => {
   connectPriceSocket();
+  connectOkxSocket();
+  connectBinanceMarketSocket();
 }).catch(showError);
 setInterval(() => {
   if (!pageVisible) return;
   loadStatus().catch(showError);
 }, STATUS_POLL_MS);
 setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
+setInterval(() => {
+  if (!pageVisible || activeAppPage !== "analysis") return;
+  loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
+}, ACTOR_ANALYSIS_REFRESH_MS);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));
 window.addEventListener("beforeunload", releaseSnapshotLeadership);

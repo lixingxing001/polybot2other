@@ -3,16 +3,24 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>polybot2other</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-86">
+    <title>EdgePulse</title>
+    <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
+    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-90">
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div>
-          <div class="eyebrow">Paper + Live Trading</div>
-          <h1>Polymarket BTC 5m Bot</h1>
+        <div class="brand-lockup">
+          <img class="brand-mark" src="/static/edgepulse.svg" alt="" aria-hidden="true">
+          <div>
+            <div class="eyebrow">Paper + Live Trading</div>
+            <h1>EdgePulse</h1>
+          </div>
         </div>
+        <nav class="app-nav" aria-label="页面导航">
+          <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">Bot</button>
+          <button id="nav-analysis" class="app-nav-item" type="button" data-nav-page="analysis">分析</button>
+        </nav>
         <div class="top-actions">
           <label class="live-toggle">
             <input id="live-enabled" type="checkbox">
@@ -24,6 +32,8 @@
         </div>
       </header>
 
+      <div class="page-stack">
+      <section id="bot-page" class="app-page is-active" data-page="bot" aria-labelledby="nav-bot">
       <section class="panel live-panel">
         <div class="panel-head live-head">
           <div class="live-title">
@@ -296,8 +306,100 @@
           </div>
         </div>
       </section>
+      </section>
+
+      <section id="analysis-page" class="app-page is-hidden" data-page="analysis" aria-labelledby="nav-analysis">
+        <section class="panel analysis-panel">
+          <div class="panel-head analysis-head">
+            <div>
+              <h2>市场参与者分析</h2>
+              <span>analysis_only=true</span>
+            </div>
+            <div class="analysis-actions">
+              <label class="analysis-stream-toggle" title="控制实时盘口流卡片是否展示">
+                <input id="analysis-realtime-toggle" type="checkbox" checked>
+                <span></span>
+                <strong>实时盘口流</strong>
+              </label>
+              <span class="analysis-badge">只读</span>
+            </div>
+          </div>
+          <div class="analysis-hero">
+            <div class="analysis-status">
+              <span>当前状态</span>
+              <strong id="analysis-status">待加载</strong>
+            </div>
+            <div class="analysis-status">
+              <span>影响下单</span>
+              <strong id="analysis-affects-trading">否</strong>
+            </div>
+            <div class="analysis-status">
+              <span>数据范围</span>
+              <strong id="analysis-data-scope">地址 / 持仓 / 成交</strong>
+            </div>
+            <div class="analysis-status">
+              <span>LLM 路径</span>
+              <strong id="analysis-llm-path">复盘旁路</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="analysis-grid">
+          <div id="analysis-realtime-card" class="panel analysis-card analysis-realtime-card">
+            <div class="panel-head">
+              <div>
+                <h2>实时盘口流</h2>
+                <span>market WebSocket / RTDS / OKX / Binance</span>
+              </div>
+            </div>
+            <div id="analysis-realtime" class="analysis-empty">等待 WebSocket 数据</div>
+          </div>
+
+          <div class="panel analysis-card">
+            <div class="panel-head">
+              <div>
+                <h2>当前市场地址</h2>
+                <span>Top holders / active wallets</span>
+              </div>
+            </div>
+            <div id="analysis-wallets" class="analysis-empty">待采集</div>
+          </div>
+
+          <div class="panel analysis-card">
+            <div class="panel-head">
+              <div>
+                <h2>地址画像</h2>
+                <span>behavior fingerprint</span>
+              </div>
+            </div>
+            <div id="analysis-summary" class="analysis-empty">待采集</div>
+          </div>
+
+          <div class="panel analysis-card">
+            <div class="panel-head">
+              <div>
+                <h2>方向概率</h2>
+                <span>realtime probability / actor adjustment</span>
+              </div>
+              <button id="analysis-refresh" class="analysis-card-action" type="button">刷新分析</button>
+            </div>
+            <div id="analysis-probability" class="analysis-empty">待采集</div>
+          </div>
+
+          <div class="panel analysis-card">
+            <div class="panel-head">
+              <div>
+                <h2>风险标签</h2>
+                <span>market actor signals</span>
+              </div>
+            </div>
+            <div id="analysis-risk-tags" class="analysis-empty">待采集</div>
+          </div>
+        </section>
+      </section>
+      </div>
     </main>
 
-    <script src="/static/app.js?v=20260529-v2-86"></script>
+    <script src="/static/app.js?v=20260529-v2-94"></script>
   </body>
 </html>

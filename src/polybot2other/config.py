@@ -68,6 +68,7 @@ class Settings:
     live_trading_runtime_enabled: bool = True
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
+    data_api_url: str = "https://data-api.polymarket.com"
 
 
 def _float_env(name: str, default: float, minimum: float | None = None) -> float:
@@ -254,4 +255,5 @@ def load_settings() -> Settings:
         live_trading_runtime_enabled=_bool_env("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", True),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
+        data_api_url=os.environ.get("POLYBOT2OTHER_DATA_API_URL", "https://data-api.polymarket.com"),
     )

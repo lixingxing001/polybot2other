@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EdgePulse 策略组合和账户口径说明</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #11171c;
+      --panel: #151d23;
+      --panel-2: #1a242c;
+      --line: #2d3a44;
+      --text: #e6edf3;
+      --muted: #9aa9b5;
+      --strong: #ffffff;
+      --accent: #6ee7b7;
+      --warn: #facc15;
+      --danger: #fb7185;
+      --info: #93c5fd;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 32px 24px 64px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      color: var(--strong);
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 32px;
+    }
+
+    h2 {
+      margin: 36px 0 14px;
+      font-size: 22px;
+    }
+
+    h3 {
+      margin: 24px 0 10px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+
+    code {
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #0d1216;
+      color: #dbeafe;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .hero {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #10171d;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .pill.good {
+      border-color: rgba(110, 231, 183, 0.35);
+      color: var(--accent);
+    }
+
+    .pill.warn {
+      border-color: rgba(250, 204, 21, 0.4);
+      color: var(--warn);
+    }
+
+    .pill.danger {
+      border-color: rgba(251, 113, 133, 0.4);
+      color: var(--danger);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 16px 0 22px;
+    }
+
+    .note,
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }
+
+    .note strong,
+    .card strong {
+      color: var(--strong);
+    }
+
+    .note.warn {
+      border-color: rgba(250, 204, 21, 0.45);
+      background: rgba(250, 204, 21, 0.08);
+    }
+
+    .note.danger {
+      border-color: rgba(251, 113, 133, 0.45);
+      background: rgba(251, 113, 133, 0.08);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 24px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--panel-2);
+      color: var(--strong);
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr:hover {
+      background: rgba(147, 197, 253, 0.05);
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status.paper {
+      color: var(--info);
+      border-color: rgba(147, 197, 253, 0.45);
+    }
+
+    .status.live {
+      color: var(--danger);
+      border-color: rgba(251, 113, 133, 0.5);
+    }
+
+    .status.sample {
+      color: var(--warn);
+      border-color: rgba(250, 204, 21, 0.45);
+    }
+
+    .status.candidate {
+      color: var(--accent);
+      border-color: rgba(110, 231, 183, 0.45);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .toc a {
+      display: block;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--text);
+      text-decoration: none;
+      background: #10171d;
+    }
+
+    .toc a:hover {
+      border-color: rgba(147, 197, 253, 0.7);
+    }
+
+    @media (max-width: 900px) {
+      main {
+        padding: 20px 14px 44px;
+      }
+
+      .grid,
+      .toc {
+        grid-template-columns: 1fr;
+      }
+
+      table {
+        display: block;
+        overflow-x: auto;
+      }
+
+      th,
+      td {
+        min-width: 140px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>EdgePulse 策略组合和账户口径说明</h1>
+      <p>
+        本文档用于区分 dashboard 里看到的主账户、实盘账户和 18 个 Paper 策略实验组合。
+        当前代码仍只跟踪 Polymarket BTC 5 分钟 Up/Down 市场；所有 Paper 组合都用隔离 SQLite 账户采样，不能把短期 Paper 表现直接等同于实盘可用性。
+      </p>
+      <div class="meta">
+        <span class="pill good">当前实验组合数：18</span>
+        <span class="pill warn">新增采样：SINGLE_FAK_ANTI_BOT_GUARD</span>
+        <span class="pill danger">唯一实盘租户：SINGLE_FAK_REAL</span>
+        <span class="pill">文档版本：v1.0</span>
+        <span class="pill">更新日期：2026-05-29</span>
+      </div>
+      <nav class="toc" aria-label="目录">
+        <a href="#account-scopes">账户口径</a>
+        <a href="#name-rules">命名规则</a>
+        <a href="#variants">组合总表</a>
+        <a href="#live-warning">实盘边界</a>
+      </nav>
+    </section>
+
+    <section id="account-scopes">
+      <h2>账户口径</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>口径</th>
+            <th>界面/接口标识</th>
+            <th>数据性质</th>
+            <th>用途</th>
+            <th>注意事项</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>主账户</strong></td>
+            <td><code>main</code></td>
+            <td><span class="status paper">Paper</span></td>
+            <td>默认 Paper 账户，承载 dashboard 当前主策略状态和主曲线。</td>
+            <td>不是实盘。它会受当前主策略开关和全局配置影响，不等同于某个固定实验租户。</td>
+          </tr>
+          <tr>
+            <td><strong>实盘账户</strong></td>
+            <td><code>live</code> / <code>SINGLE_FAK_REAL</code></td>
+            <td><span class="status live">Real</span></td>
+            <td>真实 Polymarket 下单流程，用独立数据库和 dashboard 实盘开关控制。</td>
+            <td>目前只按 <code>SINGLE_FAK</code> 的 Paper 基线行为接入，其他实验组合没有自动接入实盘。</td>
+          </tr>
+          <tr>
+            <td><strong>策略实验账户</strong></td>
+            <td><code>strategy_experiment</code> + <code>variant_id</code></td>
+            <td><span class="status paper">Paper</span></td>
+            <td>18 个隔离 Paper 对照组，每个组合有自己的 SQLite 数据库。</td>
+            <td>用于采样和复盘。新增实验组合默认不代表推荐实盘。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="name-rules">
+      <h2>命名规则</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>SINGLE</h3>
+          <p><strong>单边策略。</strong>根据 BTC 当前价相对官方目标价 <code>target_price</code> 的方向，只买 Up 或 Down 中的一边。</p>
+          <p>核心门槛包括目标价存在、价格新鲜、盘口新鲜、离目标价距离、最大入场价、价差、深度、置信度和 edge。</p>
+        </div>
+        <div class="card">
+          <h3>PAIR</h3>
+          <p><strong>双边配对策略。</strong>同时买 Up 和 Down，重点看两边合成成本是否低于 1，靠折价配对、提前平仓或结算回收利润。</p>
+          <p>PAIR 会占用两个方向的持仓槽，且有残余库存止损、尾盘强平和日内回撤阈值。</p>
+        </div>
+        <div class="card">
+          <h3>REAL</h3>
+          <p><strong>实盘租户。</strong><code>SINGLE_FAK_REAL</code> 是真实调用 Polymarket CLOB 的账户，不属于 18 个 Paper 实验组合。</p>
+          <p>它有独立预算、凭证、余额/授权检查、地理限制检查、进程锁、官方挂单检查和手动卖出流程。</p>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>字段</th>
+            <th>值</th>
+            <th>含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>订单类型</td>
+            <td><code>FAK</code></td>
+            <td>Fill And Kill。按限价立即吃可成交盘口，成交多少算多少，剩余取消。更接近 taker 实盘。</td>
+          </tr>
+          <tr>
+            <td>订单类型</td>
+            <td><code>GTC</code></td>
+            <td>Good Till Cancel。挂单一直保留到被成交、取消或市场结束，属于 maker 模拟。</td>
+          </tr>
+          <tr>
+            <td>订单类型</td>
+            <td><code>GTD</code></td>
+            <td>Good Till Date。限时挂单，当前 Paper 用配置的过期秒数控制，适合观察 5 分钟市场挂单机会。</td>
+          </tr>
+          <tr>
+            <td>订单类型</td>
+            <td><code>POST_ONLY</code></td>
+            <td>只允许 maker。若限价会立即吃到卖一，则拒单，用来测试不吃流动性的挂单路径。</td>
+          </tr>
+          <tr>
+            <td>单边开仓模式</td>
+            <td><code>LEGACY</code></td>
+            <td>历史默认模式。同一市场已有反向仓时，允许再开新方向；这不是严格止损，只是双边反转采样。</td>
+          </tr>
+          <tr>
+            <td>单边开仓模式</td>
+            <td><code>STRICT</code></td>
+            <td>同一市场只允许一个方向仓，有任何同市场持仓或挂单都不再开新方向。适合小资金保守候选。</td>
+          </tr>
+          <tr>
+            <td>单边开仓模式</td>
+            <td><code>REVERSAL</code></td>
+            <td>允许反向双边买入，但会显式标记反转原因，便于单独统计反转腿胜率、PnL 和资金占用。</td>
+          </tr>
+          <tr>
+            <td>单边开仓模式</td>
+            <td><code>STOP_AND_FLIP</code></td>
+            <td>真正止损反手。先按旧方向 bid 平掉旧仓，再买新方向；新方向不可成交时保留旧仓。</td>
+          </tr>
+          <tr>
+            <td>行情模式</td>
+            <td><code>BASE</code></td>
+            <td>基础模式。主要用 Chainlink 当前价，缺失时按混合价格源规则可 fallback。</td>
+          </tr>
+          <tr>
+            <td>行情模式</td>
+            <td><code>MULTI_CONFIRM</code></td>
+            <td>OKX/Binance 残差确认。外部残差与候选方向明显相反时过滤，不主动增强信号。</td>
+          </tr>
+          <tr>
+            <td>行情模式</td>
+            <td><code>MULTI_LEAD</code></td>
+            <td>OKX/Binance 残差领先修正。用外部残差微调置信度，尝试捕捉外部现货领先 Chainlink 的情况。</td>
+          </tr>
+          <tr>
+            <td>价格源模式</td>
+            <td><code>MIXED</code></td>
+            <td>默认模式。优先 Chainlink；缺少时允许 fallback 到其他公共价格。</td>
+          </tr>
+          <tr>
+            <td>价格源模式</td>
+            <td><code>CHAINLINK_ONLY</code></td>
+            <td>只用新鲜 Chainlink。缺少或过期时不交易，用于隔离 fallback 噪音。</td>
+          </tr>
+          <tr>
+            <td>价格源模式</td>
+            <td><code>FALLBACK_ONLY</code></td>
+            <td>只在没有新鲜 Chainlink 时采样 fallback；有新鲜 Chainlink 时主动不交易。负面对照，不应实盘。</td>
+          </tr>
+          <tr>
+            <td>防守过滤</td>
+            <td><code>ANTI_BOT_GUARD</code></td>
+            <td>Paper-only 防守采样。只过滤原本已通过的候选单，不做诱导盘口，也不接实盘。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="variants">
+      <h2>18 个 Paper 策略实验组合</h2>
+      <div class="note warn">
+        <strong>阅读方式：</strong>优先看 <code>variant_id</code>，它是数据库和接口里的稳定标识；<code>combo</code> 是 dashboard 展示名。
+        “建议用途”只代表当前开发定位，不代表长期结论。真正是否可实盘，需要等样本、回撤和订单质量复盘。
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>variant_id</th>
+            <th>combo</th>
+            <th>类型</th>
+            <th>含义</th>
+            <th>适用场景</th>
+            <th>实盘态度</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><code>SINGLE_FAK</code></td>
+            <td><code>SINGLE + FAK</code></td>
+            <td><span class="status candidate">基线</span></td>
+            <td>当前单边 FAK Paper 基线。按目标价方向买一边，允许历史 legacy 反向双边开仓。</td>
+            <td>所有单边变体的对照组；也是当前实盘接入的行为基础。</td>
+            <td>已映射到 <code>SINGLE_FAK_REAL</code>，但实盘仍受独立风控和开关控制。</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><code>SINGLE_FAK_CHAINLINK_ONLY</code></td>
+            <td><code>SINGLE + FAK CHAINLINK_ONLY</code></td>
+            <td><span class="status sample">价格源实验</span></td>
+            <td>单边 FAK，但只允许用新鲜 Chainlink 价格开仓，缺失或过期时不 fallback。</td>
+            <td>判断 fallback 是否带来噪音；适合和 <code>SINGLE_FAK</code> 对比。</td>
+            <td>候选观察，不应直接替换实盘，需先看样本覆盖率和错过机会。</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>SINGLE_FAK_ANTI_BOT_GUARD</code></td>
+            <td><code>SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD</code></td>
+            <td><span class="status sample">防守采样</span></td>
+            <td>基于 Chainlink-only 的单边 FAK，额外过滤外部价格反向、合约偏贵但锚定弱、薄盘口高价等疑似异常单。</td>
+            <td>验证“疑似被机器人或盘口噪音诱导时少下单”是否能改善回撤。</td>
+            <td>Paper-only，实盘禁止直接沿用；采样后再决定是否拆规则。</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td><code>SINGLE_FAK_FALLBACK_ONLY</code></td>
+            <td><code>SINGLE + FAK FALLBACK_ONLY</code></td>
+            <td><span class="status sample">负面对照</span></td>
+            <td>只在没有新鲜 Chainlink 时使用 fallback 价格；有 Chainlink 时不交易。</td>
+            <td>专门观察 fallback 单独开仓的质量，判断 fallback 是否应该被限制。</td>
+            <td>严禁实盘，定位是负面对照和采样。</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td><code>SINGLE_FAK_MULTI_CONFIRM</code></td>
+            <td><code>SINGLE + FAK MULTI_CONFIRM</code></td>
+            <td><span class="status sample">外部确认</span></td>
+            <td>单边 FAK，要求 OKX/Binance 基差残差至少有可用样本；若残差明显反向则过滤。</td>
+            <td>验证外部现货是否能减少错误方向单。</td>
+            <td>未验证，不接实盘；若长时间不下单，多半是外部基差样本未 ready 或过滤过严。</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td><code>SINGLE_FAK_MULTI_LEAD</code></td>
+            <td><code>SINGLE + FAK MULTI_LEAD</code></td>
+            <td><span class="status sample">领先修正</span></td>
+            <td>单边 FAK，用 OKX/Binance 残差对置信度做小幅加减，尝试捕捉外部现货领先 Chainlink。</td>
+            <td>验证你观察到的 OKX/Binance 先动、Chainlink 后动是否有统计价值。</td>
+            <td>高不确定实验，不接实盘；要先看是否只是交易所固定基差造成错觉。</td>
+          </tr>
+          <tr>
+            <td>7</td>
+            <td><code>SINGLE_FAK_STRICT</code></td>
+            <td><code>SINGLE + FAK STRICT</code></td>
+            <td><span class="status candidate">保守候选</span></td>
+            <td>单边 FAK，同一市场只允许一个方向仓；已有任何同市场仓位或挂单就不再反向开仓。</td>
+            <td>小资金保守模式，控制单个 5 分钟市场里双边占用资金的问题。</td>
+            <td>可作为未来实盘候选，但当前实盘仍是 <code>SINGLE_FAK_REAL</code> 的 legacy 行为。</td>
+          </tr>
+          <tr>
+            <td>8</td>
+            <td><code>SINGLE_FAK_REVERSAL</code></td>
+            <td><code>SINGLE + FAK REVERSAL</code></td>
+            <td><span class="status sample">反转实验</span></td>
+            <td>允许同一市场反向再买，但显式标记 <code>SINGLE_REVERSAL</code>，方便统计反转腿。</td>
+            <td>复盘反向双边买入到底是在止损、加仓，还是贡献额外收益。</td>
+            <td>不是实盘止损逻辑；不应当作风险关闭手段。</td>
+          </tr>
+          <tr>
+            <td>9</td>
+            <td><code>SINGLE_FAK_STOP_AND_FLIP</code></td>
+            <td><code>SINGLE + FAK STOP_AND_FLIP</code></td>
+            <td><span class="status sample">止损反手</span></td>
+            <td>新方向信号出现时，先检查新方向可成交，再用旧方向 bid 平旧仓，然后买新方向。</td>
+            <td>验证真正止损反手是否优于 legacy 反向双边买。</td>
+            <td>高风险实验；实盘前必须验证滑点、bid 深度、重复提交和未成交处理。</td>
+          </tr>
+          <tr>
+            <td>10</td>
+            <td><code>SINGLE_GTC</code></td>
+            <td><code>SINGLE + GTC</code></td>
+            <td><span class="status paper">挂单实验</span></td>
+            <td>单边方向判断不变，但用 GTC maker 挂单等待成交。</td>
+            <td>观察不吃流动性时能否降低成本，代价是可能错过行情。</td>
+            <td>仅 Paper。实盘 maker 需要更完整的撤单、排队和库存管理。</td>
+          </tr>
+          <tr>
+            <td>11</td>
+            <td><code>SINGLE_GTD</code></td>
+            <td><code>SINGLE + GTD</code></td>
+            <td><span class="status paper">限时挂单</span></td>
+            <td>单边方向判断不变，但挂单只保留一段时间，过期后释放预留资金。</td>
+            <td>适合 5 分钟市场里测试“挂一会儿，不追价”的执行方式。</td>
+            <td>仅 Paper，实盘前需要官方订单生命周期和撤单确认。</td>
+          </tr>
+          <tr>
+            <td>12</td>
+            <td><code>SINGLE_POST_ONLY</code></td>
+            <td><code>SINGLE + POST_ONLY</code></td>
+            <td><span class="status paper">maker 实验</span></td>
+            <td>单边 maker-only，若限价会立即吃到卖一则拒单；成交依赖后续盘口移动和队列模拟。</td>
+            <td>测试纯 maker 是否能减少成本。</td>
+            <td>仅 Paper，当前 maker 队列是模拟，不等于官方真实排队位置。</td>
+          </tr>
+          <tr>
+            <td>13</td>
+            <td><code>PAIR_FAK</code></td>
+            <td><code>PAIR + FAK</code></td>
+            <td><span class="status sample">配对 taker</span></td>
+            <td>同时买 Up 和 Down，要求双边合成成本低于阈值，并检查含费成本是否仍有毛边。</td>
+            <td>配对策略的 taker 对照组，也可观察补单和应急处理。</td>
+            <td>不接实盘。双边 taker 对深度和手续费极敏感。</td>
+          </tr>
+          <tr>
+            <td>14</td>
+            <td><code>PAIR_FAK_MULTI_CONFIRM</code></td>
+            <td><code>PAIR + FAK MULTI_CONFIRM</code></td>
+            <td><span class="status sample">配对确认</span></td>
+            <td>PAIR_FAK 加 OKX/Binance 基差样本 ready 门槛；缺样本时不开仓。</td>
+            <td>观察外部现货确认是否能减少不合理配对开仓。</td>
+            <td>不接实盘；样本不足时可能长时间没有订单。</td>
+          </tr>
+          <tr>
+            <td>15</td>
+            <td><code>PAIR_FAK_MULTI_LEAD</code></td>
+            <td><code>PAIR + FAK MULTI_LEAD</code></td>
+            <td><span class="status sample">配对领先</span></td>
+            <td>PAIR_FAK 加 OKX/Binance 残差采样说明，用于观察外部领先信号对配对是否有帮助。</td>
+            <td>配对维度的外部价格领先实验。</td>
+            <td>不接实盘；当前更多是采样标签和开仓门槛实验。</td>
+          </tr>
+          <tr>
+            <td>16</td>
+            <td><code>PAIR_GTC</code></td>
+            <td><code>PAIR + GTC</code></td>
+            <td><span class="status candidate">配对核心候选</span></td>
+            <td>双边配对 maker 挂单，Up/Down 同时挂，等待低成本成交。</td>
+            <td>历史定位是核心候选，用于测试低合成成本机会。</td>
+            <td>仍是 Paper。实盘前要处理官方挂单撤单、单边成交残余和资金占用。</td>
+          </tr>
+          <tr>
+            <td>17</td>
+            <td><code>PAIR_GTD</code></td>
+            <td><code>PAIR + GTD</code></td>
+            <td><span class="status candidate">5m 核心候选</span></td>
+            <td>PAIR_GTC 的限时版本，尤其适合 5 分钟市场，避免挂单无限等待。</td>
+            <td>测试短周期里双边限时挂单的成交和回撤表现。</td>
+            <td>Paper 候选。实盘必须先验证限时撤单和残余库存处理。</td>
+          </tr>
+          <tr>
+            <td>18</td>
+            <td><code>PAIR_POST_ONLY</code></td>
+            <td><code>PAIR + POST_ONLY</code></td>
+            <td><span class="status candidate">配对 maker 目标</span></td>
+            <td>双边配对的纯 maker-only 版本，理论上最能控制吃单成本，但成交最不确定。</td>
+            <td>用于观察极致 maker 成本控制是否有长期优势。</td>
+            <td>Paper 目标，不是当前实盘方案。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>按场景快速选择</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>你想看什么</th>
+            <th>优先看哪些组合</th>
+            <th>判断重点</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>当前单边策略是否还行</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code></td>
+            <td>胜率、PnL、回撤、fallback 是否拉低表现。</td>
+          </tr>
+          <tr>
+            <td>小资金是否要禁止反向双边买</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_STRICT</code>、<code>SINGLE_FAK_REVERSAL</code></td>
+            <td>反转腿贡献、资金占用、同市场双边单最终胜负。</td>
+          </tr>
+          <tr>
+            <td>真正止损反手有没有必要</td>
+            <td><code>SINGLE_FAK_REVERSAL</code>、<code>SINGLE_FAK_STOP_AND_FLIP</code></td>
+            <td>平旧仓损失、反手后收益、bid 深度导致的滑点。</td>
+          </tr>
+          <tr>
+            <td>OKX/Binance 是否能提高准确率</td>
+            <td><code>SINGLE_FAK_MULTI_CONFIRM</code>、<code>SINGLE_FAK_MULTI_LEAD</code>、<code>PAIR_FAK_MULTI_CONFIRM</code>、<code>PAIR_FAK_MULTI_LEAD</code></td>
+            <td>样本 ready 比例、过滤掉的单原本盈亏、残差不是固定基差而是真领先。</td>
+          </tr>
+          <tr>
+            <td>机器人/盘口异常防守是否有效</td>
+            <td><code>SINGLE_FAK_CHAINLINK_ONLY</code>、<code>SINGLE_FAK_ANTI_BOT_GUARD</code></td>
+            <td>少下了多少单、被过滤单原本盈亏、回撤是否下降、是否误杀盈利单。</td>
+          </tr>
+          <tr>
+            <td>PAIR 配对是否有长期价值</td>
+            <td><code>PAIR_FAK</code>、<code>PAIR_GTC</code>、<code>PAIR_GTD</code>、<code>PAIR_POST_ONLY</code></td>
+            <td>合成成本、含费成本、双边是否一起成交、残余库存损失。</td>
+          </tr>
+          <tr>
+            <td>准备实盘流程打通</td>
+            <td><code>SINGLE_FAK_REAL</code></td>
+            <td>凭证、钱包余额/授权、官方挂单、地理限制、软件预算、最小订单、PENDING 对账。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="live-warning">
+      <h2>实盘边界</h2>
+      <div class="note danger">
+        <p><strong>当前只有 <code>SINGLE_FAK_REAL</code> 是实盘租户。</strong>它不是 18 个 Paper 实验组合之一，而是独立 live 数据库和实盘开关管理的真实交易路径。</p>
+        <p>当前实盘行为按 <code>SINGLE_FAK</code> 基线接入：FAK taker 买入，legacy 同市场反向双边买入行为保留。<code>STRICT</code>、<code>REVERSAL</code>、<code>STOP_AND_FLIP</code>、<code>MULTI_CONFIRM</code>、<code>MULTI_LEAD</code>、<code>ANTI_BOT_GUARD</code> 和所有 <code>PAIR</code> 组合都没有自动接入实盘。</p>
+        <p>尤其注意：<code>SINGLE_FAK_FALLBACK_ONLY</code> 和 <code>SINGLE_FAK_ANTI_BOT_GUARD</code> 明确是 Paper-only 采样，不应直接套到实盘。</p>
+      </div>
+
+      <h3>建议复盘顺序</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>优先级</th>
+            <th>复盘问题</th>
+            <th>涉及组合</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>单边基线最近亏损是否来自 fallback、反向双边、还是盘口执行质量。</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code>、<code>SINGLE_FAK_FALLBACK_ONLY</code></td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>同市场反向买入到底贡献收益还是扩大回撤。</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_STRICT</code>、<code>SINGLE_FAK_REVERSAL</code>、<code>SINGLE_FAK_STOP_AND_FLIP</code></td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>OKX/Binance 的领先感是否能被残差样本证明。</td>
+            <td><code>MULTI_CONFIRM</code>、<code>MULTI_LEAD</code> 相关组合</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>ANTI_BOT_GUARD 是否只是少交易，还是确实过滤掉了坏单。</td>
+            <td><code>SINGLE_FAK_CHAINLINK_ONLY</code>、<code>SINGLE_FAK_ANTI_BOT_GUARD</code></td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td>PAIR maker 是否能稳定减少成本，同时避免单边残余。</td>
+            <td><code>PAIR_GTC</code>、<code>PAIR_GTD</code>、<code>PAIR_POST_ONLY</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>

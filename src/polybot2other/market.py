@@ -12,6 +12,7 @@ from .models import PriceTick
 SYMBOLS = ("BTC",)
 BINANCE_SYMBOLS = {"BTC": "BTCUSDT"}
 COINBASE_SYMBOLS = {"BTC": "BTC-USD"}
+OKX_SYMBOLS = {"BTC": "BTC-USDT"}
 
 
 class PublicPriceClient:
@@ -30,7 +31,7 @@ class PublicPriceClient:
             raise ValueError(f"unsupported symbol for real BTC bot: {symbol}")
         now = now or time.time()
         failures: list[str] = []
-        for fetcher in (self._fetch_coinbase, self._fetch_binance):
+        for fetcher in (self._fetch_coinbase, self._fetch_binance, self._fetch_okx):
             try:
                 price, source = fetcher(symbol)
                 if price > 0 and math.isfinite(price):
@@ -40,6 +41,22 @@ class PublicPriceClient:
                 continue
         detail = "; ".join(failures) or "no public BTC price source attempted"
         raise RuntimeError(f"real BTC price fallback unavailable: {detail}")
+
+    def fetch_sources(self, symbol: str, now: float | None = None) -> dict[str, PriceTick]:
+        if symbol not in SYMBOLS:
+            raise ValueError(f"unsupported symbol for real BTC bot: {symbol}")
+        now = now or time.time()
+        ticks: dict[str, PriceTick] = {}
+        for fetcher in (self._fetch_coinbase, self._fetch_binance, self._fetch_okx):
+            try:
+                price, source = fetcher(symbol)
+                if price > 0 and math.isfinite(price):
+                    ticks[source] = PriceTick(symbol=symbol, price=price, source=source, timestamp=now)
+            except (OSError, ValueError, KeyError, TimeoutError, urlerror.URLError, json.JSONDecodeError):
+                continue
+        if not ticks:
+            raise RuntimeError("real BTC price fallback unavailable: no public BTC price source succeeded")
+        return ticks
 
     def _fetch_binance(self, symbol: str) -> tuple[float, str]:
         api_symbol = BINANCE_SYMBOLS[symbol]
@@ -52,6 +69,15 @@ class PublicPriceClient:
         url = f"https://api.coinbase.com/v2/prices/{api_symbol}/spot"
         data = self._json_get(url)
         return float(data["data"]["amount"]), "coinbase"
+
+    def _fetch_okx(self, symbol: str) -> tuple[float, str]:
+        api_symbol = OKX_SYMBOLS[symbol]
+        url = f"https://www.okx.com/api/v5/market/ticker?instId={api_symbol}"
+        data = self._json_get(url)
+        rows = data.get("data") or []
+        if not rows:
+            raise ValueError("OKX ticker response missing data")
+        return float(rows[0]["last"]), "okx"
 
     def _json_get(self, url: str) -> dict:
         req = urlrequest.Request(url, headers={"User-Agent": "polybot2other/0.1"})
