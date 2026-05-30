@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-90">
+    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-97">
   </head>
   <body>
     <main class="app-shell">
@@ -22,6 +22,7 @@
           <button id="nav-analysis" class="app-nav-item" type="button" data-nav-page="analysis">分析</button>
         </nav>
         <div class="top-actions">
+          <button id="paper-pause-toggle" class="paper-pause-button" type="button" aria-pressed="false">暂停Paper</button>
           <label class="live-toggle">
             <input id="live-enabled" type="checkbox">
             <span></span>
@@ -395,11 +396,22 @@
             </div>
             <div id="analysis-risk-tags" class="analysis-empty">待采集</div>
           </div>
+
+          <div class="panel analysis-card analysis-wide-card">
+            <div class="panel-head">
+              <div>
+                <h2>LLM 决策复盘</h2>
+                <span>reason code PnL / NO_TRADE opportunity</span>
+              </div>
+              <button id="analysis-llm-review-refresh" class="analysis-card-action" type="button">刷新复盘</button>
+            </div>
+            <div id="analysis-llm-review" class="analysis-empty">待采集</div>
+          </div>
         </section>
       </section>
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260529-v2-94"></script>
+    <script src="/static/app.js?v=20260530-v2-104"></script>
   </body>
 </html>

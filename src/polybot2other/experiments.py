@@ -7,6 +7,8 @@ from .execution import ORDER_TYPE_FAK, ORDER_TYPE_GTC, ORDER_TYPE_GTD, ORDER_TYP
 
 STRATEGY_FAMILY_SINGLE = "SINGLE"
 STRATEGY_FAMILY_PAIR = "PAIR"
+STRATEGY_FAMILY_REALTIME_MAKER = "REALTIME_MAKER"
+STRATEGY_FAMILY_LLM_SUPER_AGENT = "LLM_SUPER_AGENT"
 SINGLE_ENTRY_MODE_LEGACY = "LEGACY"
 SINGLE_ENTRY_MODE_STRICT = "STRICT"
 SINGLE_ENTRY_MODE_REVERSAL = "REVERSAL"
@@ -52,6 +54,10 @@ class StrategyVariant:
             and self.single_entry_mode != SINGLE_ENTRY_MODE_LEGACY
         ):
             return f"{self.strategy_family} + {self.order_type} {self.single_entry_mode}{data_suffix}"
+        if self.strategy_family == STRATEGY_FAMILY_REALTIME_MAKER:
+            return f"REALTIME MAKER + {self.order_type}{data_suffix}"
+        if self.strategy_family == STRATEGY_FAMILY_LLM_SUPER_AGENT:
+            return f"LLM SUPER AGENT + PAPER{data_suffix}"
         return f"{self.strategy_family} + {self.order_type}{data_suffix}"
 
 
@@ -133,6 +139,23 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
     StrategyVariant("SINGLE_GTC", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_GTC, "75%-80%", "30%-40%", "单边挂单实验"),
     StrategyVariant("SINGLE_GTD", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_GTD, "75%-80%", "30%-40%", "单边限时挂单实验"),
     StrategyVariant("SINGLE_POST_ONLY", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_POST_ONLY, "75%-80%", "35%-45%", "单边 maker 实验"),
+    StrategyVariant(
+        "REALTIME_MAKER_POST_ONLY",
+        STRATEGY_FAMILY_REALTIME_MAKER,
+        ORDER_TYPE_POST_ONLY,
+        "采样",
+        "待验证",
+        "Paper-only 实时 fair value 做市实验，实盘禁止直接沿用",
+        market_data_mode=MARKET_DATA_MODE_MULTI_LEAD,
+    ),
+    StrategyVariant(
+        "LLM_SUPER_AGENT_PAPER",
+        STRATEGY_FAMILY_LLM_SUPER_AGENT,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only LLM 超级下注智能体路由实验，实盘禁止直接沿用",
+    ),
     StrategyVariant("PAIR_FAK", STRATEGY_FAMILY_PAIR, ORDER_TYPE_FAK, "80%-85%", "55%-65%", "配对 taker / 补单 / 应急"),
     StrategyVariant(
         "PAIR_FAK_MULTI_CONFIRM",

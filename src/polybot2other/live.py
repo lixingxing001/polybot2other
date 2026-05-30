@@ -15,7 +15,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from .config import Settings, env_file_status
+from .config import LIVE_CREDENTIAL_ENV_KEYS, Settings, env_file_status
 from .execution import (
     ORDER_TYPE_FAK,
     STATUS_CANCELED,
@@ -472,7 +472,7 @@ class PolymarketLiveClient:
             if read_retry_reasons:
                 raw["read_retry_reasons"] = read_retry_reasons
             balance = _fixed_math_amount(raw.get("balance")) or 0.0
-            allowance = _fixed_math_amount(raw.get("allowance")) or 0.0
+            allowance = _allowance_amount(raw) or 0.0
         except Exception as exc:  # noqa: BLE001 - readiness 要保留第三方错误上下文。
             errors.append(f"同步/读取 Polymarket collateral balance/allowance 失败: {type(exc).__name__}: {exc}")
             retry_reasons = _exception_retry_reasons(exc)
@@ -544,7 +544,7 @@ class PolymarketLiveClient:
             if read_retry_reasons:
                 raw["read_retry_reasons"] = read_retry_reasons
             balance = _fixed_math_amount(raw.get("balance")) or 0.0
-            allowance = _fixed_math_amount(raw.get("allowance")) or 0.0
+            allowance = _allowance_amount(raw) or 0.0
         except Exception as exc:  # noqa: BLE001
             errors.append(f"同步/读取 Polymarket conditional token balance/allowance 失败: {type(exc).__name__}: {exc}")
             retry_reasons = _exception_retry_reasons(exc)
@@ -2691,7 +2691,12 @@ class LiveStrategyRunner:
         chainlink = _float_or_none(price.get("chainlink"))
         binance = _float_or_none(price.get("binance"))
         if chainlink:
-            self.store.save_price_tick("BTC", chainlink, "live-chainlink", now)
+            self.store.save_price_tick(
+                "BTC",
+                chainlink,
+                "live-chainlink",
+                _updated_at_seconds(price.get("chainlink_updated_ms"), now),
+            )
         elif binance:
             self.store.save_price_tick("BTC", binance, "live-binance", now)
 
@@ -3173,8 +3178,12 @@ def _geoblock_block_reason(payload: dict[str, Any]) -> str | None:
 def _env_file_permission_errors() -> list[str]:
     errors: list[str] = []
     for item in env_file_status():
-        sensitive_keys = list(item.get("sensitive_keys_present") or [])
-        if not sensitive_keys:
+        live_sensitive_keys = [
+            str(key)
+            for key in (item.get("sensitive_keys_present") or [])
+            if str(key) in LIVE_CREDENTIAL_ENV_KEYS
+        ]
+        if not live_sensitive_keys:
             continue
         if item.get("secure_permissions") is not False:
             continue
@@ -3207,25 +3216,32 @@ def _normalize_tick_size(value: str | None) -> str:
 
 
 def _matched_amounts_from_response(data: dict[str, Any], side: str) -> dict[str, float] | None:
-    making = _fixed_math_amount(data.get("makingAmount") or data.get("making_amount"))
-    taking = _fixed_math_amount(data.get("takingAmount") or data.get("taking_amount"))
-    if making is None or taking is None or making <= 0 or taking <= 0:
+    making_raw = data.get("makingAmount") or data.get("making_amount")
+    taking_raw = data.get("takingAmount") or data.get("taking_amount")
+    if making_raw in (None, "") or taking_raw in (None, ""):
         return None
     normalized_side = str(side or "").upper()
     if normalized_side == "SELL":
-        shares = making
-        cash = taking
+        shares_raw = making_raw
+        cash_raw = taking_raw
     else:
-        shares = taking
-        cash = making
+        shares_raw = taking_raw
+        cash_raw = making_raw
+    parsed = _matched_cash_and_shares(cash_raw, shares_raw)
+    if parsed is None:
+        return None
+    cash, shares = parsed
     if shares <= 0 or cash <= 0:
         return None
     return {"shares": round(shares, 6), "cash": round(cash, 6), "price": round(cash / shares, 6)}
 
 
 def _matched_amounts_from_order(data: dict[str, Any], side: str) -> dict[str, float] | None:
-    shares = _fixed_math_amount(data.get("size_matched") or data.get("sizeMatched") or data.get("matched_size"))
     price = _float_or_none(data.get("price") or data.get("avg_price") or data.get("average_price"))
+    shares = _clob_quantity_amount(
+        data.get("size_matched") or data.get("sizeMatched") or data.get("matched_size"),
+        price=price,
+    )
     if shares is None or shares <= 0 or price is None or price <= 0:
         return _matched_amounts_from_response(data, side)
     cash = round(shares * price, 6)
@@ -3239,8 +3255,11 @@ def _matched_amounts_from_trades(trades: list[dict[str, Any]]) -> dict[str, floa
         status = str(row.get("status") or "").lower()
         if "failed" in status or "cancel" in status:
             continue
-        shares = _fixed_math_amount(row.get("size") or row.get("matched_size") or row.get("size_matched"))
         price = _float_or_none(row.get("price"))
+        shares = _clob_quantity_amount(
+            row.get("size") or row.get("matched_size") or row.get("size_matched"),
+            price=price,
+        )
         if shares is None or shares <= 0 or price is None or price <= 0:
             continue
         total_shares += shares
@@ -3252,6 +3271,61 @@ def _matched_amounts_from_trades(trades: list[dict[str, Any]]) -> dict[str, floa
         "cash": round(total_cash, 6),
         "price": round(total_cash / total_shares, 6),
     }
+
+
+def _matched_cash_and_shares(cash_raw: Any, shares_raw: Any) -> tuple[float, float] | None:
+    candidates: list[tuple[float, float, float]] = []
+    for cash, cash_score in _clob_amount_candidates(cash_raw):
+        for shares, shares_score in _clob_amount_candidates(shares_raw):
+            if cash <= 0 or shares <= 0:
+                continue
+            price = cash / shares
+            price_score = 100.0 if 0.001 <= price <= 1.0 else -100.0
+            size_score = 0.0
+            if cash > 100_000:
+                size_score -= 20.0
+            if shares > 100_000_000:
+                size_score -= 20.0
+            candidates.append((price_score + cash_score + shares_score + size_score, cash, shares))
+    if not candidates:
+        return None
+    score, cash, shares = max(candidates, key=lambda item: item[0])
+    if score < 50.0:
+        return None
+    return cash, shares
+
+
+def _clob_quantity_amount(value: Any, *, price: float | None = None) -> float | None:
+    candidates = _clob_amount_candidates(value)
+    if not candidates:
+        return None
+    if price and price > 0:
+        plausible = [
+            (amount, score)
+            for amount, score in candidates
+            if 0 < amount * price <= 100_000
+        ]
+        if plausible:
+            return max(plausible, key=lambda item: item[1])[0]
+    return max(candidates, key=lambda item: item[1])[0]
+
+
+def _clob_amount_candidates(value: Any) -> list[tuple[float, float]]:
+    if value in (None, ""):
+        return []
+    try:
+        text = str(value).strip()
+        amount = float(text)
+    except (TypeError, ValueError):
+        return []
+    if amount <= 0:
+        return []
+    normalized = text.lower()
+    if "." in normalized or "e" in normalized:
+        return [(amount, 2.0)]
+    decimal_score = 2.0 if amount < 1_000_000 else -4.0
+    fixed_score = 3.0 if amount >= 1_000_000 else -4.0
+    return [(amount, decimal_score), (amount / 1_000_000.0, fixed_score)]
 
 
 def _trade_matches_order(trade: dict[str, Any], order_id: str) -> bool:
@@ -3291,6 +3365,23 @@ def _fixed_math_amount(value: Any) -> float | None:
     if "." in str(value):
         return amount
     return amount / 1_000_000.0
+
+
+def _allowance_amount(raw: dict[str, Any]) -> float | None:
+    top_level = _fixed_math_amount(raw.get("allowance"))
+    if top_level is not None:
+        return top_level
+    allowances = raw.get("allowances")
+    if not isinstance(allowances, dict):
+        return None
+    parsed_values = [
+        amount
+        for amount in (_fixed_math_amount(value) for value in allowances.values())
+        if amount is not None
+    ]
+    if not parsed_values:
+        return None
+    return max(parsed_values)
 
 
 def _wallet_state_with_requirement(payload: dict[str, Any], required_cash: float | None) -> dict[str, Any]:
@@ -3360,7 +3451,14 @@ def _fill_from_response_or_sweep(
         fee=fee,
         cash_spent=cash_spent,
         quote_size=sweep_fill.quote_size,
-        reason=_append_reason(sweep_fill.reason, "official response matched amounts"),
+        reason=_append_reason(
+            sweep_fill.reason,
+            (
+                "official response matched amounts: "
+                f"fill {shares:.6f} @ avg {fill_price:.4f}, "
+                f"notional {notional:.6f}, fee {fee:.6f}"
+            ),
+        ),
         levels=(level,),
         requested_cash=sweep_fill.requested_cash,
     )
@@ -3540,6 +3638,13 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _updated_at_seconds(value: Any, fallback: float) -> float:
+    parsed = _int_or_none(value)
+    if parsed is None or parsed <= 0:
+        return fallback
+    return parsed / 1000.0 if parsed > 10_000_000_000 else float(parsed)
 
 
 def _float(value: Any, default: float) -> float:

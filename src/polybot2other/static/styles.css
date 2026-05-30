@@ -189,6 +189,26 @@ h2 {
   font-weight: 800;
 }
 
+.paper-pause-button {
+  border-color: rgba(255, 95, 109, 0.62);
+  color: var(--red);
+}
+
+.paper-pause-button:hover:not(:disabled) {
+  border-color: var(--red);
+  background: rgba(255, 95, 109, 0.1);
+}
+
+.paper-pause-button.is-paused {
+  border-color: rgba(35, 196, 131, 0.58);
+  color: var(--green);
+}
+
+.paper-pause-button.is-paused:hover:not(:disabled) {
+  border-color: var(--green);
+  background: rgba(35, 196, 131, 0.1);
+}
+
 .live-toggle input {
   position: absolute;
   opacity: 0;
@@ -306,6 +326,11 @@ button.danger-button:hover:not(:disabled) {
 .pill.error {
   background: #3a2528;
   color: var(--red);
+}
+
+.pill.paused {
+  background: #3c321d;
+  color: var(--amber);
 }
 
 .scope-switch {
@@ -1681,6 +1706,11 @@ tbody tr:hover {
   min-height: 360px;
 }
 
+.analysis-wide-card {
+  grid-column: 1 / -1;
+  min-height: 360px;
+}
+
 .analysis-body-wrap {
   min-height: 178px;
 }
@@ -1789,6 +1819,30 @@ tbody tr:hover {
   overflow: hidden;
   color: var(--muted);
   text-overflow: ellipsis;
+}
+
+.analysis-review-section {
+  display: grid;
+  gap: 10px;
+}
+
+.analysis-review-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.analysis-review-heading strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.analysis-review-table .analysis-table-wrap {
+  max-height: 320px;
 }
 
 .analysis-tag {

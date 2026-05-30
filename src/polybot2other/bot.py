@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from dataclasses import replace
@@ -33,9 +34,18 @@ from .experiments import (
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
     SINGLE_ENTRY_MODE_STRICT,
+    STRATEGY_FAMILY_LLM_SUPER_AGENT,
     STRATEGY_FAMILY_PAIR,
+    STRATEGY_FAMILY_REALTIME_MAKER,
     StrategyVariant,
     selected_strategy_variants,
+)
+from .llm_agent import (
+    LLM_MIN_CONFIDENCE_TO_TRADE,
+    LLM_ROUTE_NO_TRADE,
+    LlmSuperAgentRouter,
+    build_llm_market_features,
+    route_execution_modes,
 )
 from .live import LIVE_COMBO, LIVE_VARIANT_ID, LiveStrategyRunner
 from .market import PublicPriceClient
@@ -81,6 +91,22 @@ PAIR_MULTI_READY_MARKER = "PAIR_MULTI"
 SINGLE_STRICT_MARKER = "SINGLE_STRICT"
 SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
 SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
+REALTIME_MAKER_MARKER = "REALTIME_MAKER_PAPER"
+REALTIME_MAKER_ENTRY_MIN_FAIR = 0.57
+REALTIME_MAKER_ENTRY_MIN_EDGE = 0.03
+REALTIME_MAKER_CANCEL_MIN_EDGE = 0.01
+REALTIME_MAKER_ORDER_TTL_SECONDS = 35.0
+REALTIME_MAKER_CANCEL_GRACE_SECONDS = 10.0
+REALTIME_MAKER_BID_IMPROVEMENT = 0.01
+REALTIME_MAKER_STOP_ENTRY_SECONDS_LEFT = 75.0
+REALTIME_MAKER_REDUCE_SECONDS_LEFT = 45.0
+REALTIME_MAKER_FORCE_EXIT_SECONDS_LEFT = 25.0
+REALTIME_MAKER_TAKE_PROFIT = 0.04
+REALTIME_MAKER_EDGE_GONE_SECONDS = 18.0
+REALTIME_MAKER_EDGE_GONE_BUFFER = 0.01
+REALTIME_MAKER_STOP_FAIR_DRAWDOWN = 0.04
+REALTIME_MAKER_STOP_BID_DRAWDOWN = 0.06
+REALTIME_MAKER_ACTOR_BLOCK_THRESHOLD = 0.48
 PRICE_BASIS_MAX_SAMPLES = 180
 POST_ONLY_MIN_REST_SECONDS = 8.0
 POST_ONLY_CROSS_BUFFER = 0.005
@@ -90,6 +116,8 @@ POST_ONLY_QUEUE_FULL_SECONDS = 90.0
 LIVE_ONCE_CONFIRM_PHRASE = "PLACE_REAL_ORDER"
 LIVE_ONCE_WAITABLE_BLOCKERS = {"enabled", "market", "target_price", "signal", "orderbook_depth"}
 LIVE_ONCE_AUDIT_DIR_NAME = "audit"
+PAPER_PAUSE_REASON = "PAPER_PAUSED Paper 下单已暂停，行情和结算继续"
+PAPER_PAUSE_CANCEL_REASON = "PAPER_PAUSED 暂停 Paper 下单，取消活跃挂单"
 ACTOR_ANALYSIS_CACHE_SECONDS = 4.5
 LIVE_ONCE_AUDIT_SENSITIVE_KEYS = {
     "authorization",
@@ -174,6 +202,13 @@ class PaperTradingBot:
         self.market_data_mode = MARKET_DATA_MODE_BASE
         self.price_source_mode = PRICE_SOURCE_MODE_MIXED
         self.anti_bot_guard_mode = ANTI_BOT_GUARD_MODE_NONE
+        self.realtime_maker_enabled = False
+        self.llm_super_agent_enabled = False
+        self.llm_super_agent_router = LlmSuperAgentRouter(settings)
+        self.llm_super_agent_variant_id = "MAIN"
+        self._llm_super_agent_last_logged_key: str | None = None
+        self.paper_trading_paused = False
+        self.last_paper_pause_event: dict[str, Any] | None = None
         self.price_basis_tracker = PriceBasisTracker()
         self._actor_analysis_cache: dict[str, Any] | None = None
         self._actor_analysis_cache_key: str | None = None
@@ -213,6 +248,59 @@ class PaperTradingBot:
             if not enabled:
                 self.pair_stop_loss_streak = 0
         return self.snapshot()
+
+    def set_paper_trading_paused(self, paused: bool) -> dict[str, Any]:
+        now = time.time()
+        self._set_paper_pause_state(paused, now)
+        main_cancel = (
+            self._cancel_active_paper_orders_for_pause(now)
+            if paused
+            else {"canceled": [], "released_cash": 0.0, "orders": []}
+        )
+        experiment_cancel = (
+            self.strategy_experiments.set_paper_trading_paused(paused, cancel_active=paused, now=now)
+            if self.strategy_experiments is not None
+            else {"canceled_count": 0, "released_cash": 0.0, "variants": {}}
+        )
+        if paused:
+            self._set_paper_paused_signal()
+        return {
+            "paper_trading": {
+                **self.paper_trading_runtime(),
+                "main_cancel": _paper_cancel_summary(main_cancel),
+                "strategy_experiments_cancel": experiment_cancel,
+            },
+            "snapshot": self.snapshot(),
+        }
+
+    def _set_paper_pause_state(self, paused: bool, now: float) -> None:
+        message = "Paper 下单已暂停" if paused else "Paper 下单已恢复"
+        with self._lock:
+            self.paper_trading_paused = bool(paused)
+            self.last_paper_pause_event = {
+                "type": "PAPER_PAUSE" if paused else "PAPER_RESUME",
+                "paused": bool(paused),
+                "message": message,
+                "at": now,
+            }
+
+    def _cancel_active_paper_orders_for_pause(self, now: float) -> dict[str, Any]:
+        return self.store.cancel_active_paper_orders(
+            symbol="BTC",
+            reason=PAPER_PAUSE_CANCEL_REASON,
+            now=now,
+        )
+
+    def paper_trading_runtime(self) -> dict[str, Any]:
+        with self._lock:
+            event = dict(self.last_paper_pause_event or {})
+            paused = bool(self.paper_trading_paused)
+        return {
+            "paused": paused,
+            "message": event.get("message") or ("Paper 下单已暂停" if paused else "Paper 下单运行中"),
+            "updated_at": event.get("at"),
+            "event": event,
+        }
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -289,7 +377,12 @@ class PaperTradingBot:
         binance_price = _maybe_float(price.get("binance"))
         okx_price = _maybe_float(price.get("okx"))
         if chainlink_price:
-            self.store.save_price_tick("BTC", chainlink_price, "polymarket-rtds-chainlink", now)
+            self.store.save_price_tick(
+                "BTC",
+                chainlink_price,
+                "polymarket-rtds-chainlink",
+                _updated_at_seconds(price.get("chainlink_updated_ms"), now),
+            )
         elif binance_price:
             self.store.save_price_tick("BTC", binance_price, "polymarket-rtds-binance", now)
         elif okx_price:
@@ -549,12 +642,28 @@ class PaperTradingBot:
             price = dict(self.latest_price)
             quotes = dict(self.latest_quotes)
             pair_enabled = self.pair_strategy_enabled
+            paper_paused = self.paper_trading_paused
         if market is None:
             return
         price = self.price_basis_tracker.enrich(price)
         with self._lock:
             self.latest_price = dict(price)
+        if paper_paused:
+            now = time.time()
+            self._cancel_active_paper_orders_for_pause(now)
+            self._set_paper_paused_signal()
+            if self.strategy_experiments is not None:
+                self.strategy_experiments.set_paper_trading_paused(True, cancel_active=True, now=now)
+            self._run_strategy_experiments(market, price, quotes)
+            self._run_live_strategy(market, price, quotes)
+            return
         self._manage_resting_orders(market, quotes)
+        if self.realtime_maker_enabled:
+            self._run_realtime_maker_strategy_from_state(market, price, quotes)
+            return
+        if self.llm_super_agent_enabled:
+            self._run_llm_super_agent_strategy_from_state(market, price, quotes)
+            return
         if pair_enabled:
             self._run_pair_strategy_from_state(market, price, quotes)
             self._run_strategy_experiments(market, price, quotes)
@@ -603,8 +712,115 @@ class PaperTradingBot:
             if self.live_trading is not None:
                 self.live_trading.last_error = f"{type(exc).__name__}: {exc}"
 
+    def _run_llm_super_agent_strategy_from_state(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        now = time.time()
+        open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        account = self.store.account()
+        features = build_llm_market_features(
+            market,
+            price,
+            self._quotes_with_depth(market, quotes),
+            open_sides=[str(row.get("side") or "") for row in open_rows],
+            open_trade_count=self.store.open_trade_count("BTC"),
+            active_order_count=len(self.store.active_paper_orders("BTC", market.round_id)),
+            daily_pnl=self.store.daily_realized_pnl(),
+            cash_balance=float(account.get("cash_balance") or 0.0),
+            max_quote_age_ms=self.settings.max_quote_age_ms,
+            now=now,
+        )
+        decision = self.llm_super_agent_router.decide(features, now)
+        self._record_llm_super_agent_decision(market, decision, features, now)
+        note = _llm_super_agent_reason(decision)
+        if not decision.allow_trade or decision.route == LLM_ROUTE_NO_TRADE:
+            self._set_llm_super_agent_signal(market, decision, note)
+            return
+        if decision.confidence < LLM_MIN_CONFIDENCE_TO_TRADE:
+            self._set_llm_super_agent_signal(market, decision, f"{note} | confidence below trade threshold")
+            return
+        modes = route_execution_modes(decision.route)
+        family = modes.get("strategy_family")
+        previous = {
+            "single_entry_mode": self.single_entry_mode,
+            "market_data_mode": self.market_data_mode,
+            "anti_bot_guard_mode": self.anti_bot_guard_mode,
+        }
+        try:
+            self.market_data_mode = str(modes.get("market_data_mode") or MARKET_DATA_MODE_BASE)
+            self.anti_bot_guard_mode = str(modes.get("anti_bot_guard_mode") or ANTI_BOT_GUARD_MODE_NONE)
+            if family == "PAIR":
+                self._run_pair_strategy_from_state(market, price, quotes)
+                self._append_last_signal_reason(note)
+                return
+            self.single_entry_mode = str(modes.get("single_entry_mode") or SINGLE_ENTRY_MODE_LEGACY)
+            signal = self.strategy.signal(
+                input_from_snapshot(market, {"price": price, "quotes": quotes}),
+                self.market_data_mode,
+                self.price_source_mode,
+                self.anti_bot_guard_mode,
+            )
+            signal = replace(signal, reason=_append_reason_text(signal.reason, note))
+            with self._lock:
+                self.last_signal = {
+                    "symbol": signal.symbol,
+                    "side": signal.side,
+                    "confidence": signal.confidence,
+                    "entry_price": signal.entry_price,
+                    "move_bps": signal.move_bps,
+                    "reason": signal.reason,
+                }
+            self._maybe_place_trade(market, signal)
+        finally:
+            self.single_entry_mode = str(previous["single_entry_mode"])
+            self.market_data_mode = str(previous["market_data_mode"])
+            self.anti_bot_guard_mode = str(previous["anti_bot_guard_mode"])
+
+    def _record_llm_super_agent_decision(
+        self,
+        market: MarketRound,
+        decision: Any,
+        features: dict[str, Any],
+        now: float,
+    ) -> None:
+        key = f"{market.round_id}:{decision.decision_id}"
+        if key == self._llm_super_agent_last_logged_key:
+            return
+        self._llm_super_agent_last_logged_key = key
+        self.store.record_llm_decision(
+            round_id=market.round_id,
+            variant_id=self.llm_super_agent_variant_id,
+            decision=decision.to_record(),
+            features=features,
+            created_at=now,
+        )
+
+    def _set_llm_super_agent_signal(self, market: MarketRound, decision: Any, reason: str) -> None:
+        features_side = "LLM_WAIT" if decision.route == LLM_ROUTE_NO_TRADE else decision.route
+        with self._lock:
+            self.last_signal = {
+                "symbol": market.symbol,
+                "side": features_side,
+                "confidence": decision.confidence,
+                "entry_price": 0.0,
+                "move_bps": 0.0,
+                "reason": reason,
+            }
+
     def _maybe_place_trade(self, market, signal) -> None:
         if signal.side not in {"Up", "Down"}:
+            return
+        with self._lock:
+            paper_paused = self.paper_trading_paused
+        if paper_paused:
+            self._append_last_signal_reason(PAPER_PAUSE_REASON)
             return
         if self.store.daily_realized_pnl() <= -abs(self.settings.max_daily_loss):
             return
@@ -705,6 +921,207 @@ class PaperTradingBot:
             if not fill:
                 continue
             self.store.fill_resting_order(order, now=now, **fill)
+
+    def _run_realtime_maker_strategy_from_state(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        now = time.time()
+        quotes = self._quotes_with_depth(market, quotes)
+        state = _realtime_maker_state(market, price, quotes, now, self.settings.max_quote_age_ms)
+        if self._manage_realtime_maker_positions(market, state, quotes, now):
+            return
+        self._cancel_stale_realtime_maker_orders(market, state, quotes, now)
+        if state.get("block_reason"):
+            self._set_realtime_maker_signal(state, str(state["block_reason"]))
+            return
+        round_open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        if round_open_rows:
+            self._set_realtime_maker_signal(state, "REALTIME_MAKER_MANAGE 当前市场已有持仓，等待退出规则")
+            return
+        if self.store.active_paper_order_exists_for_round(market.round_id):
+            self._set_realtime_maker_signal(state, "REALTIME_MAKER_WAIT 当前市场已有 maker 挂单")
+            return
+        reason = self._realtime_maker_entry_block_reason(market, state, now)
+        if reason:
+            self._set_realtime_maker_signal(state, reason)
+            return
+        self._place_realtime_maker_order(market, state, quotes, now)
+
+    def _manage_realtime_maker_positions(
+        self,
+        market: MarketRound,
+        state: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        now: float,
+    ) -> bool:
+        rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC"
+            and row.get("round_id") == market.round_id
+            and REALTIME_MAKER_MARKER in str(row.get("reason") or "")
+        ]
+        if not rows:
+            return False
+        time_left = market.ends_at - now
+        managed = False
+        for side in ("Up", "Down"):
+            side_rows = [row for row in rows if row.get("side") == side]
+            if not side_rows:
+                continue
+            side_fair = _realtime_maker_side_fair(state, side)
+            quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+            bid = _maybe_float(quote.get("best_bid"))
+            if bid is None or bid <= 0:
+                continue
+            shares = sum(_maybe_float(row.get("shares")) or 0.0 for row in side_rows)
+            stake = sum(_maybe_float(row.get("stake")) or 0.0 for row in side_rows)
+            entry_price = stake / shares if shares > PAIR_EPSILON else 0.0
+            opened_at = min(_maybe_float(row.get("opened_at")) or now for row in side_rows)
+            age = max(0.0, now - opened_at)
+            exit_reason = _realtime_maker_exit_reason(side, side_fair, entry_price, bid, age, time_left)
+            if not exit_reason:
+                continue
+            closed = self._close_side_shares(side_rows, side, shares, bid, now, exit_reason)
+            if closed:
+                managed = True
+                self._set_realtime_maker_signal(state, exit_reason)
+        return managed
+
+    def _cancel_stale_realtime_maker_orders(
+        self,
+        market: MarketRound,
+        state: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        now: float,
+    ) -> None:
+        for order in self.store.active_paper_orders("BTC", market.round_id):
+            if REALTIME_MAKER_MARKER not in str(order.get("reason") or ""):
+                continue
+            side = str(order.get("side") or "")
+            limit_price = _maybe_float(order.get("limit_price"))
+            if side not in {"Up", "Down"} or limit_price is None:
+                continue
+            created_at = _maybe_float(order.get("created_at")) or now
+            order_age = max(0.0, now - created_at)
+            side_fair = _realtime_maker_side_fair(state, side)
+            quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+            best_ask = _maybe_float(quote.get("best_ask"))
+            reason = _realtime_maker_cancel_reason(
+                market,
+                state,
+                side,
+                side_fair,
+                limit_price,
+                best_ask,
+                order_age,
+                now,
+            )
+            if reason:
+                self.store.cancel_paper_order(int(order["id"]), reason, now)
+
+    def _realtime_maker_entry_block_reason(self, market: MarketRound, state: dict[str, Any], now: float) -> str | None:
+        time_left = market.ends_at - now
+        if market.target_price <= 0:
+            return "REALTIME_MAKER_WAIT 缺少官方目标价"
+        if self.store.daily_realized_pnl() <= -abs(self.settings.max_daily_loss):
+            return "REALTIME_MAKER_WAIT 日内亏损达到停止线"
+        if time_left <= REALTIME_MAKER_STOP_ENTRY_SECONDS_LEFT:
+            return "REALTIME_MAKER_WAIT 临近结算停止新增 maker 挂单"
+        if time_left > self.settings.max_time_left_seconds:
+            return "REALTIME_MAKER_WAIT 市场刚开始，等待盘口稳定"
+        if self.store.open_trade_count("BTC") >= self.settings.max_open_trades:
+            return "REALTIME_MAKER_WAIT 持仓数达到上限"
+        account = self.store.account()
+        if float(account["cash_balance"]) < 0.1:
+            return "REALTIME_MAKER_WAIT 纸交易可用资金不足"
+        side = str(state.get("side") or "")
+        side_fair = _maybe_float(state.get("side_fair"))
+        limit_price = _maybe_float(state.get("limit_price"))
+        best_ask = _maybe_float(state.get("best_ask"))
+        actor_side_fair = _maybe_float(state.get("actor_side_fair"))
+        if side not in {"Up", "Down"} or side_fair is None:
+            return "REALTIME_MAKER_WAIT 实时 fair value 不足"
+        if side_fair < REALTIME_MAKER_ENTRY_MIN_FAIR:
+            return f"REALTIME_MAKER_WAIT fair {side_fair:.4f} 低于 {REALTIME_MAKER_ENTRY_MIN_FAIR:.2f}"
+        if actor_side_fair is not None and actor_side_fair < REALTIME_MAKER_ACTOR_BLOCK_THRESHOLD:
+            return f"REALTIME_MAKER_WAIT 地址修正反向 {actor_side_fair:.4f}"
+        if limit_price is None or limit_price <= 0:
+            return "REALTIME_MAKER_WAIT 缺少可挂限价"
+        edge = side_fair - limit_price
+        if edge < REALTIME_MAKER_ENTRY_MIN_EDGE:
+            return f"REALTIME_MAKER_WAIT maker edge {edge:.4f} 低于 {REALTIME_MAKER_ENTRY_MIN_EDGE:.3f}"
+        if best_ask is not None and limit_price >= best_ask - POST_ONLY_CROSS_BUFFER:
+            return f"REALTIME_MAKER_WAIT POST_ONLY 限价 {limit_price:.4f} 接近卖一 {best_ask:.4f}"
+        return None
+
+    def _place_realtime_maker_order(
+        self,
+        market: MarketRound,
+        state: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        now: float,
+    ) -> None:
+        side = str(state.get("side") or "")
+        side_fair = _maybe_float(state.get("side_fair"))
+        limit_price = _maybe_float(state.get("limit_price"))
+        if side not in {"Up", "Down"} or side_fair is None or limit_price is None:
+            return
+        account = self.store.account()
+        stake = min(self.settings.stake_dollars, float(account["cash_balance"]))
+        if stake < 0.1:
+            return
+        quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+        expires_at = min(market.ends_at - REALTIME_MAKER_REDUCE_SECONDS_LEFT, now + REALTIME_MAKER_ORDER_TTL_SECONDS)
+        if expires_at <= now + 1.0:
+            self._set_realtime_maker_signal(state, "REALTIME_MAKER_WAIT maker 挂单有效期过短")
+            return
+        edge = side_fair - limit_price
+        reason = (
+            f"{REALTIME_MAKER_MARKER} POST_ONLY: side {side}, fair {side_fair:.4f}, "
+            f"limit {limit_price:.4f}, edge {edge:.4f}, fair_up {state.get('fair_up')}, "
+            f"actor_side {state.get('actor_side_fair')}, ttl {expires_at - now:.1f}s"
+        )
+        signal = Signal(
+            "BTC",
+            side,
+            round(side_fair, 4),
+            round(limit_price, 4),
+            _maybe_float(state.get("distance_bps")) or 0.0,
+            reason,
+        )
+        intent = TradeIntent(market, signal, stake)
+        result = simulate_resting_buy(
+            intent,
+            quote,
+            order_type=ORDER_TYPE_POST_ONLY,
+            limit_price=limit_price,
+            expires_at=expires_at,
+            post_only=True,
+        )
+        self.store.place_execution_result(intent, result)
+        if result.status not in {STATUS_RESTING, STATUS_PARTIAL_RESTING}:
+            self._set_realtime_maker_signal(state, result.reason)
+            return
+        self._set_realtime_maker_signal(state, reason)
+
+    def _set_realtime_maker_signal(self, state: dict[str, Any], reason: str) -> None:
+        with self._lock:
+            self.last_signal = {
+                "symbol": "BTC",
+                "side": state.get("side") or "REALTIME_MAKER_WAIT",
+                "confidence": _maybe_float(state.get("side_fair")) or 0.0,
+                "entry_price": _maybe_float(state.get("limit_price")) or 0.0,
+                "move_bps": _maybe_float(state.get("distance_bps")) or 0.0,
+                "reason": reason,
+            }
 
     def _resting_order_fill(self, order: dict[str, Any], quote: dict[str, Any], now: float | None = None) -> dict[str, Any] | None:
         limit_price = _maybe_float(order.get("limit_price"))
@@ -968,7 +1385,7 @@ class PaperTradingBot:
         down_signal = Signal("BTC", "Down", confidence, down_limit, 0.0, reason)
         up_intent = TradeIntent(market, up_signal, up_cash)
         down_intent = TradeIntent(market, down_signal, down_cash)
-        expires_at = self._resting_order_expires_at(market, order_type)
+        expires_at = self._resting_order_expires_at(market, order_type, now=now)
         post_only = order_type == ORDER_TYPE_POST_ONLY
         up_result = simulate_resting_buy(
             up_intent,
@@ -1284,9 +1701,10 @@ class PaperTradingBot:
             limit_price = best_ask - 0.01
         return round(max(0.01, min(0.99, limit_price)), 4)
 
-    def _resting_order_expires_at(self, market: MarketRound, order_type: str) -> float:
+    def _resting_order_expires_at(self, market: MarketRound, order_type: str, *, now: float | None = None) -> float:
         if order_type == ORDER_TYPE_GTD:
-            return min(market.ends_at, time.time() + self.settings.paper_gtd_seconds)
+            now_value = time.time() if now is None else now
+            return min(market.ends_at, now_value + self.settings.paper_gtd_seconds)
         return market.ends_at
 
     def _append_last_signal_reason(self, reason: str) -> None:
@@ -1295,6 +1713,17 @@ class PaperTradingBot:
             existing = str(signal.get("reason") or "")
             signal["reason"] = f"{existing} | {reason}" if existing else reason
             self.last_signal = signal
+
+    def _set_paper_paused_signal(self) -> None:
+        with self._lock:
+            self.last_signal = {
+                "symbol": "BTC",
+                "side": "PAPER_PAUSED",
+                "confidence": 0.0,
+                "entry_price": 0.0,
+                "move_bps": 0.0,
+                "reason": PAPER_PAUSE_REASON,
+            }
 
     def _set_last_pair_signal(self, side: str, state: dict[str, Any], reason: str) -> None:
         with self._lock:
@@ -1322,9 +1751,18 @@ class PaperTradingBot:
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             live_snapshot = self.live_trading.snapshot() if self.live_trading is not None else _disabled_live_snapshot()
+            paper_pause_event = dict(self.last_paper_pause_event or {})
+            paper_paused = bool(self.paper_trading_paused)
             runtime = {
                 "paper_only": True,
                 "running": bool(self._thread and self._thread.is_alive()),
+                "paper_trading": {
+                    "paused": paper_paused,
+                    "message": paper_pause_event.get("message")
+                    or ("Paper 下单已暂停" if paper_paused else "Paper 下单运行中"),
+                    "updated_at": paper_pause_event.get("at"),
+                    "event": paper_pause_event,
+                },
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at,
                 "last_signal": dict(self.last_signal or {}),
@@ -1366,6 +1804,14 @@ class PaperTradingBot:
                     "variants": self.settings.strategy_experiments_variants,
                 },
                 "live_trading": self.live_trading.settings_payload() if self.live_trading is not None else _disabled_live_settings(),
+                "llm_super_agent": {
+                    "enabled": self.settings.llm_super_agent_enabled,
+                    "api_key_present": bool(self.settings.llm_super_agent_api_key),
+                    "base_url": self.settings.llm_super_agent_base_url,
+                    "model": self.settings.llm_super_agent_model,
+                    "timeout_seconds": self.settings.llm_super_agent_timeout_seconds,
+                    "min_interval_seconds": self.settings.llm_super_agent_min_interval_seconds,
+                },
                 "pair_strategy": {
                     "entry_cost_threshold": PAIR_ENTRY_COST_THRESHOLD,
                     "exit_bid_threshold": PAIR_EXIT_BID_THRESHOLD,
@@ -1416,6 +1862,26 @@ class PaperTradingBot:
             self._actor_analysis_cache_key = cache_key
             self._actor_analysis_cache_until = now + ACTOR_ANALYSIS_CACHE_SECONDS
         return {"actor_analysis": analysis}
+
+    def llm_decision_review(self, limit: int = 80) -> dict[str, Any]:
+        if self.strategy_experiments is not None:
+            return self.strategy_experiments.llm_decision_review(limit)
+        if self.llm_super_agent_enabled:
+            review = self.store.llm_decision_review(
+                limit=limit,
+                opportunity_stake=self.settings.stake_dollars,
+                variant_id=self.llm_super_agent_variant_id,
+            )
+            return {"llm_review": {"status": review["status"], "primary": review, "variants": [review]}}
+        return {
+            "llm_review": {
+                "status": "DISABLED",
+                "generated_at": time.time(),
+                "primary": None,
+                "variants": [],
+                "message": "LLM super agent strategy experiment is not enabled.",
+            }
+        }
 
     def strategy_experiments_snapshot(self) -> dict[str, Any]:
         if self.strategy_experiments is None:
@@ -1978,6 +2444,9 @@ class StrategyExperimentRunner:
             bot.polymarket = polymarket
             bot.price_fallback = price_fallback
             bot.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
+            bot.realtime_maker_enabled = variant.strategy_family == STRATEGY_FAMILY_REALTIME_MAKER
+            bot.llm_super_agent_enabled = variant.strategy_family == STRATEGY_FAMILY_LLM_SUPER_AGENT
+            bot.llm_super_agent_variant_id = variant.variant_id
             bot.single_entry_mode = variant.single_entry_mode
             bot.market_data_mode = variant.market_data_mode
             bot.price_source_mode = variant.price_source_mode
@@ -1988,7 +2457,11 @@ class StrategyExperimentRunner:
 
     def _settings_for_variant(self, settings: Settings, variant: StrategyVariant) -> Settings:
         db_path = settings.strategy_experiments_db_dir / f"{variant.variant_id.lower()}.sqlite3"
-        max_open_trades = max(settings.max_open_trades, 2) if variant.strategy_family == STRATEGY_FAMILY_PAIR else settings.max_open_trades
+        max_open_trades = (
+            max(settings.max_open_trades, 2)
+            if variant.strategy_family in {STRATEGY_FAMILY_PAIR, STRATEGY_FAMILY_LLM_SUPER_AGENT}
+            else settings.max_open_trades
+        )
         return replace(
             settings,
             db_path=db_path,
@@ -1998,6 +2471,40 @@ class StrategyExperimentRunner:
             strategy_experiments_variants="",
             live_trading_runtime_enabled=False,
         )
+
+    def set_paper_trading_paused(
+        self,
+        paused: bool,
+        *,
+        cancel_active: bool = True,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        with self._lock:
+            variants = tuple(self.variants)
+        variant_results: dict[str, dict[str, Any]] = {}
+        canceled_count = 0
+        released_cash = 0.0
+        for variant in variants:
+            bot = self._bots[variant.variant_id]
+            bot._set_paper_pause_state(paused, now)
+            cancel_result = (
+                bot._cancel_active_paper_orders_for_pause(now)
+                if paused and cancel_active
+                else {"canceled": [], "released_cash": 0.0, "orders": []}
+            )
+            if paused:
+                bot._set_paper_paused_signal()
+            summary = _paper_cancel_summary(cancel_result)
+            variant_results[variant.variant_id] = summary
+            canceled_count += int(summary.get("canceled_count") or 0)
+            released_cash = round(released_cash + (_maybe_float(summary.get("released_cash")) or 0.0), 6)
+        return {
+            "paused": bool(paused),
+            "canceled_count": canceled_count,
+            "released_cash": released_cash,
+            "variants": variant_results,
+        }
 
     def run_from_state(
         self,
@@ -2084,6 +2591,33 @@ class StrategyExperimentRunner:
             "variant": detail,
             "recent_trades_page": bot.recent_trades_page(trade_limit, 0),
             "recent_orders_page": bot.orders_page(order_limit, 0),
+        }
+
+    def llm_decision_review(self, limit: int = 80) -> dict[str, Any]:
+        limit = max(1, min(300, int(limit)))
+        reviews: list[dict[str, Any]] = []
+        with self._lock:
+            variants_meta = tuple(self.variants)
+        for variant in variants_meta:
+            if variant.strategy_family != STRATEGY_FAMILY_LLM_SUPER_AGENT:
+                continue
+            bot = self._bots[variant.variant_id]
+            review = bot.store.llm_decision_review(
+                limit=limit,
+                opportunity_stake=bot.settings.stake_dollars,
+                variant_id=variant.variant_id,
+            )
+            review["combo"] = variant.combo
+            review["role"] = variant.role
+            reviews.append(review)
+        primary = reviews[0] if reviews else None
+        return {
+            "llm_review": {
+                "status": primary["status"] if primary else "DISABLED",
+                "generated_at": time.time(),
+                "primary": primary,
+                "variants": reviews,
+            }
         }
 
     def _variant_bot(self, variant_id: str) -> tuple[StrategyVariant, "PaperTradingBot"]:
@@ -2328,6 +2862,9 @@ class StrategyExperimentRunner:
             "role": variant.role,
             "db_path": str(bot.settings.db_path),
             "pair_strategy_enabled": bot.pair_strategy_enabled,
+            "llm_super_agent_enabled": bot.llm_super_agent_enabled,
+            "recent_llm_decisions": bot.store.recent_llm_decisions(3) if bot.llm_super_agent_enabled else [],
+            "paper_trading_paused": bot.paper_trading_runtime().get("paused", False),
             "last_signal": dict(bot.last_signal or {}),
             "last_error": last_error,
             "official_broadcast_error": official_broadcast_error,
@@ -2402,7 +2939,12 @@ class StrategyExperimentRunner:
         chainlink_price = _maybe_float(price.get("chainlink"))
         binance_price = _maybe_float(price.get("binance"))
         if chainlink_price:
-            store.save_price_tick("BTC", chainlink_price, "strategy-experiment-chainlink", now)
+            store.save_price_tick(
+                "BTC",
+                chainlink_price,
+                "strategy-experiment-chainlink",
+                _updated_at_seconds(price.get("chainlink_updated_ms"), now),
+            )
         elif binance_price:
             store.save_price_tick("BTC", binance_price, "strategy-experiment-binance", now)
 
@@ -2419,6 +2961,15 @@ def _copy_quotes(quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]
                 item[key] = [dict(level) for level in levels if isinstance(level, dict)]
         copied[str(side)] = item
     return copied
+
+
+def _paper_cancel_summary(result: dict[str, Any]) -> dict[str, Any]:
+    canceled = result.get("canceled") if isinstance(result.get("canceled"), list) else []
+    return {
+        "canceled_count": len(canceled),
+        "canceled": [int(item) for item in canceled],
+        "released_cash": _round_money(_maybe_float(result.get("released_cash")) or 0.0) or 0.0,
+    }
 
 
 def _disabled_live_settings() -> dict[str, Any]:
@@ -2495,6 +3046,17 @@ def _append_reason_text(existing: str, addition: str) -> str:
     if existing_text and addition_text:
         return f"{existing_text} | {addition_text}"
     return existing_text or addition_text
+
+
+def _llm_super_agent_reason(decision: Any) -> str:
+    codes = ",".join(str(item) for item in getattr(decision, "reason_codes", ())[:6])
+    code_text = f", codes {codes}" if codes else ""
+    error_text = f", error {decision.error}" if getattr(decision, "error", None) else ""
+    return (
+        f"LLM_SUPER_AGENT route {decision.route}, source {decision.source}, "
+        f"regime {decision.market_regime}, conf {decision.confidence:.4f}, "
+        f"allow {bool(decision.allow_trade)}{code_text}{error_text}, reason {decision.reason}"
+    )
 
 
 def _median(values: list[float]) -> float:
@@ -3084,6 +3646,259 @@ def _pair_multi_ready_rows(price: dict[str, Any]) -> list[tuple[str, float]]:
     return rows
 
 
+def _realtime_maker_state(
+    market: MarketRound,
+    price: dict[str, Any],
+    quotes: dict[str, dict[str, Any]],
+    now: float,
+    max_quote_age_ms: int,
+) -> dict[str, Any]:
+    fair_up = _realtime_maker_fair_up(market, price, quotes, now)
+    actor_up = _realtime_maker_actor_up(price, now)
+    adjusted_up = fair_up
+    if adjusted_up is not None and actor_up is not None:
+        adjusted_up = max(0.01, min(0.99, adjusted_up * 0.85 + actor_up * 0.15))
+    side = None
+    side_fair = None
+    actor_side_fair = None
+    if adjusted_up is not None:
+        side = "Up" if adjusted_up >= 0.5 else "Down"
+        side_fair = adjusted_up if side == "Up" else 1.0 - adjusted_up
+        if actor_up is not None:
+            actor_side_fair = actor_up if side == "Up" else 1.0 - actor_up
+    quote = quotes.get(side) if side and isinstance(quotes.get(side), dict) else {}
+    best_bid = _maybe_float(quote.get("best_bid"))
+    best_ask = _maybe_float(quote.get("best_ask"))
+    limit_price = _realtime_maker_limit_price(side_fair, best_bid, best_ask)
+    quote_age_ms = _realtime_maker_quote_age_ms(quotes, now)
+    block_reason = None
+    if quote_age_ms is None or quote_age_ms > max_quote_age_ms:
+        block_reason = "REALTIME_MAKER_WAIT 盘口报价过期"
+    elif fair_up is None:
+        block_reason = "REALTIME_MAKER_WAIT 缺少实时 fair value"
+    elif side and (best_bid is None or best_ask is None):
+        block_reason = f"REALTIME_MAKER_WAIT 缺少 {side} 买一/卖一"
+    current_price = (
+        _maybe_float(price.get("chainlink"))
+        or _maybe_float(price.get("binance_market"))
+        or _maybe_float(price.get("binance"))
+        or _maybe_float(price.get("okx"))
+    )
+    distance_bps = (
+        (current_price - market.target_price) / market.target_price * 10_000.0
+        if current_price is not None and market.target_price > 0
+        else None
+    )
+    return {
+        "side": side,
+        "fair_up": _round_float(fair_up, 4),
+        "raw_fair_up": _round_float(fair_up, 4),
+        "adjusted_fair_up": _round_float(adjusted_up, 4),
+        "actor_up": _round_float(actor_up, 4),
+        "actor_side_fair": _round_float(actor_side_fair, 4),
+        "side_fair": _round_float(side_fair, 4),
+        "limit_price": limit_price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "quote_age_ms": quote_age_ms,
+        "current_price": current_price,
+        "distance_bps": distance_bps,
+        "block_reason": block_reason,
+    }
+
+
+def _realtime_maker_fair_up(
+    market: MarketRound,
+    price: dict[str, Any],
+    quotes: dict[str, dict[str, Any]],
+    now: float,
+) -> float | None:
+    realtime = price.get("realtime_probability") if isinstance(price.get("realtime_probability"), dict) else {}
+    fair = _maybe_float(realtime.get("combined_up"))
+    if fair is not None:
+        return max(0.01, min(0.99, fair))
+    market_up = _realtime_maker_market_up(quotes)
+    target_up = _realtime_maker_target_up(market, price, now)
+    external_up = _realtime_maker_external_up(price)
+    return _weighted_probability([(market_up, 0.50), (target_up, 0.40), (external_up, 0.10)])
+
+
+def _realtime_maker_actor_up(price: dict[str, Any], now: float) -> float | None:
+    actor = price.get("actor_probability") if isinstance(price.get("actor_probability"), dict) else {}
+    status = str(actor.get("status") or "")
+    if status and status not in {"READY", "PARTIAL"}:
+        return None
+    checked_at = _maybe_float(actor.get("checked_at"))
+    if checked_at is not None and now - checked_at > 20.0:
+        return None
+    value = _maybe_float(actor.get("combined_up"))
+    return max(0.01, min(0.99, value)) if value is not None else None
+
+
+def _realtime_maker_market_up(quotes: dict[str, dict[str, Any]]) -> float | None:
+    up_mid = _quote_mid_from_quotes(quotes, "Up")
+    if up_mid is not None:
+        return up_mid
+    down_mid = _quote_mid_from_quotes(quotes, "Down")
+    return 1.0 - down_mid if down_mid is not None else None
+
+
+def _realtime_maker_target_up(market: MarketRound, price: dict[str, Any], now: float) -> float | None:
+    current = (
+        _maybe_float(price.get("chainlink"))
+        or _maybe_float(price.get("binance_market"))
+        or _maybe_float(price.get("binance"))
+        or _maybe_float(price.get("okx"))
+    )
+    if current is None or current <= 0 or market.target_price <= 0:
+        return None
+    seconds_left = max(1.0, market.ends_at - now)
+    distance_bps = (current - market.target_price) / market.target_price * 10_000.0
+    scale = max(1.0, 12.0 * (seconds_left / 300.0) ** 0.5)
+    return _logistic_probability(distance_bps, scale)
+
+
+def _realtime_maker_external_up(price: dict[str, Any]) -> float | None:
+    chainlink = _maybe_float(price.get("chainlink"))
+    if chainlink is None or chainlink <= 0:
+        return None
+    residuals: list[float] = []
+    okx = _maybe_float(price.get("okx"))
+    binance = _maybe_float(price.get("binance_market")) or _maybe_float(price.get("binance"))
+    if okx is not None:
+        residuals.append((okx - chainlink) / chainlink * 10_000.0)
+    if binance is not None:
+        residuals.append((binance - chainlink) / chainlink * 10_000.0)
+    if not residuals:
+        return None
+    return _logistic_probability(sum(residuals) / len(residuals), 6.0)
+
+
+def _realtime_maker_limit_price(side_fair: float | None, best_bid: float | None, best_ask: float | None) -> float | None:
+    if side_fair is None:
+        return None
+    if best_bid is not None and best_bid > 0:
+        candidate = best_bid + REALTIME_MAKER_BID_IMPROVEMENT
+    elif best_ask is not None:
+        candidate = best_ask - 0.02
+    else:
+        return None
+    candidate = min(candidate, side_fair - REALTIME_MAKER_ENTRY_MIN_EDGE)
+    if best_ask is not None and candidate >= best_ask - POST_ONLY_CROSS_BUFFER:
+        candidate = best_ask - 0.01
+    return round(max(0.01, min(0.99, candidate)), 4)
+
+
+def _realtime_maker_quote_age_ms(quotes: dict[str, dict[str, Any]], now: float) -> int | None:
+    updated = [
+        _maybe_int(row.get("updated_at_ms"))
+        for side in ("Up", "Down")
+        for row in [quotes.get(side) if isinstance(quotes.get(side), dict) else {}]
+    ]
+    updated = [item for item in updated if item]
+    if not updated:
+        return None
+    return max(0, int(now * 1000) - max(updated))
+
+
+def _quote_mid_from_quotes(quotes: dict[str, dict[str, Any]], side: str) -> float | None:
+    quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+    bid = _maybe_float(quote.get("best_bid"))
+    ask = _maybe_float(quote.get("best_ask"))
+    if bid is not None and ask is not None:
+        return max(0.01, min(0.99, (bid + ask) / 2.0))
+    if bid is not None:
+        return max(0.01, min(0.99, bid))
+    if ask is not None:
+        return max(0.01, min(0.99, ask))
+    return None
+
+
+def _realtime_maker_side_fair(state: dict[str, Any], side: str) -> float | None:
+    fair_up = _maybe_float(state.get("adjusted_fair_up")) or _maybe_float(state.get("fair_up"))
+    if fair_up is None:
+        return None
+    return fair_up if side == "Up" else 1.0 - fair_up
+
+
+def _realtime_maker_exit_reason(
+    side: str,
+    side_fair: float | None,
+    entry_price: float,
+    bid: float,
+    age: float,
+    time_left: float,
+) -> str | None:
+    if side_fair is None or entry_price <= 0:
+        return None
+    prefix = f"{REALTIME_MAKER_MARKER}_EXIT {side}"
+    if time_left <= REALTIME_MAKER_FORCE_EXIT_SECONDS_LEFT:
+        return f"{prefix} FORCE_EXIT time_left {time_left:.1f}s bid {bid:.4f}"
+    if time_left <= REALTIME_MAKER_REDUCE_SECONDS_LEFT and bid >= entry_price - 0.02:
+        return f"{prefix} TIME_REDUCE time_left {time_left:.1f}s bid {bid:.4f} entry {entry_price:.4f}"
+    if bid >= entry_price + REALTIME_MAKER_TAKE_PROFIT and side_fair - bid <= REALTIME_MAKER_CANCEL_MIN_EDGE:
+        return f"{prefix} TAKE_PROFIT bid {bid:.4f} entry {entry_price:.4f} fair {side_fair:.4f}"
+    if age >= REALTIME_MAKER_EDGE_GONE_SECONDS and side_fair <= entry_price + REALTIME_MAKER_EDGE_GONE_BUFFER:
+        return f"{prefix} EDGE_GONE fair {side_fair:.4f} entry {entry_price:.4f}"
+    if side_fair <= entry_price - REALTIME_MAKER_STOP_FAIR_DRAWDOWN:
+        return f"{prefix} FAIR_STOP fair {side_fair:.4f} entry {entry_price:.4f}"
+    if bid <= entry_price - REALTIME_MAKER_STOP_BID_DRAWDOWN:
+        return f"{prefix} BID_STOP bid {bid:.4f} entry {entry_price:.4f}"
+    return None
+
+
+def _realtime_maker_cancel_reason(
+    market: MarketRound,
+    state: dict[str, Any],
+    side: str,
+    side_fair: float | None,
+    limit_price: float,
+    best_ask: float | None,
+    order_age: float,
+    now: float,
+) -> str | None:
+    time_left = market.ends_at - now
+    if time_left <= REALTIME_MAKER_REDUCE_SECONDS_LEFT:
+        return f"{REALTIME_MAKER_MARKER} reduce window"
+    if side_fair is None:
+        if order_age < REALTIME_MAKER_CANCEL_GRACE_SECONDS:
+            return None
+        return f"{REALTIME_MAKER_MARKER} fair unavailable"
+    if best_ask is not None and limit_price >= best_ask - POST_ONLY_CROSS_BUFFER:
+        return f"{REALTIME_MAKER_MARKER} post-only risk ask {best_ask:.4f}"
+    edge = side_fair - limit_price
+    if side != state.get("side"):
+        if order_age < REALTIME_MAKER_CANCEL_GRACE_SECONDS and edge >= 0:
+            return None
+        return f"{REALTIME_MAKER_MARKER} direction changed to {state.get('side')}"
+    if edge < REALTIME_MAKER_CANCEL_MIN_EDGE:
+        if order_age < REALTIME_MAKER_CANCEL_GRACE_SECONDS and edge >= 0:
+            return None
+        return f"{REALTIME_MAKER_MARKER} edge decayed {edge:.4f}"
+    return None
+
+
+def _weighted_probability(values: list[tuple[float | None, float]]) -> float | None:
+    available = [(value, weight) for value, weight in values if value is not None and weight > 0]
+    if not available:
+        return None
+    total_weight = sum(weight for _, weight in available)
+    if total_weight <= 0:
+        return None
+    return max(0.01, min(0.99, sum(float(value) * weight for value, weight in available) / total_weight))
+
+
+def _logistic_probability(value: float, scale: float) -> float:
+    normalized_scale = max(0.1, float(scale))
+    return max(0.01, min(0.99, 1.0 / (1.0 + math.exp(-float(value) / normalized_scale))))
+
+
+def _round_float(value: float | None, digits: int) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
 def _live_once_blocked_payload(
     message: str,
     *,
@@ -3164,6 +3979,13 @@ def _maybe_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _updated_at_seconds(value: Any, fallback: float) -> float:
+    parsed = _maybe_int(value)
+    if parsed is None or parsed <= 0:
+        return fallback
+    return parsed / 1000.0 if parsed > 10_000_000_000 else float(parsed)
 
 
 def _round_money(value: float | None) -> float | None:

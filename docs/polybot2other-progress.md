@@ -1,5 +1,551 @@
 # polybot2other-progress
 
+## 2026-05-30 v4.03
+
+### 已完成
+
+1. 将交易记录后台刷新从 live 专用扩展为当前可见 scope 通用刷新。
+2. 当交易记录数据范围选择 `live:*` 或 `experiment:*` 的具体组合时，状态轮询后会直接重拉当前 scope 的 `/api/recent-trades`。
+3. 主账户 Paper 仍使用 `/api/status` 自带的最近交易，策略实验总览仍使用 `/api/strategy-experiments-tables`，避免增加不必要请求。
+4. 后台刷新继续使用 `forceRender:false`，只有结算状态、PnL、成交价、份额、结果等字段变化时才重绘，降低复制/选中时的闪烁。
+5. 前端 `app.js` 静态版本号提升到 `20260530-v2-104`。
+
+### 已确认决策
+
+1. 本次只修前端当前可见交易记录刷新范围，不修改交易执行、结算逻辑或数据库结构。
+2. 不对策略实验总览做每 2 秒逐组合全量刷新，避免组合数量多时造成额外性能压力。
+
+### 已知坑位
+
+1. 已打开的浏览器页面需要刷新一次 HTML 才会加载新的 `app.js?v=20260530-v2-104`。
+2. 如果未来新增多个 live variant，需要继续复用 `live:*` scope，而不是写死 `SINGLE_FAK_REAL`。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已请求首页 HTML，确认脚本版本为 `app.js?v=20260530-v2-104`。
+4. 已请求 `/api/recent-trades?account_scope=strategy_experiment&variant_id=SINGLE_FAK&limit=2&offset=0`，确认具体 Paper 组合交易记录接口可分页返回。
+5. 已请求 `/api/recent-trades?account_scope=live&limit=2&offset=0`，确认 live 交易记录接口仍正常返回。
+
+### 回滚建议
+
+1. 如需回滚本轮刷新扩展，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/static/index.html` 和本进度文档的 v4.03 改动。
+
+## 2026-05-30 v4.02
+
+### 已完成
+
+1. 修复 live 持仓自动刷新时的旧 DOM 残留：当后端返回当前数据范围持仓为空时，即使表格处于复制/选中保护窗口，也会强制清空旧持仓行。
+2. 修复 live 交易记录不随状态轮询自动刷新：当交易记录数据范围选择实盘账户时，会跟随状态轮询重新拉取 `/api/recent-trades?account_scope=live`，用于及时展示官方结算、PnL 和修正后的成交数据。
+3. 修复订单流水切换数据范围时旧账户数据短暂闪现：切换 scope 时先清空本地订单行和分页元数据，再触发渲染和新数据加载。
+4. 扩展交易记录渲染 key，纳入 `entry_price`、`shares`、`payout`、`pnl`、`official_outcome`、`settlement_source` 等字段，避免数据已修正但前端判断“无需重绘”。
+5. live 交易记录后台刷新不再强制重绘；数据未变化时保持 DOM 稳定，减少复制和选中时的闪烁。
+6. 前端 `app.js` 静态版本号提升到 `20260530-v2-103`，避免浏览器继续使用旧脚本。
+
+### 已确认决策
+
+1. 表格复制/选中保护不能阻止“持仓已经关闭/结算”的清屏动作；资金风险展示优先级高于复制过程中的 DOM 稳定。
+2. live 交易记录采用小页实时刷新，不改变主 Paper 和策略实验的分页模型，避免全局增加请求量。
+
+### 已知坑位
+
+1. 已打开的浏览器页面需要刷新一次 HTML 才会加载新的 `app.js?v=20260530-v2-103`。
+2. 如果后续增加更多实盘组合，需要把 live scope 从单一 `SINGLE_FAK_REAL` 扩展为按 `variant_id` 过滤。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，16 个 live 实盘路径回归测试通过。
+5. 已重启 dashboard 到 `http://127.0.0.1:8791`，确认首页脚本版本为 `app.js?v=20260530-v2-103`。
+6. 已请求 `/api/status`，确认 `runtime.live_trading.open_trades=[]`。
+7. 已请求 `/api/recent-trades?account_scope=live&limit=4&offset=0`，确认 live trade `1` 为 `SETTLED`、`entry_price=0.65`、`shares=3.0`、`pnl=-1.997775`、`settlement_source=polymarket_official`。
+
+### 回滚建议
+
+1. 如需回滚本轮前端刷新修复，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/static/index.html` 和本进度文档的 v4.02 改动。
+
+## 2026-05-30 v4.01
+
+### 已完成
+
+1. 修复实盘 FAK 官方成交金额解析问题：`makingAmount/takingAmount` 现在支持 fixed-math 整数、decimal 字符串，以及本次出现的 `makingAmount="1.95"` / `takingAmount="3"` 混合格式。
+2. `order_state` 和官方 trade 回查里的成交份额解析不再把小整数份额错误除以 `1_000_000`。
+3. `_fill_from_response_or_sweep()` 的 reason 增加官方成交金额摘要，后续不会只看到下单前订单簿 sweep 估算。
+4. 已修正 live 本地库中订单 `13` / trade `1` / fill `1` 的错误账本：`shares=3.0`、`avg_fill_price=0.65`、`notional=1.95`、`fee=0.047775`、`cash_spent=1.997775`。
+5. 已创建修正前备份：`data/live/single_fak_real.sqlite3.v4.01-pre-amount-repair.bak`。
+
+### 已确认决策
+
+1. 官方 `makingAmount/takingAmount` 不能继续只按“是否有小数点”判断 fixed-math；需要结合 BUY/SELL 的 cash/share 角色和二元合约价格范围选择合理单位。
+2. 本次不重算真实官方成交，只修本地账本解析和展示；官方原始 `raw_response` 保持不变。
+3. 实盘开关保持关闭，修复完成后由人工重新判断是否继续实盘。
+
+### 已知坑位
+
+1. 订单 `13` 已经在重启后按 Polymarket 官方结果结算为 `Down`，该笔 Up 实盘交易本地 PnL 为 `-1.997775`。
+2. 如果后续 CLOB API 返回其他金额格式，仍需要以 raw response 和官方订单/交易回查为准做兼容。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_order_response_parses -v`，3 个官方金额解析专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，16 个 live 实盘路径回归测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，161 个核心测试通过。
+5. 已执行 `rtk proxy git diff --check`，空白检查通过。
+6. 已重启 dashboard 到 `http://127.0.0.1:8791`。
+7. 已请求 `/api/orders?account_scope=live&limit=3&offset=0&status=all`，确认订单 `13` 显示 `filled_shares=3.0`、`avg_fill_price=0.65`、`fee=0.047775`、`cash_spent=1.997775`。
+8. 已请求 `/api/order-fills?account_scope=live&order_id=13`，确认逐档成交从 `price=650000` / `shares=0.000003` 修正为 `price=0.65` / `shares=3.0`。
+9. 已请求 `/api/live-settings`，确认 `enabled=false`、`process_lock_acquired=false`。
+
+### 回滚建议
+
+1. 如需回滚代码修复，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档的 v4.01 改动。
+2. 如需回滚本地 live 数据修正，先停止 dashboard，再用 `data/live/single_fak_real.sqlite3.v4.01-pre-amount-repair.bak` 恢复 live SQLite；注意这会回到修正前的错误显示，不建议在未确认官方账本前回滚。
+
+## 2026-05-30 v3.94
+
+### 已完成
+
+1. 修复实盘预检误判 collateral allowance 为 0 的问题。
+2. `wallet_state()` 和 `token_state()` 现在兼容 SDK 返回的 `allowances` map；顶层 `allowance` 缺失或为 0 时，会从 map 中取正数授权额度。
+3. 新增回归测试，覆盖 `balance` 存在、`allowance` 顶层缺失、`allowances` map 存在大额授权的场景。
+
+### 已确认决策
+
+1. `POLYBOT2OTHER_LIVE_SIGNATURE_TYPE=1` 是 proxy wallet 模式，`signer` 和 `funder` 不一致不是错误。
+2. 余额和授权是两个独立条件：`balance` 足够但 `allowance` 解析错误或授权不足时，实盘仍应被阻断。
+3. 本次只修 readiness 解析，不修改下单路径、签名路径和资金风控。
+
+### 已知坑位
+
+1. 如果修复后仍显示 allowance 不足，才需要进一步检查 funder 是否为实际有授权的钱包。
+2. `allowances` map 里可能有多个 spender，本次取最大正数授权额度用于 readiness 判断。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_wallet_state -v`，4 个 wallet allowance 专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，159 个核心测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy git diff --check`，空白检查通过。
+5. 已重启 dashboard 到 `http://127.0.0.1:8791`。
+6. 已执行 `/api/live-settings` 烟测，collateral wallet 现在 `ready=true`，`balance=2.379349`，`allowance=1.157920892373162e+71`，readiness `errors=[]`。
+
+### 回滚建议
+
+1. 如需回滚本轮 allowance 解析修复，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档的 v3.94 记录。
+
+## 2026-05-30 v3.93
+
+### 已完成
+
+1. 修复 Chainlink fallback 结算使用“当前最新价”的问题，改为只使用市场结束时间 `ends_at ± 5s` 内的 Chainlink tick。
+2. `settle_due_rounds()` 现在会从本地 `price_ticks` 查找最接近市场结束时间的 Chainlink tick；找不到合格 tick 时不做 fallback 临时结算，继续等待官方结果。
+3. 前端 RTDS Chainlink 价格时间戳改为使用行情消息自身 timestamp，并传给后端保存，避免用浏览器收到消息的时间替代行情时间。
+4. 主 Paper、策略实验和 live runner 保存 Chainlink tick 时优先使用 `chainlink_updated_ms`，fallback 结算时间窗口更准确。
+5. 前端脚本版本提升到 `20260530-v2-101`，避免浏览器继续使用旧脚本。
+
+### 已确认决策
+
+1. Chainlink fallback 只作为官方结果未出时的临时兜底，不应使用结束几十秒后的价格。
+2. 如果结束时间附近没有 Chainlink tick，就保持未结算，等 Polymarket 官方结果或后续官方回填。
+3. 该修复同时约束 Paper、策略实验和 live runner 的本地会计结算，避免实盘本地账本也被迟到价格污染。
+
+### 已知坑位
+
+1. 如果某轮市场结束附近完全没有 Chainlink tick，fallback 不会结算，列表会等待官方结果；这是故意收紧。
+2. 已经被官方修正过的历史交易不会被本次代码回滚或重算；历史最终口径仍以 `polymarket_official` 为准。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k chainlink_fallback -v`，4 个 Chainlink fallback 专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，158 个核心测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+5. 已执行 `rtk proxy git diff --check`，空白检查通过。
+6. 已重启 dashboard 到 `http://127.0.0.1:8791`，首页确认 `app.js?v=20260530-v2-101` 生效。
+7. 已执行 `/api/status` 烟测，服务运行中，LLM model 为 `openai/gpt-5.5`。
+8. 已执行 `/api/live-settings` 烟测，确认当前实盘未就绪原因之一为 collateral allowance `0.0`，钱包余额 `2.379349`，本次预算 `1.0`。
+
+### 回滚建议
+
+1. 如需回滚本轮 fallback 结算修复，撤销 `src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/live.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py` 和本进度文档的 v3.93 记录。
+
+## 2026-05-30 v3.92
+
+### 已完成
+
+1. 新增 `/api/llm-review` 只读接口，汇总 `LLM_SUPER_AGENT_PAPER` 的 route、reason code、实际成交 PnL 和 NO_TRADE 估算机会成本。
+2. `TradeStore` 增加 LLM 决策复盘统计，按同一市场、成交时间和交易 reason 中的 LLM route 做归因。
+3. 分析页新增“LLM 决策复盘”卡片，展示样本决策、允许率、LLM/本地来源、归因成交 PnL、NO_TRADE 方向胜率、route 表、reason code 表和最近决策表。
+4. 前端脚本版本提升到 `20260529-v2-100`，避免浏览器继续使用旧脚本。
+5. 新增单元测试覆盖 NO_TRADE 机会成本估算和 LLM route 成交归因。
+
+### 已确认决策
+
+1. 该复盘只用于观察和训练方向，不影响现有 Paper 或实盘下单链路。
+2. 当前没有订单级 `llm_decision_id`，所以成交归因是近似归因：同一市场、相近成交时间、交易 reason 中 route 匹配。
+3. NO_TRADE 机会成本是用决策时记录的 ask 和配置单笔金额估算，不等于真实可成交结果，也不包含滑点、手续费和盘口深度变化。
+
+### 待办和后期优化
+
+1. 后续如果要做更精确学习闭环，应给订单表增加 `llm_decision_id` 或决策哈希，避免只能靠时间窗口和 reason 归因。
+2. 后续可以按市场阶段、剩余秒数、quote stale、multi-source ready、near target 等特征做分桶收益统计。
+3. 后续智能体训练应先走离线规则生成和人工审核，不应直接让 LLM 在线自改风控阈值。
+
+### 已知坑位
+
+1. 多个 LLM 决策可能发生在同一轮市场，当前 route/reason PnL 属于近似归因。
+2. NO_TRADE 的 winner 估算带有事后视角，前端主展示使用 direction 估算，避免把事后最优方向误当成真实可交易信号。
+3. LLM 复盘接口最多处理最近 5000 条决策样本，避免历史数据过大拖慢分析页。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k llm_decision_review -v`，LLM 复盘专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，157 个核心测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+4. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+5. 已执行 `rtk proxy git diff --check`，空白检查通过。
+6. 已重启本地 dashboard 到 `http://127.0.0.1:8791`，并完成 `/api/llm-review?limit=5` 烟测，返回 `status=READY`、`variant_id=LLM_SUPER_AGENT_PAPER`、`decision_count=173`、`route_stats=4`。
+7. 已执行首页静态资源烟测，确认 `app.js?v=20260529-v2-100` 生效。
+
+### 回滚建议
+
+1. 如需回滚本轮 LLM 复盘，撤销 `src/polybot2other/storage.py`、`src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档的 v3.92 记录。
+
+## 2026-05-29 v3.81
+
+### 已完成
+
+1. Live Terminal 增加 LLM 相关观察日志。
+2. 后端 `/api/status` 的 `settings.llm_super_agent` 增加脱敏配置状态：是否启用、API Key 是否存在、base_url、model、timeout 和刷新间隔。
+3. 前端从 `LLM_SUPER_AGENT_PAPER` 的 `recent_llm_decisions` 中渲染 `[LLM]` 日志。
+4. LLM 日志包含 config、waiting、decision、route、allow/block、confidence、market_regime、reason、reason_codes、error 和实际映射的 Paper 执行路径。
+5. Live Terminal 支持按日志真实时间排序，避免历史 LLM 决策插入后顺序错乱。
+6. 前端脚本版本提升到 `20260529-v2-99`，避免浏览器继续使用旧 `app.js`。
+
+### 已确认决策
+
+1. 不展示 API Key、headers、完整 prompt、完整 features JSON、完整 raw response。
+2. LLM 日志只用于观察和排障，不改变任何 Paper 或实盘下单逻辑。
+3. 日志仍沿用 Live Terminal，标题统一使用 `[LLM]` 前缀，避免和真实下单日志混淆。
+
+### 已知坑位
+
+1. 如果 `LLM_SUPER_AGENT_PAPER` 尚未产生决策，Live Terminal 只会显示 `[LLM] waiting`。
+2. 当前最多展示变体返回的最近几条 LLM 决策；后续如果要深度排障，需要单独做 LLM 决策列表或详情页。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k llm -v`，LLM 专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法通过。
+
+### 回滚建议
+
+1. 如需回滚本轮 Live Terminal LLM 日志，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py` 和本进度文档的 v3.81 记录。
+
+## 2026-05-29 v3.78
+
+### 已完成
+
+1. 新增 `LLM_SUPER_AGENT_PAPER` 组合，用于 Paper-only 超级下注智能体采样。
+2. 新增 `src/polybot2other/llm_agent.py`，实现 OpenAI-compatible / HaoAI 非阻塞路由器。
+3. 路由器支持 `POLYBOT2OTHER_LLM_API_KEY` 或 `HAOAI_API_KEY`，默认 `base_url=https://api.hao.ai/v1`、`model=openai/gpt-5.4-mini`。
+4. 实时 tick 不等待 LLM 网络响应：先走本地快脑路由，后台刷新 LLM 缓存，避免 5 分钟市场热路径被 API 延迟拖慢。
+5. LLM 只能在白名单内选择已有 Paper 策略路径：`NO_TRADE`、`SINGLE_FAK`、`STOP_AND_FLIP`、`REVERSAL`、`MULTI_LEAD`、`MULTI_CONFIRM`、`ANTI_BOT_GUARD`、`PAIR_FAK`。
+6. 新增 SQLite `llm_decisions` 表，记录每次路由的输入特征、输出、来源、置信度、原因和错误信息。
+7. 策略实验列表从 19 个组合扩展到 20 个组合，并在策略组合说明 HTML 中补充 LLM 智能体说明。
+8. `.env.live.example`、`README.md` 和 live env 生成模板补充可选 LLM 配置项。
+9. 修正实盘 readiness 权限检查：LLM Key 只用于脱敏展示，不会作为实盘 CLOB 密钥阻断 `SINGLE_FAK_REAL`。
+10. 修复两个 PAIR 测试的时间戳/盘口深度不稳定问题，避免测试误走网络补深度或因测试环境慢导致报价过期。
+
+### 已确认决策
+
+1. `LLM_SUPER_AGENT_PAPER` 只用于 Paper 数据采样，不接入实盘自动下单。
+2. LLM 是策略路由器，不是订单执行器；实际下单仍复用现有确定性 Paper 交易路径和硬风控。
+3. 没有配置 API Key 时不会报错，自动使用本地快脑路由，保证采样不中断。
+4. 暂不引入 OpenAI SDK 生产依赖，使用 Python 标准库调用 OpenAI-compatible chat completions 接口。
+5. LLM 结果必须经过 JSON 解析、白名单路由、置信度阈值和现有策略风控，不能绕过价格、盘口、持仓、亏损和挂单限制。
+
+### 待办和后期优化
+
+1. 后续需要在分析页展示 `llm_decisions` 的最近决策、采纳率、各 route PnL 和错误率。
+2. 后续需要按市场类型回测 LLM 路由是否真正优于单一 `SINGLE_FAK`、`STOP_AND_FLIP`、`REVERSAL` 或 `PAIR_FAK`。
+3. 如果未来考虑实盘智能体，必须先做离线胜率证明、资金上限、人工确认、熔断、审计和影子模式，不允许直接把 Paper 路由切到真钱。
+
+### 已知坑位
+
+1. LLM 响应可能慢、失败或输出非 JSON；当前设计会记录错误并继续用本地快脑，不影响 Paper 主循环。
+2. 本地快脑只是保守启发式路由，不代表 LLM 已经有真实优势，需要长期样本验证。
+3. `HAOAI_API_KEY` 被允许从 env 文件读取，但实盘 readiness 只会因真正的 `POLYBOT2OTHER_LIVE_*` 密钥权限问题阻断。
+4. 新增 `llm_decisions` 属于 SQLite schema version 8，旧库会自动迁移；回滚代码后如保留数据库，不影响旧表读取，但会留下未使用表。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，155 个测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已执行 LLM 专项用例，确认无 API Key 时本地快脑能路由到 `PAIR_FAK` 并写入 `llm_decisions`。
+5. 已执行 readiness 专项用例，确认 LLM Key 不泄露、不阻断实盘密钥检查。
+
+### 回滚建议
+
+1. 如需回滚本轮 LLM 智能体，撤销 `src/polybot2other/llm_agent.py`、`src/polybot2other/bot.py`、`src/polybot2other/config.py`、`src/polybot2other/experiments.py`、`src/polybot2other/storage.py`、`src/polybot2other/live.py`、`src/polybot2other/live_env_setup.py`、`README.md`、`.env.live.example`、`docs/strategy-combinations-guide.html`、`tests/test_core.py` 和本进度文档的 v3.78 记录。
+2. 如需清除 LLM 采样数据，可停止服务后删除策略实验库中的 `llm_decisions` 表或删除对应 `LLM_SUPER_AGENT_PAPER` SQLite 文件。
+
+## 2026-05-29 v3.77
+
+### 已完成
+
+1. 修复右上角实盘配置面板输入框失焦后被自动刷新覆盖的问题。
+2. 为实盘配置表单增加未保存 dirty 状态，用户修改过的字段在保存前不再被 `/api/status` 轮询回写覆盖。
+3. 覆盖字段包括初始金额、单笔金额、最大持仓、最高买价、日亏停止、总回撤停止、重试次数、重试间隔和合规确认。
+4. 保存成功后清空 dirty 状态，并重新用服务端返回的配置渲染。
+5. 前端脚本版本提升到 `20260529-v2-98`，避免浏览器继续使用旧 `app.js`。
+
+### 已确认决策
+
+1. 本次只修前端表单状态保护，不修改实盘配置接口和后端配置结构。
+2. 未保存的字段只是在浏览器内保留，不代表已经生效；仍需点击保存。
+
+### 已知坑位
+
+1. 如果多个浏览器标签同时打开实盘配置，其中一个标签未保存的 dirty 字段不会自动接受另一个标签的新配置；这是为了优先保护当前正在编辑的值。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+
+### 回滚建议
+
+1. 如需回滚本次修复，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/static/index.html` 和本进度文档的 v3.77 记录。
+
+## 2026-05-29 v3.76
+
+### 已完成
+
+1. 顶部新增 `暂停Paper` / `恢复Paper` 一键开关。
+2. 新增 `POST /api/paper-pause`，用于切换 Paper 自动下单运行态。
+3. Paper 暂停后，主 Paper 账户和所有策略实验组合都会停止新增模拟下单。
+4. Paper 暂停时会取消主账户和策略实验账户的活跃 Paper 挂单，避免已存在的 GTC/GTD/POST_ONLY 模拟挂单继续成交。
+5. 暂停状态下仍继续行情采集、市场切换、结算、资金曲线和实盘 `SINGLE_FAK_REAL` 路径。
+6. 前端运行态增加 `Paper已暂停` 标记，静态资源版本提升到 `20260529-v2-97`。
+
+### 已确认决策
+
+1. 本功能只控制 Paper 模拟交易，不影响实盘开关、实盘预检、实盘下单或手动卖出。
+2. 暂停不是清仓按钮，已有 Paper 持仓继续等待官方结算或后续原有逻辑处理。
+3. 当前暂停状态是运行时状态，服务重启后默认恢复为未暂停；后续如需持久化，需要单独设计配置落库。
+
+### 待办和后期优化
+
+1. 如果后续希望重启后仍保持暂停，需要把 Paper 暂停状态写入配置或 SQLite，并在启动时加载。
+2. 后续可在暂停按钮旁增加最近一次暂停/恢复时间，便于复盘数据断点。
+
+### 已知坑位
+
+1. 点击暂停会取消当前 Paper 活跃挂单，因此不建议把这个按钮当成无副作用的 UI 预览按钮。
+2. 暂停期间仍会产生行情和结算数据，但不会产生新的 Paper 入场样本；复盘时要区分暂停时间段。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k paper_pause -v`，Paper 暂停专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+4. 已执行 `rtk proxy git diff --check`，空白检查通过。
+
+### 回滚建议
+
+1. 如需回滚本次 Paper 暂停功能，撤销 `src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档的 v3.76 记录。
+
+## 2026-05-29 v3.75
+
+### 已完成
+
+1. 将 Paper/策略实验默认 `max_daily_loss` 从 `40.0` 调整为 `100.0`，用于继续积累 SINGLE 及其他 Paper 组合采样数据。
+2. 同步修改 `Settings` dataclass 默认值和 `load_settings()` 的 `POLYBOT2OTHER_MAX_DAILY_LOSS` 默认值。
+3. 保持实盘默认单日亏损停止 `live_trading_default_max_daily_loss = 6.0` 不变，避免 Paper 采样阈值误用于实盘。
+
+### 已确认决策
+
+1. 本次只提高 Paper/策略实验采样阈值，不修改实盘 `SINGLE_FAK_REAL` 风控。
+2. 如果环境变量 `POLYBOT2OTHER_MAX_DAILY_LOSS` 被显式设置，仍以环境变量为准。
+
+### 已知坑位
+
+1. `100.0` 是 Paper 采样阈值，对实盘 20 USDC 初始资金完全不可接受，实盘不得沿用。
+2. 提高阈值会允许亏损组合继续下单，后续复盘必须单独标记这是采样阶段放宽风控产生的数据。
+
+### 验证记录
+
+1. 已执行配置加载检查，确认 `Settings().max_daily_loss = 100.0`、`load_settings().max_daily_loss = 100.0`、`live_trading_default_max_daily_loss = 6.0`。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已重启 `http://127.0.0.1:8791/`，确认运行中 `/api/status` 返回 `settings.max_daily_loss = 100.0`。
+
+### 回滚建议
+
+1. 如需回滚本次阈值调整，撤销 `src/polybot2other/config.py` 和本进度文档的 v3.75 记录。
+
+## 2026-05-29 v3.74
+
+### 已完成
+
+1. 将 Paper/策略实验默认 `max_daily_loss` 从 `20.0` 调整为 `40.0`，用于继续积累 SINGLE 组合采样数据。
+2. 同步修改 `Settings` dataclass 默认值和 `load_settings()` 的 `POLYBOT2OTHER_MAX_DAILY_LOSS` 默认值。
+3. 保持实盘默认单日亏损停止 `live_trading_default_max_daily_loss = 6.0` 不变，避免把 Paper 采样阈值误用到实盘。
+
+### 已确认决策
+
+1. 本次只提高 Paper/策略实验采样阈值，不修改实盘 `SINGLE_FAK_REAL` 风控。
+2. 如果环境变量 `POLYBOT2OTHER_MAX_DAILY_LOSS` 被显式设置，仍以环境变量为准。
+
+### 待办和后期优化
+
+1. 后续应在组合列表里直接显示 `DAILY_LOSS_STOP` 与当前 `daily_realized_pnl`，避免只从 last_signal 推断是否停单。
+
+### 已知坑位
+
+1. 已经低于 `-40` 的组合仍会被日亏损风控挡住，例如今天 `SINGLE_FAK` 已超过该阈值。
+2. 提高阈值只适合 Paper 采样，不代表实盘风险可接受。
+
+### 验证记录
+
+1. 已执行配置加载检查，确认 `Settings().max_daily_loss = 40.0`、`load_settings().max_daily_loss = 40.0`、`live_trading_default_max_daily_loss = 6.0`。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+
+### 回滚建议
+
+1. 如需回滚本次阈值调整，撤销 `src/polybot2other/config.py` 和本进度文档的 v3.74 记录。
+
+## 2026-05-29 v3.72
+
+### 已完成
+
+1. 修复交易记录在切换到策略实验/实盘数据范围后，偶发闪出主账户交易记录的问题。
+2. 修复订单流水同类问题：非主账户范围为空或请求未返回时，不再用 `/api/status` 的主账户订单兜底。
+3. `loadRecentTradesPage()` 增加请求范围和时间过滤校验，避免快速切换范围时旧请求覆盖新范围。
+4. `loadOrders()` 增加请求范围和状态过滤校验，避免旧订单请求覆盖新范围。
+5. 静态资源版本提升到 `20260529-v2-96`，避免浏览器继续加载旧 `app.js`。
+
+### 已确认决策
+
+1. 只有主账户且没有时间过滤时，才允许使用 `/api/status` 自带的 `recent_trades` / `recent_orders` 作为兜底数据。
+2. 策略实验、单个策略租户、实盘租户、以及启用时间过滤时，列表为空就展示空列表或 loading，不回退显示主账户数据。
+3. 本轮只改前端渲染和异步请求保护，不修改后端接口、数据库、策略和实盘路径。
+
+### 待办和后期优化
+
+1. 后续如继续出现闪动，应进一步把 open/order/recent 三张表的请求状态拆成独立状态机，减少 `renderAll()` 的全量重绘影响。
+
+### 已知坑位
+
+1. 历史浏览器缓存可能仍加载旧脚本，需要刷新页面拿到 `20260529-v2-96`。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已请求首页 HTML，确认引用 `20260529-v2-96`。
+4. 已请求 `/static/app.js?v=20260529-v2-96`，确认包含 `useStatusRecentTrades`、`useStatusOrders` 和异步请求范围校验逻辑。
+
+### 回滚建议
+
+1. 如需回滚本次列表范围修复，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/static/index.html` 和本进度文档的 v3.72 记录。
+
+## 2026-05-29 v3.71
+
+### 已完成
+
+1. 调整 `REALTIME_MAKER_POST_ONLY` 的 Paper-only maker 参数，解决 0 成交、订单几乎全是 `CANCELED` / `EXPIRED` 的问题。
+2. 将实时 maker 入场最小 edge 从 `0.045` 降到 `0.03`，先提高可成交样本概率。
+3. 将撤单 edge 阈值从 `0.025` 降到 `0.01`，避免市场刚向挂单靠近就被过早撤单。
+4. 将 maker 挂单 TTL 从 `12s` 提高到 `35s`，让 POST_ONLY 模拟在 8 秒排队等待后仍有足够成交窗口。
+5. 新增 `REALTIME_MAKER_CANCEL_GRACE_SECONDS = 10s`，年轻挂单遇到轻微 edge 衰减时先保留；只有 fair 低于限价、POST_ONLY 穿价风险、明显反向或超过保护期后才撤。
+6. 限价从单纯挂 `best_bid` 调整为尝试 `best_bid + 0.01`，在不穿卖一和保留最低 edge 的前提下提升成交概率。
+
+### 已确认决策
+
+1. 本轮只修当前 `REALTIME_MAKER_POST_ONLY`，不新增租户，因为旧参数没有形成有效样本。
+2. 本轮仍保持 Paper-only，不接入 `SINGLE_FAK_REAL`，也不修改任何实盘下单路径。
+3. 目标是先获得有效 maker 成交样本，而不是直接追求实盘盈利。
+
+### 待办和后期优化
+
+1. 跑出样本后需要复盘 `FILLED` 占比、平均挂单年龄、edge decayed 取消占比、成交后 PnL 和尾盘退出占比。
+2. 如果成交率仍过低，再考虑继续微调 bid improvement 或 TTL；如果成交后亏损明显，则优先收紧 edge 和反向撤单规则。
+
+### 已知坑位
+
+1. 放宽参数会提高成交率，也会提高被 adverse selection 命中的概率，需要用样本复盘，不应直接乐观。
+2. POST_ONLY 仍是 Paper 模拟队列，不等于 Polymarket 官方真实排队成交。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k realtime_maker -v`，实时 maker 专项测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_variants -v`，策略组合覆盖测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_experiments_run_all_variants -v`，19 个隔离账户实验组合运行测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+5. 已执行 `rtk proxy git diff --check`，空白检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，152 个核心测试全部通过。
+7. 已重启 `http://127.0.0.1:8791/`，首页和 `/api/status` HTTP 请求正常。
+8. 已请求 `/api/strategy-experiments`，确认仍为 19 个组合并包含 `REALTIME_MAKER_POST_ONLY`。
+
+### 回滚建议
+
+1. 如需回滚本次参数调整，撤销 `src/polybot2other/bot.py`、`tests/test_core.py`、`docs/strategy-combinations-guide.html` 和本进度文档的 v3.71 记录。
+
+## 2026-05-29 v3.68
+
+### 已完成
+
+1. 新增 `REALTIME_MAKER_POST_ONLY` Paper-only 实时做市采样组合，组合展示为 `REALTIME MAKER + POST_ONLY MULTI_LEAD`。
+2. 前端 Bot 快照补充 `realtime_probability` 和 `actor_probability` 字段，让后端策略实验能读取实时方向概率与地址修正概率。
+3. 实时做市组合只使用 Paper POST_ONLY 挂单，不接入 `SINGLE_FAK_REAL` 或任何实盘下单路径。
+4. 新增 maker 入场、撤单和退出规则：最小 fair value、最小 maker edge、挂单 TTL、临近结算停止新增、盈利退出、edge 消失退出、fair/bid 回撤退出和强制减仓窗口。
+5. 组合说明文档更新为 19 个策略/租户，并明确 `REALTIME_MAKER_POST_ONLY` 是采样实验，不得直接作为实盘策略。
+6. 静态资源版本提升到 `20260529-v2-95`。
+
+### 已确认决策
+
+1. 本次目标是采集“实时概率是否能指导买入/卖出套利”的数据，不承诺盈利最大化，更不能把未验证采样组合直接实盘化。
+2. `REALTIME_MAKER_POST_ONLY` 选择以 POST_ONLY 为基础，因为它更适合验证“赚流动性/挂 maker 单”的假设；FAK 会变成主动吃单，不适合作为这个实验的第一版。
+3. 实盘继续保持 `SINGLE_FAK_REAL` 原路径，新增实验组合不改变实盘开关、实盘预检、实盘买卖和手动卖出逻辑。
+
+### 待办和后期优化
+
+1. 累积足够样本后，需要单独复盘 `REALTIME_MAKER_POST_ONLY` 的成交率、撤单率、maker edge、退出原因分布和净 PnL。
+2. 后续可把 maker fair 权重、edge 阈值、退出阈值做成配置，但必须等样本验证后再考虑。
+3. 如要接近实盘，还需要补真实盘口队列位置、Polymarket maker/taker 费用、最小订单金额和网络/API 延迟的误差建模。
+
+### 已知坑位
+
+1. 当前 realtime fair value 来自浏览器实时快照和后端兜底模型，仍是经验模型，不是官方确定概率。
+2. POST_ONLY Paper 成交是模拟队列，不等于真实订单簿排队成交；实盘前必须重新校准。
+3. 地址修正概率如果过期或 Data API 失败，会降低参考价值；策略目前只把它作为小权重修正和反向阻断。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy git diff --check`，空白检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k realtime_maker -v`，新增实时做市测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_variants -v`，策略组合覆盖测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_experiments_run_all_variants -v`，19 个隔离账户实验组合运行测试通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，151 个核心测试全部通过。
+8. 已重启 `http://127.0.0.1:8791/`，首页 HTTP 200，确认加载 `20260529-v2-95`。
+9. 已请求 `/static/app.js?v=20260529-v2-95`，确认包含 `snapshotActorProbability` 和 `realtime_probability` 快照字段。
+10. 已请求 `/api/strategy-experiments`，确认 `variant_count=19`，且包含 `REALTIME_MAKER_POST_ONLY`。
+
+### 回滚建议
+
+1. 如需回滚本次实验组合，撤销 `src/polybot2other/experiments.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py`、`docs/strategy-combinations-guide.html` 和本进度文档的 v3.68 记录。
+
 ## 2026-05-29 v3.65
 
 ### 已完成

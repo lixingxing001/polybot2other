@@ -8,12 +8,15 @@ from typing import Any
 
 ENV_FILE_NAME = "POLYBOT2OTHER_ENV_FILE"
 ENV_KEY_PREFIX = "POLYBOT2OTHER_"
+EXTERNAL_ALLOWED_ENV_KEYS = {"HAOAI_API_KEY"}
 DEFAULT_ENV_FILES = (".env.live", ".env.local", ".env")
 SENSITIVE_ENV_KEYS = {
+    "HAOAI_API_KEY",
     "POLYBOT2OTHER_LIVE_PRIVATE_KEY",
     "POLYBOT2OTHER_LIVE_API_KEY",
     "POLYBOT2OTHER_LIVE_API_SECRET",
     "POLYBOT2OTHER_LIVE_API_PASSPHRASE",
+    "POLYBOT2OTHER_LLM_API_KEY",
 }
 LIVE_CREDENTIAL_ENV_KEYS = {
     "POLYBOT2OTHER_LIVE_PRIVATE_KEY",
@@ -36,7 +39,7 @@ class Settings:
     round_seconds: int = 300
     stake_dollars: float = 5.0
     max_open_trades: int = 2
-    max_daily_loss: float = 20.0
+    max_daily_loss: float = 100.0
     min_confidence: float = 0.62
     min_edge: float = 0.02
     max_entry_price: float = 0.72
@@ -66,6 +69,12 @@ class Settings:
     live_trading_default_retry_count: int = 2
     live_trading_default_retry_delay_ms: int = 250
     live_trading_runtime_enabled: bool = True
+    llm_super_agent_enabled: bool = True
+    llm_super_agent_api_key: str = ""
+    llm_super_agent_base_url: str = "https://api.hao.ai/v1"
+    llm_super_agent_model: str = "openai/gpt-5.4-mini"
+    llm_super_agent_timeout_seconds: float = 1.2
+    llm_super_agent_min_interval_seconds: float = 12.0
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
     data_api_url: str = "https://data-api.polymarket.com"
@@ -149,7 +158,7 @@ def _load_env_file(path: Path) -> dict[str, Any]:
             continue
         key, raw_value = line.split("=", 1)
         key = key.strip()
-        if not key.startswith(ENV_KEY_PREFIX):
+        if not key.startswith(ENV_KEY_PREFIX) and key not in EXTERNAL_ALLOWED_ENV_KEYS:
             ignored_keys += 1
             continue
         value = _env_file_value(raw_value)
@@ -219,7 +228,7 @@ def load_settings() -> Settings:
         round_seconds=_int_env("POLYBOT2OTHER_ROUND_SECONDS", 300, 60),
         stake_dollars=_float_env("POLYBOT2OTHER_STAKE_DOLLARS", 5.0, 0.1),
         max_open_trades=_int_env("POLYBOT2OTHER_MAX_OPEN_TRADES", 2, 1),
-        max_daily_loss=_float_env("POLYBOT2OTHER_MAX_DAILY_LOSS", 20.0, 0.0),
+        max_daily_loss=_float_env("POLYBOT2OTHER_MAX_DAILY_LOSS", 100.0, 0.0),
         min_confidence=_float_env("POLYBOT2OTHER_MIN_CONFIDENCE", 0.62, 0.5),
         min_edge=_float_env("POLYBOT2OTHER_MIN_EDGE", 0.02, -0.5),
         max_entry_price=_float_env("POLYBOT2OTHER_MAX_ENTRY_PRICE", 0.72, 0.01),
@@ -253,6 +262,12 @@ def load_settings() -> Settings:
         live_trading_default_retry_count=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_COUNT", 2, 0),
         live_trading_default_retry_delay_ms=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_DELAY_MS", 250, 0),
         live_trading_runtime_enabled=_bool_env("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", True),
+        llm_super_agent_enabled=_bool_env("POLYBOT2OTHER_LLM_SUPER_AGENT_ENABLED", True),
+        llm_super_agent_api_key=os.environ.get("POLYBOT2OTHER_LLM_API_KEY", os.environ.get("HAOAI_API_KEY", "")),
+        llm_super_agent_base_url=os.environ.get("POLYBOT2OTHER_LLM_BASE_URL", "https://api.hao.ai/v1"),
+        llm_super_agent_model=os.environ.get("POLYBOT2OTHER_LLM_MODEL", "openai/gpt-5.4-mini"),
+        llm_super_agent_timeout_seconds=_float_env("POLYBOT2OTHER_LLM_TIMEOUT_SECONDS", 1.2, 0.2),
+        llm_super_agent_min_interval_seconds=_float_env("POLYBOT2OTHER_LLM_MIN_INTERVAL_SECONDS", 12.0, 1.0),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
         data_api_url=os.environ.get("POLYBOT2OTHER_DATA_API_URL", "https://data-api.polymarket.com"),

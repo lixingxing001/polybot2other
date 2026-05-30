@@ -579,6 +579,89 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertIsNone(recent[0]["final_price"])
 
+    def test_llm_decision_review_estimates_no_trade_and_attributes_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-llm-review",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 240,
+                target_price=100.0,
+            )
+            features = {
+                "round_id": market.round_id,
+                "direction_side": "Up",
+                "time_left_seconds": 80,
+                "signed_distance_bps": 12.5,
+                "up": {"ask": 0.4},
+                "down": {"ask": 0.62},
+            }
+            store.upsert_round(market)
+            store.record_llm_decision(
+                round_id=market.round_id,
+                variant_id="LLM_SUPER_AGENT_PAPER",
+                decision={
+                    "route": "NO_TRADE",
+                    "allow_trade": False,
+                    "confidence": 0.9,
+                    "market_regime": "NEAR_TARGET_NOISY",
+                    "source": "llm",
+                    "reason": "wait",
+                    "reason_codes": ["NEAR_TARGET"],
+                    "valid_until": now + 20,
+                },
+                features=features,
+                created_at=now,
+            )
+            store.record_llm_decision(
+                round_id=market.round_id,
+                variant_id="LLM_SUPER_AGENT_PAPER",
+                decision={
+                    "route": "SINGLE_FAK",
+                    "allow_trade": True,
+                    "confidence": 0.8,
+                    "market_regime": "TREND",
+                    "source": "llm",
+                    "reason": "enter",
+                    "reason_codes": ["EDGE_OK"],
+                    "valid_until": now + 20,
+                },
+                features=features,
+                created_at=now + 0.1,
+            )
+            signal = Signal(
+                "BTC",
+                "Up",
+                0.8,
+                0.5,
+                12.5,
+                "LLM_SUPER_AGENT route SINGLE_FAK, source llm, regime TREND, conf 0.8, allow True, codes EDGE_OK",
+            )
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.settle_round_outcome(market.round_id, "Up", now + 20)
+
+            review = store.llm_decision_review(
+                limit=10,
+                opportunity_stake=5.0,
+                variant_id="LLM_SUPER_AGENT_PAPER",
+            )
+
+            self.assertEqual(review["status"], "READY")
+            self.assertEqual(review["summary"]["decision_count"], 2)
+            self.assertEqual(review["summary"]["settled_trade_count"], 1)
+            self.assertAlmostEqual(review["summary"]["total_pnl"], 5.0, places=6)
+            self.assertAlmostEqual(review["summary"]["no_trade_direction_estimated_pnl"], 7.5, places=6)
+            routes = {row["key"]: row for row in review["route_stats"]}
+            self.assertAlmostEqual(routes["SINGLE_FAK"]["total_pnl"], 5.0, places=6)
+            self.assertAlmostEqual(routes["NO_TRADE"]["no_trade_direction_estimated_pnl"], 7.5, places=6)
+            reasons = {row["key"]: row for row in review["reason_stats"]}
+            self.assertAlmostEqual(reasons["NEAR_TARGET"]["no_trade_direction_estimated_pnl"], 7.5, places=6)
+            self.assertEqual(review["recent_decisions"][0]["route"], "SINGLE_FAK")
+            self.assertEqual(review["recent_decisions"][0]["matched_settled_trade_count"], 1)
+
     def test_chainlink_fallback_settlement_records_source_and_final_price(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3")
@@ -594,8 +677,42 @@ class TradingCoreTest(unittest.TestCase):
             store.upsert_round(market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "chainlink fallback")
             store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
 
             settled = store.settle_due_rounds({"BTC": 99.5}, now)
+
+            self.assertEqual(len(settled), 1)
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["outcome"], "Down")
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_CHAINLINK)
+            self.assertAlmostEqual(recent[0]["final_price"], 99.5, places=6)
+
+    def test_chainlink_fallback_settlement_uses_end_time_tick_not_late_latest_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-chainlink-stale",
+                symbol="BTC",
+                started_at=now - 360,
+                ends_at=now - 70,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "stale chainlink fallback")
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 101.0, "test-chainlink", now)
+
+            self.assertEqual(store.settle_due_rounds({"BTC": 101.0}, now), [])
+            self.assertEqual(len(store.open_trades()), 1)
+            row = store.conn.execute("SELECT settled_at, outcome, final_price FROM market_rounds WHERE round_id = ?", (market.round_id,)).fetchone()
+            self.assertIsNone(row["settled_at"])
+            self.assertIsNone(row["outcome"])
+            self.assertIsNone(row["final_price"])
+
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at + 2.0)
+            settled = store.settle_due_rounds({"BTC": 101.0}, now + 1)
 
             self.assertEqual(len(settled), 1)
             recent = store.recent_trades(1)
@@ -618,6 +735,7 @@ class TradingCoreTest(unittest.TestCase):
             store.upsert_round(market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "official match")
             store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
             before = store.account()
 
@@ -650,6 +768,7 @@ class TradingCoreTest(unittest.TestCase):
             store.upsert_round(market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "official mismatch")
             store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
             self.assertAlmostEqual(store.account()["cash_balance"], 105.0, places=6)
             self.assertAlmostEqual(store.account()["realized_pnl"], 5.0, places=6)
@@ -688,6 +807,7 @@ class TradingCoreTest(unittest.TestCase):
             store.upsert_round(market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "bot official recheck")
             store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
             bot.polymarket.get_resolution = lambda slug: {"outcome": "Up"} if slug == market.round_id else None
 
@@ -719,11 +839,13 @@ class TradingCoreTest(unittest.TestCase):
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "official broadcast")
             store.upsert_round(market)
             store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
 
             variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
             variant_bot.store.upsert_round(market)
             variant_bot.store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            variant_bot.store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             variant_bot.store.settle_due_rounds({"BTC": 99.5}, now)
             bot.polymarket.get_resolution = (
                 lambda slug: {"outcome": "Up", "final_price": 101.0, "target_price": 100.0}
@@ -1500,6 +1622,122 @@ class TradingCoreTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bot.orders_page(status_filter="bad-status")
 
+    def test_paper_pause_cancels_active_orders_and_blocks_new_paper_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="POST_ONLY", stake_dollars=5.0)
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-paper-pause-main",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.33,
+                        "best_ask": 0.35,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.35, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.34,
+                        "best_ask": 0.36,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.36, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+            bot._maybe_place_trade(market, Signal("BTC", "Up", 0.7, 0.35, 10.0, "paper pause setup"))
+            self.assertEqual(len(store.active_paper_orders("BTC")), 1)
+
+            payload = bot.set_paper_trading_paused(True)
+
+            self.assertTrue(payload["paper_trading"]["paused"])
+            self.assertEqual(payload["paper_trading"]["main_cancel"]["canceled_count"], 1)
+            self.assertEqual(store.active_paper_orders("BTC"), [])
+            canceled_page = bot.orders_page(status_filter="canceled")
+            self.assertEqual(canceled_page["recent_orders_meta"]["total"], 1)
+            self.assertIn("PAPER_PAUSED", canceled_page["recent_orders"][0]["reason"])
+
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.36, -10.0, "blocked while paused"))
+
+            self.assertEqual(store.active_paper_orders("BTC"), [])
+            self.assertEqual(bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 1)
+            self.assertIn("PAPER_PAUSED", bot.snapshot()["runtime"]["last_signal"]["reason"])
+
+            bot.set_paper_trading_paused(False)
+            bot._maybe_place_trade(market, Signal("BTC", "Down", 0.7, 0.36, -10.0, "after resume"))
+
+            self.assertEqual(len(store.active_paper_orders("BTC")), 1)
+            self.assertEqual(bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 2)
+
+    def test_paper_pause_propagates_to_strategy_experiment_bots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                strategy_experiments_variants="SINGLE_POST_ONLY",
+                stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-paper-pause-experiment",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+            quotes = {
+                "Up": {
+                    "best_bid": 0.33,
+                    "best_ask": 0.35,
+                    "bid_size": 100,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.35, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+                "Down": {
+                    "best_bid": 0.34,
+                    "best_ask": 0.36,
+                    "bid_size": 100,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.36, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+            }
+            bot.strategy_experiments.run_from_state(market, price, quotes)
+            variant_bot = bot.strategy_experiments._bots["SINGLE_POST_ONLY"]
+            self.assertEqual(len(variant_bot.store.active_paper_orders("BTC")), 1)
+
+            payload = bot.set_paper_trading_paused(True)
+
+            self.assertTrue(payload["paper_trading"]["paused"])
+            self.assertEqual(
+                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["SINGLE_POST_ONLY"]["canceled_count"],
+                1,
+            )
+            self.assertTrue(variant_bot.paper_trading_runtime()["paused"])
+            self.assertEqual(variant_bot.store.active_paper_orders("BTC"), [])
+
+            bot.strategy_experiments.run_from_state(market, price, quotes)
+
+            self.assertEqual(variant_bot.store.active_paper_orders("BTC"), [])
+            self.assertEqual(variant_bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 1)
+            self.assertIn("PAPER_PAUSED", variant_bot.snapshot()["runtime"]["last_signal"]["reason"])
+
     def test_post_only_rests_reserves_cash_and_later_fills_as_maker_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="POST_ONLY", stake_dollars=5.0)
@@ -1998,7 +2236,12 @@ class TradingCoreTest(unittest.TestCase):
 
     def test_pair_strategy_does_not_open_without_official_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            settings = Settings(db_path=Path(tmp) / "test.sqlite3", max_open_trades=2, stake_dollars=5.0)
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=2,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
             now = time.time()
@@ -2014,8 +2257,20 @@ class TradingCoreTest(unittest.TestCase):
                 bot.current_market = market
                 bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
                 bot.latest_quotes = {
-                    "Up": {"best_bid": 0.39, "best_ask": 0.4, "ask_size": 100, "updated_at_ms": int(now * 1000)},
-                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "ask_size": 100, "updated_at_ms": int(now * 1000)},
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
                 }
             bot.set_pair_strategy_enabled(True)
 
@@ -2085,6 +2340,8 @@ class TradingCoreTest(unittest.TestCase):
                 "SINGLE + GTC",
                 "SINGLE + GTD",
                 "SINGLE + POST_ONLY",
+                "REALTIME MAKER + POST_ONLY MULTI_LEAD",
+                "LLM SUPER AGENT + PAPER",
                 "PAIR + FAK",
                 "PAIR + FAK MULTI_CONFIRM",
                 "PAIR + FAK MULTI_LEAD",
@@ -2100,6 +2357,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "test.sqlite3",
                 max_open_trades=2,
                 stake_dollars=5.0,
+                max_quote_age_ms=60_000,
                 paper_entry_order_type="GTD",
                 paper_gtd_seconds=60.0,
             )
@@ -2144,7 +2402,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(all(row["status"] == "RESTING" for row in active_orders))
             self.assertTrue(all("PAIR_OPEN_RESTING GTD" in row["reason"] for row in active_orders))
             self.assertAlmostEqual(sum(row["requested_cash"] for row in active_orders), 5.0, places=5)
-            self.assertLessEqual(active_orders[0]["expires_at"], now + 61.0)
+            self.assertLessEqual(active_orders[0]["expires_at"], float(active_orders[0]["created_at"]) + 61.0)
             self.assertEqual(bot.last_signal["side"], "PAIR_RESTING")
 
             bot._run_strategy_from_state()
@@ -2201,6 +2459,291 @@ class TradingCoreTest(unittest.TestCase):
             self.assertLess(active_orders[1]["limit_price"], 0.4)
             self.assertEqual(store.open_trades(), [])
 
+    def test_realtime_maker_places_post_only_and_exits_on_profit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=1,
+                stake_dollars=5.0,
+                max_quote_age_ms=3000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.realtime_maker_enabled = True
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-realtime-maker",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": int(now * 1000),
+                    "realtime_probability": {"combined_up": 0.65, "updated_at_ms": int(now * 1000)},
+                    "actor_probability": {"combined_up": 0.62, "checked_at": now, "status": "READY"},
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.53,
+                        "best_ask": 0.55,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.55, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.44,
+                        "best_ask": 0.46,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.46, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            active_orders = store.active_paper_orders("BTC", market.round_id)
+            self.assertEqual(len(active_orders), 1)
+            order = active_orders[0]
+            self.assertEqual(order["side"], "Up")
+            self.assertEqual(order["order_type"], "POST_ONLY")
+            self.assertEqual(order["post_only"], 1)
+            self.assertIn("REALTIME_MAKER_PAPER", order["reason"])
+
+            limit_price = float(order["limit_price"])
+            cash_spent = float(order["remaining_cash"])
+            shares = round(cash_spent / limit_price, 6)
+            filled = store.fill_resting_order(
+                order,
+                fill_price=limit_price,
+                shares=shares,
+                notional=round(shares * limit_price, 6),
+                fee=0.0,
+                cash_spent=round(shares * limit_price, 6),
+                level_price=limit_price,
+                reason="test maker fill",
+                now=now + 10,
+            )
+            self.assertIsNotNone(filled)
+            self.assertEqual(len(store.open_trades()), 1)
+
+            with bot._lock:
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": int((now + 12) * 1000),
+                    "realtime_probability": {"combined_up": 0.60, "updated_at_ms": int((now + 12) * 1000)},
+                    "actor_probability": {"combined_up": 0.60, "checked_at": now + 12, "status": "READY"},
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.595,
+                        "best_ask": 0.61,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.61, "size": 100}],
+                        "updated_at_ms": int((now + 12) * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.41,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.41, "size": 100}],
+                        "updated_at_ms": int((now + 12) * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["status"], "SETTLED")
+            self.assertGreater(recent[0]["pnl"], 0)
+            self.assertIn("REALTIME_MAKER_PAPER_EXIT Up TAKE_PROFIT", recent[0]["reason"])
+
+    def test_realtime_maker_keeps_young_order_when_edge_temporarily_decays(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=1,
+                stake_dollars=5.0,
+                max_quote_age_ms=3000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.realtime_maker_enabled = True
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-realtime-maker-grace",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": int(now * 1000),
+                    "realtime_probability": {"combined_up": 0.65, "updated_at_ms": int(now * 1000)},
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.53,
+                        "best_ask": 0.70,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.70, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.29,
+                        "best_ask": 0.31,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.31, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+            order = store.active_paper_orders("BTC", market.round_id)[0]
+            order_id = int(order["id"])
+            limit_price = float(order["limit_price"])
+
+            mild_edge_decay_fair = round(limit_price + 0.005, 4)
+            with bot._lock:
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": int(time.time() * 1000),
+                    "realtime_probability": {
+                        "combined_up": mild_edge_decay_fair,
+                        "updated_at_ms": int(time.time() * 1000),
+                    },
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.52,
+                        "best_ask": 0.70,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.70, "size": 100}],
+                        "updated_at_ms": int(time.time() * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.29,
+                        "best_ask": 0.31,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.31, "size": 100}],
+                        "updated_at_ms": int(time.time() * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+            active_orders = store.active_paper_orders("BTC", market.round_id)
+            self.assertEqual([int(row["id"]) for row in active_orders], [order_id])
+
+            old_created_at = time.time() - 20.0
+            with store.conn:
+                store.conn.execute(
+                    "UPDATE paper_orders SET created_at = ?, updated_at = ?, expires_at = ? WHERE id = ?",
+                    (old_created_at, old_created_at, time.time() + 60.0, order_id),
+                )
+
+            bot._run_strategy_from_state()
+            row = store.conn.execute("SELECT status, reason FROM paper_orders WHERE id = ?", (order_id,)).fetchone()
+            self.assertEqual(row["status"], STATUS_CANCELED)
+            self.assertIn("edge decayed", row["reason"])
+
+    def test_llm_super_agent_paper_uses_local_router_and_records_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                max_open_trades=2,
+                stake_dollars=5.0,
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                llm_super_agent_api_key="",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.llm_super_agent_enabled = True
+            bot.llm_super_agent_variant_id = "LLM_SUPER_AGENT_PAPER"
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-llm-super-agent",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(bot.last_signal["side"], "PAIR_OPEN")
+            self.assertIn("LLM_SUPER_AGENT route PAIR_FAK", bot.last_signal["reason"])
+            self.assertEqual(len(store.open_trades()), 2)
+            orders = store.recent_paper_orders(10, 0, "BTC")
+            self.assertEqual(len([row for row in orders if row["status"] == STATUS_FILLED]), 2)
+            decisions = store.recent_llm_decisions(5)
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions[0]["variant_id"], "LLM_SUPER_AGENT_PAPER")
+            self.assertEqual(decisions[0]["route"], "PAIR_FAK")
+            self.assertEqual(decisions[0]["allow_trade"], 1)
+            self.assertIn("pair_cost", decisions[0]["features_json"])
+
+    def test_snapshot_exposes_llm_status_without_secret_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = "haoai-secret-for-test"
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                llm_super_agent_api_key=secret,
+                llm_super_agent_base_url="https://api.hao.ai/v1",
+                llm_super_agent_model="openai/gpt-5.4-mini",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+
+            snapshot = bot.snapshot()
+            llm_status = snapshot["settings"]["llm_super_agent"]
+
+            self.assertTrue(llm_status["enabled"])
+            self.assertTrue(llm_status["api_key_present"])
+            self.assertEqual(llm_status["base_url"], "https://api.hao.ai/v1")
+            self.assertEqual(llm_status["model"], "openai/gpt-5.4-mini")
+            self.assertNotIn(secret, str(snapshot))
+
     def test_strategy_experiments_run_all_variants_in_isolated_stores(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
@@ -2250,7 +2793,7 @@ class TradingCoreTest(unittest.TestCase):
 
             snapshot = bot.strategy_experiments_snapshot()
             variants = {row["variant_id"]: row for row in snapshot["variants"]}
-            self.assertEqual(len(variants), 18)
+            self.assertEqual(len(variants), 20)
             self.assertEqual(snapshot["run_count"], 1)
             self.assertIn("profit_summary", snapshot)
             self.assertEqual(snapshot["profit_summary"]["status"], "WAITING_FOR_SAMPLE")
@@ -2258,7 +2801,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertFalse(snapshot["decision_summary"]["comparison_ready"])
             self.assertEqual(snapshot["decision_summary"]["status"], "WAITING_FOR_SAMPLE")
             self.assertEqual(snapshot["decision_summary"]["ready_count"], 0)
-            self.assertEqual(snapshot["decision_summary"]["total_count"], 18)
+            self.assertEqual(snapshot["decision_summary"]["total_count"], 20)
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
@@ -2280,6 +2823,13 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIn("当前有新鲜 Chainlink", variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["reason"])
             self.assertEqual(variants["SINGLE_FAK_MULTI_CONFIRM"]["market_data_mode"], "MULTI_CONFIRM")
             self.assertEqual(variants["SINGLE_FAK_MULTI_LEAD"]["market_data_mode"], "MULTI_LEAD")
+            self.assertEqual(variants["REALTIME_MAKER_POST_ONLY"]["strategy_family"], "REALTIME_MAKER")
+            self.assertEqual(variants["REALTIME_MAKER_POST_ONLY"]["order_summary"]["active_count"], 1)
+            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["strategy_family"], "LLM_SUPER_AGENT")
+            self.assertTrue(variants["LLM_SUPER_AGENT_PAPER"]["llm_super_agent_enabled"])
+            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["metrics"]["open_trades"], 2)
+            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["order_summary"]["filled_count"], 2)
+            self.assertTrue(variants["LLM_SUPER_AGENT_PAPER"]["recent_llm_decisions"])
             self.assertEqual(variants["PAIR_FAK"]["metrics"]["open_trades"], 2)
             self.assertEqual(variants["PAIR_GTD"]["active_orders"], 2)
             self.assertEqual(variants["PAIR_POST_ONLY"]["active_orders"], 2)
@@ -2297,8 +2847,8 @@ class TradingCoreTest(unittest.TestCase):
 
             retrospective = bot.strategy_experiments_retrospective()
             self.assertTrue(retrospective["enabled"])
-            self.assertEqual(len(retrospective["variants"]), 18)
-            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 18)
+            self.assertEqual(len(retrospective["variants"]), 20)
+            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 20)
             self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
 
             tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)
@@ -6480,6 +7030,76 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(response.filled_shares, 4.0)
             self.assertAlmostEqual(response.avg_fill_price, 0.5)
 
+    def test_live_order_response_parses_decimal_cash_and_integer_shares(self) -> None:
+        class FakePostingClient:
+            def post_order(self, order, order_type):
+                return {
+                    "success": True,
+                    "status": "matched",
+                    "orderID": "official-decimal-amounts",
+                    "makingAmount": "1.95",
+                    "takingAmount": "3",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+            )
+            live_client = PolymarketLiveClient(settings)
+            sdk = {"OrderType": type("OrderType", (), {"FAK": "FAK"})}
+
+            response = live_client._post_signed_order_with_retry(
+                FakePostingClient(),
+                sdk,
+                object(),
+                "BUY",
+                retry_count=0,
+                retry_delay_ms=0,
+            )
+
+            self.assertTrue(response.success)
+            self.assertEqual(response.order_id, "official-decimal-amounts")
+            self.assertAlmostEqual(response.cash_spent, 1.95)
+            self.assertAlmostEqual(response.filled_shares, 3.0)
+            self.assertAlmostEqual(response.avg_fill_price, 0.65)
+
+    def test_live_order_response_parses_sell_decimal_cash_and_integer_shares(self) -> None:
+        class FakePostingClient:
+            def post_order(self, order, order_type):
+                return {
+                    "success": True,
+                    "status": "matched",
+                    "orderID": "official-sell-decimal-amounts",
+                    "makingAmount": "3",
+                    "takingAmount": "1.2",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+            )
+            live_client = PolymarketLiveClient(settings)
+            sdk = {"OrderType": type("OrderType", (), {"FAK": "FAK"})}
+
+            response = live_client._post_signed_order_with_retry(
+                FakePostingClient(),
+                sdk,
+                object(),
+                "SELL",
+                retry_count=0,
+                retry_delay_ms=0,
+            )
+
+            self.assertTrue(response.success)
+            self.assertEqual(response.order_id, "official-sell-decimal-amounts")
+            self.assertAlmostEqual(response.cash_spent, 1.2)
+            self.assertAlmostEqual(response.filled_shares, 3.0)
+            self.assertAlmostEqual(response.avg_fill_price, 0.4)
+
     def test_live_terminal_no_fill_classifies_invalid_as_rejected(self) -> None:
         self.assertEqual(
             _response_terminal_no_fill_local_status(
@@ -6558,6 +7178,57 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(live_client.fake_client.params.asset_type, "COLLATERAL")
             self.assertEqual(live_client.fake_client.params.signature_type, 3)
             self.assertEqual(live_client.fake_client.update_params.asset_type, "COLLATERAL")
+
+    def test_live_wallet_state_accepts_allowances_map_without_top_level_allowance(self) -> None:
+        class FakeBalanceParams:
+            def __init__(self, asset_type=None, signature_type=-1, **_kwargs) -> None:
+                self.asset_type = asset_type
+                self.signature_type = signature_type
+
+        class FakeAssetType:
+            COLLATERAL = "COLLATERAL"
+
+        class FakeSdkClient:
+            def update_balance_allowance(self, params):
+                return {"synced": True}
+
+            def get_balance_allowance(self, params):
+                return {
+                    "balance": "2379349",
+                    "allowances": {
+                        "0xE111180000d2663C0091e4f400237545B87B996B": (
+                            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                        ),
+                        "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296": "0",
+                    },
+                }
+
+        class WalletClient(PolymarketLiveClient):
+            def __init__(self, settings) -> None:
+                super().__init__(settings)
+                self.fake_client = FakeSdkClient()
+
+            def _sdk(self):
+                return {"BalanceAllowanceParams": FakeBalanceParams, "AssetType": FakeAssetType}
+
+            def _authenticated_client(self, sdk):
+                return self.fake_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+            )
+            live_client = WalletClient(settings)
+
+            with patch.dict("os.environ", {"POLYBOT2OTHER_LIVE_SIGNATURE_TYPE": "1"}, clear=False):
+                state = live_client.wallet_state(required_cash=1.0, force=True)
+
+            self.assertTrue(state["ready"])
+            self.assertAlmostEqual(state["balance"], 2.379349)
+            self.assertGreater(state["allowance"], 1.0)
+            self.assertEqual(state["errors"], [])
 
     def test_live_wallet_state_retries_balance_allowance_read(self) -> None:
         class FakeBalanceParams:
@@ -6952,6 +7623,9 @@ class TradingCoreTest(unittest.TestCase):
 
             def wallet_state(self, **kwargs):
                 return {"ready": True, "errors": [], "balance": 10.0, "allowance": 10.0}
+
+            def geoblock_state(self, **kwargs):
+                return {"ready": True, "blocked": False, "country": "KR", "region": "11", "errors": []}
 
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / ".env.live"

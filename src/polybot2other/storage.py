@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -10,11 +11,12 @@ from typing import Any, Callable
 from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
 PAPER_MIN_OPEN_TRADE_STAKE = 0.01
+CHAINLINK_FALLBACK_SETTLEMENT_MAX_AGE_SECONDS = 5.0
 SETTLEMENT_SOURCE_POLYMARKET = "polymarket_official"
 SETTLEMENT_SOURCE_CHAINLINK = "chainlink_fallback"
 SETTLEMENT_SOURCE_EARLY_EXIT = "early_exit"
@@ -192,6 +194,27 @@ class TradeStore:
                 total_equity REAL NOT NULL,
                 created_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS llm_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id TEXT NOT NULL,
+                variant_id TEXT NOT NULL,
+                route TEXT NOT NULL,
+                allow_trade INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                market_regime TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                features_json TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                error TEXT,
+                valid_until REAL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_llm_decisions_round_created
+                ON llm_decisions(round_id, created_at DESC);
             """
         )
         self.conn.execute(
@@ -247,6 +270,256 @@ class TradeStore:
             (symbol, price, source, created_at),
         )
         self.conn.commit()
+
+    @_locked
+    def record_llm_decision(
+        self,
+        *,
+        round_id: str,
+        variant_id: str,
+        decision: dict[str, Any],
+        features: dict[str, Any],
+        created_at: float | None = None,
+    ) -> int:
+        now = time.time() if created_at is None else float(created_at)
+        response = decision.get("raw_response") if isinstance(decision.get("raw_response"), dict) else {}
+        cur = self.conn.execute(
+            """
+            INSERT INTO llm_decisions(
+                round_id, variant_id, route, allow_trade, confidence, market_regime,
+                source, reason, reason_codes_json, features_json, response_json,
+                error, valid_until, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(round_id),
+                str(variant_id),
+                str(decision.get("route") or ""),
+                1 if decision.get("allow_trade") else 0,
+                float(decision.get("confidence") or 0.0),
+                str(decision.get("market_regime") or ""),
+                str(decision.get("source") or ""),
+                str(decision.get("reason") or ""),
+                json.dumps(decision.get("reason_codes") or [], ensure_ascii=False, sort_keys=True),
+                json.dumps(features, ensure_ascii=False, sort_keys=True),
+                json.dumps(response, ensure_ascii=False, sort_keys=True),
+                decision.get("error"),
+                decision.get("valid_until"),
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    @_locked
+    def recent_llm_decisions(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(500, int(limit)))
+        rows = self.conn.execute(
+            """
+            SELECT *
+            FROM llm_decisions
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def llm_decision_review(
+        self,
+        *,
+        limit: int = 80,
+        opportunity_stake: float = 5.0,
+        variant_id: str | None = None,
+    ) -> dict[str, Any]:
+        limit = max(1, min(300, int(limit)))
+        sample_limit = max(limit, 500)
+        sample_limit = min(sample_limit, 5_000)
+        variant_filter = str(variant_id or "").strip()
+        where = "WHERE d.variant_id = ?" if variant_filter else ""
+        params: tuple[Any, ...] = (variant_filter,) if variant_filter else ()
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) AS count FROM llm_decisions d {where}",
+            params,
+        ).fetchone()
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                d.id,
+                d.round_id,
+                d.variant_id,
+                d.route,
+                d.allow_trade,
+                d.confidence,
+                d.market_regime,
+                d.source,
+                d.reason,
+                d.reason_codes_json,
+                d.features_json,
+                d.response_json,
+                d.error,
+                d.valid_until,
+                d.created_at,
+                r.outcome,
+                r.final_price,
+                r.target_price,
+                r.settled_at AS round_settled_at,
+                r.settlement_source AS market_settlement_source
+            FROM llm_decisions d
+            LEFT JOIN market_rounds r ON r.round_id = d.round_id
+            {where}
+            ORDER BY d.created_at DESC, d.id DESC
+            LIMIT ?
+            """,
+            (*params, sample_limit),
+        ).fetchall()
+        total_decision_count = int(total_row["count"] or 0) if total_row else 0
+        if not rows:
+            return {
+                "status": "EMPTY",
+                "generated_at": time.time(),
+                "variant_id": variant_filter or None,
+                "total_decision_count": total_decision_count,
+                "sample_limit": sample_limit,
+                "summary": _empty_llm_review_summary(total_decision_count, sample_limit),
+                "route_stats": [],
+                "reason_stats": [],
+                "recent_decisions": [],
+                "attribution_note": _llm_review_attribution_note(),
+            }
+
+        stake = max(0.0, float(opportunity_stake or 0.0))
+        decisions: list[dict[str, Any]] = []
+        decisions_by_round: dict[str, list[dict[str, Any]]] = {}
+        summary = _empty_llm_review_summary(total_decision_count, sample_limit)
+        route_stats: dict[str, dict[str, Any]] = {}
+        reason_stats: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            item = dict(row)
+            decision_id = int(item["id"])
+            route = str(item.get("route") or "UNKNOWN")
+            source = str(item.get("source") or "")
+            reason_codes = _json_list(item.get("reason_codes_json"))
+            if not reason_codes:
+                reason_codes = ["NO_CODE"]
+            features = _json_dict(item.get("features_json"))
+            allow_trade = bool(item.get("allow_trade"))
+            error_text = str(item.get("error") or "")
+            direction_side = _normalize_side(str(features.get("direction_side") or ""))
+            outcome = _normalize_side(str(item.get("outcome") or ""))
+            side_ask = _llm_feature_side_ask(features, direction_side)
+            opposite_ask = _llm_feature_side_ask(features, "Down" if direction_side == "Up" else "Up")
+            no_trade_estimate = (
+                _llm_no_trade_estimate(features, outcome, stake)
+                if route == "NO_TRADE"
+                else None
+            )
+            enriched = {
+                "id": decision_id,
+                "round_id": item.get("round_id"),
+                "variant_id": item.get("variant_id"),
+                "route": route,
+                "allow_trade": allow_trade,
+                "confidence": round(float(item.get("confidence") or 0.0), 6),
+                "market_regime": item.get("market_regime"),
+                "source": source,
+                "reason": item.get("reason"),
+                "reason_codes": reason_codes,
+                "error": item.get("error"),
+                "valid_until": item.get("valid_until"),
+                "created_at": item.get("created_at"),
+                "outcome": outcome or None,
+                "final_price": item.get("final_price"),
+                "target_price": item.get("target_price"),
+                "round_settled_at": item.get("round_settled_at"),
+                "settlement_source": item.get("market_settlement_source"),
+                "feature_direction_side": direction_side or None,
+                "feature_time_left_seconds": _maybe_float(features.get("time_left_seconds")),
+                "feature_distance_bps": _maybe_float(features.get("signed_distance_bps")),
+                "feature_side_ask": side_ask,
+                "feature_opposite_ask": opposite_ask,
+                "matched_trade_count": 0,
+                "matched_settled_trade_count": 0,
+                "matched_trade_pnl": 0.0,
+                "no_trade_estimate": no_trade_estimate,
+            }
+            decisions.append(enriched)
+            decisions_by_round.setdefault(str(enriched["round_id"] or ""), []).append(enriched)
+
+            _llm_review_add_decision(summary, allow_trade, source, error_text, route)
+            route_bucket = route_stats.setdefault(route, _llm_review_bucket(route))
+            _llm_review_add_decision(route_bucket, allow_trade, source, error_text, route)
+            for code in reason_codes:
+                reason_bucket = reason_stats.setdefault(code, _llm_review_bucket(code))
+                _llm_review_add_decision(reason_bucket, allow_trade, source, error_text, route)
+            if no_trade_estimate:
+                _llm_review_add_no_trade_estimate(summary, no_trade_estimate)
+                _llm_review_add_no_trade_estimate(route_bucket, no_trade_estimate)
+                for code in reason_codes:
+                    _llm_review_add_no_trade_estimate(reason_stats[code], no_trade_estimate)
+
+        for round_decisions in decisions_by_round.values():
+            round_decisions.sort(key=lambda item: (float(item.get("created_at") or 0.0), int(item.get("id") or 0)))
+
+        round_ids = [round_id for round_id in decisions_by_round if round_id]
+        if round_ids:
+            placeholders = ",".join("?" for _ in round_ids)
+            trade_rows = self.conn.execute(
+                f"""
+                SELECT id, round_id, side, stake, entry_price, shares, status, opened_at,
+                       settled_at, pnl, reason
+                FROM trades
+                WHERE round_id IN ({placeholders})
+                ORDER BY opened_at ASC, id ASC
+                """,
+                tuple(round_ids),
+            ).fetchall()
+            for trade_row in trade_rows:
+                trade = dict(trade_row)
+                matched = _match_llm_decision_for_trade(trade, decisions_by_round.get(str(trade.get("round_id") or ""), []))
+                if matched is None:
+                    continue
+                _llm_review_add_trade(summary, trade)
+                _llm_review_add_trade(route_stats.setdefault(str(matched["route"]), _llm_review_bucket(str(matched["route"]))), trade)
+                for code in matched.get("reason_codes") or ["NO_CODE"]:
+                    _llm_review_add_trade(reason_stats.setdefault(str(code), _llm_review_bucket(str(code))), trade)
+                matched["matched_trade_count"] = int(matched.get("matched_trade_count") or 0) + 1
+                if str(trade.get("status") or "").upper() == "SETTLED":
+                    matched["matched_settled_trade_count"] = int(matched.get("matched_settled_trade_count") or 0) + 1
+                    matched["matched_trade_pnl"] = round(
+                        float(matched.get("matched_trade_pnl") or 0.0) + float(trade.get("pnl") or 0.0),
+                        6,
+                    )
+
+        finalized_routes = [_finalize_llm_review_bucket(row) for row in route_stats.values()]
+        finalized_reasons = [_finalize_llm_review_bucket(row) for row in reason_stats.values()]
+        recent_decisions = []
+        for item in decisions[:limit]:
+            row = dict(item)
+            row["matched_trade_pnl"] = round(float(row.get("matched_trade_pnl") or 0.0), 6)
+            recent_decisions.append(row)
+        return {
+            "status": "READY",
+            "generated_at": time.time(),
+            "variant_id": variant_filter or (str(decisions[0].get("variant_id") or "") or None),
+            "total_decision_count": total_decision_count,
+            "sample_limit": sample_limit,
+            "summary": _finalize_llm_review_bucket(summary),
+            "route_stats": sorted(
+                finalized_routes,
+                key=lambda item: (int(item.get("decision_count") or 0), float(item.get("total_pnl") or 0.0)),
+                reverse=True,
+            ),
+            "reason_stats": sorted(
+                finalized_reasons,
+                key=lambda item: (int(item.get("decision_count") or 0), float(item.get("total_pnl") or 0.0)),
+                reverse=True,
+            )[:80],
+            "recent_decisions": recent_decisions,
+            "attribution_note": _llm_review_attribution_note(),
+        }
 
     @_locked
     def recent_prices(self, symbol: str, limit: int) -> list[dict[str, Any]]:
@@ -1420,9 +1693,12 @@ class TradeStore:
         settled: list[dict[str, Any]] = []
         for row in rows:
             symbol = row["symbol"]
-            final_price = prices.get(symbol)
-            if final_price is None:
+            if prices.get(symbol) is None:
                 continue
+            settlement_tick = self._chainlink_settlement_tick(symbol, float(row["ends_at"]))
+            if settlement_tick is None:
+                continue
+            final_price = float(settlement_tick["price"])
             outcome = "Up" if final_price >= row["target_price"] else "Down"
             settled.extend(
                 self._settle_round(
@@ -1437,6 +1713,36 @@ class TradeStore:
         if settled:
             self.record_equity()
         return settled
+
+    def _chainlink_settlement_tick(self, symbol: str, ends_at: float) -> dict[str, Any] | None:
+        max_age = CHAINLINK_FALLBACK_SETTLEMENT_MAX_AGE_SECONDS
+        row = self.conn.execute(
+            """
+            SELECT
+                price,
+                source,
+                created_at,
+                ABS(created_at - ?) AS distance_seconds
+            FROM price_ticks
+            WHERE symbol = ?
+              AND LOWER(source) LIKE '%chainlink%'
+              AND created_at BETWEEN ? AND ?
+            ORDER BY distance_seconds ASC, created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (ends_at, symbol, ends_at - max_age, ends_at + max_age),
+        ).fetchone()
+        if row is None:
+            return None
+        price = _maybe_float(row["price"])
+        if price is None:
+            return None
+        return {
+            "price": price,
+            "source": row["source"],
+            "created_at": float(row["created_at"]),
+            "distance_seconds": round(float(row["distance_seconds"] or 0.0), 6),
+        }
 
     @_locked
     def settle_round_outcome(
@@ -2731,6 +3037,241 @@ def _positive_price_or_none(value: float | None) -> float | None:
     if parsed is None or parsed <= 0:
         return None
     return float(parsed)
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item or "").strip()]
+    if not value:
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if str(item or "").strip()]
+
+
+def _llm_review_attribution_note() -> str:
+    return (
+        "trades are attributed to the latest same-round LLM trade route near trade open time; "
+        "NO_TRADE opportunity is an estimate from recorded decision-time quotes, not a real fill."
+    )
+
+
+def _empty_llm_review_summary(total_decision_count: int, sample_limit: int) -> dict[str, Any]:
+    summary = _llm_review_bucket("summary")
+    summary.update(
+        {
+            "total_decision_count": int(total_decision_count or 0),
+            "sample_limit": int(sample_limit or 0),
+            "decision_count": 0,
+        }
+    )
+    return summary
+
+
+def _llm_review_bucket(key: str) -> dict[str, Any]:
+    return {
+        "key": str(key or "UNKNOWN"),
+        "decision_count": 0,
+        "allow_count": 0,
+        "block_count": 0,
+        "no_trade_count": 0,
+        "llm_source_count": 0,
+        "local_source_count": 0,
+        "error_count": 0,
+        "trade_count": 0,
+        "settled_trade_count": 0,
+        "open_trade_count": 0,
+        "total_stake": 0.0,
+        "total_pnl": 0.0,
+        "avg_pnl": None,
+        "win_count": 0,
+        "loss_count": 0,
+        "no_trade_evaluated_count": 0,
+        "no_trade_direction_win_count": 0,
+        "no_trade_direction_estimated_pnl": 0.0,
+        "no_trade_best_estimated_pnl": 0.0,
+    }
+
+
+def _llm_review_add_decision(
+    bucket: dict[str, Any],
+    allow_trade: bool,
+    source: str,
+    error_text: str,
+    route: str,
+) -> None:
+    bucket["decision_count"] = int(bucket.get("decision_count") or 0) + 1
+    if allow_trade:
+        bucket["allow_count"] = int(bucket.get("allow_count") or 0) + 1
+    else:
+        bucket["block_count"] = int(bucket.get("block_count") or 0) + 1
+    if str(route or "").upper() == "NO_TRADE":
+        bucket["no_trade_count"] = int(bucket.get("no_trade_count") or 0) + 1
+    normalized_source = str(source or "").lower()
+    if normalized_source.startswith("llm"):
+        bucket["llm_source_count"] = int(bucket.get("llm_source_count") or 0) + 1
+    if normalized_source.startswith("local"):
+        bucket["local_source_count"] = int(bucket.get("local_source_count") or 0) + 1
+    if error_text:
+        bucket["error_count"] = int(bucket.get("error_count") or 0) + 1
+
+
+def _llm_review_add_trade(bucket: dict[str, Any], trade: dict[str, Any]) -> None:
+    bucket["trade_count"] = int(bucket.get("trade_count") or 0) + 1
+    bucket["total_stake"] = round(float(bucket.get("total_stake") or 0.0) + float(trade.get("stake") or 0.0), 6)
+    if str(trade.get("status") or "").upper() == "SETTLED":
+        pnl = float(trade.get("pnl") or 0.0)
+        bucket["settled_trade_count"] = int(bucket.get("settled_trade_count") or 0) + 1
+        bucket["total_pnl"] = round(float(bucket.get("total_pnl") or 0.0) + pnl, 6)
+        if pnl > 0:
+            bucket["win_count"] = int(bucket.get("win_count") or 0) + 1
+        elif pnl < 0:
+            bucket["loss_count"] = int(bucket.get("loss_count") or 0) + 1
+    else:
+        bucket["open_trade_count"] = int(bucket.get("open_trade_count") or 0) + 1
+
+
+def _llm_review_add_no_trade_estimate(bucket: dict[str, Any], estimate: dict[str, Any]) -> None:
+    if not estimate.get("evaluated"):
+        return
+    bucket["no_trade_evaluated_count"] = int(bucket.get("no_trade_evaluated_count") or 0) + 1
+    if estimate.get("direction_would_win"):
+        bucket["no_trade_direction_win_count"] = int(bucket.get("no_trade_direction_win_count") or 0) + 1
+    bucket["no_trade_direction_estimated_pnl"] = round(
+        float(bucket.get("no_trade_direction_estimated_pnl") or 0.0)
+        + float(estimate.get("direction_estimated_pnl") or 0.0),
+        6,
+    )
+    bucket["no_trade_best_estimated_pnl"] = round(
+        float(bucket.get("no_trade_best_estimated_pnl") or 0.0)
+        + float(estimate.get("winner_estimated_pnl") or 0.0),
+        6,
+    )
+
+
+def _finalize_llm_review_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    item = dict(bucket)
+    settled = int(item.get("settled_trade_count") or 0)
+    evaluated = int(item.get("no_trade_evaluated_count") or 0)
+    decision_count = int(item.get("decision_count") or 0)
+    item["total_stake"] = round(float(item.get("total_stake") or 0.0), 6)
+    item["total_pnl"] = round(float(item.get("total_pnl") or 0.0), 6)
+    item["avg_pnl"] = round(item["total_pnl"] / settled, 6) if settled else None
+    item["win_rate"] = round(int(item.get("win_count") or 0) / settled * 100.0, 4) if settled else None
+    item["allow_rate"] = round(int(item.get("allow_count") or 0) / decision_count * 100.0, 4) if decision_count else None
+    item["no_trade_direction_win_rate"] = (
+        round(int(item.get("no_trade_direction_win_count") or 0) / evaluated * 100.0, 4)
+        if evaluated
+        else None
+    )
+    item["no_trade_direction_estimated_pnl"] = round(float(item.get("no_trade_direction_estimated_pnl") or 0.0), 6)
+    item["no_trade_best_estimated_pnl"] = round(float(item.get("no_trade_best_estimated_pnl") or 0.0), 6)
+    return item
+
+
+def _llm_feature_side_ask(features: dict[str, Any], side: str) -> float | None:
+    normalized = _normalize_side(side)
+    key = normalized.lower() if normalized in {"Up", "Down"} else ""
+    quote = features.get(key) if key and isinstance(features.get(key), dict) else {}
+    return _maybe_float(quote.get("ask"))
+
+
+def _llm_no_trade_estimate(features: dict[str, Any], outcome: str, stake: float) -> dict[str, Any]:
+    direction_side = _normalize_side(str(features.get("direction_side") or ""))
+    normalized_outcome = _normalize_side(outcome)
+    direction_ask = _llm_feature_side_ask(features, direction_side)
+    winner_ask = _llm_feature_side_ask(features, normalized_outcome)
+    direction_pnl = _llm_estimated_binary_pnl(stake, direction_ask, direction_side, normalized_outcome)
+    winner_pnl = _llm_estimated_binary_pnl(stake, winner_ask, normalized_outcome, normalized_outcome)
+    evaluated = normalized_outcome in {"Up", "Down"} and direction_side in {"Up", "Down"} and direction_ask is not None
+    return {
+        "evaluated": bool(evaluated),
+        "stake": round(float(stake or 0.0), 6),
+        "direction_side": direction_side or None,
+        "outcome": normalized_outcome or None,
+        "direction_ask": direction_ask,
+        "winner_ask": winner_ask,
+        "direction_would_win": bool(evaluated and direction_side == normalized_outcome),
+        "direction_estimated_pnl": direction_pnl,
+        "winner_estimated_pnl": winner_pnl,
+    }
+
+
+def _llm_estimated_binary_pnl(stake: float, ask: float | None, side: str, outcome: str) -> float | None:
+    if ask is None or stake <= 0:
+        return None
+    price = max(0.01, min(0.99, float(ask)))
+    win = _normalize_side(side) == _normalize_side(outcome)
+    pnl = stake / price - stake if win else -stake
+    return round(pnl, 6)
+
+
+def _match_llm_decision_for_trade(
+    trade: dict[str, Any],
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not decisions:
+        return None
+    route = _llm_route_from_trade_reason(str(trade.get("reason") or ""))
+    opened_at = _maybe_float(trade.get("opened_at")) or 0.0
+    candidates: list[dict[str, Any]] = []
+    for decision in decisions:
+        if not decision.get("allow_trade"):
+            continue
+        if str(decision.get("route") or "").upper() == "NO_TRADE":
+            continue
+        if route and str(decision.get("route") or "") != route:
+            continue
+        created_at = _maybe_float(decision.get("created_at")) or 0.0
+        if opened_at - 30.0 <= created_at <= opened_at + 2.0:
+            candidates.append(decision)
+    if not candidates and route:
+        candidates = [
+            decision
+            for decision in decisions
+            if decision.get("allow_trade") and str(decision.get("route") or "") == route
+        ]
+    if not candidates:
+        candidates = [
+            decision
+            for decision in decisions
+            if decision.get("allow_trade") and str(decision.get("route") or "").upper() != "NO_TRADE"
+        ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (float(item.get("created_at") or 0.0), int(item.get("id") or 0)))
+    return candidates[-1]
+
+
+def _llm_route_from_trade_reason(reason: str) -> str | None:
+    marker = "LLM_SUPER_AGENT route "
+    index = reason.find(marker)
+    if index < 0:
+        return None
+    start = index + len(marker)
+    end = reason.find(",", start)
+    if end < 0:
+        end = reason.find("|", start)
+    if end < 0:
+        end = len(reason)
+    route = reason[start:end].strip()
+    return route or None
 
 
 def _maybe_float(value: Any) -> float | None:

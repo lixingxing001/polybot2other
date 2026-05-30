@@ -47,6 +47,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/actor-analysis":
             self._send_json(self.server.bot.actor_analysis(force=False), include_body=False)
             return
+        if path == "/api/llm-review":
+            self._send_json(self.server.bot.llm_decision_review(), include_body=False)
+            return
         if path == "/api/equity-curve":
             self._send_json(self.server.bot.equity_curve_window(), include_body=False)
             return
@@ -106,6 +109,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 refresh = _query_bool_optional(query, "refresh", False)
                 self._send_json(self.server.bot.actor_analysis(force=refresh))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/llm-review":
+            try:
+                limit = _query_int(query, "limit", 80, 1, 300)
+                self._send_json(self.server.bot.llm_decision_review(limit))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -290,6 +300,14 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_json_body()
                 enabled = _read_bool(payload, "pair_strategy_enabled")
                 self._send_json(self.server.bot.set_pair_strategy_enabled(enabled))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/paper-pause":
+            try:
+                payload = self._read_json_body()
+                paused = _read_bool(payload, "paused")
+                self._send_json(self.server.bot.set_paper_trading_paused(paused))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return

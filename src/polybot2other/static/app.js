@@ -14,10 +14,13 @@ const ids = {
   analysisSummary: document.getElementById("analysis-summary"),
   analysisProbability: document.getElementById("analysis-probability"),
   analysisRiskTags: document.getElementById("analysis-risk-tags"),
+  analysisLlmReview: document.getElementById("analysis-llm-review"),
+  analysisLlmReviewRefresh: document.getElementById("analysis-llm-review-refresh"),
   analysisRealtimeCard: document.getElementById("analysis-realtime-card"),
   analysisRealtime: document.getElementById("analysis-realtime"),
   analysisRealtimeToggle: document.getElementById("analysis-realtime-toggle"),
   runtime: document.getElementById("runtime-pill"),
+  paperPauseToggle: document.getElementById("paper-pause-toggle"),
   liveEnabled: document.getElementById("live-enabled"),
   liveStatus: document.getElementById("live-status"),
   liveInitialBalance: document.getElementById("live-initial-balance"),
@@ -108,6 +111,7 @@ const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
 const EQUITY_CURVE_REFRESH_MS = 30_000;
 const ACTOR_ANALYSIS_REFRESH_MS = 5_000;
+const LLM_REVIEW_REFRESH_MS = 15_000;
 const METRIC_ANIMATION_MS = 360;
 const RECENT_SKELETON_ROWS = 8;
 const LIVE_LOG_LIMIT = 80;
@@ -157,6 +161,7 @@ let liveOnce = null;
 let liveLogRows = [];
 const liveLogLastByKey = new Map();
 let liveSettingsOpen = false;
+const liveSettingsDirtyFields = new Set();
 let recentRows = [];
 let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
 let recentSummary = null;
@@ -177,6 +182,10 @@ let actorAnalysis = null;
 let actorAnalysisLoading = false;
 let actorAnalysisError = "";
 let lastActorAnalysisFetchMs = 0;
+let llmReview = null;
+let llmReviewLoading = false;
+let llmReviewError = "";
+let lastLlmReviewFetchMs = 0;
 let analysisRealtime = createRealtimeAnalysisState();
 let analysisRealtimeRenderQueued = false;
 let analysisRealtimeVisible = loadAnalysisRealtimeVisible();
@@ -199,8 +208,11 @@ let lastOpenRenderKey = "";
 let lastRecentRenderKey = "";
 let lastOrderRenderKey = "";
 let lastExperimentRenderKey = "";
+let lastOpenRenderedScope = "";
+let lastOpenRenderedCount = 0;
 let pendingOpenRender = false;
 let pendingOrderRender = false;
+let scopedRecentRefreshInFlight = false;
 const tableInteractionHoldUntil = { open: 0, order: 0 };
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
@@ -388,7 +400,57 @@ function toggleLiveSettingsPanel() {
   setLiveSettingsOpen(!liveSettingsOpen);
 }
 
-function appendLiveLog({ key = "", level = "info", title = "", message = "", details = [], code = "" } = {}) {
+function liveSettingsFieldKey(input) {
+  return input?.id || input?.name || "";
+}
+
+function syncLiveSaveDirtyState() {
+  if (!ids.liveSaveSettings) return;
+  const dirty = liveSettingsDirtyFields.size > 0;
+  ids.liveSaveSettings.classList.toggle("is-dirty", dirty);
+  ids.liveSaveSettings.title = dirty ? "有未保存的实盘配置" : "";
+}
+
+function markLiveSettingsDirty(input) {
+  const key = liveSettingsFieldKey(input);
+  if (!key) return;
+  const serverValue = input.dataset.serverValue;
+  const currentValue = input.type === "checkbox" ? String(Boolean(input.checked)) : String(input.value ?? "");
+  if (serverValue !== undefined && currentValue === serverValue) {
+    liveSettingsDirtyFields.delete(key);
+  } else {
+    liveSettingsDirtyFields.add(key);
+  }
+  syncLiveSaveDirtyState();
+}
+
+function clearLiveSettingsDirty() {
+  liveSettingsDirtyFields.clear();
+  syncLiveSaveDirtyState();
+}
+
+function liveSettingsFormControls() {
+  return [
+    ids.liveInitialBalance,
+    ids.liveStakeDollars,
+    ids.liveMaxOpenTrades,
+    ids.liveMaxEntryPrice,
+    ids.liveMaxDailyLoss,
+    ids.liveMaxTotalDrawdown,
+    ids.liveRetryCount,
+    ids.liveRetryDelayMs,
+    ids.liveComplianceAck,
+  ].filter(Boolean);
+}
+
+function bindLiveSettingsDirtyTracking() {
+  for (const input of liveSettingsFormControls()) {
+    input.addEventListener("input", () => markLiveSettingsDirty(input));
+    input.addEventListener("change", () => markLiveSettingsDirty(input));
+  }
+}
+
+function appendLiveLog({ key = "", level = "info", title = "", message = "", details = [], code = "", at_ms = null } = {}) {
   if (!ids.liveTerminalLines) return;
   const normalizedDetails = Array.isArray(details) ? details.filter(Boolean).map((item) => String(item)) : [];
   const normalized = {
@@ -402,10 +464,13 @@ function appendLiveLog({ key = "", level = "info", title = "", message = "", det
   if (key) {
     const previous = liveLogLastByKey.get(key);
     if (previous === signature) return;
-    liveLogLastByKey.set(key, signature);
+      liveLogLastByKey.set(key, signature);
   }
-  liveLogRows.unshift({ ...normalized, at_ms: Date.now() });
-  liveLogRows = liveLogRows.slice(0, LIVE_LOG_LIMIT);
+  const logAtMs = at_ms === null || at_ms === undefined ? Date.now() : normalizeMs(at_ms);
+  liveLogRows.unshift({ ...normalized, at_ms: logAtMs });
+  liveLogRows = liveLogRows
+    .sort((left, right) => (toNumber(right.at_ms) || 0) - (toNumber(left.at_ms) || 0))
+    .slice(0, LIVE_LOG_LIMIT);
   renderLiveTerminal();
 }
 
@@ -427,6 +492,98 @@ function renderLiveTerminal() {
         `${row.message ? `<span class="live-log-message">${safe(row.message)}</span>` : ""}` +
       `</div>${details}${code}</div>`;
   }).join("");
+}
+
+function renderLlmTerminalLogs(data = latestStatus) {
+  if (!ids.liveTerminalLines) return;
+  const settings = data?.settings?.llm_super_agent || {};
+  const variant = strategyExperimentVariants(data).find((row) => row.variant_id === "LLM_SUPER_AGENT_PAPER") || null;
+  if (!settings.enabled && !variant) return;
+  const apiKeyPresent = Boolean(settings.api_key_present);
+  appendLiveLog({
+    key: "llm:config",
+    level: settings.enabled === false ? "warn" : apiKeyPresent ? "pass" : "warn",
+    title: "[LLM] config",
+    message: `${settings.model || "-"} · ${settings.base_url || "-"} · key:${apiKeyPresent ? "present" : "missing"}`,
+    details: [
+      `paper_only_variant:${variant ? "ready" : "missing"}`,
+      `timeout:${fmtNumberCell(settings.timeout_seconds, 1)}s · interval:${fmtNumberCell(settings.min_interval_seconds, 1)}s`,
+      "secrets:hidden · prompt:hidden · raw_response:hidden",
+    ],
+  });
+  if (!variant) return;
+  const decisions = Array.isArray(variant.recent_llm_decisions) ? variant.recent_llm_decisions : [];
+  if (!decisions.length) {
+    appendLiveLog({
+      key: "llm:waiting",
+      level: "info",
+      title: "[LLM] waiting",
+      message: "等待下一次 LLM_SUPER_AGENT_PAPER tick 产生路由决策",
+      details: [
+        `variant:${variant.variant_id}`,
+        variant.last_signal?.reason ? `last_signal:${variant.last_signal.reason}` : "",
+      ],
+    });
+    return;
+  }
+  for (const row of decisions.slice(0, 10)) {
+    appendLlmDecisionLog(row);
+  }
+}
+
+function appendLlmDecisionLog(row = {}) {
+  const route = row.route || "NO_ROUTE";
+  const source = row.source || "-";
+  const allowTrade = row.allow_trade === true || toNumber(row.allow_trade) === 1;
+  const confidence = toNumber(row.confidence);
+  const error = String(row.error || "");
+  const codes = parseJsonArray(row.reason_codes_json).map((item) => String(item)).filter(Boolean);
+  appendLiveLog({
+    key: `llm:decision:${row.id || row.created_at || route}`,
+    at_ms: row.created_at || null,
+    level: error ? "error" : allowTrade ? "pass" : "warn",
+    title: `[LLM] ${source} ${route}`,
+    message: `${allowTrade ? "ALLOW" : "BLOCK"} · conf ${confidence === null ? "-" : fmtNumberCell(confidence, 3)} · ${row.market_regime || "-"}`,
+    details: [
+      `round:${compactText(row.round_id, 42)}`,
+      `execution:${llmRouteExecutionLabel(route, allowTrade)}`,
+      row.reason ? `reason:${row.reason}` : "",
+      codes.length ? `codes:${codes.join(", ")}` : "",
+      row.valid_until ? `valid_until:${fmtTime(row.valid_until)}` : "",
+      error ? `error:${error}` : "",
+    ],
+  });
+}
+
+function llmRouteExecutionLabel(route, allowTrade) {
+  if (!allowTrade || route === "NO_TRADE") return "NO_TRADE";
+  const labels = {
+    PAIR_FAK: "PAIR + FAK paper path",
+    SINGLE_FAK: "SINGLE + FAK paper path",
+    SINGLE_FAK_REVERSAL: "SINGLE + FAK REVERSAL paper path",
+    SINGLE_FAK_STOP_AND_FLIP: "SINGLE + FAK STOP_AND_FLIP paper path",
+    SINGLE_FAK_MULTI_LEAD: "SINGLE + FAK MULTI_LEAD paper path",
+    SINGLE_FAK_MULTI_CONFIRM: "SINGLE + FAK MULTI_CONFIRM paper path",
+    SINGLE_FAK_ANTI_BOT_GUARD: "SINGLE + FAK ANTI_BOT_GUARD paper path",
+  };
+  return labels[route] || "whitelisted paper path";
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function compactText(value, maxLength = 36) {
+  const text = String(value || "-");
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 async function withButtonLoading(button, task, after = null) {
@@ -547,9 +704,13 @@ function setActiveAppPage(page, options = {}) {
   if (nextPage === "analysis") {
     applyAnalysisRealtimeVisibility();
     renderActorAnalysis(actorAnalysis);
+    renderLlmReview(llmReview);
     renderRealtimeAnalysis();
     if (!actorAnalysis || Date.now() - lastActorAnalysisFetchMs > 5_000) {
       loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
+    }
+    if (!llmReview || Date.now() - lastLlmReviewFetchMs > 15_000) {
+      loadLlmReview({ force: false }).catch(renderLlmReviewError);
     }
   }
 }
@@ -1095,6 +1256,119 @@ function renderAnalysisRiskTags(tags, notes) {
   setAnalysisBlock(ids.analysisRiskTags, `<div class="analysis-body">${tagHtml}${noteHtml}</div>`);
 }
 
+function renderLlmReview(payload) {
+  if (!ids.analysisLlmReview) return;
+  const root = payload?.llm_review || payload || {};
+  const review = root.primary || (Array.isArray(root.variants) ? root.variants[0] : null) || root;
+  if (!review || review.status === "DISABLED") {
+    const text = llmReviewLoading ? "加载中" : (root.message || "LLM SUPER AGENT + PAPER 未启用");
+    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">${safe(text)}</div>`, true);
+    return;
+  }
+  if (review.status === "EMPTY") {
+    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">暂无 LLM 决策样本</div>`, true);
+    return;
+  }
+  if (llmReviewError) {
+    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-alert">${safe(llmReviewError)}</div>`);
+    return;
+  }
+  const summary = review.summary || {};
+  const routeRows = (review.route_stats || []).slice(0, 12).map((row) => `
+    <tr>
+      <td><span class="mono">${safe(row.key)}</span></td>
+      <td>${fmtNumberCell(row.decision_count, 0)}</td>
+      <td>${fmtPctCell(row.allow_rate)}</td>
+      <td>${fmtNumberCell(row.trade_count, 0)}</td>
+      <td>${fmtNumberCell(row.settled_trade_count, 0)}</td>
+      <td>${fmtSignedMoneyCell(row.total_pnl)}</td>
+      <td>${fmtSignedMoneyCell(row.no_trade_direction_estimated_pnl)}</td>
+      <td>${fmtPctCell(row.no_trade_direction_win_rate)}</td>
+    </tr>
+  `).join("");
+  const reasonRows = (review.reason_stats || []).slice(0, 18).map((row) => `
+    <tr>
+      <td><span class="analysis-tag">${safe(row.key)}</span></td>
+      <td>${fmtNumberCell(row.decision_count, 0)}</td>
+      <td>${fmtNumberCell(row.block_count, 0)}</td>
+      <td>${fmtNumberCell(row.trade_count, 0)}</td>
+      <td>${fmtSignedMoneyCell(row.total_pnl)}</td>
+      <td>${fmtSignedMoneyCell(row.no_trade_direction_estimated_pnl)}</td>
+      <td>${fmtPctCell(row.no_trade_direction_win_rate)}</td>
+    </tr>
+  `).join("");
+  const decisionRows = (review.recent_decisions || []).slice(0, 30).map((row) => `
+    <tr>
+      <td>${fmtTime(row.created_at)}<small>${safe(row.round_id)}</small></td>
+      <td><span class="mono">${safe(row.route)}</span><small>${safe(row.source)}</small></td>
+      <td>${row.allow_trade ? "<span class=\"positive\">ALLOW</span>" : "<span class=\"negative\">BLOCK</span>"}</td>
+      <td>${fmtNumberCell(row.confidence, 4)}</td>
+      <td><span class="${sideClass(row.feature_direction_side)}">${safe(row.feature_direction_side || "-")}</span><small>${fmtSignedBpsCell(row.feature_distance_bps)}</small></td>
+      <td><span class="${sideClass(row.outcome)}">${safe(row.outcome || "-")}</span><small>${safe(row.settlement_source || "-")}</small></td>
+      <td>${fmtSignedMoneyCell(row.matched_trade_pnl)}<small>${fmtNumberCell(row.matched_settled_trade_count, 0)} settled</small></td>
+      <td>${llmNoTradeEstimateHtml(row.no_trade_estimate)}</td>
+      <td>${analysisTagsHtml(row.reason_codes || [])}<small>${safe(row.market_regime || "")}</small></td>
+    </tr>
+  `).join("");
+  const html = `
+    <div class="analysis-body">
+      <div class="analysis-mini-grid">
+        ${analysisMetric("组合", `${review.combo || review.variant_id || "-"}`)}
+        ${analysisMetric("样本决策", `${fmtNumberCell(summary.decision_count, 0)} / ${fmtNumberCell(summary.total_decision_count, 0)}`)}
+        ${analysisMetric("允许下单率", fmtPctCell(summary.allow_rate))}
+        ${analysisMetric("LLM/本地来源", `${fmtNumberCell(summary.llm_source_count, 0)} / ${fmtNumberCell(summary.local_source_count, 0)}`)}
+        ${analysisMetric("归因成交PnL", fmtSignedMoneyCell(summary.total_pnl))}
+        ${analysisMetric("归因成交胜率", fmtPctCell(summary.win_rate))}
+        ${analysisMetric("NO_TRADE方向胜率", fmtPctCell(summary.no_trade_direction_win_rate))}
+        ${analysisMetric("NO_TRADE估算PnL", fmtSignedMoneyCell(summary.no_trade_direction_estimated_pnl))}
+      </div>
+      <div class="analysis-note">
+        ${safe(review.attribution_note || "NO_TRADE 机会成本为估算值；实盘可成交价格、滑点和手续费不在此估算内。")}
+        ${root.generated_at ? ` · 更新 ${safe(fmtTime(root.generated_at))}` : ""}
+      </div>
+      <div class="analysis-review-section">
+        <div class="analysis-review-heading"><strong>Route 归因</strong><span>按 LLM route 汇总实际成交和 NO_TRADE 估算</span></div>
+        <div class="analysis-table-wrap">
+          <table class="analysis-table">
+            <thead><tr><th>Route</th><th>决策</th><th>允许率</th><th>成交</th><th>已结算</th><th>实际PnL</th><th>NO_TRADE估算</th><th>NO_TRADE命中</th></tr></thead>
+            <tbody>${routeRows || "<tr><td colspan=\"8\">暂无 route 数据</td></tr>"}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="analysis-review-section">
+        <div class="analysis-review-heading"><strong>Reason Code 归因</strong><span>用于看哪些理由在赚钱或错过机会</span></div>
+        <div class="analysis-table-wrap">
+          <table class="analysis-table">
+            <thead><tr><th>Code</th><th>决策</th><th>阻止</th><th>成交</th><th>实际PnL</th><th>NO_TRADE估算</th><th>NO_TRADE命中</th></tr></thead>
+            <tbody>${reasonRows || "<tr><td colspan=\"7\">暂无 reason code 数据</td></tr>"}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="analysis-review-section analysis-review-table">
+        <div class="analysis-review-heading"><strong>最近决策</strong><span>用于核对 LLM 具体判断是否有效</span></div>
+        <div class="analysis-table-wrap">
+          <table class="analysis-table">
+            <thead><tr><th>时间</th><th>Route</th><th>动作</th><th>置信</th><th>方向</th><th>结算</th><th>实际PnL</th><th>NO_TRADE估算</th><th>Codes</th></tr></thead>
+            <tbody>${decisionRows || "<tr><td colspan=\"9\">暂无最近决策</td></tr>"}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+  setAnalysisBlock(ids.analysisLlmReview, html);
+}
+
+function renderLlmReviewError(error) {
+  llmReviewError = error?.message || String(error || "LLM 复盘接口异常");
+  setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-alert">${safe(llmReviewError)}</div>`);
+}
+
+function llmNoTradeEstimateHtml(estimate) {
+  if (!estimate || !estimate.evaluated) return "-";
+  const result = estimate.direction_would_win ? "命中" : "未命中";
+  return `${fmtSignedMoneyCell(estimate.direction_estimated_pnl)}<small>${safe(estimate.direction_side || "-")} -> ${safe(estimate.outcome || "-")} · ${safe(result)}</small>`;
+}
+
 function analysisMetric(label, value) {
   const raw = value === null || value === undefined ? "-" : String(value);
   const content = raw.startsWith("<span ") ? raw : safe(raw);
@@ -1140,6 +1414,29 @@ async function loadActorAnalysis({ force = false } = {}) {
     actorAnalysisLoading = false;
     ids.analysisRefresh?.classList.remove("is-loading");
     if (ids.analysisRefresh) ids.analysisRefresh.disabled = false;
+  }
+}
+
+async function loadLlmReview({ force = false } = {}) {
+  if (llmReviewLoading) return;
+  llmReviewLoading = true;
+  ids.analysisLlmReviewRefresh?.classList.add("is-loading");
+  if (ids.analysisLlmReviewRefresh) ids.analysisLlmReviewRefresh.disabled = true;
+  if (!llmReview && ids.analysisLlmReview) {
+    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">加载中</div>`, true);
+  }
+  try {
+    const params = new URLSearchParams({ limit: "80", refresh: force ? "true" : "false" });
+    const res = await fetch(`/api/llm-review?${params.toString()}`);
+    if (!res.ok) throw new Error(`llm review HTTP ${res.status}`);
+    llmReview = await res.json();
+    llmReviewError = "";
+    lastLlmReviewFetchMs = Date.now();
+    renderLlmReview(llmReview);
+  } finally {
+    llmReviewLoading = false;
+    ids.analysisLlmReviewRefresh?.classList.remove("is-loading");
+    if (ids.analysisLlmReviewRefresh) ids.analysisLlmReviewRefresh.disabled = false;
   }
 }
 
@@ -1319,9 +1616,18 @@ function appendScopeParams(params, value) {
 function renderRuntime(runtime) {
   const hasError = Boolean(runtime.last_error);
   const stalePrice = priceState.chainlink_updated_ms ? Date.now() - priceState.chainlink_updated_ms > 5_000 : true;
-  ids.runtime.textContent = hasError ? "异常" : stalePrice ? "等待实时价" : "实时运行";
-  ids.runtime.classList.toggle("error", hasError || stalePrice);
+  const paperPaused = Boolean(runtime.paper_trading?.paused);
+  const runtimeError = hasError || (!paperPaused && stalePrice);
+  ids.runtime.textContent = hasError ? "异常" : paperPaused ? "Paper已暂停" : stalePrice ? "等待实时价" : "实时运行";
+  ids.runtime.classList.toggle("error", runtimeError);
+  ids.runtime.classList.toggle("paused", paperPaused && !hasError);
   ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus} · okx ${okxWsStatus} · binance ${binanceMarketWsStatus}`;
+  if (ids.paperPauseToggle) {
+    ids.paperPauseToggle.textContent = paperPaused ? "恢复Paper" : "暂停Paper";
+    ids.paperPauseToggle.classList.toggle("is-paused", paperPaused);
+    ids.paperPauseToggle.setAttribute("aria-pressed", paperPaused ? "true" : "false");
+    ids.paperPauseToggle.title = paperPaused ? "恢复 Paper 自动下单" : "暂停 Paper 自动下单并取消活跃挂单";
+  }
 }
 
 function renderLivePanel(data = latestStatus) {
@@ -1329,15 +1635,15 @@ function renderLivePanel(data = latestStatus) {
   const settings = live.settings || data?.settings?.live_trading || {};
   const readiness = live.readiness || settings.readiness || {};
   if (ids.liveEnabled) ids.liveEnabled.checked = Boolean(settings.enabled ?? live.enabled);
-  if (ids.liveComplianceAck) ids.liveComplianceAck.checked = Boolean(settings.compliance_acknowledged);
-  setInputIfIdle(ids.liveInitialBalance, settings.initial_balance);
-  setInputIfIdle(ids.liveStakeDollars, settings.stake_dollars);
-  setInputIfIdle(ids.liveMaxOpenTrades, settings.max_open_trades);
-  setInputIfIdle(ids.liveMaxEntryPrice, settings.max_entry_price);
-  setInputIfIdle(ids.liveMaxDailyLoss, settings.max_daily_loss);
-  setInputIfIdle(ids.liveMaxTotalDrawdown, settings.max_total_drawdown);
-  setInputIfIdle(ids.liveRetryCount, settings.retry_count);
-  setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms);
+  setCheckboxIfIdle(ids.liveComplianceAck, settings.compliance_acknowledged, { preserveDirty: true });
+  setInputIfIdle(ids.liveInitialBalance, settings.initial_balance, { preserveDirty: true });
+  setInputIfIdle(ids.liveStakeDollars, settings.stake_dollars, { preserveDirty: true });
+  setInputIfIdle(ids.liveMaxOpenTrades, settings.max_open_trades, { preserveDirty: true });
+  setInputIfIdle(ids.liveMaxEntryPrice, settings.max_entry_price, { preserveDirty: true });
+  setInputIfIdle(ids.liveMaxDailyLoss, settings.max_daily_loss, { preserveDirty: true });
+  setInputIfIdle(ids.liveMaxTotalDrawdown, settings.max_total_drawdown, { preserveDirty: true });
+  setInputIfIdle(ids.liveRetryCount, settings.retry_count, { preserveDirty: true });
+  setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms, { preserveDirty: true });
   const enabled = Boolean(settings.enabled ?? live.enabled);
   const ready = Boolean(readiness.ready);
   if (ids.liveStatus) {
@@ -1553,10 +1859,27 @@ function renderLiveOnceResult() {
   updateLiveOnceButtonState();
 }
 
-function setInputIfIdle(input, value) {
+function setInputIfIdle(input, value, { preserveDirty = false } = {}) {
   if (!input || document.activeElement === input) return;
   if (value === undefined || value === null) return;
-  input.value = String(value);
+  const nextValue = String(value);
+  input.dataset.serverValue = nextValue;
+  const key = liveSettingsFieldKey(input);
+  if (preserveDirty && key && liveSettingsDirtyFields.has(key)) return;
+  input.value = nextValue;
+  if (key) liveSettingsDirtyFields.delete(key);
+  syncLiveSaveDirtyState();
+}
+
+function setCheckboxIfIdle(input, checked, { preserveDirty = false } = {}) {
+  if (!input || document.activeElement === input) return;
+  const nextChecked = Boolean(checked);
+  input.dataset.serverValue = String(nextChecked);
+  const key = liveSettingsFieldKey(input);
+  if (preserveDirty && key && liveSettingsDirtyFields.has(key)) return;
+  input.checked = nextChecked;
+  if (key) liveSettingsDirtyFields.delete(key);
+  syncLiveSaveDirtyState();
 }
 
 function renderStrategyExperiments(runtime = {}) {
@@ -1906,17 +2229,22 @@ function renderOpenTrades(rows, scope = openDataScope, options = {}) {
       return;
     }
     renderTradeTable("open", [], experimentOpenFields, ids.openTradesHead, ids.openTrades, experimentFieldKeys("open"));
+    lastOpenRenderedScope = scope;
+    lastOpenRenderedCount = 0;
     return;
   }
   ids.openCount.textContent = isExperimentAggregateScope(scope) ? `${rows.length} / ${strategyExperimentVariants().length}组` : rows.length;
   const renderKey = openRenderKey(rows, scope);
   if (!options.force && renderKey === lastOpenRenderKey) return;
-  if (!options.force && isOpenInteractionActive()) {
+  const shouldClearStaleOpenRows = rows.length === 0 && (scope !== lastOpenRenderedScope || lastOpenRenderedCount > 0);
+  if (!options.force && !shouldClearStaleOpenRows && isOpenInteractionActive()) {
     pendingOpenRender = true;
     return;
   }
   pendingOpenRender = false;
   lastOpenRenderKey = renderKey;
+  lastOpenRenderedScope = scope;
+  lastOpenRenderedCount = rows.length;
   const tableWrap = openTableWrap();
   const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
@@ -2071,7 +2399,24 @@ function renderRecentSummary(summary, scope = recentDataScope) {
 }
 
 function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summary = recentSummary) {
-  const idsKey = rows.map((row) => `${row.variant_id || "main"}:${row.id}:${row.status}:${row.settled_at || ""}:${row.pnl ?? ""}:${row.reason || ""}`).join(",");
+  const idsKey = rows.map((row) => [
+    row.variant_id || row.account_scope || "main",
+    row.id,
+    row.status || "",
+    row.side || "",
+    row.entry_price ?? "",
+    row.shares ?? "",
+    row.stake ?? "",
+    row.payout ?? "",
+    row.pnl ?? "",
+    row.return_pct ?? "",
+    row.outcome || "",
+    row.official_outcome || "",
+    row.settlement_source || "",
+    row.settled_at || "",
+    row.closed_at || "",
+    row.reason || "",
+  ].join(":")).join(",");
   return [
     scope,
     idsKey,
@@ -2735,6 +3080,7 @@ async function loadStatus(manual = false) {
   renderAll(data, { forceOrder: manual });
   loadEquityCurve(false).catch(showError);
   loadOrders(orderStatusFilter !== "all").catch(showError);
+  refreshVisibleScopedRecentTrades().catch(showError);
   if (strategyExperimentViewActive()) {
     loadStrategyExperimentTables({ force: manual }).catch(showError);
   }
@@ -2877,11 +3223,14 @@ async function loadOrders(force = false) {
     return;
   }
   if (!force && isMainScope(orderDataScope) && orderRows.length && orderMeta.status_filter === orderStatusFilter) return;
+  const requestScope = orderDataScope;
+  const requestStatusFilter = orderStatusFilter;
   const params = new URLSearchParams({ limit: String(ORDER_PAGE_SIZE), offset: "0", status: orderStatusFilter });
-  appendScopeParams(params, orderDataScope);
+  appendScopeParams(params, requestScope);
   const res = await fetch(`/api/orders?${params.toString()}`);
   if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
   const page = await res.json();
+  if (requestScope !== orderDataScope || requestStatusFilter !== orderStatusFilter) return;
   applyOrderPage(page.recent_orders, page.recent_orders_meta || { status_filter: orderStatusFilter }, { replace: force });
   renderRecentOrders(orderRows, { force });
 }
@@ -3052,11 +3401,21 @@ function handleOrderStatusFilterChange() {
 
 function handleDataScopeChange(kind, value) {
   const normalized = value || "main";
-  if (kind === "open") openDataScope = normalized;
+  if (kind === "open") {
+    openDataScope = normalized;
+    pendingOpenRender = false;
+    lastOpenRenderKey = "";
+  }
   if (kind === "order") {
     orderDataScope = normalized;
     expandedOrderId = null;
     loadingOrderId = null;
+    orderRows = [];
+    orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
+    if (latestStatus) {
+      latestStatus.recent_orders = orderRows;
+      latestStatus.recent_orders_meta = orderMeta;
+    }
     lastOrderRenderKey = "";
   }
   if (kind === "recent") {
@@ -3083,8 +3442,6 @@ function handleDataScopeChange(kind, value) {
     loadStrategyExperimentTables({ force: true }).catch(showError);
   }
   if (kind === "order") {
-    orderRows = [];
-    orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
     loadOrders(true).catch(showError);
   } else if (kind === "recent" && !recentRows.length) {
     loadRecentTradesPage(true).catch(showError);
@@ -3111,6 +3468,10 @@ function recentFilterActive() {
   return recentFilters.start_at !== null || recentFilters.end_at !== null;
 }
 
+function recentFilterKey() {
+  return `${recentFilters.start_at ?? ""}:${recentFilters.end_at ?? ""}`;
+}
+
 function datetimeLocalToSeconds(value) {
   if (!value) return null;
   const millis = new Date(value).getTime();
@@ -3118,28 +3479,31 @@ function datetimeLocalToSeconds(value) {
   return Math.floor(millis / 1000);
 }
 
-function recentTradeQueryParams(offset) {
+function recentTradeQueryParams(offset, scope = recentDataScope) {
   const params = new URLSearchParams({
     limit: String(RECENT_PAGE_SIZE),
     offset: String(offset),
   });
   if (recentFilters.start_at !== null) params.set("start_at", String(recentFilters.start_at));
   if (recentFilters.end_at !== null) params.set("end_at", String(recentFilters.end_at));
-  appendScopeParams(params, recentDataScope);
+  appendScopeParams(params, scope);
   return params;
 }
 
-async function loadRecentTradesPage(replace = false) {
-  if (isExperimentAggregateScope(recentDataScope)) {
+async function loadRecentTradesPage(replace = false, options = {}) {
+  const requestScope = recentDataScope;
+  const requestFilterKey = recentFilterKey();
+  if (isExperimentAggregateScope(requestScope)) {
     strategyTradeLimit = replace ? RECENT_PAGE_SIZE : Math.min(500, Number(strategyTables?.recent_trades_meta?.loaded || 0) + RECENT_PAGE_SIZE);
     await loadStrategyExperimentTables({ force: true, tradeLimit: strategyTradeLimit });
     return;
   }
   const offset = replace ? 0 : recentRows.length;
-  const params = recentTradeQueryParams(offset);
+  const params = recentTradeQueryParams(offset, requestScope);
   const res = await fetch(`/api/recent-trades?${params.toString()}`);
   if (!res.ok) throw new Error(`recent trades HTTP ${res.status}`);
   const page = await res.json();
+  if (requestScope !== recentDataScope || requestFilterKey !== recentFilterKey()) return;
   const nextRows = Array.isArray(page.recent_trades) ? page.recent_trades : [];
   const meta = page.recent_trades_meta || {};
   if (replace) {
@@ -3163,8 +3527,22 @@ async function loadRecentTradesPage(replace = false) {
       latestStatus.recent_trades_summary = recentSummary;
     }
   }
-  lastRecentRenderKey = "";
+  if (options.forceRender !== false) lastRecentRenderKey = "";
   renderRecentTrades(recentRows);
+}
+
+function recentScopeNeedsDirectRefresh(scope = recentDataScope) {
+  return isLiveScope(scope) || isExperimentVariantScope(scope);
+}
+
+async function refreshVisibleScopedRecentTrades() {
+  if (!recentScopeNeedsDirectRefresh(recentDataScope) || scopedRecentRefreshInFlight) return;
+  scopedRecentRefreshInFlight = true;
+  try {
+    await loadRecentTradesPage(true, { forceRender: false });
+  } finally {
+    scopedRecentRefreshInFlight = false;
+  }
 }
 
 async function applyRecentTradeFilter() {
@@ -3199,6 +3577,29 @@ async function resetRecentTradeFilter() {
   await loadRecentTradesPage(true);
 }
 
+async function togglePaperPause() {
+  const paused = !Boolean(latestStatus?.runtime?.paper_trading?.paused);
+  return withButtonLoading(ids.paperPauseToggle, async () => {
+    const res = await fetch("/api/paper-pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    if (!res.ok) throw new Error(`paper pause HTTP ${res.status}`);
+    const payload = await res.json();
+    latestStatus = payload.snapshot || latestStatus;
+    expandedOrderId = null;
+    loadingOrderId = null;
+    orderRows = [];
+    recentRows = [];
+    lastOrderRenderKey = "";
+    lastRecentRenderKey = "";
+    renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+    loadOrders(true).catch(showError);
+    loadRecentTradesPage(true).catch(showError);
+  });
+}
+
 function liveSettingsPayload(overrides = {}) {
   return {
     enabled: ids.liveEnabled?.checked || false,
@@ -3227,6 +3628,7 @@ async function saveLiveSettings(overrides = {}) {
       if (!res.ok) throw new Error(`live settings HTTP ${res.status}`);
       const payload = await res.json();
       latestStatus = payload.snapshot || latestStatus;
+      clearLiveSettingsDirty();
       if (!Object.keys(overrides || {}).length) setLiveSettingsOpen(false);
       appendLiveLog({ level: "pass", title: "保存实盘配置", message: "已保存" });
       renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
@@ -3463,6 +3865,7 @@ function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   renderRuntime(data.runtime);
   renderLivePanel(data);
+  renderLlmTerminalLogs(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));
   renderMarket(data.runtime);
@@ -3472,21 +3875,29 @@ function renderAllNow(data = latestStatus, options = {}) {
   }
   const openRows = scopedOpenRows(openDataScope, data);
   renderOpenTrades(openRows, openDataScope, { force: Boolean(options.force || options.forceOpen) });
+  const useStatusOrders = isMainScope(orderDataScope) && orderStatusFilter === "all" && !orderRows.length;
   const visibleOrderRows = isExperimentAggregateScope(orderDataScope)
     ? strategyTables?.recent_orders || []
-    : orderStatusFilter === "all" && !orderRows.length ? data.recent_orders || [] : orderRows;
+    : useStatusOrders ? data.recent_orders || [] : orderRows;
   renderRecentOrders(visibleOrderRows, {
     force: Boolean(options.force || options.forceOrder),
     scope: orderDataScope,
-    meta: isExperimentAggregateScope(orderDataScope) ? strategyTables?.recent_orders_meta || {} : orderMeta,
+    meta: isExperimentAggregateScope(orderDataScope)
+      ? strategyTables?.recent_orders_meta || {}
+      : useStatusOrders ? data.recent_orders_meta || orderMeta : orderMeta,
   });
+  const useStatusRecentTrades = isMainScope(recentDataScope) && !recentFilterActive() && !recentRows.length;
   const visibleRecentRows = isExperimentAggregateScope(recentDataScope)
     ? strategyTables?.recent_trades || []
-    : recentRows.length ? recentRows : data.recent_trades;
+    : useStatusRecentTrades ? data.recent_trades || [] : recentRows;
   renderRecentTrades(visibleRecentRows || [], {
     scope: recentDataScope,
-    meta: isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta,
-    summary: isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_summary || {} : recentSummary,
+    meta: isExperimentAggregateScope(recentDataScope)
+      ? strategyTables?.recent_trades_meta || {}
+      : useStatusRecentTrades ? data.recent_trades_meta || recentMeta : recentMeta,
+    summary: isExperimentAggregateScope(recentDataScope)
+      ? strategyTables?.recent_trades_summary || {}
+      : useStatusRecentTrades ? data.recent_trades_summary || recentSummary : recentSummary,
   });
   const now = Date.now();
   if (options.forceChart || now - lastChartRenderMs >= CHART_RENDER_INTERVAL_MS) {
@@ -3746,14 +4157,14 @@ function processPriceMessage(message) {
     const ts = normalizeMs(row.timestamp || payload.timestamp || message.timestamp || now);
     if (topic === "crypto_prices_chainlink" || symbol === "btc/usd") {
       priceState.chainlink = value;
-      priceState.chainlink_updated_ms = now;
+      priceState.chainlink_updated_ms = ts;
       priceState.source = "polymarket-rtds-chainlink";
-      recordRealtimePriceEvent("chainlink", value, now);
+      recordRealtimePriceEvent("chainlink", value, ts);
       if (!marketTargetPrice(activeMarket) && !priceState.target_price && activeMarket?.start_ts && Math.abs(ts - activeMarket.start_ts * 1000) <= 20_000) {
         priceState.target_price = value;
         priceState.target_price_source = "rtds-chainlink-fallback";
         priceState.target_price_fallback = true;
-        priceState.target_price_updated_ms = now;
+        priceState.target_price_updated_ms = ts;
       }
     } else if (topic === "crypto_prices" || symbol === "btcusdt") {
       priceState.binance = value;
@@ -3884,6 +4295,8 @@ async function postSnapshot() {
     target_price: officialTarget,
     target_price_source: officialTarget == null ? null : "market.target_price",
     target_price_fallback: false,
+    realtime_probability: realtimeDirectionProbability(Date.now()),
+    actor_probability: snapshotActorProbability(),
   };
   try {
     const res = await fetch("/api/live-snapshot", {
@@ -3905,6 +4318,18 @@ async function postSnapshot() {
   } finally {
     snapshotInFlight = false;
   }
+}
+
+function snapshotActorProbability() {
+  const payload = actorAnalysis?.actor_analysis || actorAnalysis || {};
+  const probability = payload.probability;
+  if (!probability || typeof probability !== "object" || !Object.keys(probability).length) return null;
+  return {
+    ...probability,
+    checked_at: payload.checked_at || null,
+    status: payload.status || null,
+    cached: Boolean(payload.cached),
+  };
 }
 
 function toNumber(value) {
@@ -3939,6 +4364,7 @@ function handleVisibilityChange() {
   loadEquityCurve(false).catch(showError);
   if (activeAppPage === "analysis") {
     loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
+    loadLlmReview({ force: false }).catch(renderLlmReviewError);
   }
   foregroundRefreshTimer = setTimeout(() => {
     loadStatus(true).catch(showError);
@@ -3980,12 +4406,14 @@ function queueChartHoverDraw() {
 for (const navItem of ids.navItems || []) {
   navItem.addEventListener("click", () => setActiveAppPage(navItem.dataset.navPage));
 }
+bindLiveSettingsDirtyTracking();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 setActiveAppPage(locationAppPage(), { syncHash: false });
 applyAnalysisRealtimeVisibility();
 
 ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.paperPauseToggle?.addEventListener("click", () => togglePaperPause().catch(showError));
 ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
 ids.liveSettingsToggle?.addEventListener("click", (event) => {
   event.stopPropagation();
@@ -4000,6 +4428,7 @@ ids.liveOnce?.addEventListener("click", () => runLiveOnce().catch(showError));
 ids.liveOpenOrdersRefresh?.addEventListener("click", () => refreshLiveOpenOrders().catch(showError));
 ids.liveEmergencyStop?.addEventListener("click", () => liveEmergencyStop().catch(showError));
 ids.analysisRefresh?.addEventListener("click", () => loadActorAnalysis({ force: true }).catch(renderActorAnalysisError));
+ids.analysisLlmReviewRefresh?.addEventListener("click", () => loadLlmReview({ force: true }).catch(renderLlmReviewError));
 ids.analysisRealtimeToggle?.addEventListener("change", () => setAnalysisRealtimeVisible(ids.analysisRealtimeToggle.checked));
 document.addEventListener("click", () => {
   if (liveSettingsOpen) setLiveSettingsOpen(false);
@@ -4076,6 +4505,10 @@ setInterval(() => {
   if (!pageVisible || activeAppPage !== "analysis") return;
   loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
 }, ACTOR_ANALYSIS_REFRESH_MS);
+setInterval(() => {
+  if (!pageVisible || activeAppPage !== "analysis") return;
+  loadLlmReview({ force: false }).catch(renderLlmReviewError);
+}, LLM_REVIEW_REFRESH_MS);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));
 window.addEventListener("beforeunload", releaseSnapshotLeadership);

@@ -209,6 +209,12 @@ POLYBOT2OTHER_PAPER_GTD_SECONDS=90
 POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED=true
 POLYBOT2OTHER_STRATEGY_EXPERIMENTS_DB_DIR=data/strategy-experiments
 POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS=
+POLYBOT2OTHER_LLM_SUPER_AGENT_ENABLED=true
+POLYBOT2OTHER_LLM_API_KEY=
+POLYBOT2OTHER_LLM_BASE_URL=https://api.hao.ai/v1
+POLYBOT2OTHER_LLM_MODEL=openai/gpt-5.4-mini
+POLYBOT2OTHER_LLM_TIMEOUT_SECONDS=1.2
+POLYBOT2OTHER_LLM_MIN_INTERVAL_SECONDS=12
 POLYBOT2OTHER_LIVE_TRADING_DB_PATH=data/live/single_fak_real.sqlite3
 POLYBOT2OTHER_LIVE_TRADING_SETTINGS_PATH=data/live/live-settings.json
 POLYBOT2OTHER_LIVE_CHAIN_ID=137
@@ -234,6 +240,8 @@ POLYBOT2OTHER_CLOB_URL=https://clob.polymarket.com
 `POLYBOT2OTHER_LIVE_DEFAULT_RETRY_COUNT` and `POLYBOT2OTHER_LIVE_DEFAULT_RETRY_DELAY_MS` are also editable from the dashboard. They cover live order create/sign, order post, wallet/token balance and allowance sync, and official order/trade rechecks for retryable timeout/network/429/5xx failures.
 
 Set `POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED=false` when you want a process to run Paper collection only. This is stronger than turning off the dashboard live switch because the live runner is not instantiated at all.
+
+`LLM_SUPER_AGENT_PAPER` is Paper-only. It uses a non-blocking LLM router when `POLYBOT2OTHER_LLM_API_KEY` or `HAOAI_API_KEY` is present, otherwise it falls back to the local fast router. The LLM can only recommend whitelisted Paper strategy routes; hard risk checks and execution remain deterministic.
 
 For the end-to-end live setup checklist, use `docs/live-trading-runbook.md`. Copy `.env.live.example` to `.env.live`, run `chmod 600 .env.live`, then fill the private values locally. `.env.live` is ignored and must hold the real private values only on the local machine.
 
