@@ -34,7 +34,12 @@ from .storage import (
     TradeStore,
     normalize_paper_order_status_filter,
 )
-from .strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
+from .strategy import (
+    MULTI_SOURCE_MAX_AGE_MS,
+    MULTI_SOURCE_MIN_SAMPLES,
+    RealBtcFiveMinuteStrategy,
+    input_from_snapshot,
+)
 
 try:
     import fcntl
@@ -59,6 +64,15 @@ LIVE_MIN_USDC = 0.1
 LIVE_EPSILON = 0.000001
 LIVE_STARTUP_REARM_MESSAGE = "服务启动后实盘开关已自动关闭，需要人工重新预检并开启"
 LIVE_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
+LIVE_FALLBACK_SOURCE_CHAINLINK = "chainlink"
+LIVE_FALLBACK_SOURCE_OKX = "okx"
+LIVE_FALLBACK_SOURCE_BINANCE = "binance"
+LIVE_FALLBACK_SOURCE_ORDER = (
+    LIVE_FALLBACK_SOURCE_CHAINLINK,
+    LIVE_FALLBACK_SOURCE_OKX,
+    LIVE_FALLBACK_SOURCE_BINANCE,
+)
+LIVE_BASIS_FALLBACK_SOURCES = (LIVE_FALLBACK_SOURCE_OKX, LIVE_FALLBACK_SOURCE_BINANCE)
 
 
 @dataclass(frozen=True)
@@ -72,6 +86,7 @@ class LiveRuntimeConfig:
     max_daily_loss: float
     max_total_drawdown: float
     max_entry_price: float
+    fallback_sources: tuple[str, ...]
     retry_count: int
     retry_delay_ms: int
     compliance_acknowledged: bool
@@ -86,6 +101,7 @@ class LiveRuntimeConfig:
             max_daily_loss=max(0.0, round(float(self.max_daily_loss), 2)),
             max_total_drawdown=max(0.0, round(float(self.max_total_drawdown), 2)),
             max_entry_price=max(0.01, min(0.99, round(float(self.max_entry_price), 4))),
+            fallback_sources=_normalize_live_fallback_sources(self.fallback_sources),
             retry_count=max(0, min(10, int(self.retry_count))),
             retry_delay_ms=max(0, min(10_000, int(self.retry_delay_ms))),
             compliance_acknowledged=bool(self.compliance_acknowledged),
@@ -116,6 +132,9 @@ class LiveSettingsStore:
             max_daily_loss=_float(payload.get("max_daily_loss"), self.defaults.max_daily_loss),
             max_total_drawdown=_float(payload.get("max_total_drawdown"), self.defaults.max_total_drawdown),
             max_entry_price=_float(payload.get("max_entry_price"), self.defaults.max_entry_price),
+            fallback_sources=_normalize_live_fallback_sources(
+                payload.get("fallback_sources", self.defaults.fallback_sources)
+            ),
             retry_count=_int(payload.get("retry_count"), self.defaults.retry_count),
             retry_delay_ms=_int(payload.get("retry_delay_ms"), self.defaults.retry_delay_ms),
             compliance_acknowledged=bool(
@@ -1305,6 +1324,7 @@ class LiveStrategyRunner:
             max_daily_loss=settings.live_trading_default_max_daily_loss,
             max_total_drawdown=settings.live_trading_default_max_total_drawdown,
             max_entry_price=settings.max_entry_price,
+            fallback_sources=(),
             retry_count=settings.live_trading_default_retry_count,
             retry_delay_ms=settings.live_trading_default_retry_delay_ms,
             compliance_acknowledged=False,
@@ -1406,6 +1426,26 @@ class LiveStrategyRunner:
             "requested_external_order_id": order_id or None,
         }
 
+    def _signal_from_state(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> tuple[Signal, dict[str, Any], dict[str, Any]]:
+        signal_price, price_selection = _live_signal_price_payload(
+            price,
+            self.config.fallback_sources,
+            self.settings.max_quote_age_ms,
+        )
+        if price_selection.get("blocked"):
+            reason = str(price_selection.get("message") or "LIVE fallback price source blocked")
+            return Signal("BTC", "NO_TRADE", 0.0, 0.0, 0.0, reason), signal_price, price_selection
+        signal = self.strategy.signal(input_from_snapshot(market, {"price": signal_price, "quotes": quotes}))
+        note = str(price_selection.get("note") or "").strip()
+        if note:
+            signal = replace(signal, reason=_append_reason(signal.reason, note))
+        return signal, signal_price, price_selection
+
     def preflight(
         self,
         market: MarketRound | None,
@@ -1498,7 +1538,9 @@ class LiveStrategyRunner:
             )
         )
 
-        signal = self.strategy.signal(input_from_snapshot(market, {"price": price, "quotes": quotes}))
+        signal, _signal_price, price_selection = self._signal_from_state(market, price, quotes)
+        payload["price_selection"] = price_selection
+        payload["price_basis"] = price_selection.get("basis") or []
         payload["signal"] = {
             "symbol": signal.symbol,
             "side": signal.side,
@@ -1689,6 +1731,9 @@ class LiveStrategyRunner:
             max_daily_loss=_float(payload.get("max_daily_loss"), current.max_daily_loss),
             max_total_drawdown=_float(payload.get("max_total_drawdown"), current.max_total_drawdown),
             max_entry_price=_float(payload.get("max_entry_price"), current.max_entry_price),
+            fallback_sources=_normalize_live_fallback_sources(
+                payload.get("fallback_sources", current.fallback_sources)
+            ),
             retry_count=_int(payload.get("retry_count"), current.retry_count),
             retry_delay_ms=_int(payload.get("retry_delay_ms"), current.retry_delay_ms),
             compliance_acknowledged=_bool(
@@ -1872,8 +1917,7 @@ class LiveStrategyRunner:
         self._reconcile_official_settlements(now)
         self._backfill_official_final_prices(now)
         self._reconcile_live_orders(now)
-        payload = {"price": price, "quotes": quotes}
-        signal = self.strategy.signal(input_from_snapshot(market, payload))
+        signal, _signal_price, price_selection = self._signal_from_state(market, price, quotes)
         self.last_signal = {
             "symbol": signal.symbol,
             "side": signal.side,
@@ -1881,6 +1925,7 @@ class LiveStrategyRunner:
             "entry_price": signal.entry_price,
             "move_bps": signal.move_bps,
             "reason": signal.reason,
+            "price_selection": price_selection,
         }
         if not self.config.enabled:
             return
@@ -2134,6 +2179,9 @@ class LiveStrategyRunner:
             row = next((item for item in self.store.open_trades() if int(item["id"]) == int(trade_id)), None)
             if row is None:
                 raise ValueError("live trade not found or already closed")
+            ends_at = _float_or_none(row.get("ends_at"))
+            if ends_at is not None and ends_at <= time.time():
+                raise RuntimeError("市场已结束，等待官方结算，禁止继续手动卖出")
             active_exit = self.store.active_live_exit_order_for_trade(int(trade_id))
             if active_exit is not None:
                 raise RuntimeError(
@@ -2375,6 +2423,15 @@ class LiveStrategyRunner:
         order_summary = self.store.paper_order_summary("BTC")
         trade_summary = self.store.recent_trade_summary("BTC")
         metrics = self.store.metrics()
+        readiness = self.client.readiness(
+            required_cash=self.config.stake_dollars,
+            retry_count=self.config.retry_count,
+            retry_delay_ms=self.config.retry_delay_ms,
+        )
+        open_orders = self.client.open_orders_state(
+            retry_count=self.config.retry_count,
+            retry_delay_ms=self.config.retry_delay_ms,
+        )
         return {
             "enabled": self.config.enabled,
             "variant_id": LIVE_VARIANT_ID,
@@ -2393,19 +2450,415 @@ class LiveStrategyRunner:
             "startup_rearmed": self.startup_rearmed,
             "last_order_at": self.last_order_at,
             "last_order": dict(self.last_order or {}),
-            "readiness": self.client.readiness(
-                required_cash=self.config.stake_dollars,
-                retry_count=self.config.retry_count,
-                retry_delay_ms=self.config.retry_delay_ms,
-            ),
-            "open_orders": self.client.open_orders_state(
-                retry_count=self.config.retry_count,
-                retry_delay_ms=self.config.retry_delay_ms,
-            ),
+            "readiness": readiness,
+            "open_orders": open_orders,
             "settings": asdict(self.config),
             "variant": self.variant_payload(metrics, trade_summary, order_summary),
             "variants": [self.variant_payload(metrics, trade_summary, order_summary)],
         }
+
+    def gate_status(
+        self,
+        market: MarketRound | None,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        *,
+        readiness: dict[str, Any] | None = None,
+        official_open_orders: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        checks: list[dict[str, Any]] = []
+        readiness_payload = readiness if isinstance(readiness, dict) else self.client.readiness(
+            required_cash=self.config.stake_dollars,
+            retry_count=self.config.retry_count,
+            retry_delay_ms=self.config.retry_delay_ms,
+        )
+        open_orders_payload = (
+            official_open_orders
+            if isinstance(official_open_orders, dict)
+            else self.client.open_orders_state(
+                retry_count=self.config.retry_count,
+                retry_delay_ms=self.config.retry_delay_ms,
+            )
+        )
+        account = self.store.account()
+        metrics = self.store.metrics()
+        daily_pnl = self.store.daily_realized_pnl()
+        open_trade_count = self.store.open_trade_count("BTC")
+        payload: dict[str, Any] = {
+            "checked_at": now,
+            "variant_id": LIVE_VARIANT_ID,
+            "combo": LIVE_COMBO,
+            "execution_mode": "LIVE",
+            "checks": checks,
+            "enabled": self.config.enabled,
+            "can_place_order": False,
+            "overall_status": "BLOCKED",
+            "overall_label": "已阻断",
+            "primary_blocker": None,
+            "primary_message": "",
+            "next_action": "",
+            "metrics": {
+                "daily_realized_pnl": round(float(daily_pnl), 6),
+                "daily_loss_limit": round(float(self.config.max_daily_loss), 6),
+                "total_pnl": round(_float(metrics.get("total_pnl"), 0.0), 6),
+                "total_drawdown_limit": round(float(self.config.max_total_drawdown), 6),
+                "open_trades": open_trade_count,
+                "max_open_trades": self.config.max_open_trades,
+                "cash_balance": round(float(account["cash_balance"]), 6),
+                "configured_stake": round(float(self.config.stake_dollars), 6),
+            },
+        }
+
+        checks.append(_gate_check("runtime", "PASS", "live runner 已加载"))
+        checks.append(
+            _gate_check(
+                "enabled",
+                "PASS" if self.config.enabled else "BLOCK",
+                "实盘开关已开启" if self.config.enabled else "实盘开关当前关闭",
+                current="ON" if self.config.enabled else "OFF",
+                required="ON",
+            )
+        )
+        process_lock_ok = (not self.config.enabled) or self.process_lock.locked
+        checks.append(
+            _gate_check(
+                "process_lock",
+                "PASS" if process_lock_ok else "BLOCK",
+                "实盘进程锁已持有" if self.process_lock.locked else (
+                    "实盘关闭，无需持有进程锁" if not self.config.enabled else "实盘进程锁未持有"
+                ),
+                current="locked" if self.process_lock.locked else "unlocked",
+                required="locked when enabled",
+                path=str(self.process_lock.path),
+            )
+        )
+        checks.append(
+            _gate_check(
+                "compliance_acknowledged",
+                "PASS" if self.config.compliance_acknowledged else "BLOCK",
+                "风险确认已勾选" if self.config.compliance_acknowledged else "风险确认未勾选",
+                current=bool(self.config.compliance_acknowledged),
+                required=True,
+            )
+        )
+
+        geo_check = readiness_payload.get("geo_check") if isinstance(readiness_payload.get("geo_check"), dict) else {}
+        geo_reason = _geoblock_block_reason(geo_check) if geo_check else None
+        checks.append(
+            _gate_check(
+                "geo_access",
+                "PASS" if geo_reason is None else "BLOCK",
+                "Polymarket 地区访问检查通过" if geo_reason is None else geo_reason,
+                current=geo_check.get("country") or "-",
+                required="not restricted",
+                errors=list(geo_check.get("errors") or []) if geo_check else [],
+            )
+        )
+
+        readiness_errors = list(readiness_payload.get("errors") or [])
+        wallet = readiness_payload.get("wallet") if isinstance(readiness_payload.get("wallet"), dict) else {}
+        wallet_errors = list(wallet.get("errors") or []) if wallet else []
+        credential_errors = [item for item in readiness_errors if item not in wallet_errors and item != geo_reason]
+        checks.append(
+            _gate_check(
+                "credentials",
+                "PASS" if not credential_errors else "BLOCK",
+                "SDK 和凭证格式检查通过" if not credential_errors else str(credential_errors[0]),
+                errors=credential_errors,
+            )
+        )
+
+        if market is None:
+            checks.append(_gate_check("market", "BLOCK", "当前市场不可用"))
+            return _finalize_gate_status(payload)
+
+        payload["market"] = {
+            "round_id": market.round_id,
+            "target_price": market.target_price,
+            "ends_at": market.ends_at,
+            "seconds_left": round(max(0.0, market.ends_at - now), 3),
+        }
+        checks.append(_gate_check("market", "PASS", f"当前市场 {market.round_id}"))
+        checks.append(
+            _gate_check(
+                "target_price",
+                "PASS" if market.target_price > 0 else "BLOCK",
+                f"官方目标价 {market.target_price:.2f}" if market.target_price > 0 else "缺少官方 market.target_price",
+                current=round(float(market.target_price), 6),
+                required="> 0",
+            )
+        )
+
+        signal, _signal_price, price_selection = self._signal_from_state(market, price, quotes)
+        payload["price_selection"] = price_selection
+        payload["price_basis"] = price_selection.get("basis") or []
+        signal_ok = signal.side in {"Up", "Down"}
+        payload["signal"] = {
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "confidence": signal.confidence,
+            "entry_price": signal.entry_price,
+            "move_bps": signal.move_bps,
+            "reason": signal.reason,
+        }
+        checks.append(
+            _gate_check(
+                "signal",
+                "PASS" if signal_ok else "BLOCK",
+                f"当前信号 {signal.side}" if signal_ok else f"当前策略不下单: {signal.side}",
+                current=signal.side,
+                required="Up/Down",
+            )
+        )
+
+        source_name, source_age_ms = _gate_price_source(price, now)
+        price_source_status = "BLOCK" if source_name is None else "WARN" if source_name == "fallback" else "PASS"
+        price_source_message = (
+            "当前价格源不可用"
+            if source_name is None
+            else (
+                "当前价格源为 fallback，实盘风险较高"
+                if source_name == "fallback"
+                else f"当前价格源 {source_name or '-'}"
+            )
+        )
+        if price_selection.get("mode") == "SELECTED":
+            selected_source = str(price_selection.get("selected_source") or "")
+            source_name = selected_source or source_name
+            source_age_ms = _float_or_none(price_selection.get("selected_age_ms"))
+            price_source_message = str(price_selection.get("message") or price_source_message)
+            if price_selection.get("blocked"):
+                price_source_status = "BLOCK"
+            elif selected_source == LIVE_FALLBACK_SOURCE_CHAINLINK:
+                price_source_status = "PASS"
+            else:
+                price_source_status = "WARN"
+        checks.append(
+            _gate_check(
+                "price_source",
+                price_source_status,
+                price_source_message,
+                current=source_name or "-",
+                threshold="prefer Chainlink",
+                age_ms=source_age_ms,
+                fallback_sources=list(self.config.fallback_sources),
+            )
+        )
+
+        daily_ok = daily_pnl > -abs(self.config.max_daily_loss)
+        checks.append(
+            _gate_check(
+                "daily_loss",
+                "PASS" if daily_ok else "BLOCK",
+                (
+                    f"单日已实现 PnL {daily_pnl:.4f}，未触发 {self.config.max_daily_loss:.2f} USDC 停止"
+                    if daily_ok
+                    else f"单日亏损 {daily_pnl:.4f} 已达到停止阈值 -{abs(self.config.max_daily_loss):.2f} USDC"
+                ),
+                current=round(float(daily_pnl), 6),
+                threshold=-abs(self.config.max_daily_loss),
+            )
+        )
+        total_pnl = _float(metrics.get("total_pnl"), 0.0)
+        drawdown_ok = total_pnl > -abs(self.config.max_total_drawdown)
+        checks.append(
+            _gate_check(
+                "total_drawdown",
+                "PASS" if drawdown_ok else "BLOCK",
+                (
+                    f"总 PnL {total_pnl:.4f}，未触发 {self.config.max_total_drawdown:.2f} USDC 总回撤停止"
+                    if drawdown_ok
+                    else f"总回撤 {total_pnl:.4f} 已达到停止阈值 -{abs(self.config.max_total_drawdown):.2f} USDC"
+                ),
+                current=round(float(total_pnl), 6),
+                threshold=-abs(self.config.max_total_drawdown),
+            )
+        )
+        max_open_ok = open_trade_count < self.config.max_open_trades
+        checks.append(
+            _gate_check(
+                "max_open_trades",
+                "PASS" if max_open_ok else "BLOCK",
+                (
+                    f"当前持仓 {open_trade_count}/{self.config.max_open_trades}"
+                    if max_open_ok
+                    else f"实盘最大同时持仓 {self.config.max_open_trades} 笔已满"
+                ),
+                current=open_trade_count,
+                threshold=self.config.max_open_trades,
+            )
+        )
+
+        current_market_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        same_direction_open = bool(signal_ok and any(row.get("side") == signal.side for row in current_market_rows))
+        checks.append(
+            _gate_check(
+                "duplicate_direction",
+                "BLOCK" if same_direction_open else "PASS",
+                (
+                    f"当前市场已有 {signal.side} 持仓，跳过重复开仓"
+                    if same_direction_open
+                    else "当前市场无同方向持仓"
+                ),
+                current="yes" if same_direction_open else "no",
+                required="no",
+            )
+        )
+        active_same_side_order = bool(signal_ok and self.store.active_paper_order_exists(market.round_id, signal.side))
+        active_entry_order = self.store.active_live_entry_order_exists_for_round(market.round_id)
+        checks.append(
+            _gate_check(
+                "pending_entry_order",
+                "BLOCK" if (active_same_side_order or active_entry_order) else "PASS",
+                (
+                    "当前市场已有待确认实盘买入订单"
+                    if active_entry_order
+                    else "已有同方向实盘订单，等待状态确认"
+                    if active_same_side_order
+                    else "当前市场无待确认买入订单"
+                ),
+                current="yes" if (active_same_side_order or active_entry_order) else "no",
+                required="no",
+            )
+        )
+
+        stake, stake_source = self._entry_stake_for_market(market, account)
+        software_cash_ok = stake >= LIVE_MIN_USDC and float(account["cash_balance"]) >= LIVE_MIN_USDC
+        checks.append(
+            _gate_check(
+                "software_cash",
+                "PASS" if software_cash_ok else "BLOCK",
+                (
+                    f"软件隔离账户可用 {float(account['cash_balance']):.4f}，本次预算 {stake:.4f}"
+                    if software_cash_ok
+                    else "实盘隔离预算可用资金不足"
+                ),
+                current=round(float(account["cash_balance"]), 6),
+                threshold=round(float(stake), 6),
+                stake_source=stake_source,
+            )
+        )
+
+        if signal_ok:
+            quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
+            quote_age_ms = _gate_quote_age_ms(quote, now)
+            max_age_ms = int(self.settings.max_quote_age_ms)
+            if quote_age_ms is None:
+                quote_status = "BLOCK"
+                quote_message = f"缺少 {signal.side} 盘口时间戳"
+            elif quote_age_ms > max_age_ms:
+                quote_status = "BLOCK"
+                quote_message = f"{signal.side} 盘口报价过期 {quote_age_ms:.0f}ms > {max_age_ms}ms"
+            elif quote_age_ms > max_age_ms * 0.8:
+                quote_status = "WARN"
+                quote_message = f"{signal.side} 盘口接近过期 {quote_age_ms:.0f}ms / {max_age_ms}ms"
+            else:
+                quote_status = "PASS"
+                quote_message = f"{signal.side} 盘口新鲜 {quote_age_ms:.0f}ms / {max_age_ms}ms"
+            checks.append(
+                _gate_check(
+                    "quote_freshness",
+                    quote_status,
+                    quote_message,
+                    current=round(quote_age_ms, 3) if quote_age_ms is not None else None,
+                    threshold=max_age_ms,
+                    side=signal.side,
+                )
+            )
+            limit_price = self._entry_limit_price(signal)
+            entry_price_ok = signal.entry_price <= self.config.max_entry_price + LIVE_EPSILON
+            checks.append(
+                _gate_check(
+                    "max_entry_price",
+                    "PASS" if entry_price_ok else "BLOCK",
+                    (
+                        f"买入价 {signal.entry_price:.4f} <= 最高买价 {self.config.max_entry_price:.4f}"
+                        if entry_price_ok
+                        else f"买入价 {signal.entry_price:.4f} 高于最高买价 {self.config.max_entry_price:.4f}"
+                    ),
+                    current=round(float(signal.entry_price), 6),
+                    threshold=round(float(self.config.max_entry_price), 6),
+                )
+            )
+            min_order_size = _float(quote.get("min_order_size"), 0.0)
+            min_order_ok = not min_order_size or stake + LIVE_EPSILON >= min_order_size
+            checks.append(
+                _gate_check(
+                    "min_order_size",
+                    "PASS" if min_order_ok else "BLOCK",
+                    (
+                        "市场最小订单检查通过"
+                        if min_order_ok
+                        else f"实盘预算 {stake:.2f} 低于市场最小订单 {min_order_size:.2f}"
+                    ),
+                    current=round(float(stake), 6),
+                    threshold=round(float(min_order_size), 6),
+                )
+            )
+            sweep = sweep_taker_buy_by_budget(
+                quote,
+                limit_price=limit_price,
+                budget=stake,
+                taker_fee_rate=self.settings.paper_taker_fee_rate,
+            )
+            depth_ok = sweep.shares >= self.settings.min_ask_size
+            checks.append(
+                _gate_check(
+                    "orderbook_depth",
+                    "PASS" if depth_ok else "BLOCK",
+                    (
+                        f"FAK 可成交份额 {sweep.shares:.6f}"
+                        if depth_ok
+                        else "FAK 可成交份额不足"
+                    ),
+                    current=round(float(sweep.shares), 6),
+                    threshold=round(float(self.settings.min_ask_size), 6),
+                    limit_price=limit_price,
+                    best_ask=quote.get("best_ask"),
+                )
+            )
+
+        open_order_errors = list(open_orders_payload.get("errors") or [])
+        open_orders_count = int(open_orders_payload.get("count") or 0)
+        official_orders_ok = bool(open_orders_payload.get("ready")) and open_orders_count == 0 and not open_order_errors
+        checks.append(
+            _gate_check(
+                "official_open_orders_clear",
+                "PASS" if official_orders_ok else "BLOCK",
+                (
+                    "官方 CLOB open orders 为 0"
+                    if official_orders_ok
+                    else (
+                        f"官方 CLOB 仍有 {open_orders_count} 笔 open orders，先刷新挂单或执行实盘急停"
+                        if open_orders_count
+                        else (open_order_errors[0] if open_order_errors else "官方 CLOB open orders 未确认")
+                    )
+                ),
+                current=open_orders_count,
+                required=0,
+                errors=open_order_errors,
+            )
+        )
+        checks.append(
+            _gate_check(
+                "collateral_wallet",
+                "PASS" if wallet and not wallet_errors else "BLOCK",
+                (
+                    f"collateral balance {float(wallet.get('balance') or 0.0):.6f}, allowance {float(wallet.get('allowance') or 0.0):.6f}"
+                    if wallet and not wallet_errors
+                    else (wallet_errors[0] if wallet_errors else "collateral wallet 未检查")
+                ),
+                current=round(float(wallet.get("balance") or 0.0), 6) if wallet else None,
+                threshold=round(float(stake), 6),
+                errors=wallet_errors,
+            )
+        )
+        return _finalize_gate_status(payload)
 
     def variant_payload(
         self,
@@ -3147,6 +3600,308 @@ def _finalize_preflight_payload(payload: dict[str, Any], *, signal_ok: bool) -> 
     payload["can_enable_live"] = bool(payload["arming_ready"])
     payload["can_place_next_order"] = bool(payload["ready"] and signal_ok and payload.get("enabled"))
     return payload
+
+
+def _normalize_live_fallback_sources(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_values = [item.strip().lower() for item in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = [str(item or "").strip().lower() for item in value]
+    else:
+        raw_values = []
+    selected = {item for item in raw_values if item in LIVE_FALLBACK_SOURCE_ORDER}
+    return tuple(source for source in LIVE_FALLBACK_SOURCE_ORDER if source in selected)
+
+
+def _live_signal_price_payload(
+    price: dict[str, Any],
+    fallback_sources: tuple[str, ...],
+    max_age_ms: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    now_ms = int(time.time() * 1000)
+    selected = _normalize_live_fallback_sources(fallback_sources)
+    basis_rows = _live_basis_rows(price, now_ms, selected)
+    selection: dict[str, Any] = {
+        "mode": "DEFAULT" if not selected else "SELECTED",
+        "fallback_sources": list(selected),
+        "basis": basis_rows,
+        "blocked": False,
+        "message": "",
+        "note": "",
+        "selected_source": None,
+        "selected_sources": [],
+        "selected_price": None,
+        "selected_age_ms": None,
+    }
+    if not selected:
+        payload = dict(price)
+        source, age_ms = _gate_price_source(payload, time.time())
+        selection.update(
+            {
+                "selected_source": source or "default",
+                "selected_sources": [source] if source else [],
+                "selected_price": (
+                    _float_or_none(payload.get("chainlink"))
+                    or _live_source_price(payload, LIVE_FALLBACK_SOURCE_BINANCE)
+                    or _live_source_price(payload, LIVE_FALLBACK_SOURCE_OKX)
+                ),
+                "selected_age_ms": age_ms,
+                "message": "未选择实盘 fallback 来源，使用 SINGLE_FAK_REAL 默认价格源",
+            }
+        )
+        return payload, selection
+
+    chainlink = _float_or_none(price.get("chainlink"))
+    chainlink_updated_ms = _int_or_none(price.get("chainlink_updated_ms"))
+    chainlink_age_ms = max(0, now_ms - chainlink_updated_ms) if chainlink_updated_ms else None
+    chainlink_fresh = (
+        chainlink is not None
+        and chainlink > 0
+        and chainlink_age_ms is not None
+        and chainlink_age_ms <= max_age_ms
+    )
+    if LIVE_FALLBACK_SOURCE_CHAINLINK in selected and chainlink_fresh:
+        payload = dict(price)
+        selection.update(
+            {
+                "selected_source": LIVE_FALLBACK_SOURCE_CHAINLINK,
+                "selected_sources": [LIVE_FALLBACK_SOURCE_CHAINLINK],
+                "selected_price": chainlink,
+                "selected_age_ms": chainlink_age_ms,
+                "message": "已选择 Chainlink，当前 Chainlink 新鲜，优先使用 Chainlink",
+                "note": "LIVE_FALLBACK selected Chainlink",
+            }
+        )
+        return payload, selection
+
+    selected_basis_sources = [source for source in selected if source in LIVE_BASIS_FALLBACK_SOURCES]
+    ready_rows = [
+        row
+        for row in basis_rows
+        if row.get("source") in selected_basis_sources
+        and row.get("ready")
+        and _float_or_none(row.get("adjusted_price")) is not None
+    ]
+    if ready_rows:
+        adjusted_price = sum(float(row["adjusted_price"]) for row in ready_rows) / len(ready_rows)
+        updated_ms = max(int(row.get("updated_ms") or 0) for row in ready_rows)
+        selected_names = [str(row.get("source")) for row in ready_rows]
+        median_text = ", ".join(
+            f"{row.get('source')} {float(row.get('median_bps') or 0.0):+.2f}bps" for row in ready_rows
+        )
+        payload = dict(price)
+        payload["chainlink"] = None
+        payload["chainlink_updated_ms"] = None
+        payload["binance"] = round(adjusted_price, 8)
+        payload["binance_updated_ms"] = updated_ms
+        payload["source"] = f"basis-adjusted:{','.join(selected_names)}"
+        selection.update(
+            {
+                "selected_source": "basis_adjusted",
+                "selected_sources": selected_names,
+                "selected_price": round(adjusted_price, 8),
+                "selected_age_ms": max(0, now_ms - updated_ms) if updated_ms else None,
+                "message": f"使用基差校正价 {adjusted_price:.2f}，来源 {','.join(selected_names)}",
+                "note": f"LIVE_FALLBACK basis_adjusted {','.join(selected_names)} median {median_text}",
+            }
+        )
+        return payload, selection
+
+    reasons = [str(row.get("reason") or "") for row in basis_rows if row.get("source") in selected_basis_sources]
+    if LIVE_FALLBACK_SOURCE_CHAINLINK in selected:
+        reasons.append("Chainlink 不可用或过期")
+    message = "实盘 fallback 选择无可用价格源，样本不足则 NO_TRADE"
+    if reasons:
+        message = f"{message}: {'; '.join(item for item in reasons if item)}"
+    selection.update({"blocked": True, "message": message})
+    return dict(price), selection
+
+
+def _live_basis_rows(price: dict[str, Any], now_ms: int, selected: tuple[str, ...]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    chainlink = _float_or_none(price.get("chainlink"))
+    for source in LIVE_BASIS_FALLBACK_SOURCES:
+        source_price = _live_source_price(price, source)
+        updated_ms = _live_source_updated_ms(price, source)
+        age_ms = max(0, now_ms - updated_ms) if updated_ms else None
+        median_bps = _float_or_none(price.get(f"{source}_basis_median_bps"))
+        latest_bps = _float_or_none(price.get(f"{source}_basis_latest_bps"))
+        if latest_bps is None and chainlink and source_price:
+            latest_bps = (source_price - chainlink) / chainlink * 10_000.0
+        samples = _int_or_none(price.get(f"{source}_basis_samples")) or 0
+        adjusted_price = None
+        if source_price is not None and median_bps is not None:
+            adjusted_price = source_price / (1.0 + median_bps / 10_000.0)
+        ready = (
+            source in selected
+            and source_price is not None
+            and source_price > 0
+            and updated_ms is not None
+            and age_ms is not None
+            and age_ms <= MULTI_SOURCE_MAX_AGE_MS
+            and median_bps is not None
+            and samples >= MULTI_SOURCE_MIN_SAMPLES
+            and adjusted_price is not None
+        )
+        reason = "ready"
+        if source_price is None or source_price <= 0:
+            reason = "缺少实时价"
+        elif updated_ms is None or age_ms is None or age_ms > MULTI_SOURCE_MAX_AGE_MS:
+            reason = f"价格过期或缺时间戳 age={age_ms if age_ms is not None else '-'}ms"
+        elif median_bps is None or samples < MULTI_SOURCE_MIN_SAMPLES:
+            reason = f"基差样本不足 {samples}/{MULTI_SOURCE_MIN_SAMPLES}"
+        rows.append(
+            {
+                "source": source,
+                "selected": source in selected,
+                "ready": ready,
+                "reason": reason,
+                "price": round(float(source_price), 8) if source_price is not None else None,
+                "updated_ms": updated_ms,
+                "age_ms": age_ms,
+                "latest_bps": round(float(latest_bps), 6) if latest_bps is not None else None,
+                "median_bps": round(float(median_bps), 6) if median_bps is not None else None,
+                "samples": samples,
+                "adjusted_price": round(float(adjusted_price), 8) if adjusted_price is not None else None,
+                "basis_usd": round(float(source_price - adjusted_price), 6)
+                if source_price is not None and adjusted_price is not None
+                else None,
+            }
+        )
+    return rows
+
+
+def _live_source_price(price: dict[str, Any], source: str) -> float | None:
+    if source == LIVE_FALLBACK_SOURCE_BINANCE:
+        return _float_or_none(price.get("binance_market")) or _float_or_none(price.get("binance"))
+    if source == LIVE_FALLBACK_SOURCE_OKX:
+        return _float_or_none(price.get("okx"))
+    return _float_or_none(price.get(source))
+
+
+def _live_source_updated_ms(price: dict[str, Any], source: str) -> int | None:
+    if source == LIVE_FALLBACK_SOURCE_BINANCE:
+        return _int_or_none(price.get("binance_market_updated_ms")) or _int_or_none(price.get("binance_updated_ms"))
+    if source == LIVE_FALLBACK_SOURCE_OKX:
+        return _int_or_none(price.get("okx_updated_ms"))
+    return _int_or_none(price.get(f"{source}_updated_ms"))
+
+
+def _gate_check(
+    key: str,
+    status: str,
+    message: str,
+    *,
+    current: Any = None,
+    threshold: Any = None,
+    required: Any = None,
+    errors: list[str] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    normalized = str(status or "PASS").strip().upper()
+    if normalized not in {"PASS", "WARN", "BLOCK"}:
+        normalized = "BLOCK"
+    payload = {
+        "key": key,
+        "status": normalized,
+        "message": message,
+        "current": current,
+        "threshold": threshold,
+        "required": required,
+        "errors": list(errors or []),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _finalize_gate_status(payload: dict[str, Any]) -> dict[str, Any]:
+    checks = [row for row in payload.get("checks", []) if isinstance(row, dict)]
+    blocked = [row for row in checks if row.get("status") == "BLOCK"]
+    warnings = [row for row in checks if row.get("status") == "WARN"]
+    payload["blocked_checks"] = blocked
+    payload["warning_checks"] = warnings
+    signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else {}
+    signal_block_only = bool(blocked) and all(row.get("key") == "signal" for row in blocked)
+    can_place = not blocked and bool(payload.get("enabled")) and signal.get("side") in {"Up", "Down"}
+    payload["can_place_order"] = can_place
+    if can_place:
+        payload["overall_status"] = "READY_WITH_WARN" if warnings else "READY"
+        payload["overall_label"] = "可下单但有警告" if warnings else "可下单"
+        payload["primary_blocker"] = None
+        payload["primary_message"] = warnings[0]["message"] if warnings else "全部条件通过"
+        payload["next_action"] = "实盘开关开启时，满足当前信号会提交订单"
+        return payload
+    if not payload.get("enabled"):
+        primary = _first_check(checks, "enabled") or (blocked[0] if blocked else None)
+        payload["overall_status"] = "DISABLED"
+        payload["overall_label"] = "实盘关闭"
+    elif signal_block_only:
+        primary = blocked[0]
+        payload["overall_status"] = "WAIT_SIGNAL"
+        payload["overall_label"] = "等待信号"
+    else:
+        primary = blocked[0] if blocked else (warnings[0] if warnings else None)
+        payload["overall_status"] = "BLOCKED" if blocked else "WARN"
+        payload["overall_label"] = "已阻断" if blocked else "有警告"
+    payload["primary_blocker"] = primary.get("key") if primary else None
+    payload["primary_message"] = primary.get("message") if primary else "暂无状态"
+    payload["next_action"] = _gate_next_action(str(payload.get("primary_blocker") or ""))
+    return payload
+
+
+def _first_check(checks: list[dict[str, Any]], key: str) -> dict[str, Any] | None:
+    return next((row for row in checks if row.get("key") == key), None)
+
+
+def _gate_next_action(key: str) -> str:
+    return {
+        "enabled": "打开顶部实盘开关；重启后实盘默认关闭，需要重新预检并手动开启",
+        "process_lock": "确认只运行一个 dashboard 进程，必要时用 restart-dashboard.sh 重启",
+        "compliance_acknowledged": "在实盘配置中勾选风险确认后保存",
+        "geo_access": "地区检查未通过时不要实盘下单",
+        "credentials": "检查 .env.live 的私钥、签名类型、funder 和 API 凭证",
+        "market": "等待后端发现当前 BTC 5m 市场",
+        "target_price": "等待官方 market.target_price 可用；缺目标价禁止实盘",
+        "signal": "等待下一次市场波动产生 Up/Down 信号",
+        "price_source": "检查实盘 fallback 复选框；基差样本不足时先采样，不要实盘",
+        "daily_loss": "日亏损已触发；等待窗口恢复或手动调整阈值",
+        "total_drawdown": "总回撤已触发；停止实盘或手动调整总回撤阈值",
+        "max_open_trades": "等待持仓结算/卖出，或调整最大持仓",
+        "duplicate_direction": "等待当前市场同方向持仓结算，不重复开同方向",
+        "pending_entry_order": "等待待确认买入订单变为成交、取消或超时",
+        "software_cash": "提高隔离初始金额或降低单笔金额",
+        "quote_freshness": "等待后台 CLOB WebSocket/REST 刷新盘口",
+        "max_entry_price": "等待更低买价，或手动提高最高买价",
+        "min_order_size": "提高单笔金额到市场最小订单以上",
+        "orderbook_depth": "等待盘口深度恢复",
+        "official_open_orders_clear": "点击刷新挂单；若仍有官方挂单，执行实盘急停或手动处理",
+        "collateral_wallet": "检查 Polymarket USDC 余额和 CLOB collateral allowance",
+    }.get(key, "查看阻断条件明细")
+
+
+def _gate_price_source(price: dict[str, Any], now: float) -> tuple[str | None, float | None]:
+    chainlink = _float_or_none(price.get("chainlink"))
+    chainlink_at = _int_or_none(price.get("chainlink_updated_ms"))
+    if chainlink is not None and chainlink > 0 and chainlink_at:
+        age_ms = max(0.0, now * 1000.0 - float(chainlink_at))
+        return "Chainlink", round(age_ms, 3)
+    for key in ("binance", "okx", "binance_market"):
+        fallback = _float_or_none(price.get(key))
+        updated_key = f"{key}_updated_ms"
+        updated = _int_or_none(price.get(updated_key))
+        if fallback is not None and fallback > 0:
+            age_ms = max(0.0, now * 1000.0 - float(updated)) if updated else None
+            return "fallback", round(age_ms, 3) if age_ms is not None else None
+    return None, None
+
+
+def _gate_quote_age_ms(quote: dict[str, Any], now: float) -> float | None:
+    updated_ms = _int_or_none(quote.get("updated_at_ms"))
+    if updated_ms is None or updated_ms <= 0:
+        return None
+    return max(0.0, now * 1000.0 - float(updated_ms))
 
 
 def _blocked_preflight_check(row: dict[str, Any]) -> dict[str, Any]:

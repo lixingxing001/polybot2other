@@ -1,5 +1,448 @@
 # polybot2other-progress
 
+## 2026-05-30 v4.26
+
+### 已完成
+
+1. 后端新增 Polymarket RTDS Chainlink WebSocket 行情线程，订阅 `crypto_prices_chainlink` 的 `btc/usd` 实时价格。
+2. 后台 REST fallback 价格刷新现在会保留后端 Chainlink 价格，并在同一个 `paper_price` / `execution_price` payload 中写入 OKX/Binance。
+3. 基差采样从浏览器展示链路收口到后台价格链路；页面关闭时仍可通过后端 Chainlink + OKX/Binance 积累样本。
+4. `PriceBasisTracker` 现在要求 Chainlink 与 OKX/Binance 都是新鲜报价才采样，并按 Chainlink 时间戳 + 外部源时间戳去重，避免同一报价被 tick 循环重复计样。
+5. 当 Chainlink 新鲜但 OKX/Binance 缺失或过期时，后台仍会触发 fallback 刷新，防止只维护 Chainlink 导致基差样本一直为 0。
+6. `ws_status` 新增 `backend_rtds_ws`、`backend_rtds_ws_at`、`backend_rtds_ws_topic` 和 `backend_rtds_ws_error`，用于观察后端 RTDS 链路状态。
+
+### 已确认决策
+
+1. 浏览器端 Chainlink 仍可用于页面展示，但不再作为 Paper/实盘采样和交易的唯一来源。
+2. 实盘/Paper 策略统一读取后台维护的 `paper_price` / `execution_price`，避免页面关闭后停止采样。
+3. 基差样本必须来自同一短时间窗口内的新鲜 Chainlink 与 OKX/Binance，不能用过期 Chainlink 估算。
+
+### 已知坑位
+
+1. 服务刚重启时需要等待后端 RTDS 和 REST fallback 都收到至少 5 个有效样本，OKX/Binance 基差校正才会从 `NO_TRADE` 变为可用。
+2. 如果 Polymarket RTDS WebSocket 被网络阻断，`backend_rtds_ws_error` 会显示错误，基差样本仍会停留在当前数量。
+3. 当前未新增配置开关，RTDS 后端订阅默认随 bot 启动；如果后续要支持禁用，需要新增配置项并补文档。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k test_rtds_chainlink_parser_reads_crypto_price_payload -v`，RTDS Chainlink 消息解析测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k test_backend_chainlink_and_rest_prices_feed_basis_to_execution_scope -v`，后端 Chainlink + REST 基差写入执行口径测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k test_backend_price_refresh_runs_when_chainlink_is_fresh_but_fallback_missing -v`，Chainlink 新鲜但 fallback 缺失仍触发刷新测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k live_snapshot -v`，3 条浏览器快照隔离回归通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k backend -v`，4 条后台行情回归通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k basis -v`，5 条基差相关回归通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -v`，175 条核心回归全部通过。
+9. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+10. 已查询 `/api/status`，确认 `backend_rtds_ws=message`、`backend_rtds_ws_error=null`，`execution_price` 已包含 Chainlink，OKX/Binance 基差样本已从重启初期增长到 58/62。
+
+### 回滚建议
+
+1. 如需回滚本轮后端 RTDS Chainlink 采样修复，撤销 `src/polybot2other/clob_ws.py`、`src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档 v4.26 改动。
+
+## 2026-05-30 v4.24
+
+### 已完成
+
+1. 实盘设置新增价格源复选框：`Chainlink`、`OKX基差校正`、`Binance基差校正`。
+2. 当未选择任何价格源时，`SINGLE_FAK_REAL` 继续沿用原有默认 fallback 行为，保持向后兼容。
+3. 当选择多个价格源时，实盘信号按固定顺序执行：新鲜 Chainlink 优先；Chainlink 不可用时，只允许使用样本充足的 OKX/Binance 基差校正价；样本不足则 `NO_TRADE`。
+4. 当只选择单个价格源时，严格只按该来源执行；例如只选 OKX 时，即使 Chainlink 可用也不会使用 Chainlink，OKX 基差样本不足则不交易。
+5. OKX/Binance 基差校正使用滚动中位数 bps，校正价按 `source_price / (1 + median_bps / 10000)` 计算，避免固定美元差写死。
+6. 基差 tracker 在 Chainlink 暂时缺失时仍会把已有滚动中位数和样本数带到 price payload，支持“Chainlink 没有时使用已采样基差校正价”的实盘路径。
+7. 实盘条件卡片新增基差展示区，展示 OKX/Binance 是否已选、是否可用、样本数、中位数 bps、当前价、校正价和估算美元差。
+
+### 已确认决策
+
+1. 实盘裸 fallback 仍保留为空选默认模式，防止已有配置被强制改变。
+2. 多选模式不是投票，而是优先级：Chainlink 优先，其次 OKX/Binance 基差校正。
+3. OKX/Binance 校正源必须满足样本数和新鲜度要求；样本不足时禁止实盘下单，只继续采样。
+4. 本轮不改变 Paper 实验组合的入场逻辑，只扩展 `SINGLE_FAK_REAL` 实盘价格源选择。
+
+### 已知坑位
+
+1. 如果服务启动后还没有足够 Chainlink 与 OKX/Binance 同时存在的样本，选择 OKX/Binance 基差校正会先显示样本不足并 `NO_TRADE`。
+2. 复选框保存后才生效；服务重启后实盘开关仍按安全规则自动关闭，需要重新预检并人工开启。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k live_gate_uses_selected_okx_basis_adjusted_price -v`，OKX 基差校正方向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k live_gate_blocks_selected_basis_fallback_when_samples_are_insufficient -v`，样本不足阻断测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k price_basis_tracker_keeps_median_when_chainlink_is_temporarily_missing -v`，Chainlink 暂缺仍保留基差样本测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k basis -v`，4 条基差相关回归通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k single_fak_real -v`，16 条实盘相关回归通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -v`，172 条核心回归全部通过。
+9. 已执行 `rtk proxy git diff --check`，空白检查通过。
+
+### 回滚建议
+
+1. 如需回滚本轮实盘 fallback 选择功能，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档 v4.24 改动。
+
+## 2026-05-30 v4.20
+
+### 已完成
+
+1. 纠正顶部资金卡片展示口径：`总资产` 和 `总盈亏` 改回只展示结算/会计口径 `total_equity` / `total_pnl`。
+2. 保留 `未实现盈亏` 使用实时盘口估值，避免实时盘口波动污染已结算统计。
+3. 保留后端 `estimated_total_equity` / `estimated_total_pnl` 作为诊断字段，但前端顶部卡片不直接使用。
+
+### 已确认决策
+
+1. `总资产` 和 `总盈亏` 是结算后统计，不应实时波动。
+2. `未实现盈亏` 可以随当前持仓可退出价实时变化。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy git diff --check`，空白检查通过。
+3. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+4. 已查询 `/api/status`，确认实盘 metrics 同时保留 `total_equity` / `total_pnl` 和 `unrealized_pnl` / `estimated_total_*` 字段。
+
+### 回滚建议
+
+1. 如需回滚本轮口径纠正，撤销 `src/polybot2other/static/app.js` 和本进度文档 v4.20 改动。
+
+## 2026-05-30 v4.19
+
+### 已完成
+
+1. 修复 `SINGLE_FAK_REAL` 实盘资金卡片未实时展示未实现盈亏的问题。
+2. 后端 snapshot 现在会用已装饰的实盘持仓重新计算实盘组合 metrics，补齐 `open_mark_value`、`unrealized_pnl`、`estimated_total_equity`、`estimated_total_pnl` 和 `estimated_total_pnl_pct`。
+3. 前端总资产和总盈亏卡片保持展示结算/会计口径 `total_equity` / `total_pnl`，不使用实时估算值。
+4. 保留数据库会计口径 `total_equity` / `total_pnl` 不被盘口波动污染，实时估值只用于 `未实现盈亏` 和诊断字段。
+5. 增加实盘回归断言，确保 `SINGLE_FAK_REAL` 资金 metrics 的 `unrealized_pnl` 和持仓行实时 `unrealized_pnl` 一致。
+
+### 已确认决策
+
+1. 本轮只修 dashboard 展示口径，不改变实盘下单、结算、数据库资金曲线和风控判断。
+2. 实时估值按当前市场对应方向的 `best_bid` 计算可退出回款；已结束等待官方结算的仓位不再套用下一轮盘口。
+3. 顶部资金卡片是否展示实盘数据仍由“资金口径”下拉决定，选择 `SINGLE + FAK REAL` 才展示实盘隔离账户。
+4. `总资产` 和 `总盈亏` 必须是结算后统计，不能随盘口实时波动；`未实现盈亏` 才允许实时浮动。
+
+### 已知坑位
+
+1. 如果实盘持仓已进入 `PENDING_SETTLEMENT`，未实现盈亏会保持非实时估值或空值，等待官方结算，这是避免误用下一轮盘口的保护。
+2. 服务重启后实盘开关会自动关闭，需要重新预检后人工开启。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k test_single_fak_real_places_live_order_and_live_scope_pages`，实盘资金实时估值回归通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k single_fak_real -v`，16 条实盘相关回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k unrealized -v`，未实现盈亏会计口径回归通过。
+6. 已执行 `rtk proxy git diff --check`，空白检查通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -v`，169 个核心测试全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮实时资金卡片修复，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档 v4.19 改动。
+
+## 2026-05-30 v4.17
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_REAL` 实盘下单条件指示器，后端在 snapshot 中输出 `runtime.live_trading.gate_status`。
+2. 条件指示器按 `PASS`、`WARN`、`BLOCK` 展示实盘开关、进程锁、风险确认、地区/凭证、市场/目标价、策略信号、价格源、日亏停止、总回撤停止、最大持仓、重复方向、待确认买入、隔离资金、盘口新鲜度、最高买价、最小订单、盘口深度、官方挂单和余额授权。
+3. 指示器输出 `overall_status`、`primary_blocker`、`primary_message` 和 `next_action`，让页面直接说明当前为什么不能实盘下单以及下一步该处理什么。
+4. 前端在实盘卡片下方新增条件状态区，展示总状态、主因、下一步、风控数值、当前信号和关键检查项，并把状态同步写入 Live Terminal。
+5. 状态展示把 `DISABLED` 作为警告态而不是错误态，避免“实盘开关关闭”被误认为系统异常；无价格源会明确阻断，fallback 价格源仅警告。
+6. 新增日亏阈值回归测试，确保实盘达到单日亏损停止后主阻断原因稳定显示为 `daily_loss`。
+
+### 已确认决策
+
+1. 本轮只增加只读诊断能力，不改变 `SINGLE_FAK_REAL` 下单策略和真实下单流程。
+2. 指示器复用 snapshot 已经读取到的 readiness 和官方 open orders，避免页面刷新额外放大官方 API 调用。
+3. 实盘是否会下单仍以原有 `run_from_state` 风控为准；指示器用于解释当前门控状态，不绕过任何实盘保护。
+
+### 已知坑位
+
+1. 服务重启后实盘开关仍会自动关闭，状态会显示 `DISABLED` / 主因 `enabled`，这是实盘安全保护的预期行为。
+2. 条件状态来自最近一次后端 snapshot；极短时间内的盘口变化仍以实际下单时的后端检查为准。
+3. 如果同时存在多个阻断原因，页面主因展示第一优先阻断项，完整原因需要看下方检查项和 Live Terminal。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -k test_live_gate_status_exposes_daily_loss_blocker`，新增日亏阻断用例通过。
+4. 已执行 `rtk proxy git diff --check`，空白检查通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_core.py' -v`，169 个核心测试全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮实盘条件指示器，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档 v4.17 改动。
+
+## 2026-05-30 v4.14
+
+### 已完成
+
+1. 已结束但尚未拿到官方结果的 `OPEN` 交易现在会在后端装饰为 `PENDING_SETTLEMENT`，并带 `settlement_pending=true`。
+2. 当前持仓不再把当前 active 市场的价格、距离 bps 和盘口套到上一轮已结束市场上，避免旧持仓显示误导性实时价格。
+3. 最近交易的状态展示支持 `PENDING_SETTLEMENT(等待官方结算)`，结算来源在该阶段展示为“等待官方结算”。
+4. 持仓表对待结算仓位的买一/卖一、可退出回款、未实现盈亏、当前价和距离 bps 展示为“已结束/等待结算”，不再显示空白或错误估值。
+5. 实盘手动卖出增加后端保护：市场已结束后禁止继续提交卖出，必须等待官方结算。
+
+### 已确认决策
+
+1. 实盘盈亏仍以 Polymarket 官方结算为准，不使用 Binance/OKX 代替官方结果。
+2. Chainlink 本地兜底只在本地确实有结束点附近 Chainlink tick 时触发；缺 tick 时保持等待官方结算，避免实盘结果被错误源污染。
+3. 待结算仓位仍保留在本地 `OPEN` 数据中，表示资金尚未本地入账，但 UI 必须和可卖出的普通持仓区分开。
+
+### 已知坑位
+
+1. 如果 Polymarket 官方 resolution 延迟，交易记录会短暂保持 `PENDING_SETTLEMENT`，这是保护实盘口径的预期行为。
+2. 当前未新增独立 `pending_settlement_trades` 接口；后续如需把待结算仓位从持仓表完全移出，可再拆接口和统计口径。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other`，Python 编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python tests/test_core.py -k test_expired_open_trade_is_marked_pending_settlement_without_current_quote -v`，新增待结算持仓回归测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python tests/test_core.py -k test_live_manual_sell_blocks_after_market_end -v`，实盘已结束市场禁止卖出回归测试通过。
+5. 已执行 `rtk proxy git diff --check`，空白检查通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python tests/test_core.py -v`，168 个核心测试全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮待结算展示和手动卖出保护，撤销 `src/polybot2other/bot.py`、`src/polybot2other/live.py`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档 v4.14 改动。
+
+## 2026-05-30 v4.13
+
+### 已完成
+
+1. 将 `/api/live-snapshot` 改为轻量展示上报接口：只更新展示态 `latest_price` / `latest_quotes` 和浏览器状态，不再执行策略 tick、结算复查、官方 final price 回填或返回完整 snapshot。
+2. `/api/live-snapshot` 返回轻量 ACK，包含 `ok`、`market`、`updated_at`、`display_quote_sides` 和 `market_data_scope`，避免每秒返回 300KB 级完整 dashboard payload。
+3. 前端 `postSnapshot()` 不再把 `/api/live-snapshot` 响应当完整状态渲染，避免 WebSocket 快照上报后触发 `renderAll()`。
+4. 前端自动刷新、市场边界刷新、切回前台刷新、取消订单后刷新、卖出后刷新、初始化加载改为调用普通 `/api/status`。
+5. `/api/tick` 只保留给页面右上角手动刷新按钮，避免自动流程触发完整策略 tick。
+
+### 已确认决策
+
+1. 页面上报只服务展示和分析，不参与 Paper/实盘策略循环。
+2. 后台 bot 自己按主循环和后端行情线程运行，页面自动刷新不得额外触发策略判断。
+3. `/api/status` 暂时保留完整 payload，后续如果页面仍有压力，再拆轻量 status stream。
+
+### 已知坑位
+
+1. `/api/status` 和 `/api/status-stream` 目前仍可能返回/推送完整 snapshot；这次先修最高频且最不该重的 `/api/live-snapshot` 和自动 `/api/tick`。
+2. 手动点击刷新按钮仍会调用 `/api/tick`，这是预期行为。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_snapshot -v`，3 个 live snapshot 职责隔离测试通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k clob_ws -v`，2 个 CLOB WS 回归测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak -v`，21 个 SINGLE/实盘相关回归通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，166 个核心测试全部通过。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+9. 已实测 `/api/live-snapshot` 连续 3 次响应约 748 bytes，耗时约 1-2ms。
+10. 已实测 `/api/tick` 仍为完整手动 tick，响应约 303KB、耗时约 5.1s；前端自动路径已不再调用它。
+
+### 回滚建议
+
+1. 如需回滚本轮接口轻量化，撤销 `src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档 v4.13 改动。
+
+## 2026-05-30 v4.12
+
+### 已完成
+
+1. 新增后端 Polymarket CLOB market WebSocket 客户端，使用标准库完成 WSS 握手、frame 读写、PING 保活和断线重连，不新增生产依赖。
+2. 新增本地 CLOB orderbook 合并逻辑：`book` 作为全量快照，`price_change` 作为价位增删，`best_bid_ask` 作为最优价更新。
+3. Bot 启动时新增 `polybot2other-clob-ws` 后台线程，自动订阅当前 BTC 5m 市场 Up/Down token。
+4. 后端 CLOB WS 收到盘口后同步写入 `latest_quotes`、`paper_quotes`、`execution_quotes`，页面展示、Paper、实盘执行都可使用同一后端盘口源。
+5. REST orderbook 刷新改为兜底：只有后端盘口超过策略新鲜度窗口时才触发 REST 刷新，不再因为浏览器 feed stale 而固定 REST 刷盘口。
+6. `/api/status.runtime.ws_status` 增加 `backend_clob_ws`、`backend_clob_ws_at`、`backend_clob_ws_market`、`backend_clob_ws_event` 等状态，便于 Live Terminal 和排障查看。
+7. README 顶部行情说明更新为后端 CLOB WS 优先、REST 兜底，浏览器 WS 只负责展示和分析。
+
+### 已确认决策
+
+1. 本轮不引入 `websocket-client` / `websockets` 等新依赖，避免实盘前增加供应链和部署变量。
+2. 后端 CLOB WS 只负责 Polymarket orderbook；外部 BTC 价格源仍沿用后端 REST fail-fast 路线，后续可单独接 OKX/Binance 后端 WS。
+3. WS 没有新盘口事件时仍按策略新鲜度判断 stale；如果超过窗口，REST 会补一次快照，避免把“连接还在”误判成“报价一定新鲜”。
+
+### 已知坑位
+
+1. 标准库 WebSocket 客户端只实现项目需要的 text/ping/pong/close 和普通 frame，不覆盖所有复杂扩展；当前不启用压缩扩展。
+2. Polymarket WS 如果长时间无 `book/price_change/best_bid_ask` 事件，策略仍可能短暂走 REST 兜底，这是实盘安全取舍。
+3. 后端 BTC 价格源还不是 WebSocket，方向价格实时性仍受公共 REST 价格刷新影响。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k clob_ws -v`，2 个 CLOB WS orderbook / bot ingest 测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k backend_market_data_refreshes -v`，后端行情刷新兜底测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_snapshot -v`，3 个浏览器 snapshot 隔离测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak -v`，21 个 SINGLE/实盘相关回归通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_preflight -v`，7 个实盘预检回归通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k pair_strategy -v`，4 个 PAIR 回归通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，166 个核心测试全部通过。
+9. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+10. 已执行 `rtk proxy git diff --check`，空白检查通过。
+11. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+12. 已抽样 `/api/status`，确认 `ws_status.market=clob-ws`、`backend_clob_ws=message`、`backend_clob_ws_event=price_change`，且 `paper_quotes` 的 Up/Down 来源为 `clob-ws-price-change`。
+
+### 回滚建议
+
+1. 如需回滚后端 CLOB WebSocket，删除 `src/polybot2other/clob_ws.py`，撤销 `src/polybot2other/bot.py`、`tests/test_core.py`、`README.md` 和本进度文档 v4.12 改动。
+
+## 2026-05-30 v4.11
+
+### 已完成
+
+1. 新增 Paper 后台行情隔离态：`paper_price` / `paper_quotes` 只由后端行情维护和后端 Paper 深度补齐写入。
+2. 浏览器 `/api/live-snapshot` 现在只更新 `latest_price` / `latest_quotes` 展示态，不再写入 Paper 执行态，也不再把浏览器价格 tick 写入 Paper 交易库。
+3. 主账户 Paper、PAIR、REALTIME_MAKER、LLM SUPER AGENT + PAPER 和策略实验入口改为读取 `paper_price` / `paper_quotes`。
+4. 策略实验子 bot 在接收主 bot 后台 Paper 行情时同步写入自己的 `paper_price` / `paper_quotes`，避免实验组合回退到浏览器展示态。
+5. `/api/status` payload 增加 `runtime.paper_price`、`runtime.paper_quotes`，并在 `runtime.market_data_scope.paper` 标记为 `backend_only`。
+6. 保留测试兼容：当浏览器 feed 从未接入时，`latest_*` 可以作为无浏览器的后端兼容输入；一旦浏览器 feed 出现，Paper 只读 `paper_*`。
+
+### 已确认决策
+
+1. Paper 和实盘都不依赖页面；页面只负责展示、配置和人工操作。
+2. `latest_*` 继续作为展示态，允许浏览器 snapshot 补充页面显示，但不参与 Paper/实盘下单。
+3. 不让 Paper 直接复用 `execution_*`，保留 `paper_*` 和 `execution_*` 两套 backend-only 状态，方便后续 Paper 和实盘使用不同风控。
+
+### 已知坑位
+
+1. `paper_*` 仍来自当前后端 REST fail-fast 行情维护，不是交易所毫秒级 WebSocket。
+2. 如果浏览器已经接入但后端 Paper 行情为空，Paper 会阻断而不是使用浏览器展示态，这可能导致极短时间内少采样，但符合实盘安全口径。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_snapshot -v`，浏览器 snapshot 不驱动 Paper 下单的隔离测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k backend_market_data_refreshes -v`，后端行情刷新写入 Paper/实盘执行态测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k bot_fak_entry -v`，Paper FAK 入场回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak -v`，21 个 SINGLE/实盘相关回归通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k pair_strategy -v`，4 个 PAIR 回归通过。
+7. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k realtime_maker -v`，2 个 REALTIME_MAKER 回归通过。
+8. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_experiment -v`，9 个策略实验回归通过。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，164 个核心测试全部通过。
+10. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+11. 已执行 `rtk proxy git diff --check`，空白检查通过。
+12. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+13. 已抽样 `/api/status`，确认 `market_data_scope.paper=backend_only`，且 `paper_price` / `paper_quotes` 已由后台行情返回。
+
+### 回滚建议
+
+1. 如需回滚本轮 Paper 隔离，撤销 `src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档的 v4.11 改动。
+
+## 2026-05-30 v4.10
+
+### 已完成
+
+1. 新增实盘执行行情隔离：`execution_price` / `execution_quotes` 只由后端行情维护写入，浏览器 `/api/live-snapshot` 不再写入执行态。
+2. 保留 `latest_price` / `latest_quotes` 作为页面展示和 Paper 采样状态；浏览器打开后仍可补展示态，但不会覆盖实盘执行数据源。
+3. 持续实盘 runner、实盘预检、one-shot 实盘、手动卖出都改为读取执行态行情。
+4. `/api/status` payload 增加 `runtime.execution_price`、`runtime.execution_quotes` 和 `runtime.market_data_scope`，方便页面和日志区分展示态与执行态。
+5. 新增 `/api/status-stream` SSE 状态流；页面打开后优先通过后端 SSE 接收状态，SSE 断开或停滞时回退原 `/api/status` 轮询。
+6. 前端脚本版本提升到 `20260530-v2-105`。
+
+### 已确认决策
+
+1. 本轮不引入后端 WebSocket 新依赖，先用 SSE 做后端到页面的推送显示。
+2. 浏览器 WebSocket 仍保留为展示和分析增强，但实盘下单只读后端执行态。
+3. 如果执行态为空而浏览器已经接入，实盘应阻断而不是回退使用浏览器态；仅在测试或无浏览器 feed 的兼容场景允许使用旧 `latest_*`。
+
+### 已知坑位
+
+1. SSE 推送的是后端状态，不是交易所毫秒级原始盘口；后端行情源仍是当前 REST fail-fast 版本。
+2. `/api/status-stream` 当前发送完整 snapshot，组合和列表数据继续增多时，后续可拆轻量状态流。
+
+### 验证记录
+
+1. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_snapshot -v`，浏览器 snapshot 不写入执行态的测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k backend_market_data_refreshes -v`，后端行情刷新测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，16 个实盘路径测试通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_preflight -v`，7 个实盘预检测试通过。
+7. 已执行 `rtk proxy git diff --check`，空白检查通过。
+8. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+9. 已请求 `/api/status`，确认 `runtime.execution_price`、`runtime.execution_quotes` 已返回，且 `market_data_scope.execution=backend_only`。
+10. 已请求 `/api/status-stream`，确认 SSE 返回 `data:` 事件流。
+11. 已请求首页 HTML，确认前端脚本版本为 `app.js?v=20260530-v2-105`。
+12. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，163 个核心测试全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮执行态隔离和 SSE 推送，撤销 `src/polybot2other/bot.py`、`src/polybot2other/web.py`、`src/polybot2other/static/app.js`、`src/polybot2other/static/index.html`、`tests/test_core.py` 和本进度文档的 v4.10 改动。
+
+## 2026-05-30 v4.09
+
+### 已完成
+
+1. 将后端行情维护从主交易 `tick` 中拆出，新增独立后台行情刷新线程；页面关闭或浏览器 WebSocket 降频时，后端仍会主动维护当前 BTC 5m 市场的盘口和外部价格源。
+2. 将 Polymarket CLOB 盘口刷新和外部 BTC 价格刷新拆成两条路径：盘口每 1 秒尝试刷新，价格源慢请求不再阻塞盘口刷新。
+3. 后台行情专用请求超时改为按 `max_quote_age_ms` 推导的短超时；当前 3000ms 有效期下约 1.5 秒，慢请求直接失败并快速重试，避免一次 SSL 握手超时拖住 4 秒以上。
+4. Up/Down CLOB 盘口改为批量 POST `/books` 拉取，失败时才回退单 token `/book`；Binance/Coinbase/OKX 公共价格源改为并行拉取，降低串行 REST 请求造成的行情空档和 TLS 握手开销。
+5. 修复 WSL 下 `restart-dashboard.sh` 后台启动后接口空响应的问题：setsid 子进程内部直接把 Python stdout/stderr 重定向到日志文件，避免 stderr pipe 断开导致 `send_response()` 写日志失败。
+6. 将 `logs/` 加入 `.gitignore`，避免运行日志进入待提交文件。
+
+### 已确认决策
+
+1. 不放宽 `max_quote_age_ms=3000ms`；遇到行情源超时或连续失败时继续 `NO_TRADE`，这是实盘安全边界。
+2. 本轮仍不引入后端 WebSocket 新依赖；当前是 REST fail-fast 版本，适合先把实盘流程从浏览器依赖中解耦。
+3. 如果需要进一步降低偶发 stale，下一步应做真正后端 CLOB WebSocket，而不是继续提高旧盘口容忍度。
+
+### 已知坑位
+
+1. 抽样中 Up/Down 报价年龄多数从原来的 5-10 秒下降到约 1-3 秒；当 Polymarket CLOB 或浏览器 feed 出现慢响应时仍可能短暂到 3-5 秒，连续 `_ssl.c:983 handshake timed out` 时可能出现约 6 秒以上空档，此时策略会阻断下单。
+2. REST 高频刷新会增加 CLOB `/book` 请求量；实盘长期开启前需要观察是否触发上游限流。
+3. 页面浏览器 feed 仍可能覆盖展示状态，但实盘策略的后台行情刷新不再依赖页面打开。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k backend_market_data_refreshes -v`，后端行情刷新回归测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k polymarket_quote -v`，盘口解析测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k polymarket_quotes -v`，批量 `/books` 盘口测试通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，16 个 live 实盘路径回归测试通过；输出存在 ResourceWarning，但测试结果为 OK。
+6. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+7. 已连续请求 `/api/status` 抽样，确认后台行情年龄从原来的 5-10 秒明显下降；稳定请求下约 1-3 秒，慢响应时仍会短暂到 3-5 秒；连续 CLOB SSL 超时时保持 `NO_TRADE`。
+8. 已执行 `rtk proxy git diff --check`，空白检查通过。
+9. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，163 个核心测试全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮实盘行情刷新修复，撤销 `src/polybot2other/bot.py`、`src/polybot2other/market.py`、`src/polybot2other/polymarket.py`、`restart-dashboard.sh`、`.gitignore` 和本进度文档的 v4.09 改动。
+
+## 2026-05-30 v4.08
+
+### 已完成
+
+1. 修复实盘策略过度依赖浏览器 `/api/live-snapshot` 的问题：后端主循环现在会按策略新鲜度主动刷新 Polymarket CLOB orderbook 和外部 BTC 价格源。
+2. 新增后端行情刷新判定：只要 Up/Down 盘口或价格源接近 `max_quote_age_ms` 风控窗口，就触发后端 REST 行情补齐，而不是等浏览器 snapshot 超过 `live_snapshot_max_age_seconds`。
+3. 保留 `max_quote_age_ms=3000ms` 的实盘保守风控，不通过放宽旧数据阈值解决问题。
+4. 浏览器 WebSocket snapshot 仍保留为展示和补充来源，但不再是实盘策略唯一的盘口新鲜度来源。
+5. 新增回归测试，覆盖“浏览器 feed 仍未过期但策略盘口已过期时，后端必须主动刷新行情”的场景。
+
+### 已确认决策
+
+1. 当前项目没有后端 WebSocket 生产依赖；本轮不引入新依赖，先用后端常驻 REST 刷新消除浏览器节流造成的实盘阻断。
+2. 后续如果要进一步降低延迟，应单独引入并评估后端 WebSocket 客户端依赖，把 CLOB/OKX/Binance/Chainlink 全部改为后端长连接。
+
+### 已知坑位
+
+1. 后端 REST 刷新比真正后端 WebSocket 延迟更高，且会增加 CLOB book 和公共价格 API 请求量。
+2. 当前仍保留浏览器实时分析功能；页面隐藏时分析卡片可能变慢，但实盘策略不应再因此长期 `盘口报价过期`。
+3. 如果 Polymarket CLOB REST 或公共价格 REST 临时失败，策略仍会按旧的保守规则阻断真实下单。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k backend_market_data_refreshes -v`，新增后端行情刷新测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，Python 编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k single_fak_real -v`，16 个 live 实盘路径回归测试通过。
+
+### 回滚建议
+
+1. 如需回滚本轮后端行情刷新修复，撤销 `src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档的 v4.08 改动。
+
 ## 2026-05-30 v4.03
 
 ### 已完成

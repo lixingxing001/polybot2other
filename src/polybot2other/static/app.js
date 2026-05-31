@@ -32,6 +32,7 @@ const ids = {
   liveRetryCount: document.getElementById("live-retry-count"),
   liveRetryDelayMs: document.getElementById("live-retry-delay-ms"),
   liveComplianceAck: document.getElementById("live-compliance-ack"),
+  liveFallbackSources: Array.from(document.querySelectorAll("[data-live-fallback-source]")),
   liveSettingsToggle: document.getElementById("live-settings-toggle"),
   liveSettingsPanel: document.getElementById("live-settings-panel"),
   liveSaveSettings: document.getElementById("live-save-settings"),
@@ -41,6 +42,7 @@ const ids = {
   liveOnce: document.getElementById("live-once"),
   liveOpenOrdersRefresh: document.getElementById("live-open-orders-refresh"),
   liveEmergencyStop: document.getElementById("live-emergency-stop"),
+  liveGateStatus: document.getElementById("live-gate-status"),
   liveReadiness: document.getElementById("live-readiness"),
   livePreflightResult: document.getElementById("live-preflight-result"),
   liveDoctorResult: document.getElementById("live-doctor-result"),
@@ -104,6 +106,7 @@ const RTDS_PING_MS = 5_000;
 const OKX_PING_MS = 20_000;
 const SNAPSHOT_POST_MS = 1_000;
 const STATUS_POLL_MS = 2_000;
+const STATUS_STREAM_STALE_MS = 4_000;
 const RECENT_PAGE_SIZE = 100;
 const ORDER_PAGE_SIZE = 20;
 const CHART_RENDER_INTERVAL_MS = 5_000;
@@ -138,6 +141,11 @@ const ORDER_STATUS_LABELS = {
   EXPIRED: "已过期",
   REJECTED: "已拒绝",
 };
+const TRADE_STATUS_LABELS = {
+  OPEN: "持仓中",
+  SETTLED: "已结算",
+  PENDING_SETTLEMENT: "等待官方结算",
+};
 
 let activeMarket = null;
 let activeAppPage = "bot";
@@ -155,6 +163,9 @@ let binanceMarketWsStatus = "waiting";
 let lastSnapshotPostMs = 0;
 let snapshotInFlight = false;
 let latestStatus = null;
+let statusStream = null;
+let statusStreamConnected = false;
+let lastStatusStreamAt = 0;
 let livePreflight = null;
 let liveDoctor = null;
 let liveOnce = null;
@@ -244,23 +255,24 @@ let priceState = {
 
 const openTradeFields = [
   { key: "live_sell_action", label: "操作", render: (row) => liveSellButton(row) },
+  { key: "position_state", label: "状态", render: (row) => positionStateText(row) },
   { key: "strategy_type", label: "策略", render: (row) => safe(row.strategy_type) },
   { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
   { key: "stake", label: "本金", render: (row) => fmtMoneyCell(row.stake) },
   { key: "entry_price", label: "买入价", render: (row) => fmtNumberCell(row.entry_price, 4) },
   { key: "entry_probability_pct", label: "买入概率", render: (row) => fmtPctCell(row.entry_probability_pct) },
   { key: "shares", label: "份额", render: (row) => fmtNumberCell(row.shares, 6) },
-  { key: "current_bid", label: "当前买一", render: (row) => fmtNumberCell(row.current_bid, 4) },
-  { key: "current_ask", label: "当前卖一", render: (row) => fmtNumberCell(row.current_ask, 4) },
-  { key: "exit_value", label: "可退出回款", render: (row) => fmtMoneyCell(row.exit_value) },
-  { key: "unrealized_pnl", label: "未实现盈亏", render: (row) => fmtSignedMoneyCell(row.unrealized_pnl) },
-  { key: "unrealized_roi_pct", label: "未实现ROI", render: (row) => fmtSignedPctCell(row.unrealized_roi_pct) },
+  { key: "current_bid", label: "当前买一", render: (row) => positionNumberCell(row, "current_bid", 4) },
+  { key: "current_ask", label: "当前卖一", render: (row) => positionNumberCell(row, "current_ask", 4) },
+  { key: "exit_value", label: "可退出回款", render: (row) => positionMoneyCell(row, "exit_value") },
+  { key: "unrealized_pnl", label: "未实现盈亏", render: (row) => positionSignedMoneyCell(row, "unrealized_pnl") },
+  { key: "unrealized_roi_pct", label: "未实现ROI", render: (row) => positionSignedPctCell(row, "unrealized_roi_pct") },
   { key: "max_payout", label: "最大回款", render: (row) => fmtMoneyCell(row.max_payout) },
   { key: "max_profit", label: "最大盈利", render: (row) => fmtSignedMoneyCell(row.max_profit) },
   { key: "max_loss", label: "最大亏损", render: (row) => fmtMoneyCell(row.max_loss) },
   { key: "target_price", label: "目标价", render: (row) => fmtMoneyCell(row.target_price) },
-  { key: "current_price", label: "当前价", render: (row) => fmtMoneyCell(row.current_price) },
-  { key: "current_distance_bps", label: "距离bps", render: (row) => fmtSignedBpsCell(row.current_distance_bps) },
+  { key: "current_price", label: "当前价", render: (row) => positionMoneyCell(row, "current_price") },
+  { key: "current_distance_bps", label: "距离bps", render: (row) => positionSignedBpsCell(row, "current_distance_bps") },
   { key: "opened_at", label: "开仓时间", render: (row) => fmtDateTimeCell(row.opened_at) },
   { key: "ends_at", label: "到期", render: (row) => fmtDateTimeCell(row.ends_at) },
   { key: "left", label: "剩余", render: (row) => safe(fmtLeft(row.ends_at)) },
@@ -276,7 +288,7 @@ const recentTradeFields = [
   { key: "round_id", label: "市场", render: (row) => safe(row.round_id), cellClass: "mono-cell" },
   { key: "strategy_type", label: "策略", render: (row) => safe(row.strategy_type) },
   { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
-  { key: "status", label: "状态", render: (row) => safe(row.status) },
+  { key: "status", label: "状态", render: (row) => tradeStatusText(row) },
   { key: "stake", label: "本金", render: (row) => fmtMoneyCell(row.stake) },
   { key: "entry_price", label: "买入价", render: (row) => fmtNumberCell(row.entry_price, 4) },
   { key: "entry_probability_pct", label: "买入概率", render: (row) => fmtPctCell(row.entry_probability_pct) },
@@ -336,7 +348,7 @@ const scopedOpenFields = [comboField, ...openTradeFields];
 const scopedRecentFields = [comboField, ...recentTradeFields];
 
 const defaultOpenFieldKeys = [
-  "live_sell_action", "strategy_type", "side", "stake", "entry_price", "shares", "current_bid", "current_ask",
+  "live_sell_action", "position_state", "strategy_type", "side", "stake", "entry_price", "shares", "current_bid", "current_ask",
   "exit_value", "unrealized_pnl", "unrealized_roi_pct", "max_payout",
   "max_profit", "target_price", "current_price", "current_distance_bps",
   "left", "reason",
@@ -401,7 +413,7 @@ function toggleLiveSettingsPanel() {
 }
 
 function liveSettingsFieldKey(input) {
-  return input?.id || input?.name || "";
+  return input?.id || input?.name || (input?.dataset?.liveFallbackSource ? `live-fallback-${input.dataset.liveFallbackSource}` : "");
 }
 
 function syncLiveSaveDirtyState() {
@@ -440,6 +452,7 @@ function liveSettingsFormControls() {
     ids.liveRetryCount,
     ids.liveRetryDelayMs,
     ids.liveComplianceAck,
+    ...(ids.liveFallbackSources || []),
   ].filter(Boolean);
 }
 
@@ -1644,6 +1657,7 @@ function renderLivePanel(data = latestStatus) {
   setInputIfIdle(ids.liveMaxTotalDrawdown, settings.max_total_drawdown, { preserveDirty: true });
   setInputIfIdle(ids.liveRetryCount, settings.retry_count, { preserveDirty: true });
   setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms, { preserveDirty: true });
+  setLiveFallbackSourcesIfIdle(settings.fallback_sources || [], { preserveDirty: true });
   const enabled = Boolean(settings.enabled ?? live.enabled);
   const ready = Boolean(readiness.ready);
   if (ids.liveStatus) {
@@ -1653,6 +1667,7 @@ function renderLivePanel(data = latestStatus) {
       : "实盘关闭";
     if (lastError) ids.liveStatus.textContent = `${ids.liveStatus.textContent} · ${lastError}`;
   }
+  renderLiveGateStatus(live);
   if (ids.liveReadiness) {
     const errors = Array.isArray(readiness.errors) ? readiness.errors : [];
     const wallet = readiness.wallet || {};
@@ -1726,6 +1741,189 @@ function renderLivePanel(data = latestStatus) {
   renderLivePreflightResult();
   renderLiveDoctorResult();
   renderLiveOnceResult();
+}
+
+function renderLiveGateStatus(live = {}) {
+  if (!ids.liveGateStatus) return;
+  const gate = live.gate_status || {};
+  const checks = Array.isArray(gate.checks) ? gate.checks : [];
+  if (!checks.length) {
+    ids.liveGateStatus.innerHTML = `
+      <div class="live-gate-summary live-gate-block">
+        <div>
+          <span>实盘下单条件</span>
+          <strong>等待状态</strong>
+        </div>
+        <small>后端尚未返回条件明细</small>
+      </div>
+    `;
+    return;
+  }
+  const status = gate.overall_status || "UNKNOWN";
+  const statusClass = gateStatusClass(status);
+  const blocked = Array.isArray(gate.blocked_checks) ? gate.blocked_checks : checks.filter((row) => row.status === "BLOCK");
+  const warnings = Array.isArray(gate.warning_checks) ? gate.warning_checks : checks.filter((row) => row.status === "WARN");
+  const primaryKey = gate.primary_blocker || blocked[0]?.key || warnings[0]?.key || "-";
+  const primaryMessage = gate.primary_message || blocked[0]?.message || warnings[0]?.message || "全部条件通过";
+  const nextAction = gate.next_action || "-";
+  const metrics = gate.metrics || {};
+  const signal = gate.signal || {};
+  const priceSelection = gate.price_selection || {};
+  const basisRows = Array.isArray(gate.price_basis) ? gate.price_basis : [];
+  const visibleChecks = gateVisibleChecks(checks);
+  ids.liveGateStatus.innerHTML = `
+    <div class="live-gate-summary ${statusClass}">
+      <div>
+        <span>实盘下单条件</span>
+        <strong>${safe(status)}(${safe(gate.overall_label || gateStatusLabel(status))})</strong>
+      </div>
+      <div>
+        <span>主因</span>
+        <strong>${safe(gateCheckName(primaryKey))}</strong>
+        <small>${safe(primaryMessage)}</small>
+      </div>
+      <div>
+        <span>下一步</span>
+        <strong>${safe(nextAction)}</strong>
+      </div>
+      <div>
+        <span>风控</span>
+        <strong>${fmtSignedMoneyCell(metrics.daily_realized_pnl)} / -${fmtNumberCell(metrics.daily_loss_limit, 2)}</strong>
+        <small>总 ${fmtSignedMoneyCell(metrics.total_pnl)} / -${fmtNumberCell(metrics.total_drawdown_limit, 2)}</small>
+      </div>
+      <div>
+        <span>信号</span>
+        <strong>${safe(signal.side || "-")}</strong>
+        <small>${signal.entry_price == null ? "-" : `entry ${fmtNumberCell(signal.entry_price, 4)} · ${fmtSignedBpsCell(signal.move_bps)}`}</small>
+      </div>
+      <div>
+        <span>价格源</span>
+        <strong>${safe(priceSelection.selected_source || "-")}</strong>
+        <small>${priceSelection.selected_price == null ? safe(priceSelection.message || "-") : `${fmtNumberCell(priceSelection.selected_price, 2)} · ${safe(priceSelection.message || "")}`}</small>
+      </div>
+    </div>
+    <div class="live-gate-checks">
+      ${visibleChecks.map((check) => `
+        <div class="live-gate-check ${gateCheckClass(check.status)}" title="${safe(check.message || "")}">
+          <span>${safe(gateCheckName(check.key))}</span>
+          <strong>${safe(check.status || "-")}${gateCheckLabel(check) ? `(${safe(gateCheckLabel(check))})` : ""}</strong>
+          <small>${safe(gateCheckMeta(check))}</small>
+        </div>
+      `).join("")}
+    </div>
+    ${basisRows.length ? `
+      <div class="live-basis-strip">
+        ${basisRows.map((row) => `
+          <div class="live-basis-item ${row.ready ? "ready" : row.selected ? "warn" : ""}">
+            <span>${safe(String(row.source || "").toUpperCase())}${row.selected ? " · 已选" : ""}</span>
+            <strong>${row.median_bps == null ? "-" : fmtSignedBpsCell(row.median_bps)}</strong>
+            <small>样本 ${safe(row.samples ?? 0)} · 现价 ${row.price == null ? "-" : fmtNumberCell(row.price, 2)} · 校正 ${row.adjusted_price == null ? "-" : fmtNumberCell(row.adjusted_price, 2)} · 差 ${row.basis_usd == null ? "-" : fmtSignedMoneyCell(row.basis_usd)} · ${safe(row.reason || "")}</small>
+          </div>
+        `).join("")}
+      </div>
+    ` : ""}
+  `;
+  appendLiveLog({
+    key: "live-gate",
+    level: gateLogLevel(status),
+    title: `实盘条件 ${status}`,
+    message: primaryMessage,
+    details: [
+      `primary:${primaryKey}`,
+      `next:${nextAction}`,
+      `blocked:${blocked.map((row) => row.key).join(", ") || "-"}`,
+      `warn:${warnings.map((row) => row.key).join(", ") || "-"}`,
+    ],
+    at_ms: gate.checked_at ? gate.checked_at * 1000 : null,
+  });
+}
+
+function gateVisibleChecks(checks) {
+  const priority = [
+    "enabled", "signal", "daily_loss", "total_drawdown", "max_open_trades",
+    "pending_entry_order", "duplicate_direction", "quote_freshness", "price_source",
+    "software_cash", "collateral_wallet", "official_open_orders_clear",
+    "credentials", "geo_access", "target_price", "orderbook_depth", "min_order_size",
+  ];
+  const byKey = new Map(checks.map((row) => [row.key, row]));
+  const ordered = priority.map((key) => byKey.get(key)).filter(Boolean);
+  const rest = checks.filter((row) => !priority.includes(row.key));
+  return ordered.concat(rest).slice(0, 18);
+}
+
+function gateStatusClass(status) {
+  const raw = String(status || "").toUpperCase();
+  if (raw === "READY") return "live-gate-pass";
+  if (raw === "READY_WITH_WARN" || raw === "WAIT_SIGNAL" || raw === "WARN" || raw === "DISABLED") return "live-gate-warn";
+  return "live-gate-block";
+}
+
+function gateLogLevel(status) {
+  const raw = String(status || "").toUpperCase();
+  if (raw === "READY") return "pass";
+  if (raw === "READY_WITH_WARN" || raw === "WAIT_SIGNAL" || raw === "WARN" || raw === "DISABLED") return "warn";
+  return "error";
+}
+
+function gateStatusLabel(status) {
+  const labels = {
+    READY: "可下单",
+    READY_WITH_WARN: "可下单但有警告",
+    WAIT_SIGNAL: "等待信号",
+    DISABLED: "实盘关闭",
+    BLOCKED: "已阻断",
+    WARN: "有警告",
+  };
+  return labels[String(status || "").toUpperCase()] || "未知";
+}
+
+function gateCheckClass(status) {
+  const raw = String(status || "").toUpperCase();
+  if (raw === "PASS") return "pass";
+  if (raw === "WARN") return "warn";
+  return "block";
+}
+
+function gateCheckLabel(check) {
+  const labels = { PASS: "通过", WARN: "警告", BLOCK: "阻断" };
+  return labels[String(check?.status || "").toUpperCase()] || "";
+}
+
+function gateCheckName(key) {
+  const names = {
+    runtime: "运行时",
+    enabled: "实盘开关",
+    process_lock: "进程锁",
+    compliance_acknowledged: "风险确认",
+    geo_access: "地区检查",
+    credentials: "凭证/SDK",
+    market: "当前市场",
+    target_price: "目标价",
+    signal: "策略信号",
+    price_source: "价格源",
+    daily_loss: "日亏停止",
+    total_drawdown: "总回撤停止",
+    max_open_trades: "最大持仓",
+    duplicate_direction: "同向持仓",
+    pending_entry_order: "待确认买入",
+    software_cash: "隔离资金",
+    quote_freshness: "盘口新鲜度",
+    max_entry_price: "最高买价",
+    min_order_size: "最小订单",
+    orderbook_depth: "盘口深度",
+    official_open_orders_clear: "官方挂单",
+    collateral_wallet: "余额/授权",
+  };
+  return names[String(key || "")] || String(key || "-");
+}
+
+function gateCheckMeta(check) {
+  const parts = [];
+  if (check.current !== null && check.current !== undefined && check.current !== "") parts.push(`当前 ${check.current}`);
+  if (check.threshold !== null && check.threshold !== undefined && check.threshold !== "") parts.push(`阈值 ${check.threshold}`);
+  if (check.required !== null && check.required !== undefined && check.required !== "") parts.push(`要求 ${check.required}`);
+  if (check.age_ms !== null && check.age_ms !== undefined) parts.push(`age ${fmtNumberCell(check.age_ms, 0)}ms`);
+  return parts.join(" · ") || check.message || "-";
 }
 
 function renderLivePreflightResult() {
@@ -1880,6 +2078,13 @@ function setCheckboxIfIdle(input, checked, { preserveDirty = false } = {}) {
   input.checked = nextChecked;
   if (key) liveSettingsDirtyFields.delete(key);
   syncLiveSaveDirtyState();
+}
+
+function setLiveFallbackSourcesIfIdle(sources = [], { preserveDirty = false } = {}) {
+  const selected = new Set(Array.isArray(sources) ? sources.map((item) => String(item).toLowerCase()) : []);
+  for (const input of ids.liveFallbackSources || []) {
+    setCheckboxIfIdle(input, selected.has(String(input.dataset.liveFallbackSource || "").toLowerCase()), { preserveDirty });
+  }
 }
 
 function renderStrategyExperiments(runtime = {}) {
@@ -2403,6 +2608,9 @@ function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summa
     row.variant_id || row.account_scope || "main",
     row.id,
     row.status || "",
+    row.status_display || "",
+    row.status_label || "",
+    row.settlement_pending ? "pending" : "",
     row.side || "",
     row.entry_price ?? "",
     row.shares ?? "",
@@ -2437,6 +2645,9 @@ function openRenderKey(rows, scope = openDataScope) {
     row.variant_id || row.account_scope || "main",
     row.id,
     row.status || "",
+    row.position_state || "",
+    row.position_state_label || "",
+    row.settlement_pending ? "pending" : "",
     row.side || "",
     row.shares ?? "",
     row.current_bid ?? "",
@@ -2599,17 +2810,63 @@ function canCancelOrder(row) {
 
 function liveSellButton(row) {
   if (row?.account_scope !== "live" || row?.status !== "OPEN") return "-";
+  if (row?.settlement_pending) {
+    return `<button class="table-action live-sell-button" type="button" disabled title="市场已结束，等待官方结算">等待结算</button>`;
+  }
   if (row?.pending_live_sell_order_id) {
     return `<button class="table-action live-sell-button" type="button" disabled title="等待官方确认卖出订单">卖出确认中</button>`;
   }
   return `<button class="table-action live-sell-button" type="button" data-live-sell-trade-id="${safe(row.id)}">卖出</button>`;
 }
 
+function statusWithLabel(status, label) {
+  const raw = String(status || "").trim();
+  if (!raw) return "-";
+  return label ? `${safe(raw)}(${safe(label)})` : safe(raw);
+}
+
+function positionStateText(row) {
+  const raw = row?.position_state || row?.status_display || row?.status || "";
+  const label = row?.position_state_label || row?.status_label || TRADE_STATUS_LABELS[raw] || "";
+  return statusWithLabel(raw, label);
+}
+
+function tradeStatusText(row) {
+  const raw = row?.status_display || row?.position_state || row?.status || "";
+  const label = row?.status_label || row?.position_state_label || TRADE_STATUS_LABELS[raw] || "";
+  return statusWithLabel(raw, label);
+}
+
+function endedPositionCell(row, fallback = "已结束") {
+  if (!row?.settlement_pending) return null;
+  return `<span class="muted">${safe(fallback)}</span>`;
+}
+
+function positionNumberCell(row, key, digits = 4) {
+  return endedPositionCell(row) || fmtNumberCell(row?.[key], digits);
+}
+
+function positionMoneyCell(row, key) {
+  return endedPositionCell(row, "等待结算") || fmtMoneyCell(row?.[key]);
+}
+
+function positionSignedMoneyCell(row, key) {
+  return endedPositionCell(row, "等待结算") || fmtSignedMoneyCell(row?.[key]);
+}
+
+function positionSignedPctCell(row, key) {
+  return endedPositionCell(row, "等待结算") || fmtSignedPctCell(row?.[key]);
+}
+
+function positionSignedBpsCell(row, key) {
+  return endedPositionCell(row, "等待结算") || fmtSignedBpsCell(row?.[key]);
+}
+
 function orderStatusText(status) {
   const raw = String(status || "").trim();
   if (!raw) return "-";
   const label = ORDER_STATUS_LABELS[raw];
-  return label ? `${safe(raw)}(${safe(label)})` : safe(raw);
+  return statusWithLabel(raw, label);
 }
 
 function isCurrentMarketOrder(row) {
@@ -3051,6 +3308,16 @@ async function loadStatus(manual = false) {
   const res = await fetch(manual ? "/api/tick" : "/api/status", manual ? { method: "POST" } : {});
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
+  applyStatusPayload(data, { manual, refreshAuxiliary: true });
+}
+
+async function runManualTick() {
+  await loadStatus();
+}
+
+function applyStatusPayload(data, options = {}) {
+  const manual = Boolean(options.manual);
+  const refreshAuxiliary = options.refreshAuxiliary !== false;
   latestStatus = data;
   if (data.runtime.current_market) applyMarket(data.runtime.current_market);
   if (data.runtime.latest_quotes && !Object.keys(quotes).length) quotes = data.runtime.latest_quotes;
@@ -3078,12 +3345,38 @@ async function loadStatus(manual = false) {
     data.recent_orders_meta = orderMeta;
   }
   renderAll(data, { forceOrder: manual });
+  if (!refreshAuxiliary) return;
   loadEquityCurve(false).catch(showError);
   loadOrders(orderStatusFilter !== "all").catch(showError);
   refreshVisibleScopedRecentTrades().catch(showError);
   if (strategyExperimentViewActive()) {
     loadStrategyExperimentTables({ force: manual }).catch(showError);
   }
+}
+
+function connectStatusStream() {
+  if (!window.EventSource || statusStream) return;
+  statusStream = new EventSource("/api/status-stream");
+  statusStream.onopen = () => {
+    statusStreamConnected = true;
+  };
+  statusStream.onmessage = (event) => {
+    lastStatusStreamAt = Date.now();
+    if (!pageVisible) return;
+    try {
+      applyStatusPayload(JSON.parse(event.data), { refreshAuxiliary: false });
+    } catch (error) {
+      showError(error);
+    }
+  };
+  statusStream.onerror = () => {
+    statusStreamConnected = false;
+    if (statusStream) {
+      statusStream.close();
+      statusStream = null;
+    }
+    setTimeout(connectStatusStream, 2_000);
+  };
 }
 
 async function loadEquityCurve(force = false) {
@@ -3340,7 +3633,7 @@ async function cancelOrder(orderId) {
     const reason = payload.not_canceled[String(orderId)] || "取消失败";
     throw new Error(reason);
   }
-  await loadStatus(true);
+  await loadStatus();
   await loadOrders(true);
   renderRecentOrders(orderRows, { force: true });
 }
@@ -3356,7 +3649,7 @@ async function cancelOrders(scope) {
   if (!(payload.canceled || []).length && payload.not_canceled && Object.keys(payload.not_canceled).length) {
     throw new Error(Object.values(payload.not_canceled)[0] || "批量取消失败");
   }
-  await loadStatus(true);
+  await loadStatus();
   await loadOrders(true);
   renderRecentOrders(orderRows, { force: true });
 }
@@ -3369,7 +3662,7 @@ async function sellLiveTrade(tradeId) {
     body: JSON.stringify({ trade_id: tradeId }),
   });
   if (!res.ok) throw new Error(`live sell HTTP ${res.status}`);
-  await loadStatus(true);
+  await loadStatus();
   if (isLiveScope(openDataScope) || isLiveScope(orderDataScope) || isLiveScope(recentDataScope)) {
     await loadOrders(true);
     await loadRecentTradesPage(true);
@@ -3611,6 +3904,10 @@ function liveSettingsPayload(overrides = {}) {
     max_total_drawdown: toNumber(ids.liveMaxTotalDrawdown?.value) ?? 12,
     retry_count: Math.max(0, Math.round(toNumber(ids.liveRetryCount?.value) ?? 2)),
     retry_delay_ms: Math.max(0, Math.round(toNumber(ids.liveRetryDelayMs?.value) ?? 250)),
+    fallback_sources: (ids.liveFallbackSources || [])
+      .filter((input) => input.checked)
+      .map((input) => String(input.dataset.liveFallbackSource || "").toLowerCase())
+      .filter(Boolean),
     compliance_acknowledged: ids.liveComplianceAck?.checked || false,
     ...overrides,
   };
@@ -4313,8 +4610,7 @@ async function postSnapshot() {
       }),
     });
     if (!res.ok) throw new Error(`snapshot HTTP ${res.status}`);
-    latestStatus = await res.json();
-    renderAll(latestStatus);
+    await res.json();
   } finally {
     snapshotInFlight = false;
   }
@@ -4353,12 +4649,13 @@ function showError(error) {
 async function refreshMarketBoundary() {
   if (!pageVisible) return;
   if (activeMarket && Date.now() / 1000 < activeMarket.end_ts - 1) return;
-  await loadStatus(true);
+  await loadStatus();
 }
 
 function handleVisibilityChange() {
   pageVisible = document.visibilityState !== "hidden";
   if (!pageVisible) return;
+  connectStatusStream();
   if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer);
   renderAll(latestStatus, { force: true, forceChart: true });
   loadEquityCurve(false).catch(showError);
@@ -4367,7 +4664,7 @@ function handleVisibilityChange() {
     loadLlmReview({ force: false }).catch(renderLlmReviewError);
   }
   foregroundRefreshTimer = setTimeout(() => {
-    loadStatus(true).catch(showError);
+    loadStatus().catch(showError);
   }, 150);
 }
 
@@ -4412,7 +4709,7 @@ window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), 
 setActiveAppPage(locationAppPage(), { syncHash: false });
 applyAnalysisRealtimeVisibility();
 
-ids.tickButton.addEventListener("click", () => loadStatus(true).catch(showError));
+ids.tickButton.addEventListener("click", () => runManualTick().catch(showError));
 ids.paperPauseToggle?.addEventListener("click", () => togglePaperPause().catch(showError));
 ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
 ids.liveSettingsToggle?.addEventListener("click", (event) => {
@@ -4490,16 +4787,18 @@ document.addEventListener("mouseup", scheduleProtectedTableFlush);
 document.addEventListener("pointerup", scheduleProtectedTableFlush);
 
 initFieldOptions();
-setRecentLoading(true);
-loadStatus(true).then(() => {
-  connectPriceSocket();
-  connectOkxSocket();
-  connectBinanceMarketSocket();
-}).catch(showError);
-setInterval(() => {
-  if (!pageVisible) return;
-  loadStatus().catch(showError);
-}, STATUS_POLL_MS);
+	setRecentLoading(true);
+	loadStatus().then(() => {
+	  connectStatusStream();
+	  connectPriceSocket();
+	  connectOkxSocket();
+	  connectBinanceMarketSocket();
+	}).catch(showError);
+	setInterval(() => {
+	  if (!pageVisible) return;
+	  if (statusStreamConnected && Date.now() - lastStatusStreamAt < STATUS_STREAM_STALE_MS) return;
+	  loadStatus().catch(showError);
+	}, STATUS_POLL_MS);
 setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
 setInterval(() => {
   if (!pageVisible || activeAppPage !== "analysis") return;

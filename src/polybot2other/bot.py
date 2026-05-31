@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Any
 
 from .actor_analysis import PolymarketDataClient, build_actor_analysis
+from .clob_ws import ClobMarketWebSocketFeed, RtdsChainlinkWebSocketFeed
 from .config import Settings, reload_live_credential_env
 from .execution import (
     ORDER_TYPE_GTC,
@@ -62,6 +63,8 @@ from .strategy import MULTI_SOURCE_KEYS, RealBtcFiveMinuteStrategy, input_from_s
 
 
 LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
+BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS = 1.0
+BACKEND_MARKET_DATA_REFRESH_RATIO = 0.5
 OFFICIAL_RECHECK_INTERVAL_SECONDS = 10.0
 OFFICIAL_RECHECK_WINDOW_SECONDS = 24 * 60 * 60
 OFFICIAL_RECHECK_LIMIT = 5
@@ -75,6 +78,7 @@ ORDERS_MAX_LIMIT = 200
 EQUITY_CURVE_DEFAULT_DAYS = 90
 EQUITY_CURVE_DEFAULT_MAX_POINTS = 1200
 EQUITY_CURVE_MAX_POINTS = 5000
+TRADE_STATUS_PENDING_SETTLEMENT = "PENDING_SETTLEMENT"
 PAIR_ENTRY_COST_THRESHOLD = 0.98
 PAIR_EXIT_BID_THRESHOLD = 0.98
 PAIR_ENTRY_MIN_SECONDS_LEFT = 45
@@ -139,34 +143,45 @@ class LiveOnceBlockedError(RuntimeError):
 
 
 class PriceBasisTracker:
-    """跟踪 OKX/Binance 相对 Chainlink 的短窗基差；只用于 Paper 实验。"""
+    """跟踪 OKX/Binance 相对 Chainlink 的短窗基差。"""
 
     def __init__(self, max_samples: int = PRICE_BASIS_MAX_SAMPLES) -> None:
         self.max_samples = max(10, int(max_samples))
         self._basis: dict[str, list[float]] = {source: [] for source in MULTI_SOURCE_KEYS}
+        self._last_sample_keys: dict[str, tuple[int, int]] = {}
 
     def enrich(self, price: dict[str, Any], now_ms: int | None = None) -> dict[str, Any]:
         enriched = dict(price)
         now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        for source in MULTI_SOURCE_KEYS:
+            samples = self._basis.setdefault(source, [])
+            if samples:
+                enriched[f"{source}_basis_median_bps"] = _median(samples)
+                enriched[f"{source}_basis_samples"] = len(samples)
         chainlink = _maybe_float(enriched.get("chainlink"))
-        if chainlink and chainlink > 0:
+        chainlink_updated_ms = _maybe_int(enriched.get("chainlink_updated_ms"))
+        chainlink_age_ms = max(0, now_ms - chainlink_updated_ms) if chainlink_updated_ms else None
+        if chainlink and chainlink > 0 and chainlink_updated_ms and chainlink_age_ms <= self.settings_max_age_ms:
             for source in MULTI_SOURCE_KEYS:
                 source_price = _multi_source_price_for_basis(enriched, source)
                 updated_ms = _multi_source_updated_ms_for_basis(enriched, source)
                 samples = self._basis.setdefault(source, [])
-                if samples:
-                    enriched[f"{source}_basis_median_bps"] = _median(samples)
-                    enriched[f"{source}_basis_samples"] = len(samples)
                 if not source_price or not updated_ms:
                     continue
                 age_ms = max(0, now_ms - updated_ms)
                 if age_ms > self.settings_max_age_ms:
                     continue
+                sample_key = (chainlink_updated_ms, updated_ms)
+                if self._last_sample_keys.get(source) == sample_key:
+                    continue
                 basis_bps = (source_price - chainlink) / chainlink * 10_000.0
                 samples.append(basis_bps)
+                self._last_sample_keys[source] = sample_key
                 if len(samples) > self.max_samples:
                     del samples[: len(samples) - self.max_samples]
                 enriched[f"{source}_basis_latest_bps"] = basis_bps
+                enriched[f"{source}_basis_median_bps"] = _median(samples)
+                enriched[f"{source}_basis_samples"] = len(samples)
         enriched["multi_context"] = multi_source_price_context(enriched, now_ms)
         return enriched
 
@@ -182,17 +197,41 @@ class PaperTradingBot:
         self.polymarket = PolymarketClient(settings.gamma_url, settings.clob_url, settings.request_timeout_seconds)
         self.actor_data = PolymarketDataClient(settings.data_api_url, settings.request_timeout_seconds)
         self.price_fallback = PublicPriceClient(settings.request_timeout_seconds)
+        backend_market_data_timeout = min(
+            settings.request_timeout_seconds,
+            max(1.0, (settings.max_quote_age_ms / 1000.0) * BACKEND_MARKET_DATA_REFRESH_RATIO),
+        )
+        self.market_data_polymarket = PolymarketClient(
+            settings.gamma_url,
+            settings.clob_url,
+            backend_market_data_timeout,
+        )
+        self.market_data_price_fallback = PublicPriceClient(backend_market_data_timeout)
         self.strategy = RealBtcFiveMinuteStrategy(settings)
         self._lock = threading.Lock()
+        self._market_data_refresh_lock = threading.Lock()
+        self._price_refresh_lock = threading.Lock()
+        self._price_basis_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._market_data_thread: threading.Thread | None = None
+        self._clob_ws_thread: threading.Thread | None = None
+        self._rtds_ws_thread: threading.Thread | None = None
+        self._price_refresh_thread: threading.Thread | None = None
         self.last_error: str | None = None
         self.last_tick_at: float | None = None
         self.last_signal: dict[str, Any] | None = None
         self.current_market = None
         self.latest_price: dict[str, Any] = {}
         self.latest_quotes: dict[str, dict[str, Any]] = {}
+        self.paper_price: dict[str, Any] = {}
+        self.paper_quotes: dict[str, dict[str, Any]] = {}
+        self.execution_price: dict[str, Any] = {}
+        self.execution_quotes: dict[str, dict[str, Any]] = {}
         self._last_live_snapshot_ingest_at = 0.0
+        self._last_backend_market_data_refresh_at = 0.0
+        self._last_backend_quote_refresh_at = 0.0
+        self._last_backend_price_refresh_at = 0.0
         self._official_recheck_next_at: dict[str, float] = {}
         self._official_price_backfill_next_at: dict[str, float] = {}
         self.pair_strategy_enabled = False
@@ -210,6 +249,8 @@ class PaperTradingBot:
         self.paper_trading_paused = False
         self.last_paper_pause_event: dict[str, Any] | None = None
         self.price_basis_tracker = PriceBasisTracker()
+        self.clob_ws_feed = ClobMarketWebSocketFeed(timeout_seconds=settings.request_timeout_seconds)
+        self.rtds_chainlink_feed = RtdsChainlinkWebSocketFeed(timeout_seconds=settings.request_timeout_seconds)
         self._actor_analysis_cache: dict[str, Any] | None = None
         self._actor_analysis_cache_key: str | None = None
         self._actor_analysis_cache_until = 0.0
@@ -218,6 +259,8 @@ class PaperTradingBot:
             "price": "waiting",
             "browser_feed_at": None,
             "backend_rest_fallback_at": None,
+            "backend_rtds_ws": "waiting",
+            "backend_rtds_ws_at": None,
         }
         self.strategy_experiments = (
             StrategyExperimentRunner(settings, self.polymarket, self.price_fallback)
@@ -229,6 +272,25 @@ class PaperTradingBot:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._stop.clear()
+        self._market_data_thread = threading.Thread(
+            target=self._run_market_data,
+            name="polybot2other-market-data-refresh",
+            daemon=True,
+        )
+        self._market_data_thread.start()
+        self._clob_ws_thread = threading.Thread(
+            target=self._run_clob_ws,
+            name="polybot2other-clob-ws",
+            daemon=True,
+        )
+        self._clob_ws_thread.start()
+        self._rtds_ws_thread = threading.Thread(
+            target=self._run_rtds_chainlink_ws,
+            name="polybot2other-rtds-chainlink-ws",
+            daemon=True,
+        )
+        self._rtds_ws_thread.start()
         self._thread = threading.Thread(target=self._run, name="polybot2other-real-btc-paper-bot", daemon=True)
         self._thread.start()
 
@@ -236,6 +298,14 @@ class PaperTradingBot:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=3)
+        if self._market_data_thread:
+            self._market_data_thread.join(timeout=3)
+        if self._clob_ws_thread:
+            self._clob_ws_thread.join(timeout=3)
+        if self._rtds_ws_thread:
+            self._rtds_ws_thread.join(timeout=3)
+        if self._price_refresh_thread:
+            self._price_refresh_thread.join(timeout=3)
 
     def set_pair_strategy_enabled(self, enabled: bool) -> dict[str, Any]:
         with self._lock:
@@ -307,6 +377,50 @@ class PaperTradingBot:
             self.tick()
             self._stop.wait(self.settings.tick_seconds)
 
+    def _run_market_data(self) -> None:
+        while not self._stop.is_set():
+            self._refresh_backend_market_data_once()
+            self._stop.wait(BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS)
+
+    def _run_clob_ws(self) -> None:
+        self.clob_ws_feed.run(
+            self._stop,
+            self._clob_ws_market,
+            self._ingest_backend_clob_ws_quotes,
+            self._set_backend_clob_ws_status,
+        )
+
+    def _run_rtds_chainlink_ws(self) -> None:
+        self.rtds_chainlink_feed.run(
+            self._stop,
+            self._ingest_backend_chainlink_price,
+            self._set_backend_rtds_ws_status,
+        )
+
+    def _clob_ws_market(self) -> MarketRound | None:
+        with self._lock:
+            return self.current_market
+
+    def _refresh_backend_market_data_once(self) -> None:
+        now = time.time()
+        try:
+            with self._lock:
+                market = self.current_market
+            if market is None or market.ends_at <= now + 0.5:
+                market = self._refresh_market()
+            if market is not None:
+                if self._backend_quote_refresh_needed(now):
+                    self._backend_quote_snapshot(market, blocking=False)
+                if self._backend_price_refresh_needed(time.time()):
+                    self._start_backend_price_refresh(market)
+            with self._lock:
+                self.ws_status["backend_market_data_loop_at"] = time.time()
+                self.ws_status.pop("backend_market_data_error", None)
+        except Exception as exc:  # noqa: BLE001 - keep dashboard and trading loop alive.
+            with self._lock:
+                self.ws_status["backend_market_data_loop_at"] = time.time()
+                self.ws_status["backend_market_data_error"] = f"{type(exc).__name__}: {exc}"
+
     def tick(self) -> None:
         now = time.time()
         try:
@@ -314,8 +428,8 @@ class PaperTradingBot:
             if market is None:
                 self._set_error("current_btc_5m_market_unavailable", now)
                 return
-            if self._live_feed_stale(now) or self._price_feed_stale(now):
-                self._rest_fallback_snapshot(market)
+            if self._backend_market_data_refresh_needed(now) and not self._market_data_loop_alive():
+                self._backend_market_data_snapshot(market)
             self._settle_due(now)
             self._reconcile_official_settlements(now)
             self._backfill_official_final_prices(now)
@@ -325,7 +439,7 @@ class PaperTradingBot:
                 self.live_trading.store.record_equity()
             with self._lock:
                 self.last_error = None
-                self.last_tick_at = now
+                self.last_tick_at = time.time()
         except Exception as exc:  # noqa: BLE001 - dashboard must keep running and expose the error.
             self._set_error(f"{type(exc).__name__}: {exc}", now)
 
@@ -340,25 +454,42 @@ class PaperTradingBot:
             and client_market.get("slug") == cached_market.round_id
             and now - last_ingest_at < LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS
         ):
-            return self.snapshot(extra={"throttled_snapshot": True})
+            return {
+                "ok": True,
+                "throttled_snapshot": True,
+                "market": market_to_payload(cached_market),
+                "updated_at": now,
+            }
         if cached_market is not None and client_market.get("slug") == cached_market.round_id:
             with self._lock:
                 self._last_live_snapshot_ingest_at = now
 
-        market = self._refresh_market()
-        if market is None:
-            with self._lock:
-                cached_market = self.current_market
-            if (
-                cached_market is not None
-                and cached_market.ends_at > now
-                and client_market.get("slug") == cached_market.round_id
-            ):
-                market = cached_market
-            else:
-                raise RuntimeError("current BTC 5m market unavailable")
+        if (
+            cached_market is not None
+            and cached_market.ends_at > now
+            and client_market.get("slug") == cached_market.round_id
+        ):
+            market = cached_market
+        else:
+            market = self._refresh_market()
+            if market is None:
+                with self._lock:
+                    cached_market = self.current_market
+                if (
+                    cached_market is not None
+                    and cached_market.ends_at > now
+                    and client_market.get("slug") == cached_market.round_id
+                ):
+                    market = cached_market
+                else:
+                    raise RuntimeError("current BTC 5m market unavailable")
         if client_market.get("slug") and client_market.get("slug") != market.round_id:
-            return self.snapshot(extra={"ignored_snapshot": "stale_market"})
+            return {
+                "ok": True,
+                "ignored_snapshot": "stale_market",
+                "market": market_to_payload(market),
+                "updated_at": now,
+            }
 
         price = payload.get("price") if isinstance(payload.get("price"), dict) else {}
         price = dict(price)
@@ -373,20 +504,6 @@ class PaperTradingBot:
             price.pop("target_price_updated_ms", None)
         quotes = payload.get("quotes") if isinstance(payload.get("quotes"), dict) else {}
         cleaned_quotes = _clean_quotes(quotes)
-        chainlink_price = _maybe_float(price.get("chainlink"))
-        binance_price = _maybe_float(price.get("binance"))
-        okx_price = _maybe_float(price.get("okx"))
-        if chainlink_price:
-            self.store.save_price_tick(
-                "BTC",
-                chainlink_price,
-                "polymarket-rtds-chainlink",
-                _updated_at_seconds(price.get("chainlink_updated_ms"), now),
-            )
-        elif binance_price:
-            self.store.save_price_tick("BTC", binance_price, "polymarket-rtds-binance", now)
-        elif okx_price:
-            self.store.save_price_tick("BTC", okx_price, "okx-browser-ws", now)
         self.store.upsert_round(market)
         with self._lock:
             self.current_market = market
@@ -397,13 +514,30 @@ class PaperTradingBot:
                 "price": str(payload.get("price_ws_status") or "browser"),
                 "browser_feed_at": now,
                 "backend_rest_fallback_at": self.ws_status.get("backend_rest_fallback_at"),
+                "backend_market_data_loop_at": self.ws_status.get("backend_market_data_loop_at"),
+                "backend_market_data_error": self.ws_status.get("backend_market_data_error"),
+                "backend_clob_ws": self.ws_status.get("backend_clob_ws"),
+                "backend_clob_ws_at": self.ws_status.get("backend_clob_ws_at"),
+                "backend_clob_ws_market": self.ws_status.get("backend_clob_ws_market"),
+                "backend_clob_ws_event": self.ws_status.get("backend_clob_ws_event"),
+                "backend_clob_ws_error": self.ws_status.get("backend_clob_ws_error"),
+                "backend_rtds_ws": self.ws_status.get("backend_rtds_ws"),
+                "backend_rtds_ws_at": self.ws_status.get("backend_rtds_ws_at"),
+                "backend_rtds_ws_topic": self.ws_status.get("backend_rtds_ws_topic"),
+                "backend_rtds_ws_error": self.ws_status.get("backend_rtds_ws_error"),
             }
             self._last_live_snapshot_ingest_at = now
-        self._settle_due(now)
-        self._reconcile_official_settlements(now)
-        self._backfill_official_final_prices(now)
-        self._run_strategy_from_state()
-        return self.snapshot()
+        return {
+            "ok": True,
+            "market": market_to_payload(market),
+            "updated_at": now,
+            "display_quote_sides": sorted(cleaned_quotes),
+            "market_data_scope": {
+                "display": "browser_or_backend",
+                "paper": "backend_only",
+                "execution": "backend_only",
+            },
+        }
 
     def _refresh_market(self):
         try:
@@ -420,6 +554,10 @@ class PaperTradingBot:
             if previous is None or previous.round_id != market.round_id:
                 self.latest_quotes = {}
                 self.latest_price = {}
+                self.paper_quotes = {}
+                self.paper_price = {}
+                self.execution_quotes = {}
+                self.execution_price = {}
                 self.last_signal = None
         self.store.upsert_round(market)
         return market
@@ -443,36 +581,301 @@ class PaperTradingBot:
         )
 
     def _rest_fallback_snapshot(self, market) -> None:
-        quotes = self.polymarket.get_quotes(market)
+        self._refresh_backend_quotes(market)
+        self._refresh_backend_prices(market)
+
+    def _refresh_backend_quotes(self, market: MarketRound) -> None:
+        quotes = self.market_data_polymarket.get_quotes(market)
         now = time.time()
-        ticks = self.price_fallback.fetch_sources("BTC", now)
-        fallback_tick = ticks.get("coinbase") or ticks.get("binance") or ticks.get("okx")
-        if fallback_tick is None:
-            fallback_tick = self.price_fallback.fetch_symbol("BTC", now)
-        now_ms = int(time.time() * 1000)
-        price = {
-            "chainlink": None,
-            "binance": ticks.get("binance").price if ticks.get("binance") else fallback_tick.price,
-            "binance_updated_ms": now_ms,
-            "okx": ticks.get("okx").price if ticks.get("okx") else None,
-            "okx_updated_ms": now_ms if ticks.get("okx") else None,
-            "source": f"{fallback_tick.source}-rest-fallback",
-        }
-        if market.target_price > 0:
-            price["target_price"] = market.target_price
-            price["target_price_source"] = "market.target_price"
-            price["target_price_fallback"] = False
+        backend_quotes = {side: quote.to_dict() for side, quote in quotes.items()}
         with self._lock:
-            self.latest_quotes = {side: quote.to_dict() for side, quote in quotes.items()}
-            self.latest_price = price
-            self.ws_status["backend_rest_fallback_at"] = time.time()
+            self.latest_quotes = _copy_quotes(backend_quotes)
+            self.paper_quotes = _copy_quotes(backend_quotes)
+            self.execution_quotes = _copy_quotes(backend_quotes)
+            self.ws_status["backend_rest_fallback_at"] = now
             fed_at = self.ws_status.get("browser_feed_at")
             if not fed_at or now - float(fed_at) > self.settings.live_snapshot_max_age_seconds:
                 self.ws_status["market"] = "rest-fallback"
+            self._last_backend_quote_refresh_at = now
+
+    def _refresh_backend_prices(self, market: MarketRound) -> None:
+        now = time.time()
+        ticks = self.market_data_price_fallback.fetch_sources("BTC", now)
+        fallback_tick = ticks.get("coinbase") or ticks.get("binance") or ticks.get("okx")
+        if fallback_tick is None:
+            fallback_tick = self.market_data_price_fallback.fetch_symbol("BTC", now)
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            price = dict(self.execution_price or self.paper_price or {})
+        price.update(
+            {
+                "binance": ticks.get("binance").price if ticks.get("binance") else fallback_tick.price,
+                "binance_updated_ms": now_ms,
+                "okx": ticks.get("okx").price if ticks.get("okx") else None,
+                "okx_updated_ms": now_ms if ticks.get("okx") else None,
+                "source": (
+                    "backend-rtds-chainlink+rest-fallback"
+                    if _maybe_float(price.get("chainlink"))
+                    else f"{fallback_tick.source}-rest-fallback"
+                ),
+            }
+        )
+        price = self._backend_price_payload(market, price, now_ms)
+        with self._lock:
+            self.latest_price = dict(price)
+            self.paper_price = dict(price)
+            self.execution_price = dict(price)
+            self.ws_status["backend_rest_fallback_at"] = time.time()
+            fed_at = self.ws_status.get("browser_feed_at")
+            if not fed_at or now - float(fed_at) > self.settings.live_snapshot_max_age_seconds:
                 self.ws_status["price"] = "rest-fallback"
             else:
                 self.ws_status["price"] = "rest-fallback"
+            self._last_backend_price_refresh_at = time.time()
         self.store.save_price_tick("BTC", fallback_tick.price, fallback_tick.source, time.time())
+
+    def _backend_price_payload(
+        self,
+        market: MarketRound | None,
+        price: dict[str, Any],
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        payload = dict(price)
+        if market is not None and market.target_price > 0:
+            payload["target_price"] = market.target_price
+            payload["target_price_source"] = "market.target_price"
+            payload["target_price_fallback"] = False
+        with self._price_basis_lock:
+            return self.price_basis_tracker.enrich(payload, now_ms)
+
+    def _set_backend_rtds_ws_status(self, status: dict[str, Any]) -> None:
+        state = str(status.get("state") or "unknown")
+        with self._lock:
+            self.ws_status["backend_rtds_ws"] = state
+            self.ws_status["backend_rtds_ws_at"] = _maybe_float(status.get("at")) or time.time()
+            if status.get("topic"):
+                self.ws_status["backend_rtds_ws_topic"] = str(status.get("topic"))
+            if status.get("error"):
+                self.ws_status["backend_rtds_ws_error"] = str(status.get("error"))
+            elif state in {"connected", "message", "connecting"}:
+                self.ws_status.pop("backend_rtds_ws_error", None)
+
+    def _ingest_backend_chainlink_price(
+        self,
+        price: dict[str, Any],
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        chainlink = _maybe_float(price.get("chainlink"))
+        updated_ms = _maybe_int(price.get("chainlink_updated_ms"))
+        if chainlink is None or chainlink <= 0 or not updated_ms:
+            return
+        now = time.time()
+        with self._lock:
+            market = self.current_market
+            merged = dict(self.execution_price or self.paper_price or {})
+        merged["chainlink"] = chainlink
+        merged["chainlink_updated_ms"] = updated_ms
+        merged["source"] = str(price.get("source") or "polymarket-rtds-chainlink")
+        enriched = self._backend_price_payload(market, merged, int(now * 1000))
+        with self._lock:
+            self.latest_price = dict(enriched)
+            self.paper_price = dict(enriched)
+            self.execution_price = dict(enriched)
+            self._last_backend_market_data_refresh_at = max(self._last_backend_market_data_refresh_at, now)
+            self.ws_status["price"] = "backend-rtds-chainlink"
+            self.ws_status["backend_rtds_ws"] = str((status or {}).get("state") or "message")
+            self.ws_status["backend_rtds_ws_at"] = _maybe_float((status or {}).get("at")) or now
+            self.ws_status["backend_rtds_ws_topic"] = str((status or {}).get("topic") or "crypto_prices_chainlink")
+            self.ws_status.pop("backend_rtds_ws_error", None)
+
+    def _set_backend_clob_ws_status(self, status: dict[str, Any]) -> None:
+        state = str(status.get("state") or "unknown")
+        with self._lock:
+            self.ws_status["backend_clob_ws"] = state
+            self.ws_status["backend_clob_ws_at"] = _maybe_float(status.get("at")) or time.time()
+            if status.get("market"):
+                self.ws_status["backend_clob_ws_market"] = str(status.get("market"))
+            if status.get("event_type"):
+                self.ws_status["backend_clob_ws_event"] = str(status.get("event_type"))
+            if status.get("error"):
+                self.ws_status["backend_clob_ws_error"] = str(status.get("error"))
+            elif state in {"connected", "message", "resubscribe", "waiting_market", "connecting"}:
+                self.ws_status.pop("backend_clob_ws_error", None)
+
+    def _ingest_backend_clob_ws_quotes(
+        self,
+        market: MarketRound,
+        quotes: dict[str, dict[str, Any]],
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        now = time.time()
+        cleaned = _clean_quotes(quotes)
+        if not cleaned:
+            return
+        with self._lock:
+            current = self.current_market
+            if current is None or current.round_id != market.round_id:
+                return
+            latest = _copy_quotes(self.latest_quotes)
+            latest.update(_merge_quote_depth(cleaned, latest))
+            paper = _copy_quotes(self.paper_quotes)
+            paper.update(_merge_quote_depth(cleaned, paper))
+            execution = _copy_quotes(self.execution_quotes)
+            execution.update(_merge_quote_depth(cleaned, execution))
+            self.latest_quotes = latest
+            self.paper_quotes = paper
+            self.execution_quotes = execution
+            self._last_backend_quote_refresh_at = now
+            self._last_backend_market_data_refresh_at = max(self._last_backend_market_data_refresh_at, now)
+            self.ws_status["market"] = "clob-ws"
+            self.ws_status["backend_clob_ws"] = str((status or {}).get("state") or "message")
+            self.ws_status["backend_clob_ws_at"] = _maybe_float((status or {}).get("at")) or now
+            self.ws_status["backend_clob_ws_market"] = market.round_id
+            self.ws_status["backend_clob_ws_event"] = str((status or {}).get("event_type") or "")
+            self.ws_status.pop("backend_clob_ws_error", None)
+
+    def _backend_market_data_snapshot(self, market: MarketRound, *, blocking: bool = True) -> bool:
+        acquired = self._market_data_refresh_lock.acquire(blocking=blocking)
+        if not acquired:
+            return False
+        try:
+            self._rest_fallback_snapshot(market)
+            with self._lock:
+                self._last_backend_market_data_refresh_at = time.time()
+            return True
+        finally:
+            self._market_data_refresh_lock.release()
+
+    def _backend_quote_snapshot(self, market: MarketRound, *, blocking: bool = True) -> bool:
+        acquired = self._market_data_refresh_lock.acquire(blocking=blocking)
+        if not acquired:
+            return False
+        try:
+            self._refresh_backend_quotes(market)
+            with self._lock:
+                self._last_backend_market_data_refresh_at = max(
+                    self._last_backend_market_data_refresh_at,
+                    self._last_backend_quote_refresh_at,
+                )
+            return True
+        finally:
+            self._market_data_refresh_lock.release()
+
+    def _start_backend_price_refresh(self, market: MarketRound) -> bool:
+        acquired = self._price_refresh_lock.acquire(blocking=False)
+        if not acquired:
+            return False
+
+        def _worker() -> None:
+            try:
+                self._refresh_backend_prices(market)
+                with self._lock:
+                    self._last_backend_market_data_refresh_at = max(
+                        self._last_backend_market_data_refresh_at,
+                        self._last_backend_price_refresh_at,
+                    )
+            except Exception as exc:  # noqa: BLE001 - price source failure must not stop quote refresh.
+                with self._lock:
+                    self.ws_status["backend_market_data_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._price_refresh_lock.release()
+
+        self._price_refresh_thread = threading.Thread(
+            target=_worker,
+            name="polybot2other-price-refresh",
+            daemon=True,
+        )
+        self._price_refresh_thread.start()
+        return True
+
+    def _market_data_loop_alive(self) -> bool:
+        return bool(self._market_data_thread and self._market_data_thread.is_alive())
+
+    def _backend_market_data_refresh_needed(self, now: float) -> bool:
+        return self._backend_quote_refresh_needed(now) or self._backend_price_refresh_needed(now)
+
+    def _backend_quote_refresh_needed(self, now: float) -> bool:
+        if now - self._last_backend_quote_refresh_at < BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS:
+            return False
+        return self._quote_feed_stale_for_strategy(now)
+
+    def _backend_price_refresh_needed(self, now: float) -> bool:
+        if now - self._last_backend_price_refresh_at < BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS:
+            return False
+        if self._price_feed_stale(now):
+            return True
+        return self._price_feed_stale_for_strategy(now) or self._fallback_price_feed_stale_for_strategy(now)
+
+    def _strategy_feed_refresh_age_seconds(self) -> float:
+        return max(
+            BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS,
+            (self.settings.max_quote_age_ms / 1000.0) * BACKEND_MARKET_DATA_REFRESH_RATIO,
+        )
+
+    def _paper_market_data_locked(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+        price = dict(self.paper_price)
+        quotes = _copy_quotes(self.paper_quotes)
+        if not self.ws_status.get("browser_feed_at"):
+            latest_price = dict(self.latest_price)
+            latest_quotes = _copy_quotes(self.latest_quotes)
+            if latest_price or latest_quotes:
+                return latest_price, latest_quotes, "compat_latest_without_browser"
+        if price or quotes or self.ws_status.get("browser_feed_at"):
+            return price, quotes, "backend"
+        return dict(self.latest_price), _copy_quotes(self.latest_quotes), "compat_latest_without_browser"
+
+    def _paper_market_data(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+        with self._lock:
+            return self._paper_market_data_locked()
+
+    def _execution_market_data_locked(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+        price = dict(self.execution_price)
+        quotes = _copy_quotes(self.execution_quotes)
+        if (price or quotes) or self.ws_status.get("browser_feed_at"):
+            return price, quotes, "backend"
+        return dict(self.latest_price), _copy_quotes(self.latest_quotes), "compat_latest_without_browser"
+
+    def _execution_market_data(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
+        with self._lock:
+            return self._execution_market_data_locked()
+
+    def _quote_feed_stale_for_strategy(self, now: float) -> bool:
+        with self._lock:
+            _price, quotes, _source = self._execution_market_data_locked()
+        if not quotes.get("Up") or not quotes.get("Down"):
+            return True
+        updated_ms = max(
+            _maybe_int(quotes.get("Up", {}).get("updated_at_ms")) or 0,
+            _maybe_int(quotes.get("Down", {}).get("updated_at_ms")) or 0,
+        )
+        if not updated_ms:
+            return True
+        return now - updated_ms / 1000.0 > self._strategy_feed_refresh_age_seconds()
+
+    def _price_feed_stale_for_strategy(self, now: float) -> bool:
+        with self._lock:
+            price, _quotes, _source = self._execution_market_data_locked()
+        latest_ms = max(
+            _maybe_int(price.get("chainlink_updated_ms")) or 0,
+            _maybe_int(price.get("binance_updated_ms")) or 0,
+            _maybe_int(price.get("binance_market_updated_ms")) or 0,
+            _maybe_int(price.get("okx_updated_ms")) or 0,
+        )
+        if not latest_ms:
+            return True
+        return now - latest_ms / 1000.0 > self._strategy_feed_refresh_age_seconds()
+
+    def _fallback_price_feed_stale_for_strategy(self, now: float) -> bool:
+        with self._lock:
+            price, _quotes, _source = self._execution_market_data_locked()
+        latest_ms = max(
+            _maybe_int(price.get("binance_updated_ms")) or 0,
+            _maybe_int(price.get("binance_market_updated_ms")) or 0,
+            _maybe_int(price.get("okx_updated_ms")) or 0,
+        )
+        if not latest_ms:
+            return True
+        return now - latest_ms / 1000.0 > self._strategy_feed_refresh_age_seconds()
 
     def _live_feed_stale(self, now: float) -> bool:
         with self._lock:
@@ -481,7 +884,7 @@ class PaperTradingBot:
 
     def _price_feed_stale(self, now: float) -> bool:
         with self._lock:
-            price = dict(self.latest_price)
+            price, _quotes, _source = self._execution_market_data_locked()
         latest_ms = max(_maybe_int(price.get("chainlink_updated_ms")) or 0, _maybe_int(price.get("binance_updated_ms")) or 0)
         if not latest_ms:
             return True
@@ -509,7 +912,7 @@ class PaperTradingBot:
                         self._official_price_backfill_next_at[slug] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
                 continue
         with self._lock:
-            price = dict(self.latest_price)
+            price, _quotes, _source = self._paper_market_data_locked()
         chainlink_price = _maybe_float(price.get("chainlink"))
         if chainlink_price:
             settled = self.store.settle_due_rounds({"BTC": chainlink_price}, now)
@@ -639,15 +1042,16 @@ class PaperTradingBot:
     def _run_strategy_from_state(self) -> None:
         with self._lock:
             market = self.current_market
-            price = dict(self.latest_price)
-            quotes = dict(self.latest_quotes)
+            price, quotes, _source = self._paper_market_data_locked()
             pair_enabled = self.pair_strategy_enabled
             paper_paused = self.paper_trading_paused
         if market is None:
             return
-        price = self.price_basis_tracker.enrich(price)
-        with self._lock:
-            self.latest_price = dict(price)
+        has_paper_market_data = bool(price or quotes)
+        price = self._backend_price_payload(market, price)
+        if has_paper_market_data:
+            with self._lock:
+                self.paper_price = dict(price)
         if paper_paused:
             now = time.time()
             self._cancel_active_paper_orders_for_pause(now)
@@ -683,9 +1087,9 @@ class PaperTradingBot:
                 "confidence": signal.confidence,
                 "entry_price": signal.entry_price,
                 "move_bps": signal.move_bps,
-                "reason": signal.reason,
+            "reason": signal.reason,
             }
-        self._maybe_place_trade(market, signal)
+        self._maybe_place_trade(market, signal, quotes)
         self._run_strategy_experiments(market, price, quotes)
         self._run_live_strategy(market, price, quotes)
 
@@ -707,7 +1111,8 @@ class PaperTradingBot:
     ) -> None:
         try:
             if self.live_trading is not None:
-                self.live_trading.run_from_state(market, price, quotes)
+                live_price, live_quotes, _source = self._execution_market_data()
+                self.live_trading.run_from_state(market, live_price, live_quotes)
         except Exception as exc:  # noqa: BLE001 - 实盘错误必须暴露但不能阻塞 Paper 采样。
             if self.live_trading is not None:
                 self.live_trading.last_error = f"{type(exc).__name__}: {exc}"
@@ -777,7 +1182,7 @@ class PaperTradingBot:
                     "move_bps": signal.move_bps,
                     "reason": signal.reason,
                 }
-            self._maybe_place_trade(market, signal)
+            self._maybe_place_trade(market, signal, quotes)
         finally:
             self.single_entry_mode = str(previous["single_entry_mode"])
             self.market_data_mode = str(previous["market_data_mode"])
@@ -814,7 +1219,12 @@ class PaperTradingBot:
                 "reason": reason,
             }
 
-    def _maybe_place_trade(self, market, signal) -> None:
+    def _maybe_place_trade(
+        self,
+        market,
+        signal,
+        quotes: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         if signal.side not in {"Up", "Down"}:
             return
         with self._lock:
@@ -860,8 +1270,10 @@ class PaperTradingBot:
         stake = min(self.settings.stake_dollars, float(account["cash_balance"]))
         if stake < 0.1:
             return
-        with self._lock:
-            quotes = dict(self.latest_quotes)
+        if quotes is None:
+            with self._lock:
+                _price, quotes, _source = self._paper_market_data_locked()
+        quotes = _copy_quotes(quotes)
         quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
         quote = self._quote_with_depth(market, signal.side, quote)
         if single_entry_mode == SINGLE_ENTRY_MODE_REVERSAL and opposite_rows:
@@ -1643,6 +2055,14 @@ class PaperTradingBot:
             fresh = self.polymarket.get_quote(token_id, side).to_dict()
         except Exception:  # noqa: BLE001 - missing stop-and-flip exit bid should not stop the bot loop.
             return quote
+        if fresh:
+            with self._lock:
+                latest = dict(self.latest_quotes)
+                latest[side] = fresh
+                self.latest_quotes = latest
+                paper = _copy_quotes(self.paper_quotes)
+                paper[side] = fresh
+                self.paper_quotes = paper
         return fresh or quote
 
     def _quote_with_depth(self, market: MarketRound, side: str, quote: dict[str, Any]) -> dict[str, Any]:
@@ -1659,6 +2079,9 @@ class PaperTradingBot:
             latest = dict(self.latest_quotes)
             latest[side] = fresh
             self.latest_quotes = latest
+            paper = _copy_quotes(self.paper_quotes)
+            paper[side] = fresh
+            self.paper_quotes = paper
         return fresh
 
     def _quotes_with_depth(self, market: MarketRound, quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1675,10 +2098,13 @@ class PaperTradingBot:
                 merged[side] = fresh
         with self._lock:
             latest = dict(self.latest_quotes)
+            paper = _copy_quotes(self.paper_quotes)
             for side, fresh in fresh_quotes.items():
                 if fresh.get("asks"):
                     latest[side] = fresh
+                    paper[side] = fresh
             self.latest_quotes = latest
+            self.paper_quotes = paper
         return merged
 
     def _entry_limit_price(self, signal: Signal) -> float:
@@ -1769,13 +2195,43 @@ class PaperTradingBot:
                 "current_market": market_to_payload(self.current_market),
                 "latest_price": dict(self.latest_price),
                 "latest_quotes": dict(self.latest_quotes),
+                "paper_price": dict(self.paper_price),
+                "paper_quotes": _copy_quotes(self.paper_quotes),
+                "execution_price": dict(self.execution_price),
+                "execution_quotes": _copy_quotes(self.execution_quotes),
+                "market_data_scope": {
+                    "display": "browser_or_backend",
+                    "paper": "backend_only",
+                    "execution": "backend_only",
+                },
                 "ws_status": dict(self.ws_status),
                 "pair_strategy": self._pair_strategy_runtime_locked(),
                 "strategy_experiments": self.strategy_experiments_snapshot(),
                 "live_trading": live_snapshot,
             }
+            if self.live_trading is not None:
+                live_snapshot["gate_status"] = self.live_trading.gate_status(
+                    self.current_market,
+                    dict(self.execution_price),
+                    _copy_quotes(self.execution_quotes),
+                    readiness=live_snapshot.get("readiness") if isinstance(live_snapshot.get("readiness"), dict) else None,
+                    official_open_orders=(
+                        live_snapshot.get("open_orders") if isinstance(live_snapshot.get("open_orders"), dict) else None
+                    ),
+                )
         if self.live_trading is not None:
             live_snapshot["open_trades"] = self._decorate_open_trades(self.live_trading.open_trades(), runtime)
+            live_metrics = self._metrics_with_open_marks(
+                self.live_trading.store.metrics(),
+                live_snapshot["open_trades"],
+            )
+            live_variant = live_snapshot.get("variant") if isinstance(live_snapshot.get("variant"), dict) else None
+            if live_variant is not None:
+                live_variant["metrics"] = live_metrics
+            live_variants = live_snapshot.get("variants") if isinstance(live_snapshot.get("variants"), list) else []
+            for variant in live_variants:
+                if isinstance(variant, dict) and variant.get("variant_id") == LIVE_VARIANT_ID:
+                    variant["metrics"] = live_metrics
         open_trades = self._decorate_open_trades(
             [row for row in self.store.open_trades() if row["symbol"] == "BTC"],
             runtime,
@@ -1957,8 +2413,7 @@ class PaperTradingBot:
             raise ValueError("live trading is disabled in this runtime")
         with self._lock:
             market = self.current_market
-            price = dict(self.latest_price)
-            quotes = _copy_quotes(self.latest_quotes)
+            price, quotes, _source = self._execution_market_data_locked()
         return {
             "live_preflight": self.live_trading.preflight(market, price, quotes),
             "snapshot": self.snapshot(),
@@ -2014,8 +2469,7 @@ class PaperTradingBot:
                     self._rest_fallback_snapshot(market)
             with self._lock:
                 market = self.current_market
-                price = dict(self.latest_price)
-                quotes = _copy_quotes(self.latest_quotes)
+                price, quotes, _source = self._execution_market_data_locked()
             if market is None:
                 if max_wait <= 0 or time.time() >= deadline:
                     message = "current market unavailable for one-shot live run"
@@ -2267,7 +2721,7 @@ class PaperTradingBot:
         if self.live_trading is None:
             raise ValueError("live trading is disabled in this runtime")
         with self._lock:
-            quotes = _copy_quotes(self.latest_quotes)
+            _price, quotes, _source = self._execution_market_data_locked()
         result = self.live_trading.sell_trade(max(1, int(trade_id)), quotes)
         result["snapshot"] = self.snapshot()
         return result
@@ -2338,7 +2792,8 @@ class PaperTradingBot:
         raise ValueError("account_scope must be main, strategy_experiment, or live")
 
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
-        state = _pair_quote_state(self.latest_quotes, time.time())
+        _price, quotes, _source = self._paper_market_data_locked()
+        state = _pair_quote_state(quotes, time.time())
         return {
             "enabled": self.pair_strategy_enabled,
             "stop_loss_streak": self.pair_stop_loss_streak,
@@ -2353,18 +2808,24 @@ class PaperTradingBot:
         latest_price = runtime.get("latest_price") if isinstance(runtime.get("latest_price"), dict) else {}
         latest_quotes = runtime.get("latest_quotes") if isinstance(runtime.get("latest_quotes"), dict) else {}
         current_price = _maybe_float(latest_price.get("chainlink")) or _maybe_float(latest_price.get("binance"))
+        now = time.time()
         decorated: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            settlement_pending = _is_pending_settlement_trade(item, now)
             item["strategy_type"] = _strategy_type(row.get("reason"))
             item["exit_note"] = _exit_note(row.get("reason"))
             item["max_payout"] = _round_money(_maybe_float(row.get("shares")))
             item["max_profit"] = _round_money((_maybe_float(row.get("shares")) or 0.0) - (_maybe_float(row.get("stake")) or 0.0))
             item["max_loss"] = _round_money(_maybe_float(row.get("stake")) or 0.0)
             item["entry_probability_pct"] = _round_pct((_maybe_float(row.get("entry_price")) or 0.0) * 100.0)
-            item["current_price"] = current_price
-            item["current_distance_bps"] = _distance_bps(current_price, _maybe_float(row.get("target_price")))
-            if current_market.get("round_id") == row.get("round_id"):
+            item["settlement_pending"] = settlement_pending
+            item["position_state"] = TRADE_STATUS_PENDING_SETTLEMENT if settlement_pending else str(row.get("status") or "")
+            item["position_state_label"] = "等待官方结算" if settlement_pending else ""
+            item["is_current_market"] = current_market.get("round_id") == row.get("round_id")
+            if item["is_current_market"] and not settlement_pending:
+                item["current_price"] = current_price
+                item["current_distance_bps"] = _distance_bps(current_price, _maybe_float(row.get("target_price")))
                 quote = latest_quotes.get(str(row.get("side"))) if isinstance(latest_quotes.get(str(row.get("side"))), dict) else {}
                 bid = _maybe_float(quote.get("best_bid"))
                 ask = _maybe_float(quote.get("best_ask"))
@@ -2383,6 +2844,7 @@ class PaperTradingBot:
 
     def _decorate_recent_trades(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         decorated: list[dict[str, Any]] = []
+        now = time.time()
         for row in rows:
             item = dict(row)
             item["strategy_type"] = _strategy_type(row.get("reason"))
@@ -2397,7 +2859,15 @@ class PaperTradingBot:
             item["roi_pct"] = _roi_pct(pnl, stake)
             item["resolved_return"] = _round_money(_maybe_float(row.get("payout")))
             item["final_distance_bps"] = _distance_bps(_maybe_float(row.get("final_price")), _maybe_float(row.get("target_price")))
-            item["settlement_source_label"] = _settlement_source_label(row.get("settlement_source"), row)
+            if _is_pending_settlement_trade(item, now):
+                item["settlement_pending"] = True
+                item["status_display"] = TRADE_STATUS_PENDING_SETTLEMENT
+                item["status_label"] = "等待官方结算"
+            else:
+                item["settlement_pending"] = False
+                item["status_display"] = str(row.get("status") or "")
+                item["status_label"] = ""
+            item["settlement_source_label"] = _settlement_source_label(row.get("settlement_source"), item)
             decorated.append(item)
         return decorated
 
@@ -2526,6 +2996,8 @@ class StrategyExperimentRunner:
                     bot.current_market = market
                     bot.latest_price = dict(price)
                     bot.latest_quotes = _copy_quotes(quotes)
+                    bot.paper_price = dict(price)
+                    bot.paper_quotes = _copy_quotes(quotes)
                     bot.ws_status = {
                         "market": "strategy-experiment",
                         "price": "strategy-experiment",
@@ -4012,6 +4484,15 @@ def _distance_bps(price: float | None, target: float | None) -> float | None:
     return round((price - target) / target * 10_000.0, 4)
 
 
+def _is_pending_settlement_trade(row: dict[str, Any], now: float) -> bool:
+    if str(row.get("status") or "").upper() != "OPEN":
+        return False
+    ends_at = _maybe_float(row.get("ends_at"))
+    if ends_at is None or ends_at > now:
+        return False
+    return row.get("settled_at") in (None, "") and row.get("outcome") in (None, "")
+
+
 def _strategy_type(reason: Any) -> str:
     text = str(reason or "")
     if "PAIR_" in text:
@@ -4026,6 +4507,8 @@ def _exit_note(reason: Any) -> str:
 
 
 def _settlement_source_label(source: Any, row: dict[str, Any]) -> str:
+    if row.get("settlement_pending"):
+        return "等待官方结算"
     normalized = str(source or "").strip()
     if normalized == SETTLEMENT_SOURCE_POLYMARKET:
         return "Polymarket官方"

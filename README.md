@@ -10,8 +10,8 @@ The default mode still runs Paper trading continuously. Live trading is opt-in a
 - Only BTC 5-minute markets are tracked.
 - Current market discovery uses Polymarket Gamma event slugs such as `btc-updown-5m-<window_start_unix>`.
 - Orderbook quotes use Polymarket CLOB token ids for the active Up/Down market.
-- The browser dashboard uses Polymarket CLOB market WebSocket and RTDS crypto price WebSocket where available.
-- If the browser WebSocket feed is stale or closed, the backend falls back to CLOB REST orderbook and public BTC price APIs for display and paper-trading continuity.
+- The backend maintains the active market orderbook through Polymarket CLOB market WebSocket and falls back to CLOB REST when the backend WebSocket quote feed is stale.
+- The browser dashboard still uses WebSocket streams for display and analysis, but browser feeds do not drive Paper or live order decisions.
 - Paper entries are simulated as CLOB-style orders. The default entry mode is FAK, walks visible ask levels up to the execution limit, and charges the configured taker fee per filled level.
 - GTC/GTD/POST_ONLY are simulated as resting maker orders. GTC can rest until market end, GTD expires after `POLYBOT2OTHER_PAPER_GTD_SECONDS`, and POST_ONLY additionally requires queue time, price-through-limit movement, and partial queue fills.
 - Resting maker partial fills from the same paper order are aggregated into one open position. Tiny resting fills below `$0.01` are ignored, and residual reserved cash at or below `$0.05` is released as dust instead of creating `$0.00` open positions.

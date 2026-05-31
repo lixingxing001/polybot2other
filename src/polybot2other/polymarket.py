@@ -77,6 +77,31 @@ class PolymarketClient:
         return self._parse_market(market_raw or raw)
 
     def get_quotes(self, market: MarketRound) -> dict[str, PolymarketQuote]:
+        quote_inputs = (("Up", market.up_token), ("Down", market.down_token))
+        try:
+            books = self._post_json(
+                f"{self.clob_url}/books",
+                [{"token_id": token_id} for _, token_id in quote_inputs],
+            )
+        except Exception:  # noqa: BLE001 - fall back to individual CLOB book reads.
+            books = None
+        if isinstance(books, list) and books:
+            by_token: dict[str, dict[str, Any]] = {}
+            for book in books:
+                if not isinstance(book, dict):
+                    continue
+                token_id = str(book.get("asset_id") or book.get("token_id") or "")
+                if token_id:
+                    by_token[token_id] = book
+            quotes: dict[str, PolymarketQuote] = {}
+            for index, (outcome, token_id) in enumerate(quote_inputs):
+                book = by_token.get(token_id)
+                if book is None and index < len(books) and isinstance(books[index], dict):
+                    book = books[index]
+                if book is not None:
+                    quotes[outcome] = self._quote_from_book(token_id, outcome, book)
+            if len(quotes) == len(quote_inputs):
+                return quotes
         return {
             "Up": self.get_quote(market.up_token, "Up"),
             "Down": self.get_quote(market.down_token, "Down"),
@@ -84,6 +109,9 @@ class PolymarketClient:
 
     def get_quote(self, token_id: str, outcome: str) -> PolymarketQuote:
         book = self._get_json(f"{self.clob_url}/book", {"token_id": token_id})
+        return self._quote_from_book(token_id, outcome, book)
+
+    def _quote_from_book(self, token_id: str, outcome: str, book: dict[str, Any]) -> PolymarketQuote:
         bids = _book_levels(book.get("bids"), reverse=True)
         asks = _book_levels(book.get("asks"), reverse=False)
         best_bid = bids[0] if bids else None
@@ -229,6 +257,20 @@ class PolymarketClient:
     def _get_json(self, url: str, params: dict[str, str]) -> Any:
         full_url = f"{url}?{urllib.parse.urlencode(params)}" if params else url
         req = urllib.request.Request(full_url, headers={"User-Agent": "polybot2other/0.2"})
+        with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=self.ssl_context) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _post_json(self, url: str, payload: Any) -> Any:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "polybot2other/0.2",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=self.ssl_context) as response:
             return json.loads(response.read().decode("utf-8"))
 

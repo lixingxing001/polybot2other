@@ -11,10 +11,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from polybot2other.actor_analysis import build_actor_analysis
+from polybot2other.clob_ws import ClobMarketOrderBook, rtds_chainlink_price_from_payload
 from polybot2other.config import Settings, env_file_status, load_settings, reload_live_credential_env
 from polybot2other.bot import (
     LiveOnceBlockedError,
     PaperTradingBot,
+    PriceBasisTracker,
     _experiment_decision_summary,
     _experiment_profit_summary,
     _experiment_review_score,
@@ -54,7 +56,7 @@ from polybot2other.live_env_setup import LiveEnvSetupValues, validate_live_env_v
 from polybot2other.live_evidence import build_live_evidence_payload, main as live_evidence_main
 from polybot2other.live_once import main as live_once_main
 from polybot2other.live_preflight import build_live_preflight_payload, main as live_preflight_main
-from polybot2other.models import MarketRound, PaperFill, PaperFillLevel, Signal
+from polybot2other.models import MarketRound, PaperFill, PaperFillLevel, PriceTick, Signal, TradeIntent
 from polybot2other.polymarket import PolymarketClient
 from polybot2other.report_snapshot import generate_strategy_experiment_report_snapshot
 from polybot2other.storage import (
@@ -1131,6 +1133,51 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["estimated_total_equity"], 94.0, places=5)
             self.assertAlmostEqual(metrics["estimated_total_pnl"], -6.0, places=5)
 
+    def test_expired_open_trade_is_marked_pending_settlement_without_current_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            expired_market = MarketRound(
+                round_id="btc-updown-5m-pending-settlement",
+                symbol="BTC",
+                started_at=now - 360,
+                ends_at=now - 60,
+                target_price=100.0,
+            )
+            current_market = MarketRound(
+                round_id="btc-updown-5m-current-after-pending",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 240,
+                target_price=101.0,
+            )
+            store.upsert_round(expired_market)
+            store.upsert_round(current_market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "test pending settlement")
+            store.place_trade(type("Intent", (), {"market": expired_market, "signal": signal, "stake_dollars": 10.0})())
+            with bot._lock:
+                bot.current_market = current_market
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.2, "best_ask": 0.21, "updated_at_ms": int(now * 1000)},
+                }
+                bot.latest_price = {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)}
+
+            snapshot = bot.snapshot()
+            open_trade = snapshot["open_trades"][0]
+            self.assertTrue(open_trade["settlement_pending"])
+            self.assertEqual(open_trade["position_state"], "PENDING_SETTLEMENT")
+            self.assertEqual(open_trade["position_state_label"], "等待官方结算")
+            self.assertIsNone(open_trade.get("current_price"))
+            self.assertIsNone(open_trade.get("current_bid"))
+            self.assertIsNone(open_trade.get("current_distance_bps"))
+
+            recent = bot.recent_trades_page(5, 0)["recent_trades"][0]
+            self.assertTrue(recent["settlement_pending"])
+            self.assertEqual(recent["status_display"], "PENDING_SETTLEMENT")
+            self.assertEqual(recent["settlement_source_label"], "等待官方结算")
+
     def test_fak_execution_charges_fee_and_caps_by_top_ask_size(self) -> None:
         now = time.time()
         market = MarketRound(
@@ -2188,12 +2235,14 @@ class TradingCoreTest(unittest.TestCase):
                 },
             }
 
-            snapshot = bot.ingest_live_snapshot(payload)
+            result = bot.ingest_live_snapshot(payload)
+            snapshot = bot.snapshot()
 
+            self.assertTrue(result["ok"])
+            self.assertLess(len(json.dumps(result)), 1000)
             self.assertEqual(snapshot["runtime"]["current_market"]["target_price"], 0.0)
             self.assertNotIn("target_price", snapshot["runtime"]["latest_price"])
-            self.assertEqual(snapshot["runtime"]["last_signal"]["side"], "NO_TRADE")
-            self.assertIn("缺少官方目标价", snapshot["runtime"]["last_signal"]["reason"])
+            self.assertEqual(snapshot["runtime"]["last_signal"], {})
             self.assertEqual(store.open_trades(), [])
 
     def test_live_snapshot_uses_official_market_target_over_client_fallback(self) -> None:
@@ -2227,12 +2276,372 @@ class TradingCoreTest(unittest.TestCase):
                 },
             }
 
-            snapshot = bot.ingest_live_snapshot(payload)
+            result = bot.ingest_live_snapshot(payload)
+            snapshot = bot.snapshot()
 
+            self.assertTrue(result["ok"])
+            self.assertLess(len(json.dumps(result)), 1000)
             self.assertEqual(snapshot["runtime"]["current_market"]["target_price"], 100.0)
             self.assertEqual(snapshot["runtime"]["latest_price"]["target_price"], 100.0)
             self.assertEqual(snapshot["runtime"]["latest_price"]["target_price_source"], "market.target_price")
             self.assertFalse(snapshot["runtime"]["latest_price"]["target_price_fallback"])
+            self.assertEqual(snapshot["runtime"]["paper_price"], {})
+            self.assertEqual(snapshot["runtime"]["paper_quotes"], {})
+            self.assertEqual(snapshot["runtime"]["execution_price"], {})
+            self.assertEqual(snapshot["runtime"]["execution_quotes"], {})
+
+            paper_price, paper_quotes, paper_source = bot._paper_market_data()
+            self.assertEqual(paper_price, {})
+            self.assertEqual(paper_quotes, {})
+            self.assertEqual(paper_source, "backend")
+            execution_price, execution_quotes, execution_source = bot._execution_market_data()
+            self.assertEqual(execution_price, {})
+            self.assertEqual(execution_quotes, {})
+            self.assertEqual(execution_source, "backend")
+
+    def test_live_snapshot_does_not_drive_paper_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+                live_trading_runtime_enabled=False,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-paper-isolated",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                slug="btc-updown-5m-paper-isolated",
+            )
+            bot.polymarket.find_current_btc_5m_market = lambda: market
+            snapshot_payload = {
+                "market": {"slug": market.round_id},
+                "price": {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)},
+                "quotes": {
+                    "Up": {"best_bid": 0.52, "best_ask": 0.54, "ask_size": 100, "updated_at_ms": int(now * 1000)},
+                    "Down": {"best_bid": 0.45, "best_ask": 0.47, "ask_size": 100, "updated_at_ms": int(now * 1000)},
+                },
+            }
+
+            calls = []
+            bot._run_strategy_from_state = lambda: calls.append("strategy")
+
+            result = bot.ingest_live_snapshot(snapshot_payload)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(calls, [])
+            self.assertEqual(store.open_trades(), [])
+            snapshot = bot.snapshot()
+            self.assertEqual(snapshot["runtime"]["paper_price"], {})
+            self.assertEqual(snapshot["runtime"]["paper_quotes"], {})
+            self.assertEqual(snapshot["runtime"]["market_data_scope"]["paper"], "backend_only")
+
+    def test_backend_market_data_refreshes_when_quotes_exceed_strategy_age(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+                live_snapshot_max_age_seconds=8.0,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-backend-feed",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            stale_quote_ms = now_ms - settings.max_quote_age_ms - 500
+            with bot._lock:
+                bot.current_market = market
+                bot.ws_status["browser_feed_at"] = now
+                bot.latest_price = {"binance": 101.0, "binance_updated_ms": now_ms}
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.50, "best_ask": 0.52, "updated_at_ms": stale_quote_ms},
+                    "Down": {"best_bid": 0.48, "best_ask": 0.50, "updated_at_ms": stale_quote_ms},
+                }
+                bot.paper_price = {"binance": 101.0, "binance_updated_ms": now_ms}
+                bot.paper_quotes = {
+                    "Up": {"best_bid": 0.50, "best_ask": 0.52, "updated_at_ms": stale_quote_ms},
+                    "Down": {"best_bid": 0.48, "best_ask": 0.50, "updated_at_ms": stale_quote_ms},
+                }
+                bot.execution_price = {"binance": 101.0, "binance_updated_ms": now_ms}
+                bot.execution_quotes = {
+                    "Up": {"best_bid": 0.50, "best_ask": 0.52, "updated_at_ms": stale_quote_ms},
+                    "Down": {"best_bid": 0.48, "best_ask": 0.50, "updated_at_ms": stale_quote_ms},
+                }
+
+            refresh_calls = []
+
+            def fake_rest_fallback_snapshot(snapshot_market):
+                refresh_calls.append(snapshot_market.round_id)
+                fresh_ms = int(time.time() * 1000)
+                with bot._lock:
+                    bot.latest_price = {"binance": 101.0, "binance_updated_ms": fresh_ms}
+                    bot.latest_quotes = {
+                        "Up": {"best_bid": 0.50, "best_ask": 0.52, "updated_at_ms": fresh_ms},
+                        "Down": {"best_bid": 0.48, "best_ask": 0.50, "updated_at_ms": fresh_ms},
+                    }
+                    bot.paper_price = dict(bot.latest_price)
+                    bot.paper_quotes = dict(bot.latest_quotes)
+                    bot.execution_price = dict(bot.latest_price)
+                    bot.execution_quotes = dict(bot.latest_quotes)
+
+            bot._refresh_market = lambda: market
+            bot._rest_fallback_snapshot = fake_rest_fallback_snapshot
+            bot._settle_due = lambda _now: None
+            bot._reconcile_official_settlements = lambda _now: None
+            bot._backfill_official_final_prices = lambda _now: None
+            bot._run_strategy_from_state = lambda: None
+
+            self.assertFalse(bot._live_feed_stale(now))
+            self.assertFalse(bot._price_feed_stale(now))
+            self.assertTrue(bot._backend_market_data_refresh_needed(now))
+
+            bot.tick()
+
+            self.assertEqual(refresh_calls, [market.round_id])
+            paper_price, paper_quotes, paper_source = bot._paper_market_data()
+            self.assertEqual(paper_source, "backend")
+            self.assertIn("binance_updated_ms", paper_price)
+            self.assertGreater(int(paper_quotes["Up"].get("updated_at_ms") or 0), stale_quote_ms)
+
+    def test_clob_ws_orderbook_applies_book_and_price_changes(self) -> None:
+        now = time.time()
+        market = MarketRound(
+            round_id="btc-updown-5m-clob-ws-book",
+            symbol="BTC",
+            started_at=now - 60,
+            ends_at=now + 180,
+            target_price=100.0,
+            up_token="up-token",
+            down_token="down-token",
+        )
+        book = ClobMarketOrderBook.for_market(market)
+
+        changed = book.apply_payload(
+            {
+                "event_type": "book",
+                "asset_id": "up-token",
+                "bids": [{"price": "0.49", "size": "20"}, {"price": "0.50", "size": "10"}],
+                "asks": [{"price": "0.52", "size": "8"}, {"price": "0.51", "size": "12"}],
+                "timestamp": "1780120000000",
+            },
+            now,
+        )
+
+        self.assertEqual(changed["Up"]["best_bid"], 0.5)
+        self.assertEqual(changed["Up"]["bid_size"], 10.0)
+        self.assertEqual(changed["Up"]["best_ask"], 0.51)
+        self.assertEqual(changed["Up"]["ask_size"], 12.0)
+        self.assertEqual(changed["Up"]["source"], "clob-ws-book")
+
+        changed = book.apply_payload(
+            {
+                "event_type": "price_change",
+                "timestamp": "1780120000500",
+                "price_changes": [
+                    {
+                        "asset_id": "up-token",
+                        "side": "BUY",
+                        "price": "0.50",
+                        "size": "0",
+                        "best_bid": "0.49",
+                        "best_ask": "0.51",
+                    },
+                    {
+                        "asset_id": "up-token",
+                        "side": "SELL",
+                        "price": "0.51",
+                        "size": "5",
+                        "best_bid": "0.49",
+                        "best_ask": "0.51",
+                    },
+                ],
+            },
+            now,
+        )
+
+        self.assertEqual(changed["Up"]["best_bid"], 0.49)
+        self.assertEqual(changed["Up"]["best_ask"], 0.51)
+        self.assertEqual(changed["Up"]["ask_size"], 5.0)
+        self.assertEqual(changed["Up"]["source"], "clob-ws-price-change")
+
+    def test_rtds_chainlink_parser_reads_crypto_price_payload(self) -> None:
+        tick = rtds_chainlink_price_from_payload(
+            {
+                "topic": "crypto_prices_chainlink",
+                "payload": {
+                    "data": [
+                        {
+                            "symbol": "btc/usd",
+                            "value": "101.25",
+                            "timestamp": 1780120000,
+                        }
+                    ]
+                },
+            },
+            now=1780120001.0,
+        )
+
+        self.assertIsNotNone(tick)
+        assert tick is not None
+        self.assertEqual(tick["chainlink"], 101.25)
+        self.assertEqual(tick["chainlink_updated_ms"], 1780120000000)
+        self.assertEqual(tick["source"], "polymarket-rtds-chainlink")
+
+    def test_backend_clob_ws_quotes_feed_paper_and_live_without_rest_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            fresh_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-clob-ws-ingest",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+                bot.ws_status["browser_feed_at"] = now - 120
+
+            quotes = {
+                "Up": {
+                    "token_id": "up-token",
+                    "best_bid": 0.53,
+                    "best_ask": 0.54,
+                    "bid_size": 10,
+                    "ask_size": 20,
+                    "bids": [{"price": 0.53, "size": 10}],
+                    "asks": [{"price": 0.54, "size": 20}],
+                    "updated_at_ms": fresh_ms,
+                    "source": "clob-ws-book",
+                },
+                "Down": {
+                    "token_id": "down-token",
+                    "best_bid": 0.45,
+                    "best_ask": 0.46,
+                    "bid_size": 30,
+                    "ask_size": 40,
+                    "bids": [{"price": 0.45, "size": 30}],
+                    "asks": [{"price": 0.46, "size": 40}],
+                    "updated_at_ms": fresh_ms,
+                    "source": "clob-ws-book",
+                },
+            }
+
+            bot._ingest_backend_clob_ws_quotes(market, quotes, {"state": "message", "event_type": "book", "at": now})
+
+            self.assertFalse(bot._backend_quote_refresh_needed(now))
+            paper_price, paper_quotes, paper_source = bot._paper_market_data()
+            execution_price, execution_quotes, execution_source = bot._execution_market_data()
+            self.assertEqual(paper_source, "backend")
+            self.assertEqual(execution_source, "backend")
+            self.assertEqual(paper_price, {})
+            self.assertEqual(execution_price, {})
+            self.assertEqual(paper_quotes["Up"]["source"], "clob-ws-book")
+            self.assertEqual(execution_quotes["Down"]["best_ask"], 0.46)
+            snapshot = bot.snapshot()
+            self.assertEqual(snapshot["runtime"]["ws_status"]["market"], "clob-ws")
+            self.assertEqual(snapshot["runtime"]["ws_status"]["backend_clob_ws"], "message")
+
+    def test_backend_chainlink_and_rest_prices_feed_basis_to_execution_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-rtds-basis",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+
+            class FakePriceClient:
+                def fetch_sources(self, symbol, now_arg):
+                    return {
+                        "binance": PriceTick(symbol, 101.0, "binance", now_arg),
+                        "okx": PriceTick(symbol, 102.0, "okx", now_arg),
+                    }
+
+                def fetch_symbol(self, symbol, now_arg):
+                    return PriceTick(symbol, 101.0, "binance", now_arg)
+
+            bot.market_data_price_fallback = FakePriceClient()
+            bot._ingest_backend_chainlink_price(
+                {
+                    "chainlink": 100.0,
+                    "chainlink_updated_ms": int(now * 1000),
+                    "source": "polymarket-rtds-chainlink",
+                },
+                {"state": "message", "topic": "crypto_prices_chainlink", "at": now},
+            )
+            bot._refresh_backend_prices(market)
+
+            paper_price, _paper_quotes, paper_source = bot._paper_market_data()
+            execution_price, _execution_quotes, execution_source = bot._execution_market_data()
+
+            self.assertEqual(paper_source, "compat_latest_without_browser")
+            self.assertEqual(execution_source, "backend")
+            self.assertAlmostEqual(execution_price["chainlink"], 100.0)
+            self.assertEqual(execution_price["okx_basis_samples"], 1)
+            self.assertEqual(execution_price["binance_basis_samples"], 1)
+            self.assertAlmostEqual(execution_price["okx_basis_median_bps"], 200.0, places=6)
+            self.assertAlmostEqual(execution_price["binance_basis_median_bps"], 100.0, places=6)
+            self.assertEqual(paper_price["okx_basis_samples"], 1)
+            self.assertEqual(bot.snapshot()["runtime"]["ws_status"]["backend_rtds_ws"], "message")
+
+    def test_backend_price_refresh_runs_when_chainlink_is_fresh_but_fallback_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            with bot._lock:
+                bot.execution_price = {"chainlink": 100.0, "chainlink_updated_ms": int(now * 1000)}
+                bot._last_backend_price_refresh_at = now - 2.0
+
+            self.assertTrue(bot._backend_price_refresh_needed(now))
 
     def test_pair_strategy_does_not_open_without_official_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2298,8 +2707,20 @@ class TradingCoreTest(unittest.TestCase):
                 bot.current_market = market
                 bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
                 bot.latest_quotes = {
-                    "Up": {"best_bid": 0.39, "best_ask": 0.4, "ask_size": 100, "updated_at_ms": int(now * 1000)},
-                    "Down": {"best_bid": 0.49, "best_ask": 0.5, "ask_size": 100, "updated_at_ms": int(now * 1000)},
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
                 }
             bot.set_pair_strategy_enabled(True)
             bot._run_strategy_from_state()
@@ -3374,6 +3795,36 @@ class TradingCoreTest(unittest.TestCase):
         self.assertEqual(blocked.side, "NO_TRADE")
         self.assertIn("MULTI_CONFIRM", blocked.reason)
 
+    def test_price_basis_tracker_keeps_median_when_chainlink_is_temporarily_missing(self) -> None:
+        tracker = PriceBasisTracker(max_samples=10)
+        now_ms = int(time.time() * 1000)
+        seeded = tracker.enrich(
+            {
+                "chainlink": 100.0,
+                "chainlink_updated_ms": now_ms,
+                "okx": 101.0,
+                "okx_updated_ms": now_ms,
+                "binance": 100.5,
+                "binance_updated_ms": now_ms,
+            },
+            now_ms=now_ms,
+        )
+        without_chainlink = tracker.enrich(
+            {
+                "chainlink": None,
+                "okx": 102.0,
+                "okx_updated_ms": now_ms + 100,
+                "binance": 101.0,
+                "binance_updated_ms": now_ms + 100,
+            },
+            now_ms=now_ms + 100,
+        )
+
+        self.assertAlmostEqual(seeded["okx_basis_median_bps"], 100.0, places=6)
+        self.assertEqual(without_chainlink["okx_basis_samples"], 1)
+        self.assertAlmostEqual(without_chainlink["okx_basis_median_bps"], 100.0, places=6)
+        self.assertEqual(without_chainlink["binance_basis_samples"], 1)
+
     def test_parse_real_btc_5m_market(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
         raw = {
@@ -3461,6 +3912,51 @@ class TradingCoreTest(unittest.TestCase):
         self.assertEqual(quote["asks"][0], {"price": 0.34, "size": 2.0})
         self.assertEqual(quote["min_order_size"], 5.0)
         self.assertEqual(quote["tick_size"], "0.01")
+
+    def test_polymarket_quotes_use_batch_books_endpoint(self) -> None:
+        client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
+        post_calls = []
+
+        def fake_post_json(url, payload):
+            post_calls.append((url, payload))
+            return [
+                {
+                    "asset_id": "up-token",
+                    "bids": [{"price": "0.41", "size": "3"}],
+                    "asks": [{"price": "0.42", "size": "4"}],
+                    "min_order_size": "1",
+                    "tick_size": "0.01",
+                },
+                {
+                    "asset_id": "down-token",
+                    "bids": [{"price": "0.57", "size": "5"}],
+                    "asks": [{"price": "0.58", "size": "6"}],
+                    "min_order_size": "1",
+                    "tick_size": "0.01",
+                },
+            ]
+
+        client._post_json = fake_post_json
+        client._get_json = lambda _url, _params: self.fail("individual /book fallback should not be used")
+        market = MarketRound(
+            "round-1",
+            "BTC",
+            time.time() - 1,
+            time.time() + 100,
+            73000.0,
+            "BTC test",
+            "condition",
+            "up-token",
+            "down-token",
+        )
+
+        quotes = client.get_quotes(market)
+
+        self.assertEqual(len(post_calls), 1)
+        self.assertTrue(post_calls[0][0].endswith("/books"))
+        self.assertEqual(post_calls[0][1], [{"token_id": "up-token"}, {"token_id": "down-token"}])
+        self.assertEqual(quotes["Up"].best_ask, 0.42)
+        self.assertEqual(quotes["Down"].best_bid, 0.57)
 
     def test_live_trading_stays_disabled_until_explicit_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3709,6 +4205,228 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(fake_client.wallet_calls[-1]["force"])
             self.assertEqual(fake_client.sign_calls[-1]["token_id"], "up-token")
             self.assertEqual(fake_client.buy_calls, [])
+
+    def test_live_gate_status_exposes_daily_loss_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                live_trading_default_max_daily_loss=1.0,
+                live_trading_default_max_total_drawdown=12.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_daily_loss": 1.0,
+                    "max_total_drawdown": 12.0,
+                    "max_open_trades": 2,
+                    "max_entry_price": 0.72,
+                }
+            )
+            self.assertTrue(bot.live_trading.config.enabled)
+            now = time.time()
+            loss_market = MarketRound(
+                round_id="btc-updown-5m-live-gate-loss",
+                symbol="BTC",
+                started_at=now - 900,
+                ends_at=now - 600,
+                target_price=100.0,
+                up_token="loss-up-token",
+                down_token="loss-down-token",
+            )
+            bot.live_trading.store.upsert_round(loss_market)
+            bot.live_trading.store.place_trade(
+                TradeIntent(
+                    loss_market,
+                    Signal("BTC", "Up", 0.9, 0.5, 100.0, "seed loss for live gate"),
+                    5.0,
+                )
+            )
+            bot.live_trading.store.settle_round_outcome(
+                loss_market.round_id,
+                "Down",
+                now=now - 300,
+                final_price=99.0,
+                target_price=100.0,
+            )
+            market = MarketRound(
+                round_id="btc-updown-5m-live-gate-current",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)}
+            quotes = {
+                "Up": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "asks": [{"price": 0.52, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+                "Down": {
+                    "best_bid": 0.45,
+                    "best_ask": 0.47,
+                    "asks": [{"price": 0.47, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+            }
+
+            gate = bot.live_trading.gate_status(
+                market,
+                price,
+                quotes,
+                readiness=fake_client.readiness(required_cash=5.0),
+                official_open_orders=fake_client.open_orders_state(),
+            )
+            checks = {row["key"]: row for row in gate["checks"]}
+
+            self.assertFalse(gate["can_place_order"])
+            self.assertEqual(gate["overall_status"], "BLOCKED")
+            self.assertEqual(gate["primary_blocker"], "daily_loss")
+            self.assertEqual(checks["daily_loss"]["status"], "BLOCK")
+            self.assertLessEqual(gate["metrics"]["daily_realized_pnl"], -5.0)
+            self.assertEqual(checks["signal"]["status"], "PASS")
+            self.assertEqual(checks["collateral_wallet"]["status"], "PASS")
+
+    def test_live_gate_uses_selected_okx_basis_adjusted_price(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": False,
+                    "compliance_acknowledged": True,
+                    "fallback_sources": ["okx"],
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_entry_price": 0.8,
+                }
+            )
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-basis-okx",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": None,
+                "okx": 101.0,
+                "okx_updated_ms": int(now * 1000),
+                "okx_basis_median_bps": 300.0,
+                "okx_basis_samples": 8,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.30,
+                    "best_ask": 0.32,
+                    "asks": [{"price": 0.32, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+                "Down": {
+                    "best_bid": 0.40,
+                    "best_ask": 0.42,
+                    "asks": [{"price": 0.42, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+            }
+
+            gate = bot.live_trading.gate_status(
+                market,
+                price,
+                quotes,
+                readiness=fake_client.readiness(required_cash=5.0),
+                official_open_orders=fake_client.open_orders_state(),
+            )
+
+            self.assertEqual(gate["signal"]["side"], "Down")
+            self.assertLess(gate["price_selection"]["selected_price"], 100.0)
+            self.assertEqual(gate["price_selection"]["selected_source"], "basis_adjusted")
+            self.assertEqual(gate["price_selection"]["selected_sources"], ["okx"])
+            self.assertIn("basis_adjusted okx", gate["signal"]["reason"])
+
+    def test_live_gate_blocks_selected_basis_fallback_when_samples_are_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": False,
+                    "compliance_acknowledged": True,
+                    "fallback_sources": ["okx"],
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                }
+            )
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-basis-insufficient",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": None,
+                "okx": 101.0,
+                "okx_updated_ms": int(now * 1000),
+                "okx_basis_median_bps": 300.0,
+                "okx_basis_samples": 2,
+            }
+            quotes = {
+                "Up": {"best_bid": 0.30, "best_ask": 0.32, "updated_at_ms": int(now * 1000)},
+                "Down": {"best_bid": 0.40, "best_ask": 0.42, "updated_at_ms": int(now * 1000)},
+            }
+
+            gate = bot.live_trading.gate_status(
+                market,
+                price,
+                quotes,
+                readiness=fake_client.readiness(required_cash=5.0),
+                official_open_orders=fake_client.open_orders_state(),
+            )
+            checks = {row["key"]: row for row in gate["checks"]}
+
+            self.assertEqual(gate["signal"]["side"], "NO_TRADE")
+            self.assertTrue(gate["price_selection"]["blocked"])
+            self.assertIn("基差样本不足", gate["price_selection"]["message"])
+            self.assertEqual(checks["price_source"]["status"], "BLOCK")
 
     def test_live_preflight_blocks_when_official_open_orders_exist_and_does_not_sign(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5341,6 +6059,18 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(bot.live_trading.client.buy_calls[0]["token_id"], "up-token")
             self.assertEqual(bot.live_trading.client.buy_calls[0]["tick_size"], "0.01")
             self.assertIsNone(bot.live_trading.client.buy_calls[0]["neg_risk"])
+            snapshot = bot.snapshot()
+            live_snapshot = snapshot["runtime"]["live_trading"]
+            live_open_trade = live_snapshot["open_trades"][0]
+            live_metrics = live_snapshot["variant"]["metrics"]
+            self.assertAlmostEqual(live_metrics["unrealized_pnl"], live_open_trade["unrealized_pnl"], places=6)
+            self.assertAlmostEqual(live_metrics["open_mark_value"], live_open_trade["exit_value"], places=6)
+            self.assertAlmostEqual(
+                live_metrics["estimated_total_equity"],
+                live_metrics["cash_balance"] + live_metrics["open_mark_value"],
+                places=6,
+            )
+            self.assertEqual(live_snapshot["variants"][0]["metrics"]["unrealized_pnl"], live_metrics["unrealized_pnl"])
 
     def test_single_fak_real_stake_change_applies_next_market_when_current_market_has_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6300,6 +7030,61 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(any(row["external_order_id"] == "live-sell-1" for row in orders))
             self.assertEqual(bot.live_trading.client.sell_calls[0]["token_id"], "up-token")
             self.assertEqual(bot.live_trading.client.token_calls[0]["token_id"], "up-token")
+
+    def test_live_manual_sell_blocks_after_market_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                stake_dollars=5.0,
+                live_trading_default_stake_dollars=5.0,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {"enabled": True, "compliance_acknowledged": True, "initial_balance": 20.0, "stake_dollars": 5.0}
+            )
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-sell-ended",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)}
+            quotes = {
+                "Up": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.52, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+                "Down": {"best_bid": 0.45, "best_ask": 0.47, "ask_size": 100, "updated_at_ms": int(now * 1000)},
+            }
+            bot.live_trading.run_from_state(market, price, quotes)
+            trade_id = int(bot.live_trading.store.open_trades()[0]["id"])
+            with bot.live_trading.store.conn:
+                bot.live_trading.store.conn.execute(
+                    "UPDATE market_rounds SET ends_at = ? WHERE round_id = ?",
+                    (now - 1, market.round_id),
+                )
+            with bot._lock:
+                bot.latest_quotes = {
+                    "Up": {"best_bid": 0.40, "best_ask": 0.41, "bid_size": 100, "updated_at_ms": int(now * 1000)},
+                }
+
+            with self.assertRaisesRegex(RuntimeError, "市场已结束"):
+                bot.sell_live_trade(trade_id)
+
+            self.assertEqual(fake_client.sell_calls, [])
 
     def test_live_manual_sell_blocks_when_token_allowance_is_below_shares(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

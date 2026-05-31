@@ -66,11 +66,19 @@
             <label><span>重试次数</span><input id="live-retry-count" type="number" min="0" max="10" step="1"></label>
             <label><span>重试间隔ms</span><input id="live-retry-delay-ms" type="number" min="0" step="50"></label>
           </div>
+          <div class="live-fallback-settings">
+            <span>实盘价格源</span>
+            <label><input type="checkbox" data-live-fallback-source="chainlink">Chainlink</label>
+            <label><input type="checkbox" data-live-fallback-source="okx">OKX基差校正</label>
+            <label><input type="checkbox" data-live-fallback-source="binance">Binance基差校正</label>
+            <small>空选时沿用 SINGLE_FAK_REAL 默认 fallback；多选时按 Chainlink 优先，其次基差校正价。</small>
+          </div>
           <div class="live-settings-footer">
             <label class="live-ack"><input id="live-compliance-ack" type="checkbox">确认地区/账户合规且承担真实资金风险</label>
             <button id="live-save-settings" type="button">保存配置</button>
           </div>
         </div>
+        <div id="live-gate-status" class="live-gate-status" aria-live="polite"></div>
         <div id="live-terminal" class="live-terminal" aria-live="polite">
           <div class="live-terminal-head">
             <strong>Live Terminal</strong>
@@ -412,6 +420,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260530-v2-104"></script>
+    <script src="/static/app.js?v=20260530-v2-105"></script>
   </body>
 </html>

@@ -22,6 +22,7 @@ from .storage import PAPER_ORDER_STATUS_FILTERS, TradeStore
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+STATUS_STREAM_INTERVAL_SECONDS = 1.0
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -104,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.bot.snapshot())
+            return
+        if path == "/api/status-stream":
+            self._send_status_stream()
             return
         if path == "/api/actor-analysis":
             try:
@@ -442,6 +446,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
             except BrokenPipeError:
                 return
+
+    def _send_status_stream(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        while True:
+            try:
+                payload = json.dumps(self.server.bot.snapshot(), ensure_ascii=False, separators=(",", ":"))
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            time.sleep(STATUS_STREAM_INTERVAL_SECONDS)
 
     def _send_json_status(self, status: HTTPStatus, payload: dict[str, Any], include_body: bool = True) -> None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

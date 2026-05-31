@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from concurrent import futures
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -47,13 +48,17 @@ class PublicPriceClient:
             raise ValueError(f"unsupported symbol for real BTC bot: {symbol}")
         now = now or time.time()
         ticks: dict[str, PriceTick] = {}
-        for fetcher in (self._fetch_coinbase, self._fetch_binance, self._fetch_okx):
-            try:
-                price, source = fetcher(symbol)
-                if price > 0 and math.isfinite(price):
-                    ticks[source] = PriceTick(symbol=symbol, price=price, source=source, timestamp=now)
-            except (OSError, ValueError, KeyError, TimeoutError, urlerror.URLError, json.JSONDecodeError):
-                continue
+        fetchers = (self._fetch_coinbase, self._fetch_binance, self._fetch_okx)
+        with futures.ThreadPoolExecutor(max_workers=len(fetchers), thread_name_prefix="polybot2other-price") as executor:
+            submitted = {executor.submit(fetcher, symbol): fetcher for fetcher in fetchers}
+            for future in futures.as_completed(submitted):
+                fetcher = submitted[future]
+                try:
+                    price, source = future.result()
+                    if price > 0 and math.isfinite(price):
+                        ticks[source] = PriceTick(symbol=symbol, price=price, source=source, timestamp=now)
+                except (OSError, ValueError, KeyError, TimeoutError, urlerror.URLError, json.JSONDecodeError):
+                    continue
         if not ticks:
             raise RuntimeError("real BTC price fallback unavailable: no public BTC price source succeeded")
         return ticks
