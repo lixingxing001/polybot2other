@@ -1,5 +1,47 @@
 # polybot2other-progress
 
+## 2026-05-31 v4.27
+
+### 已完成
+
+1. 策略实验 runner 新增独立官方结算补偿：每轮扫描各实验库中已结束但仍为 `OPEN` 的 BTC round，按 round 调用 Polymarket 官方 resolution，并复用现有 `apply_official_resolution()` 写回所有实验库。
+2. 保留 Chainlink fallback 的 5 秒窗口，不扩大本地兜底结算窗口，避免临界市场被错误价格结算。
+3. 新增回归测试覆盖“主账户没有对应持仓、策略实验库有已结束 OPEN 持仓、缺少 Chainlink 结束点 tick，但官方结果可用”的收口路径。
+4. 已对 `data/strategy-experiments` 下 20 个实验库做 SQLite online backup，备份目录为 `data/strategy-experiments/backups/settlement-fix-20260531-150914`。
+5. 重启 dashboard 后，新补偿逻辑已自动把当前策略实验聚合持仓里的 20 条 `PENDING_SETTLEMENT` 收口为官方结算。
+
+### 已确认决策
+
+1. 不在前端隐藏已结束的 OPEN 持仓；待结算显示仍用于暴露账本未收口问题。
+2. 优先使用官方 Polymarket resolution 修复策略实验待结算，不用放宽 Chainlink fallback 时间窗口。
+3. 数据修复走正常后端结算路径，不直接手写 SQL 改 `payout` / `pnl`。
+
+### 待办和后期优化
+
+1. 如后续 pending 数量明显增加，可把官方补偿扫描的候选数量、限流间隔和最近错误暴露到 `/api/status` 诊断字段。
+2. 可以在策略实验表格增加“待官方结算数量”摘要，方便快速发现账本积压。
+
+### 已知坑位
+
+1. 官方 Gamma resolution 偶发慢响应时，策略实验聚合接口可能在补偿期间短暂变慢；当前每轮最多查 `OFFICIAL_RECHECK_LIMIT` 个 round，并按失败间隔重试。
+2. 如果官方 resolution 长时间缺失，记录仍会保持 `PENDING_SETTLEMENT`，这是为了避免错误 fallback 结算污染实验结果。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall src/polybot2other tests`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k test_strategy_experiments_settle_pending_open_trades_from_official_resolution -v`，新增定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k official_resolution -v`，4 条官方结算相关回归通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k strategy_experiments -v`，3 条策略实验相关回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -v`，176 条核心回归全部通过。
+6. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+7. 已请求 `/api/strategy-experiments-tables?trade_limit=50&order_limit=1&status=all`，确认 `open=0`、`pending=0`。
+8. 已只读核对 SQLite，确认策略实验库中 `ended_open=0`、`pending_ui=0`，最近 10 分钟写入 20 条 `polymarket_official` 结算。
+
+### 回滚建议
+
+1. 如需回滚代码，撤销 `src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档 v4.27 改动后重启 dashboard。
+2. 如需回滚本次策略实验数据修复，先停止 dashboard，再用 `data/strategy-experiments/backups/settlement-fix-20260531-150914` 中对应 SQLite 文件覆盖 `data/strategy-experiments/*.sqlite3`；注意这会恢复 20 条待结算持仓。
+
 ## 2026-05-30 v4.26
 
 ### 已完成

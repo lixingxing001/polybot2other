@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from polybot2other.actor_analysis import build_actor_analysis
@@ -866,6 +867,61 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(variant_bot.store.account()["cash_balance"], 95.0, places=6)
             self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["official_count"], 1)
             self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["chainlink_count"], 0)
+            self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
+
+    def test_strategy_experiments_settle_pending_open_trades_from_official_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                strategy_experiments_enabled=True,
+                strategy_experiments_db_dir=Path(tmp) / "experiments",
+                strategy_experiments_variants="SINGLE_FAK",
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            ended_market = MarketRound(
+                round_id="btc-updown-5m-experiment-official-pending",
+                symbol="BTC",
+                started_at=now - 601,
+                ends_at=now - 301,
+                target_price=100.0,
+            )
+            current_market = MarketRound(
+                round_id="btc-updown-5m-experiment-current",
+                symbol="BTC",
+                started_at=now,
+                ends_at=now + 300,
+                target_price=101.0,
+            )
+            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot.store.upsert_round(ended_market)
+            signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "experiment official pending")
+            variant_bot.store.place_trade(
+                type("Intent", (), {"market": ended_market, "signal": signal, "stake_dollars": 5.0})()
+            )
+            self.assertEqual(len(variant_bot.store.open_trades()), 1)
+            calls: list[str] = []
+
+            def fake_resolution(slug: str) -> dict[str, Any] | None:
+                calls.append(slug)
+                if slug == ended_market.round_id:
+                    return {"outcome": "Up", "final_price": 101.0, "target_price": 100.0}
+                return None
+
+            bot.polymarket.get_resolution = fake_resolution
+
+            bot.strategy_experiments.run_from_state(current_market, {"chainlink": 101.0}, {})
+
+            self.assertEqual(calls, [ended_market.round_id])
+            self.assertEqual(variant_bot.store.open_trades(), [])
+            recent = variant_bot.store.recent_trades(1)
+            self.assertEqual(recent[0]["round_id"], ended_market.round_id)
+            self.assertEqual(recent[0]["status"], "SETTLED")
+            self.assertEqual(recent[0]["outcome"], "Up")
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(recent[0]["payout"], 0.0, places=6)
+            self.assertAlmostEqual(recent[0]["pnl"], -5.0, places=6)
             self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
 
     def test_bot_records_official_resolution_final_and_target_prices(self) -> None:

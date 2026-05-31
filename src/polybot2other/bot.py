@@ -2898,6 +2898,7 @@ class PaperTradingBot:
 class StrategyExperimentRunner:
     def __init__(self, settings: Settings, polymarket: PolymarketClient, price_fallback: PublicPriceClient) -> None:
         self.settings = settings
+        self.polymarket = polymarket
         self.variants = selected_strategy_variants(settings.strategy_experiments_variants)
         self._lock = threading.RLock()
         self._bots: dict[str, PaperTradingBot] = {}
@@ -2907,6 +2908,7 @@ class StrategyExperimentRunner:
         self.last_run_at: float | None = None
         self.official_broadcast_count = 0
         self.last_official_broadcast_at: float | None = None
+        self._official_settlement_next_at: dict[str, float] = {}
         for variant in self.variants:
             variant_settings = self._settings_for_variant(settings, variant)
             store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
@@ -2987,6 +2989,7 @@ class StrategyExperimentRunner:
             self.run_count += 1
             self.last_run_at = now
             variants = tuple(self.variants)
+        self._settle_pending_official_rounds(variants, now)
         for variant in variants:
             bot = self._bots[variant.variant_id]
             try:
@@ -3399,6 +3402,64 @@ class StrategyExperimentRunner:
             except Exception as exc:  # noqa: BLE001 - one experiment store must not block official broadcast to others.
                 with self._lock:
                     self._official_broadcast_errors[variant.variant_id] = f"{type(exc).__name__}: {exc}"
+
+    def _settle_pending_official_rounds(self, variants: tuple[StrategyVariant, ...], now: float) -> None:
+        candidates = self._pending_official_round_ids(variants, now)
+        checked = 0
+        for round_id in candidates:
+            with self._lock:
+                next_at = self._official_settlement_next_at.get(round_id, 0.0)
+            if next_at > now:
+                continue
+            if checked >= OFFICIAL_RECHECK_LIMIT:
+                break
+            checked += 1
+            try:
+                resolution = self.polymarket.get_resolution(round_id)
+                outcome = resolution.get("outcome") if isinstance(resolution, dict) else None
+                if outcome in {"Up", "Down"}:
+                    final_price = _maybe_float(resolution.get("final_price"))
+                    target_price = _maybe_float(resolution.get("target_price"))
+                    self.apply_official_resolution(
+                        round_id,
+                        str(outcome),
+                        now,
+                        final_price=final_price,
+                        target_price=target_price,
+                    )
+                    with self._lock:
+                        self._official_settlement_next_at.pop(round_id, None)
+                else:
+                    with self._lock:
+                        self._official_settlement_next_at[round_id] = now + OFFICIAL_RECHECK_INTERVAL_SECONDS
+            except Exception:  # noqa: BLE001 - official settlement lag must not stop experiment ticks.
+                with self._lock:
+                    self._official_settlement_next_at[round_id] = now + OFFICIAL_RECHECK_INTERVAL_SECONDS
+
+    def _pending_official_round_ids(self, variants: tuple[StrategyVariant, ...], now: float) -> list[str]:
+        rounds: dict[str, float] = {}
+        for variant in variants:
+            bot = self._bots[variant.variant_id]
+            try:
+                rows = bot.store.open_trades()
+            except Exception as exc:  # noqa: BLE001 - keep other experiment stores progressing.
+                with self._lock:
+                    self._errors[variant.variant_id] = f"{type(exc).__name__}: {exc}"
+                continue
+            for row in rows:
+                if row.get("symbol") != "BTC" or not _is_pending_settlement_trade(row, now):
+                    continue
+                round_id = str(row.get("round_id") or "").strip()
+                if not round_id:
+                    continue
+                rounds.setdefault(round_id, _maybe_float(row.get("ends_at")) or 0.0)
+        return [
+            round_id
+            for round_id, _ends_at in sorted(
+                rounds.items(),
+                key=lambda item: (item[1], item[0]),
+            )
+        ]
 
     @staticmethod
     def _settle_due_from_price(store: TradeStore, price: dict[str, Any], now: float) -> None:
