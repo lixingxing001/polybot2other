@@ -86,13 +86,15 @@ const ids = {
   openCount: document.getElementById("open-count"),
   orderCount: document.getElementById("order-count"),
   tradeCount: document.getElementById("trade-count"),
+  orderPrevPage: document.getElementById("order-prev-page"),
   orderPageInfo: document.getElementById("order-page-info"),
-  loadMoreOrders: document.getElementById("load-more-orders"),
+  orderNextPage: document.getElementById("order-next-page"),
   orderStatusFilter: document.getElementById("order-status-filter"),
   cancelCurrentOrders: document.getElementById("cancel-current-orders"),
   cancelAllOrders: document.getElementById("cancel-all-orders"),
+  recentPrevPage: document.getElementById("recent-prev-page"),
   recentPageInfo: document.getElementById("recent-page-info"),
-  loadMoreRecent: document.getElementById("load-more-recent"),
+  recentNextPage: document.getElementById("recent-next-page"),
   chart: document.getElementById("equity-chart"),
   chartTooltip: document.getElementById("equity-tooltip"),
   paperOnly: document.getElementById("paper-only"),
@@ -111,6 +113,7 @@ const STATUS_POLL_MS = 2_000;
 const STATUS_STREAM_STALE_MS = 4_000;
 const RECENT_PAGE_SIZE = 100;
 const ORDER_PAGE_SIZE = 20;
+const TABLE_PAGE_SIZE = 10;
 const CHART_RENDER_INTERVAL_MS = 5_000;
 const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
@@ -178,6 +181,7 @@ const liveSettingsDirtyFields = new Set();
 let recentRows = [];
 let recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
 let recentSummary = null;
+let recentPage = 1;
 let recentFilters = { start_at: null, end_at: null };
 let recentLoading = true;
 let openDataScope = "main";
@@ -206,12 +210,15 @@ let recentTransitionTimer = null;
 let orderRows = [];
 let orderStatusFilter = "all";
 let orderMeta = { limit: ORDER_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, status_filter: orderStatusFilter };
+let orderPage = 1;
+let orderPageLoading = false;
 let expandedOrderId = null;
 let loadingOrderId = null;
 const orderFillCache = new Map();
 let expandedExperimentId = null;
 let loadingExperimentId = null;
 const experimentDetailCache = new Map();
+let recentPageLoading = false;
 let pageVisible = document.visibilityState !== "hidden";
 let renderQueued = false;
 let pendingRenderData = null;
@@ -2579,6 +2586,22 @@ function quoteText(row) {
   return `${bid} / ${ask}`;
 }
 
+function paginateMeta(total, page) {
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const totalPages = safeTotal > 0 ? Math.ceil(safeTotal / TABLE_PAGE_SIZE) : 0;
+  const maxPage = Math.max(1, totalPages);
+  const currentPage = Math.min(Math.max(1, Number(page) || 1), maxPage);
+  const start = safeTotal > 0 ? (currentPage - 1) * TABLE_PAGE_SIZE : 0;
+  return {
+    total: safeTotal,
+    totalPages,
+    currentPage,
+    displayPage: safeTotal > 0 ? currentPage : 0,
+    start,
+    end: start + TABLE_PAGE_SIZE,
+  };
+}
+
 function renderOpenTrades(rows, scope = openDataScope, options = {}) {
   if ((isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)) && strategyTablesLoading && !strategyTables) {
     ids.openCount.textContent = "加载中";
@@ -2620,10 +2643,13 @@ function renderRecentOrders(rows, options = {}) {
   const meta = options.meta || (isExperimentAggregateScope(scope) ? strategyTables?.recent_orders_meta || {} : orderMeta);
   const total = Number(meta.total || rows.length || 0);
   const loaded = rows.length;
+  const pagination = paginateMeta(total, orderPage);
+  if (pagination.currentPage !== orderPage) orderPage = pagination.currentPage;
+  const pageRows = rows.slice(pagination.start, pagination.end);
   ids.orderCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
-  ids.orderPageInfo.textContent = `${scopeLabel(scope)} · ${total > loaded ? `最近 ${loaded} / ${total} 条` : `最近 ${loaded} 条`}`;
-  ids.loadMoreOrders.hidden = !meta.has_more;
-  ids.loadMoreOrders.disabled = false;
+  ids.orderPageInfo.textContent = `${scopeLabel(scope)} · 第 ${pagination.displayPage} / ${pagination.totalPages} 页 · 共 ${total} 条`;
+  ids.orderPrevPage.disabled = pagination.totalPages === 0 || pagination.currentPage <= 1;
+  ids.orderNextPage.disabled = pagination.totalPages === 0 || pagination.currentPage >= pagination.totalPages;
   updateOrderActionButtons(rows);
   const renderKey = orderRenderKey(rows, scope, meta);
   if (!options.force && renderKey === lastOrderRenderKey) return;
@@ -2638,7 +2664,7 @@ function renderRecentOrders(rows, options = {}) {
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
   const fields = isMainScope(scope) ? recentOrderFields : scopedOrderFields;
   const selected = isMainScope(scope) ? selectedFields.order : experimentFieldKeys("order");
-  renderTradeTable("order", rows, fields, ids.recentOrdersHead, ids.recentOrders, selected);
+  renderTradeTable("order", pageRows, fields, ids.recentOrdersHead, ids.recentOrders, selected);
   if (tableWrap) {
     tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
     tableWrap.scrollLeft = Math.min(scrollLeft, Math.max(0, tableWrap.scrollWidth - tableWrap.clientWidth));
@@ -2655,27 +2681,29 @@ function renderRecentTrades(rows, options = {}) {
   }
   const total = Number(meta.total || rows.length || 0);
   const loaded = rows.length;
+  const pagination = paginateMeta(total, recentPage);
+  if (pagination.currentPage !== recentPage) recentPage = pagination.currentPage;
+  const pageRows = rows.slice(pagination.start, pagination.end);
   const filtered = recentFilterActive();
   ids.tradeCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
-  ids.recentPageInfo.textContent = total > loaded
-    ? `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} ${loaded} / ${total} 条`
-    : `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} ${loaded} 条`;
-  ids.loadMoreRecent.hidden = !meta.has_more;
-  ids.loadMoreRecent.disabled = false;
+  ids.recentPageInfo.textContent = `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} · 第 ${pagination.displayPage} / ${pagination.totalPages} 页 · 共 ${total} 条`;
+  ids.recentPrevPage.disabled = pagination.totalPages === 0 || pagination.currentPage <= 1;
+  ids.recentNextPage.disabled = pagination.totalPages === 0 || pagination.currentPage >= pagination.totalPages;
   renderRecentSummary(summary, scope);
   const renderKey = recentRenderKey(rows, scope, meta, summary);
   if (renderKey === lastRecentRenderKey) return;
   lastRecentRenderKey = renderKey;
   const fields = isMainScope(scope) ? recentTradeFields : scopedRecentFields;
   const selected = isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent");
-  renderTradeTable("recent", rows, fields, ids.recentTradesHead, ids.recentTrades, selected);
+  renderTradeTable("recent", pageRows, fields, ids.recentTradesHead, ids.recentTrades, selected);
   applyRecentContentTransition();
 }
 
 function renderRecentSkeleton() {
   ids.tradeCount.textContent = "加载中";
   ids.recentPageInfo.textContent = "正在加载交易记录";
-  ids.loadMoreRecent.hidden = true;
+  ids.recentPrevPage.disabled = true;
+  ids.recentNextPage.disabled = true;
   renderRecentSummarySkeleton();
   ids.recentTradesHead.innerHTML = `
     <tr>
@@ -2782,6 +2810,7 @@ function recentRenderKey(rows, scope = recentDataScope, meta = recentMeta, summa
     scope,
     idsKey,
     (isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent")).join(","),
+    recentPage,
     meta.loaded,
     meta.total,
     meta.has_more,
@@ -2833,6 +2862,7 @@ function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
     scope,
     rowsKey,
     (isMainScope(scope) ? selectedFields.order : experimentFieldKeys("order")).join(","),
+    orderPage,
     meta.loaded,
     meta.total,
     meta.has_more,
@@ -3685,42 +3715,39 @@ async function loadOrders(force = false) {
 }
 
 async function loadMoreOrders() {
-  ids.loadMoreOrders.disabled = true;
-  try {
-    if (isExperimentAggregateScope(orderDataScope)) {
-      strategyOrderLimit = Math.min(200, Number(strategyTables?.recent_orders_meta?.loaded || 0) + ORDER_PAGE_SIZE);
-      await loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit });
-      return;
-    }
-    const params = new URLSearchParams({
-      limit: String(ORDER_PAGE_SIZE),
-      offset: String(orderRows.length),
-      status: orderStatusFilter,
-    });
-    appendScopeParams(params, orderDataScope);
-    const res = await fetch(`/api/orders?${params.toString()}`);
-    if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
-    const page = await res.json();
-    const nextRows = Array.isArray(page.recent_orders) ? page.recent_orders : [];
-    const seen = new Set(orderRows.map((row) => row.id));
-    orderRows = orderRows.concat(nextRows.filter((row) => !seen.has(row.id)));
-    const meta = page.recent_orders_meta || {};
-    orderMeta = {
-      limit: Number(meta.limit || ORDER_PAGE_SIZE),
-      offset: 0,
-      loaded: orderRows.length,
-      total: Number(meta.total || orderRows.length),
-      has_more: orderRows.length < Number(meta.total || orderRows.length),
-      status_filter: String(meta.status_filter || orderStatusFilter),
-    };
-    if (latestStatus) {
-      latestStatus.recent_orders = orderRows;
-      latestStatus.recent_orders_meta = orderMeta;
-    }
-    renderRecentOrders(orderRows, { force: true });
-  } finally {
-    ids.loadMoreOrders.disabled = false;
+  if (isExperimentAggregateScope(orderDataScope)) {
+    const loaded = Number(strategyTables?.recent_orders_meta?.loaded || strategyTables?.recent_orders?.length || 0);
+    strategyOrderLimit = Math.min(200, loaded + ORDER_PAGE_SIZE);
+    await loadStrategyExperimentTables({ force: true, orderLimit: strategyOrderLimit });
+    return;
   }
+  if (!orderMeta.has_more) return;
+  const params = new URLSearchParams({
+    limit: String(ORDER_PAGE_SIZE),
+    offset: String(orderRows.length),
+    status: orderStatusFilter,
+  });
+  appendScopeParams(params, orderDataScope);
+  const res = await fetch(`/api/orders?${params.toString()}`);
+  if (!res.ok) throw new Error(`orders HTTP ${res.status}`);
+  const page = await res.json();
+  const nextRows = Array.isArray(page.recent_orders) ? page.recent_orders : [];
+  const seen = new Set(orderRows.map((row) => row.id));
+  orderRows = orderRows.concat(nextRows.filter((row) => !seen.has(row.id)));
+  const meta = page.recent_orders_meta || {};
+  orderMeta = {
+    limit: Number(meta.limit || ORDER_PAGE_SIZE),
+    offset: 0,
+    loaded: orderRows.length,
+    total: Number(meta.total || orderRows.length),
+    has_more: orderRows.length < Number(meta.total || orderRows.length),
+    status_filter: String(meta.status_filter || orderStatusFilter),
+  };
+  if (latestStatus) {
+    latestStatus.recent_orders = orderRows;
+    latestStatus.recent_orders_meta = orderMeta;
+  }
+  renderRecentOrders(orderRows, { force: true });
 }
 
 async function toggleOrderFills(orderId) {
@@ -3831,6 +3858,7 @@ function confirmLiveSell(tradeId) {
 
 function handleOrderStatusFilterChange() {
   orderStatusFilter = ids.orderStatusFilter.value || "all";
+  orderPage = 1;
   expandedOrderId = null;
   loadingOrderId = null;
   orderRows = [];
@@ -3857,6 +3885,7 @@ function handleDataScopeChange(kind, value) {
   }
   if (kind === "order") {
     orderDataScope = normalized;
+    orderPage = 1;
     expandedOrderId = null;
     loadingOrderId = null;
     orderRows = [];
@@ -3869,6 +3898,7 @@ function handleDataScopeChange(kind, value) {
   }
   if (kind === "recent") {
     recentDataScope = normalized;
+    recentPage = 1;
     lastRecentRenderKey = "";
     recentRows = [];
     recentSummary = null;
@@ -4001,6 +4031,7 @@ async function applyRecentTradeFilter() {
     throw new Error("结束时间不能早于开始时间");
   }
   recentFilters = { start_at: startAt, end_at: endAt };
+  recentPage = 1;
   recentRows = [];
   recentSummary = null;
   recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: startAt, end_at: endAt };
@@ -4019,6 +4050,7 @@ async function resetRecentTradeFilter() {
   ids.recentStartTime.value = "";
   ids.recentEndTime.value = "";
   recentFilters = { start_at: null, end_at: null };
+  recentPage = 1;
   recentRows = [];
   recentSummary = null;
   recentMeta = { limit: RECENT_PAGE_SIZE, offset: 0, loaded: 0, total: 0, has_more: false, start_at: null, end_at: null };
@@ -4039,6 +4071,8 @@ async function togglePaperPause() {
     latestStatus = payload.snapshot || latestStatus;
     expandedOrderId = null;
     loadingOrderId = null;
+    orderPage = 1;
+    recentPage = 1;
     orderRows = [];
     recentRows = [];
     lastOrderRenderKey = "";
@@ -4286,11 +4320,82 @@ async function refreshLiveOpenOrders() {
 }
 
 async function loadMoreRecentTrades() {
-  ids.loadMoreRecent.disabled = true;
+  const meta = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta;
+  const hasMore = Boolean(meta.has_more);
+  if (!hasMore) return;
+  await loadRecentTradesPage(false);
+}
+
+async function ensureOrderRowsForPage(targetPage) {
+  const required = Math.max(1, targetPage) * TABLE_PAGE_SIZE;
+  let loadedRows = currentOrderRows();
+  let meta = isExperimentAggregateScope(orderDataScope) ? strategyTables?.recent_orders_meta || {} : orderMeta;
+  let guard = 0;
+  while (required > loadedRows.length && Boolean(meta.has_more) && guard < 50) {
+    await loadMoreOrders();
+    loadedRows = currentOrderRows();
+    meta = isExperimentAggregateScope(orderDataScope) ? strategyTables?.recent_orders_meta || {} : orderMeta;
+    guard += 1;
+  }
+}
+
+async function ensureRecentRowsForPage(targetPage) {
+  const required = Math.max(1, targetPage) * TABLE_PAGE_SIZE;
+  let loadedRows = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades || [] : recentRows;
+  let meta = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta;
+  let guard = 0;
+  while (required > loadedRows.length && Boolean(meta.has_more) && guard < 50) {
+    await loadMoreRecentTrades();
+    loadedRows = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades || [] : recentRows;
+    meta = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta;
+    guard += 1;
+  }
+}
+
+async function changeOrderPage(step) {
+  if (orderPageLoading) return;
+  const rows = currentOrderRows();
+  const meta = isExperimentAggregateScope(orderDataScope) ? strategyTables?.recent_orders_meta || {} : orderMeta;
+  const total = Number(meta.total || rows.length || 0);
+  const pageMeta = paginateMeta(total, orderPage);
+  const current = pageMeta.currentPage;
+  const target = current + step;
+  if (pageMeta.totalPages > 0 && target > pageMeta.totalPages) return;
+  if (target < 1) return;
+  orderPageLoading = true;
+  ids.orderPrevPage.disabled = true;
+  ids.orderNextPage.disabled = true;
   try {
-    await loadRecentTradesPage(false);
+    await ensureOrderRowsForPage(target);
+    orderPage = target;
+    lastOrderRenderKey = "";
+    renderRecentOrders(currentOrderRows(), { force: true });
   } finally {
-    ids.loadMoreRecent.disabled = false;
+    orderPageLoading = false;
+  }
+}
+
+async function changeRecentPage(step) {
+  if (recentPageLoading) return;
+  const rows = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades || [] : recentRows;
+  const meta = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades_meta || {} : recentMeta;
+  const total = Number(meta.total || rows.length || 0);
+  const pageMeta = paginateMeta(total, recentPage);
+  const current = pageMeta.currentPage;
+  const target = current + step;
+  if (pageMeta.totalPages > 0 && target > pageMeta.totalPages) return;
+  if (target < 1) return;
+  recentPageLoading = true;
+  ids.recentPrevPage.disabled = true;
+  ids.recentNextPage.disabled = true;
+  try {
+    await ensureRecentRowsForPage(target);
+    recentPage = target;
+    lastRecentRenderKey = "";
+    const latestRows = isExperimentAggregateScope(recentDataScope) ? strategyTables?.recent_trades || [] : recentRows;
+    renderRecentTrades(latestRows, { force: true });
+  } finally {
+    recentPageLoading = false;
   }
 }
 
@@ -4932,14 +5037,16 @@ ids.openTrades.addEventListener("click", (event) => {
     showError(error);
   });
 });
-ids.loadMoreOrders.addEventListener("click", () => loadMoreOrders().catch(showError));
+ids.orderPrevPage.addEventListener("click", () => changeOrderPage(-1).catch(showError));
+ids.orderNextPage.addEventListener("click", () => changeOrderPage(1).catch(showError));
 ids.orderStatusFilter.addEventListener("change", handleOrderStatusFilterChange);
 ids.openDataScope.addEventListener("change", () => handleDataScopeChange("open", ids.openDataScope.value));
 ids.orderDataScope.addEventListener("change", () => handleDataScopeChange("order", ids.orderDataScope.value));
 ids.recentDataScope.addEventListener("change", () => handleDataScopeChange("recent", ids.recentDataScope.value));
 bindCancelOrdersButton(ids.cancelCurrentOrders, "current_market");
 bindCancelOrdersButton(ids.cancelAllOrders, "all");
-ids.loadMoreRecent.addEventListener("click", () => loadMoreRecentTrades().catch(showError));
+ids.recentPrevPage.addEventListener("click", () => changeRecentPage(-1).catch(showError));
+ids.recentNextPage.addEventListener("click", () => changeRecentPage(1).catch(showError));
 ids.applyRecentFilter.addEventListener("click", () => applyRecentTradeFilter().catch(showError));
 ids.resetRecentFilter.addEventListener("click", () => resetRecentTradeFilter().catch(showError));
 ids.chart.addEventListener("mousemove", handleChartMove);

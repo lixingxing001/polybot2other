@@ -1690,6 +1690,88 @@ button.danger-button:hover:not(:disabled) {
   overflow-x: auto;
 }
 
+.table-wrap,
+.order-table-wrap,
+.recent-table-wrap,
+.experiment-table-wrap,
+.analysis-table-wrap,
+.analysis-event-list {
+  scrollbar-width: none;
+}
+
+.table-wrap::-webkit-scrollbar,
+.order-table-wrap::-webkit-scrollbar,
+.recent-table-wrap::-webkit-scrollbar,
+.experiment-table-wrap::-webkit-scrollbar,
+.analysis-table-wrap::-webkit-scrollbar,
+.analysis-event-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.table-wrap:hover,
+.table-wrap:focus-within,
+.order-table-wrap:hover,
+.order-table-wrap:focus-within,
+.recent-table-wrap:hover,
+.recent-table-wrap:focus-within,
+.experiment-table-wrap:hover,
+.experiment-table-wrap:focus-within,
+.analysis-table-wrap:hover,
+.analysis-table-wrap:focus-within,
+.analysis-event-list:hover,
+.analysis-event-list:focus-within {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(154, 167, 177, 0.72) transparent;
+}
+
+.table-wrap:hover::-webkit-scrollbar,
+.table-wrap:focus-within::-webkit-scrollbar,
+.order-table-wrap:hover::-webkit-scrollbar,
+.order-table-wrap:focus-within::-webkit-scrollbar,
+.recent-table-wrap:hover::-webkit-scrollbar,
+.recent-table-wrap:focus-within::-webkit-scrollbar,
+.experiment-table-wrap:hover::-webkit-scrollbar,
+.experiment-table-wrap:focus-within::-webkit-scrollbar,
+.analysis-table-wrap:hover::-webkit-scrollbar,
+.analysis-table-wrap:focus-within::-webkit-scrollbar,
+.analysis-event-list:hover::-webkit-scrollbar,
+.analysis-event-list:focus-within::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.table-wrap:hover::-webkit-scrollbar-thumb,
+.table-wrap:focus-within::-webkit-scrollbar-thumb,
+.order-table-wrap:hover::-webkit-scrollbar-thumb,
+.order-table-wrap:focus-within::-webkit-scrollbar-thumb,
+.recent-table-wrap:hover::-webkit-scrollbar-thumb,
+.recent-table-wrap:focus-within::-webkit-scrollbar-thumb,
+.experiment-table-wrap:hover::-webkit-scrollbar-thumb,
+.experiment-table-wrap:focus-within::-webkit-scrollbar-thumb,
+.analysis-table-wrap:hover::-webkit-scrollbar-thumb,
+.analysis-table-wrap:focus-within::-webkit-scrollbar-thumb,
+.analysis-event-list:hover::-webkit-scrollbar-thumb,
+.analysis-event-list:focus-within::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(154, 167, 177, 0.72);
+}
+
+.table-wrap:hover::-webkit-scrollbar-track,
+.table-wrap:focus-within::-webkit-scrollbar-track,
+.order-table-wrap:hover::-webkit-scrollbar-track,
+.order-table-wrap:focus-within::-webkit-scrollbar-track,
+.recent-table-wrap:hover::-webkit-scrollbar-track,
+.recent-table-wrap:focus-within::-webkit-scrollbar-track,
+.experiment-table-wrap:hover::-webkit-scrollbar-track,
+.experiment-table-wrap:focus-within::-webkit-scrollbar-track,
+.analysis-table-wrap:hover::-webkit-scrollbar-track,
+.analysis-table-wrap:focus-within::-webkit-scrollbar-track,
+.analysis-event-list:hover::-webkit-scrollbar-track,
+.analysis-event-list:focus-within::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 .order-table-wrap {
   max-height: 226px;
   overflow: auto;
@@ -1723,9 +1805,9 @@ button.danger-button:hover:not(:disabled) {
 
 .table-footer {
   min-height: 48px;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 10px 16px;
   border-top: 1px solid var(--line);
@@ -1733,8 +1815,15 @@ button.danger-button:hover:not(:disabled) {
   font-size: 13px;
 }
 
-.table-footer button[hidden] {
-  display: none;
+.table-footer span {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.page-button {
+  min-height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
 }
 
 table {
