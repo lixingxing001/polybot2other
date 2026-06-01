@@ -464,32 +464,30 @@ class PaperTradingBot:
             with self._lock:
                 self._last_live_snapshot_ingest_at = now
 
-        if (
-            cached_market is not None
-            and cached_market.ends_at > now
-            and client_market.get("slug") == cached_market.round_id
-        ):
-            market = cached_market
-        else:
+        if cached_market is None:
             market = self._refresh_market()
             if market is None:
-                with self._lock:
-                    cached_market = self.current_market
-                if (
-                    cached_market is not None
-                    and cached_market.ends_at > now
-                    and client_market.get("slug") == cached_market.round_id
-                ):
-                    market = cached_market
-                else:
-                    raise RuntimeError("current BTC 5m market unavailable")
-        if client_market.get("slug") and client_market.get("slug") != market.round_id:
+                return {
+                    "ok": True,
+                    "ignored_snapshot": "market_unavailable",
+                    "updated_at": now,
+                }
+            cached_market = market
+        if cached_market.ends_at <= now:
+            return {
+                "ok": True,
+                "ignored_snapshot": "expired_market",
+                "market": market_to_payload(cached_market),
+                "updated_at": now,
+            }
+        if client_market.get("slug") and client_market.get("slug") != cached_market.round_id:
             return {
                 "ok": True,
                 "ignored_snapshot": "stale_market",
-                "market": market_to_payload(market),
+                "market": market_to_payload(cached_market),
                 "updated_at": now,
             }
+        market = cached_market
 
         price = payload.get("price") if isinstance(payload.get("price"), dict) else {}
         price = dict(price)
@@ -868,14 +866,21 @@ class PaperTradingBot:
     def _fallback_price_feed_stale_for_strategy(self, now: float) -> bool:
         with self._lock:
             price, _quotes, _source = self._execution_market_data_locked()
-        latest_ms = max(
-            _maybe_int(price.get("binance_updated_ms")) or 0,
-            _maybe_int(price.get("binance_market_updated_ms")) or 0,
-            _maybe_int(price.get("okx_updated_ms")) or 0,
-        )
-        if not latest_ms:
-            return True
-        return now - latest_ms / 1000.0 > self._strategy_feed_refresh_age_seconds()
+        selected_sources = self._selected_live_fallback_price_sources()
+        max_age_seconds = self._strategy_feed_refresh_age_seconds()
+        for source in selected_sources:
+            updated_ms = _fallback_source_updated_ms(price, source)
+            if not updated_ms:
+                return True
+            if now - updated_ms / 1000.0 > max_age_seconds:
+                return True
+        return False
+
+    def _selected_live_fallback_price_sources(self) -> tuple[str, ...]:
+        if self.live_trading is None:
+            return MULTI_SOURCE_KEYS
+        selected = tuple(source for source in self.live_trading.config.fallback_sources if source in MULTI_SOURCE_KEYS)
+        return selected or MULTI_SOURCE_KEYS
 
     def _live_feed_stale(self, now: float) -> bool:
         with self._lock:
@@ -2176,7 +2181,10 @@ class PaperTradingBot:
 
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
-            live_snapshot = self.live_trading.snapshot() if self.live_trading is not None else _disabled_live_snapshot()
+            live_runner = self.live_trading
+            current_market = self.current_market
+            execution_price = dict(self.execution_price)
+            execution_quotes = _copy_quotes(self.execution_quotes)
             paper_pause_event = dict(self.last_paper_pause_event or {})
             paper_paused = bool(self.paper_trading_paused)
             runtime = {
@@ -2192,13 +2200,13 @@ class PaperTradingBot:
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at,
                 "last_signal": dict(self.last_signal or {}),
-                "current_market": market_to_payload(self.current_market),
+                "current_market": market_to_payload(current_market),
                 "latest_price": dict(self.latest_price),
                 "latest_quotes": dict(self.latest_quotes),
                 "paper_price": dict(self.paper_price),
                 "paper_quotes": _copy_quotes(self.paper_quotes),
-                "execution_price": dict(self.execution_price),
-                "execution_quotes": _copy_quotes(self.execution_quotes),
+                "execution_price": execution_price,
+                "execution_quotes": execution_quotes,
                 "market_data_scope": {
                     "display": "browser_or_backend",
                     "paper": "backend_only",
@@ -2206,23 +2214,27 @@ class PaperTradingBot:
                 },
                 "ws_status": dict(self.ws_status),
                 "pair_strategy": self._pair_strategy_runtime_locked(),
-                "strategy_experiments": self.strategy_experiments_snapshot(),
-                "live_trading": live_snapshot,
+                "strategy_experiments": {"enabled": False, "variants": []},
+                "live_trading": {},
             }
-            if self.live_trading is not None:
-                live_snapshot["gate_status"] = self.live_trading.gate_status(
-                    self.current_market,
-                    dict(self.execution_price),
-                    _copy_quotes(self.execution_quotes),
-                    readiness=live_snapshot.get("readiness") if isinstance(live_snapshot.get("readiness"), dict) else None,
-                    official_open_orders=(
-                        live_snapshot.get("open_orders") if isinstance(live_snapshot.get("open_orders"), dict) else None
-                    ),
-                )
-        if self.live_trading is not None:
-            live_snapshot["open_trades"] = self._decorate_open_trades(self.live_trading.open_trades(), runtime)
+        strategy_experiments_snapshot = self.strategy_experiments_snapshot()
+        live_snapshot = live_runner.snapshot(refresh_external=False) if live_runner is not None else _disabled_live_snapshot()
+        if live_runner is not None:
+            live_snapshot["gate_status"] = live_runner.gate_status(
+                current_market,
+                execution_price,
+                execution_quotes,
+                readiness=live_snapshot.get("readiness") if isinstance(live_snapshot.get("readiness"), dict) else None,
+                official_open_orders=(
+                    live_snapshot.get("open_orders") if isinstance(live_snapshot.get("open_orders"), dict) else None
+                ),
+            )
+        runtime["strategy_experiments"] = strategy_experiments_snapshot
+        runtime["live_trading"] = live_snapshot
+        if live_runner is not None:
+            live_snapshot["open_trades"] = self._decorate_open_trades(live_runner.open_trades(), runtime)
             live_metrics = self._metrics_with_open_marks(
-                self.live_trading.store.metrics(),
+                live_runner.store.metrics(),
                 live_snapshot["open_trades"],
             )
             live_variant = live_snapshot.get("variant") if isinstance(live_snapshot.get("variant"), dict) else None
@@ -2259,7 +2271,9 @@ class PaperTradingBot:
                     "db_dir": str(self.settings.strategy_experiments_db_dir),
                     "variants": self.settings.strategy_experiments_variants,
                 },
-                "live_trading": self.live_trading.settings_payload() if self.live_trading is not None else _disabled_live_settings(),
+                "live_trading": _live_settings_from_snapshot(live_snapshot)
+                if live_runner is not None
+                else _disabled_live_settings(),
                 "llm_super_agent": {
                     "enabled": self.settings.llm_super_agent_enabled,
                     "api_key_present": bool(self.settings.llm_super_agent_api_key),
@@ -3515,6 +3529,27 @@ def _disabled_live_settings() -> dict[str, Any]:
     }
 
 
+def _live_settings_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    settings = dict(snapshot.get("settings") if isinstance(snapshot.get("settings"), dict) else {})
+    settings.update(
+        {
+            "variant_id": snapshot.get("variant_id") or LIVE_VARIANT_ID,
+            "combo": snapshot.get("combo") or LIVE_COMBO,
+            "db_path": snapshot.get("db_path"),
+            "process_lock_path": snapshot.get("process_lock_path"),
+            "process_lock_acquired": snapshot.get("process_lock_acquired"),
+            "process_lock": snapshot.get("process_lock"),
+            "startup_rearmed": snapshot.get("startup_rearmed"),
+            "startup_rearm_skipped_active_lock": snapshot.get("startup_rearm_skipped_active_lock"),
+            "settings_file": snapshot.get("settings_file"),
+            "readiness": snapshot.get("readiness"),
+            "open_orders": snapshot.get("open_orders"),
+        }
+    )
+    settings["enabled"] = bool(settings.get("enabled"))
+    return settings
+
+
 def _disabled_live_snapshot() -> dict[str, Any]:
     return {
         "enabled": False,
@@ -4512,6 +4547,14 @@ def _maybe_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _fallback_source_updated_ms(price: dict[str, Any], source: str) -> int | None:
+    if source == "binance":
+        return _maybe_int(price.get("binance_market_updated_ms")) or _maybe_int(price.get("binance_updated_ms"))
+    if source == "okx":
+        return _maybe_int(price.get("okx_updated_ms"))
+    return _maybe_int(price.get(f"{source}_updated_ms"))
 
 
 def _updated_at_seconds(value: Any, fallback: float) -> float:

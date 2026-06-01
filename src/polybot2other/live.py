@@ -63,6 +63,7 @@ LIVE_PENDING_ORDER_MAX_AGE_SECONDS = 120.0
 LIVE_MIN_USDC = 0.1
 LIVE_EPSILON = 0.000001
 LIVE_STARTUP_REARM_MESSAGE = "服务启动后实盘开关已自动关闭，需要人工重新预检并开启"
+LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE = "检测到已有实盘进程持锁，未改写磁盘实盘开关"
 LIVE_GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 LIVE_FALLBACK_SOURCE_CHAINLINK = "chainlink"
 LIVE_FALLBACK_SOURCE_OKX = "okx"
@@ -151,6 +152,33 @@ class LiveSettingsStore:
         tmp_path.replace(self.path)
         return next_config
 
+    def file_status(self, runtime_config: LiveRuntimeConfig) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "path": str(self.path),
+            "exists": self.path.exists(),
+            "runtime_enabled": bool(runtime_config.enabled),
+            "runtime_updated_at": runtime_config.updated_at,
+            "enabled": None,
+            "updated_at": None,
+            "enabled_matches_runtime": None,
+            "error": None,
+        }
+        if not payload["exists"]:
+            return payload
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            payload["error"] = f"{type(exc).__name__}: {exc}"
+            return payload
+        if not isinstance(raw, dict):
+            payload["error"] = "settings file payload is not an object"
+            return payload
+        enabled = bool(raw.get("enabled", self.defaults.enabled))
+        payload["enabled"] = enabled
+        payload["updated_at"] = _float(raw.get("updated_at"), 0.0)
+        payload["enabled_matches_runtime"] = enabled == bool(runtime_config.enabled)
+        return payload
+
 
 class LiveProcessLock:
     """进程级实盘锁；同一 live settings path 同时只允许一个 runner 持有。"""
@@ -198,6 +226,28 @@ class LiveProcessLock:
                 handle.close()
             self._forget_path()
             return f"无法获取实盘进程锁 {self.path}: {exc}，实盘开关保持关闭"
+
+    def active_holder_exists(self) -> bool:
+        if self.locked:
+            return True
+        with self._registry_lock:
+            if self._path_key in self._held_paths:
+                return True
+        if fcntl is None or not self.path.exists():
+            return False
+        handle = None
+        try:
+            handle = self.path.open("a+", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        finally:
+            if handle is not None:
+                handle.close()
 
     def release(self) -> None:
         handle = self._handle
@@ -293,6 +343,81 @@ class PolymarketLiveClient:
             "geo_check": geo_check,
             "wallet": wallet,
             "install_hint": "rtk proxy python3 -m pip install -e .",
+        }
+
+    def cached_readiness(self, required_cash: float | None = None) -> dict[str, Any]:
+        errors = self.readiness_errors()
+        geo_check = self._cached_geoblock_state()
+        geo_error = _geoblock_block_reason(geo_check)
+        if geo_error:
+            errors.append(geo_error)
+        wallet = None
+        if not errors:
+            wallet = self._cached_wallet_state(required_cash=required_cash or LIVE_MIN_USDC)
+            errors.extend(wallet.get("errors") or [])
+        return {
+            "ready": not errors,
+            "errors": errors,
+            "host": self.host,
+            "chain_id": self.chain_id,
+            "sdk": "py_clob_client_v2",
+            "sdk_version": _package_version("py_clob_client_v2"),
+            "sdk_status": self.sdk_status(),
+            "credential_env": [
+                "POLYBOT2OTHER_LIVE_PRIVATE_KEY",
+                "POLYBOT2OTHER_LIVE_SIGNATURE_TYPE",
+                "POLYBOT2OTHER_LIVE_FUNDER_ADDRESS",
+                "POLYBOT2OTHER_LIVE_API_KEY",
+                "POLYBOT2OTHER_LIVE_API_SECRET",
+                "POLYBOT2OTHER_LIVE_API_PASSPHRASE",
+            ],
+            "credential_presence": self._credential_presence(),
+            "credential_mode": self._credential_mode(),
+            "credential_addresses": self._credential_address_summary(),
+            "env_files": env_file_status(),
+            "geo_check": geo_check,
+            "wallet": wallet,
+            "cached": True,
+            "install_hint": "rtk proxy python3 -m pip install -e .",
+        }
+
+    def _cached_wallet_state(self, *, required_cash: float | None = None) -> dict[str, Any]:
+        if self._wallet_cache:
+            checked_at, payload = self._wallet_cache
+            cached = _wallet_state_with_requirement(dict(payload), required_cash)
+            cached["cached"] = True
+            cached["stale"] = time.time() - checked_at > 30.0
+            return cached
+        return {
+            "checked_at": None,
+            "asset_type": "COLLATERAL",
+            "balance": 0.0,
+            "allowance": 0.0,
+            "raw": {},
+            "errors": ["wallet cache empty; async refresh pending"],
+            "ready": False,
+            "required_cash": required_cash,
+            "cached": True,
+            "cache_missing": True,
+        }
+
+    def _cached_geoblock_state(self) -> dict[str, Any]:
+        if self._geoblock_cache:
+            checked_at, payload = self._geoblock_cache
+            cached = dict(payload)
+            cached["cached"] = True
+            cached["stale"] = time.time() - checked_at > 300.0
+            return cached
+        return {
+            "ready": False,
+            "blocked": None,
+            "country": None,
+            "region": None,
+            "checked_at": None,
+            "errors": ["geoblock cache empty; async refresh pending"],
+            "source": LIVE_GEOBLOCK_URL,
+            "cached": True,
+            "cache_missing": True,
         }
 
     def sdk_status(self) -> dict[str, Any]:
@@ -799,6 +924,24 @@ class PolymarketLiveClient:
         self._open_orders_cache = (now, payload)
         return payload
 
+    def cached_open_orders_state(self) -> dict[str, Any]:
+        if self._open_orders_cache:
+            checked_at, payload = self._open_orders_cache
+            cached = dict(payload)
+            cached["cached"] = True
+            cached["stale"] = time.time() - checked_at > 10.0
+            return cached
+        return {
+            "ready": False,
+            "skipped": True,
+            "errors": ["open orders cache empty; async refresh pending"],
+            "orders": [],
+            "count": 0,
+            "checked_at": None,
+            "cached": True,
+            "cache_missing": True,
+        }
+
     def geoblock_state(
         self,
         *,
@@ -1292,18 +1435,30 @@ class LiveStrategyRunner:
             settings.live_trading_settings_path.with_name(f"{settings.live_trading_settings_path.name}.lock")
         )
         loaded_config = self.settings_store.load()
-        self.startup_rearmed = bool(loaded_config.enabled)
-        self.config = (
-            self.settings_store.save(replace(loaded_config, enabled=False).normalized())
-            if self.startup_rearmed
-            else loaded_config
-        )
+        self.startup_rearm_skipped_active_lock = False
+        if loaded_config.enabled and self.process_lock.active_holder_exists():
+            self.startup_rearmed = False
+            self.startup_rearm_skipped_active_lock = True
+            self.config = replace(loaded_config, enabled=False).normalized()
+        else:
+            self.startup_rearmed = bool(loaded_config.enabled)
+            self.config = (
+                self.settings_store.save(replace(loaded_config, enabled=False).normalized())
+                if self.startup_rearmed
+                else loaded_config
+            )
         self.store = TradeStore(settings.live_trading_db_path, self.config.initial_balance)
         self.store.rebase_initial_balance(self.config.initial_balance)
         self.client = PolymarketLiveClient(settings)
         self.strategy = RealBtcFiveMinuteStrategy(settings)
         self.last_signal: dict[str, Any] | None = None
-        self.last_error: str | None = LIVE_STARTUP_REARM_MESSAGE if self.startup_rearmed else None
+        self.last_error: str | None = (
+            LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE
+            if self.startup_rearm_skipped_active_lock
+            else LIVE_STARTUP_REARM_MESSAGE
+            if self.startup_rearmed
+            else None
+        )
         self.last_order_at: float | None = None
         self.last_order: dict[str, Any] | None = None
         self.run_count = 0
@@ -1313,6 +1468,8 @@ class LiveStrategyRunner:
         self._official_price_backfill_next_at: dict[str, float] = {}
         self._live_order_reconcile_next_at: dict[str, float] = {}
         self._run_lock = threading.Lock()
+        self._status_refresh_lock = threading.Lock()
+        self._status_refresh_thread: threading.Thread | None = None
 
     @staticmethod
     def _default_config(settings: Settings) -> LiveRuntimeConfig:
@@ -1340,6 +1497,8 @@ class LiveStrategyRunner:
         payload["process_lock_acquired"] = self.process_lock.locked
         payload["process_lock"] = self.process_lock.payload()
         payload["startup_rearmed"] = self.startup_rearmed
+        payload["startup_rearm_skipped_active_lock"] = self.startup_rearm_skipped_active_lock
+        payload["settings_file"] = self.settings_store.file_status(self.config)
         payload["readiness"] = self.client.readiness(
             required_cash=self.config.stake_dollars,
             retry_count=self.config.retry_count,
@@ -2419,19 +2578,13 @@ class LiveStrategyRunner:
             if temporary_process_lock:
                 self._release_process_lock()
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, refresh_external: bool = True) -> dict[str, Any]:
         order_summary = self.store.paper_order_summary("BTC")
         trade_summary = self.store.recent_trade_summary("BTC")
         metrics = self.store.metrics()
-        readiness = self.client.readiness(
-            required_cash=self.config.stake_dollars,
-            retry_count=self.config.retry_count,
-            retry_delay_ms=self.config.retry_delay_ms,
-        )
-        open_orders = self.client.open_orders_state(
-            retry_count=self.config.retry_count,
-            retry_delay_ms=self.config.retry_delay_ms,
-        )
+        readiness, open_orders = self._external_status_payload(refresh_external=refresh_external)
+        if not refresh_external:
+            self._start_status_refresh_if_needed()
         return {
             "enabled": self.config.enabled,
             "variant_id": LIVE_VARIANT_ID,
@@ -2448,14 +2601,51 @@ class LiveStrategyRunner:
             "last_signal": dict(self.last_signal or {}),
             "last_error": self.last_error,
             "startup_rearmed": self.startup_rearmed,
+            "startup_rearm_skipped_active_lock": self.startup_rearm_skipped_active_lock,
             "last_order_at": self.last_order_at,
             "last_order": dict(self.last_order or {}),
             "readiness": readiness,
             "open_orders": open_orders,
             "settings": asdict(self.config),
+            "settings_file": self.settings_store.file_status(self.config),
             "variant": self.variant_payload(metrics, trade_summary, order_summary),
             "variants": [self.variant_payload(metrics, trade_summary, order_summary)],
         }
+
+    def _external_status_payload(self, *, refresh_external: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+        if refresh_external:
+            readiness = self.client.readiness(
+                required_cash=self.config.stake_dollars,
+                retry_count=self.config.retry_count,
+                retry_delay_ms=self.config.retry_delay_ms,
+            )
+            open_orders = self.client.open_orders_state(
+                retry_count=self.config.retry_count,
+                retry_delay_ms=self.config.retry_delay_ms,
+            )
+            return readiness, open_orders
+        return (
+            self.client.cached_readiness(required_cash=self.config.stake_dollars),
+            self.client.cached_open_orders_state(),
+        )
+
+    def _start_status_refresh_if_needed(self) -> bool:
+        if not self._status_refresh_lock.acquire(blocking=False):
+            return False
+
+        def _worker() -> None:
+            try:
+                self._external_status_payload(refresh_external=True)
+            finally:
+                self._status_refresh_lock.release()
+
+        self._status_refresh_thread = threading.Thread(
+            target=_worker,
+            name="polybot2other-live-status-refresh",
+            daemon=True,
+        )
+        self._status_refresh_thread.start()
+        return True
 
     def gate_status(
         self,

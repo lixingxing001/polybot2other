@@ -23,12 +23,98 @@ from .storage import PAPER_ORDER_STATUS_FILTERS, TradeStore
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATUS_STREAM_INTERVAL_SECONDS = 1.0
+STATUS_SNAPSHOT_CACHE_SECONDS = 0.5
+LIVE_SNAPSHOT_CACHE_SECONDS = 0.5
 
 
 class DashboardServer(ThreadingHTTPServer):
     def __init__(self, server_address, handler_class, bot: PaperTradingBot) -> None:
         super().__init__(server_address, handler_class)
         self.bot = bot
+        self._status_snapshot_cache: dict[str, Any] | None = None
+        self._status_snapshot_cache_at = 0.0
+        self._status_snapshot_lock = threading.Lock()
+        self._status_snapshot_refresh_lock = threading.Lock()
+        self._live_snapshot_cache: dict[str, Any] | None = None
+        self._live_snapshot_cache_at = 0.0
+        self._live_snapshot_cache_key = ""
+        self._live_snapshot_lock = threading.Lock()
+        self._live_snapshot_refresh_lock = threading.Lock()
+
+    def status_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        with self._status_snapshot_lock:
+            if (
+                self._status_snapshot_cache is not None
+                and now - self._status_snapshot_cache_at <= STATUS_SNAPSHOT_CACHE_SECONDS
+            ):
+                return self._status_snapshot_cache
+            if self._status_snapshot_cache is not None:
+                cached = self._status_snapshot_cache
+                self._start_status_snapshot_refresh()
+                return cached
+            payload = self.bot.snapshot()
+            self._status_snapshot_cache = payload
+            self._status_snapshot_cache_at = time.time()
+            return payload
+
+    def _start_status_snapshot_refresh(self) -> bool:
+        if not self._status_snapshot_refresh_lock.acquire(blocking=False):
+            return False
+
+        def _worker() -> None:
+            try:
+                payload = self.bot.snapshot()
+                with self._status_snapshot_lock:
+                    self._status_snapshot_cache = payload
+                    self._status_snapshot_cache_at = time.time()
+            finally:
+                self._status_snapshot_refresh_lock.release()
+
+        threading.Thread(target=_worker, name="polybot2other-status-cache-refresh", daemon=True).start()
+        return True
+
+    def live_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
+        key = str(market.get("slug") or "")
+        now = time.time()
+        with self._live_snapshot_lock:
+            if (
+                self._live_snapshot_cache is not None
+                and key
+                and key == self._live_snapshot_cache_key
+                and now - self._live_snapshot_cache_at <= LIVE_SNAPSHOT_CACHE_SECONDS
+            ):
+                cached = dict(self._live_snapshot_cache)
+                cached["server_throttled_snapshot"] = True
+                cached["updated_at"] = now
+                return cached
+            if self._live_snapshot_cache is not None:
+                cached = dict(self._live_snapshot_cache)
+                self._start_live_snapshot_refresh(payload, key)
+                cached["server_refreshing_snapshot"] = True
+                cached["updated_at"] = now
+                return cached
+        self._start_live_snapshot_refresh(payload, key)
+        return {"ok": True, "accepted_snapshot": True, "updated_at": now}
+
+    def _start_live_snapshot_refresh(self, payload: dict[str, Any], key: str) -> bool:
+        if not self._live_snapshot_refresh_lock.acquire(blocking=False):
+            return False
+        payload_copy = dict(payload)
+
+        def _worker() -> None:
+            try:
+                result = self.bot.ingest_live_snapshot(payload_copy)
+                with self._live_snapshot_lock:
+                    self._live_snapshot_cache = dict(result)
+                    self._live_snapshot_cache_at = time.time()
+                    self._live_snapshot_cache_key = key
+            finally:
+                self._live_snapshot_refresh_lock.release()
+
+        threading.Thread(target=_worker, name="polybot2other-live-snapshot-refresh", daemon=True).start()
+        return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -43,7 +129,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_static("index.html", include_body=False)
             return
         if path == "/api/status":
-            self._send_json(self.server.bot.snapshot(), include_body=False)
+            self._send_json(self.server.status_snapshot(), include_body=False)
             return
         if path == "/api/actor-analysis":
             self._send_json(self.server.bot.actor_analysis(force=False), include_body=False)
@@ -104,7 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_static("index.html")
             return
         if path == "/api/status":
-            self._send_json(self.server.bot.snapshot())
+            self._send_json(self.server.status_snapshot())
             return
         if path == "/api/status-stream":
             self._send_status_stream()
@@ -293,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/live-snapshot":
             try:
                 payload = self._read_json_body()
-                self._send_json(self.server.bot.ingest_live_snapshot(payload))
+                self._send_json(self.server.live_snapshot(payload))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             except (RuntimeError, urllib.error.URLError, TimeoutError) as exc:
@@ -455,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         while True:
             try:
-                payload = json.dumps(self.server.bot.snapshot(), ensure_ascii=False, separators=(",", ":"))
+                payload = json.dumps(self.server.status_snapshot(), ensure_ascii=False, separators=(",", ":"))
                 self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):

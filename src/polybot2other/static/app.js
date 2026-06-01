@@ -1815,7 +1815,7 @@ function renderLiveGateStatus(live = {}) {
       <div class="live-basis-strip">
         ${basisRows.map((row) => `
           <div class="live-basis-item ${row.ready ? "ready" : row.selected ? "warn" : ""}">
-            <span>${safe(String(row.source || "").toUpperCase())}${row.selected ? " · 已选" : ""}</span>
+            <span>${safe(String(row.source || "").toUpperCase())}${row.selected ? ` · 已选 · ${row.ready ? "可用" : "不可用"}` : ""}</span>
             <strong>${row.median_bps == null ? "-" : fmtSignedBpsCell(row.median_bps)}</strong>
             <small>样本 ${safe(row.samples ?? 0)} · 现价 ${row.price == null ? "-" : fmtNumberCell(row.price, 2)} · 校正 ${row.adjusted_price == null ? "-" : fmtNumberCell(row.adjusted_price, 2)} · 差 ${row.basis_usd == null ? "-" : fmtSignedMoneyCell(row.basis_usd)} · ${safe(row.reason || "")}</small>
           </div>

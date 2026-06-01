@@ -11,7 +11,7 @@ from typing import Any, Callable
 from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
@@ -172,11 +172,20 @@ class TradeStore:
             CREATE INDEX IF NOT EXISTS idx_paper_orders_round_created
                 ON paper_orders(round_id, created_at DESC);
 
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_symbol_created_at
+                ON paper_orders(symbol, created_at DESC, id DESC);
+
             CREATE INDEX IF NOT EXISTS idx_paper_orders_trade_id
                 ON paper_orders(trade_id);
 
             CREATE INDEX IF NOT EXISTS idx_paper_fills_order_id
                 ON paper_fills(order_id, level_index);
+
+            CREATE INDEX IF NOT EXISTS idx_trades_status_opened_at
+                ON trades(status, opened_at DESC, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_trades_symbol_activity_at
+                ON trades(symbol, COALESCE(settled_at, opened_at) DESC, id DESC);
 
             CREATE TABLE IF NOT EXISTS price_ticks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,6 +195,9 @@ class TradeStore:
                 created_at REAL NOT NULL
             );
 
+            CREATE INDEX IF NOT EXISTS idx_price_ticks_symbol_created_at
+                ON price_ticks(symbol, created_at DESC);
+
             CREATE TABLE IF NOT EXISTS equity_curve (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 cash_balance REAL NOT NULL,
@@ -194,6 +206,9 @@ class TradeStore:
                 total_equity REAL NOT NULL,
                 created_at REAL NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_equity_curve_created_at
+                ON equity_curve(created_at DESC);
 
             CREATE TABLE IF NOT EXISTS llm_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

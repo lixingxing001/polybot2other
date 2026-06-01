@@ -46,9 +46,11 @@ from polybot2other.experiments import (
     STRATEGY_VARIANTS,
 )
 from polybot2other.live import (
+    LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE,
     LIVE_STARTUP_REARM_MESSAGE,
     LIVE_VARIANT_ID,
     LiveOrderResponse,
+    LiveProcessLock,
     PolymarketLiveClient,
     _response_terminal_no_fill_local_status,
 )
@@ -61,13 +63,14 @@ from polybot2other.models import MarketRound, PaperFill, PaperFillLevel, PriceTi
 from polybot2other.polymarket import PolymarketClient
 from polybot2other.report_snapshot import generate_strategy_experiment_report_snapshot
 from polybot2other.storage import (
+    SCHEMA_VERSION,
     SETTLEMENT_SOURCE_CHAINLINK,
     SETTLEMENT_SOURCE_EARLY_EXIT,
     SETTLEMENT_SOURCE_POLYMARKET,
     TradeStore,
 )
 from polybot2other.strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
-from polybot2other.web import _strategy_experiments_retrospective_report_html
+from polybot2other.web import DashboardServer, Handler, _strategy_experiments_retrospective_report_html
 
 
 class FakeLiveClient:
@@ -163,6 +166,24 @@ class FakeLiveClient:
             "env_files": list(self.env_files),
         }
 
+    def cached_readiness(self, **kwargs) -> dict:
+        wallet = dict(self.wallet_payload)
+        wallet["required_cash"] = kwargs.get("required_cash")
+        errors = list(self.readiness_error_list or []) + list(wallet.get("errors", []))
+        return {
+            "ready": not errors,
+            "errors": errors,
+            "sdk": "fake",
+            "sdk_version": "fake-1.0",
+            "sdk_status": {"package": "fake", "version": "fake-1.0", "compatible": True, "errors": []},
+            "chain_id": 137,
+            "host": "fake",
+            "wallet": wallet,
+            "credential_presence": dict(self.credential_presence),
+            "env_files": list(self.env_files),
+            "cached": True,
+        }
+
     def readiness_errors(self) -> list[str]:
         return list(self.readiness_error_list)
 
@@ -198,6 +219,12 @@ class FakeLiveClient:
         self.open_orders_calls.append(kwargs)
         payload = dict(self.open_orders_payload)
         payload["orders"] = [dict(row) for row in self.open_orders_payload.get("orders", [])]
+        return payload
+
+    def cached_open_orders_state(self) -> dict:
+        payload = dict(self.open_orders_payload)
+        payload["orders"] = [dict(row) for row in self.open_orders_payload.get("orders", [])]
+        payload["cached"] = True
         return payload
 
     def geoblock_state(self, **kwargs) -> dict:
@@ -298,6 +325,33 @@ class FakeActorDataClient:
 
 
 class TradingCoreTest(unittest.TestCase):
+    def test_trade_store_schema_creates_hot_path_indexes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradeStore(Path(tmp) / "test.sqlite3", 100.0)
+            index_rows = store.conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'
+                """
+            ).fetchall()
+            indexes = {str(row["name"]) for row in index_rows}
+
+            self.assertTrue(
+                {
+                    "idx_equity_curve_created_at",
+                    "idx_price_ticks_symbol_created_at",
+                    "idx_trades_status_opened_at",
+                    "idx_trades_symbol_activity_at",
+                    "idx_paper_orders_symbol_created_at",
+                }.issubset(indexes)
+            )
+
+            schema_version = store.conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()["value"]
+            self.assertEqual(str(SCHEMA_VERSION), schema_version)
+
     def test_actor_analysis_is_read_only_and_scores_wallets(self) -> None:
         market = MarketRound(
             "btc-updown-5m-1780000000",
@@ -2699,6 +2753,229 @@ class TradingCoreTest(unittest.TestCase):
 
             self.assertTrue(bot._backend_price_refresh_needed(now))
 
+    def test_backend_price_refresh_checks_each_selected_live_fallback_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            assert bot.live_trading is not None
+            bot.live_trading.update_settings({"fallback_sources": ["okx", "binance"]})
+            now = time.time()
+            with bot._lock:
+                bot.execution_price = {
+                    "binance_market": 101.0,
+                    "binance_market_updated_ms": int(now * 1000),
+                    "binance_updated_ms": int(now * 1000),
+                    "okx": 102.0,
+                    "okx_updated_ms": int((now - 10.0) * 1000),
+                }
+                bot._last_backend_price_refresh_at = now - 2.0
+
+            self.assertTrue(bot._backend_price_refresh_needed(now))
+
+            bot.live_trading.update_settings({"fallback_sources": ["binance"]})
+            self.assertFalse(bot._backend_price_refresh_needed(now))
+
+    def test_status_snapshot_does_not_hold_bot_lock_during_live_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            assert bot.live_trading is not None
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-status-lock",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+                bot._last_live_snapshot_ingest_at = 0.0
+
+            entered = threading.Event()
+            release = threading.Event()
+            snapshot_errors: list[BaseException] = []
+
+            def slow_live_snapshot(*, refresh_external: bool = True) -> dict[str, Any]:
+                entered.set()
+                release.wait(2.0)
+                return {
+                    "enabled": False,
+                    "variant_id": LIVE_VARIANT_ID,
+                    "combo": "SINGLE + FAK REAL",
+                    "execution_mode": "LIVE",
+                    "db_path": str(settings.live_trading_db_path),
+                    "settings_path": str(settings.live_trading_settings_path),
+                    "process_lock_path": str(bot.live_trading.process_lock.path),
+                    "process_lock_acquired": False,
+                    "process_lock": {},
+                    "run_count": 0,
+                    "last_run_at": None,
+                    "overlap_skip_count": 0,
+                    "last_signal": {},
+                    "last_error": None,
+                    "startup_rearmed": False,
+                    "last_order_at": None,
+                    "last_order": {},
+                    "readiness": fake_client.readiness(required_cash=5.0),
+                    "open_orders": fake_client.open_orders_state(),
+                    "settings": {"enabled": False, "fallback_sources": []},
+                    "variant": {"variant_id": LIVE_VARIANT_ID, "metrics": {}},
+                    "variants": [{"variant_id": LIVE_VARIANT_ID, "metrics": {}}],
+                }
+
+            bot.live_trading.snapshot = slow_live_snapshot  # type: ignore[method-assign]
+
+            def run_snapshot() -> None:
+                try:
+                    bot.snapshot()
+                except BaseException as exc:  # noqa: BLE001 - surface thread failures to the assertion below.
+                    snapshot_errors.append(exc)
+
+            snapshot_thread = threading.Thread(target=run_snapshot, daemon=True)
+            snapshot_thread.start()
+            self.assertTrue(entered.wait(1.0))
+
+            ingest_errors: list[BaseException] = []
+
+            def run_ingest() -> None:
+                try:
+                    bot.ingest_live_snapshot(
+                        {
+                            "market": {"slug": market.round_id},
+                            "price": {"chainlink": 101.0, "chainlink_updated_ms": int(time.time() * 1000)},
+                            "quotes": {},
+                            "market_ws_status": "test",
+                            "price_ws_status": "test",
+                        }
+                    )
+                except BaseException as exc:  # noqa: BLE001 - surface thread failures to the assertion below.
+                    ingest_errors.append(exc)
+
+            ingest_thread = threading.Thread(target=run_ingest, daemon=True)
+            ingest_thread.start()
+            ingest_thread.join(0.5)
+            self.assertFalse(ingest_thread.is_alive(), "live snapshot ingest was blocked by status snapshot")
+            release.set()
+            snapshot_thread.join(2.0)
+            self.assertFalse(snapshot_thread.is_alive())
+            self.assertEqual([], ingest_errors)
+            self.assertEqual([], snapshot_errors)
+
+    def test_dashboard_live_snapshot_refreshes_in_background(self) -> None:
+        class SlowSnapshotBot:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.calls = 0
+
+            def ingest_live_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+                self.calls += 1
+                self.entered.set()
+                self.release.wait(2.0)
+                return {"ok": True, "seq": self.calls, "market": payload.get("market", {})}
+
+        bot = SlowSnapshotBot()
+        server = DashboardServer(("127.0.0.1", 0), Handler, bot)  # type: ignore[arg-type]
+        try:
+            payload = {"market": {"slug": "btc-updown-5m-web-live-snapshot"}, "price": {}, "quotes": {}}
+            started = time.perf_counter()
+            result = server.live_snapshot(payload)
+            first_elapsed = time.perf_counter() - started
+
+            self.assertTrue(result["accepted_snapshot"])
+            self.assertLess(first_elapsed, 0.5)
+            self.assertTrue(bot.entered.wait(1.0))
+
+            started = time.perf_counter()
+            second_result = server.live_snapshot(payload)
+            second_elapsed = time.perf_counter() - started
+
+            self.assertTrue(second_result["accepted_snapshot"])
+            self.assertLess(second_elapsed, 0.5)
+            self.assertEqual(bot.calls, 1)
+
+            bot.release.set()
+            deadline = time.time() + 2.0
+            cached: dict[str, Any] | None = None
+            while time.time() < deadline:
+                with server._live_snapshot_lock:
+                    cached = dict(server._live_snapshot_cache or {})
+                if cached:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(cached.get("seq"), 1)
+
+            bot.entered.clear()
+            bot.release.clear()
+            with server._live_snapshot_lock:
+                server._live_snapshot_cache_at = 0.0
+
+            started = time.perf_counter()
+            stale_result = server.live_snapshot(payload)
+            stale_elapsed = time.perf_counter() - started
+
+            self.assertEqual(stale_result["seq"], 1)
+            self.assertTrue(stale_result["server_refreshing_snapshot"])
+            self.assertLess(stale_elapsed, 0.5)
+            self.assertTrue(bot.entered.wait(1.0))
+        finally:
+            bot.release.set()
+            server.server_close()
+
+    def test_live_snapshot_ignores_expired_market_without_sync_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-expired-live-snapshot",
+                symbol="BTC",
+                started_at=now - 360,
+                ends_at=now - 60,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+
+            refresh_calls: list[bool] = []
+
+            def fail_refresh() -> None:
+                refresh_calls.append(True)
+                raise AssertionError("live snapshot must not refresh market synchronously")
+
+            bot._refresh_market = fail_refresh  # type: ignore[method-assign]
+            result = bot.ingest_live_snapshot(
+                {
+                    "market": {"slug": market.round_id},
+                    "price": {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)},
+                    "quotes": {},
+                }
+            )
+
+            self.assertEqual(result["ignored_snapshot"], "expired_market")
+            self.assertEqual(refresh_calls, [])
+
     def test_pair_strategy_does_not_open_without_official_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
@@ -4089,6 +4366,52 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(persisted["compliance_acknowledged"])
             self.assertTrue(bot.live_settings()["startup_rearmed"])
             self.assertFalse(bot.snapshot()["runtime"]["live_trading"]["enabled"])
+
+    def test_live_startup_does_not_disable_settings_file_when_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_settings_path = Path(tmp) / "live-settings.json"
+            live_settings_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "initial_balance": 20.0,
+                        "stake_dollars": 2.0,
+                        "max_open_trades": 2,
+                        "max_daily_loss": 6.0,
+                        "max_total_drawdown": 12.0,
+                        "max_entry_price": 0.72,
+                        "retry_count": 2,
+                        "retry_delay_ms": 250,
+                        "compliance_acknowledged": True,
+                        "updated_at": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lock = LiveProcessLock(live_settings_path.with_name(f"{live_settings_path.name}.lock"))
+            self.assertIsNone(lock.acquire())
+            try:
+                settings = Settings(
+                    db_path=Path(tmp) / "main.sqlite3",
+                    live_trading_db_path=Path(tmp) / "live.sqlite3",
+                    live_trading_settings_path=live_settings_path,
+                )
+                store = TradeStore(settings.db_path, settings.initial_balance)
+
+                bot = PaperTradingBot(settings, store)
+
+                self.assertFalse(bot.live_trading.config.enabled)
+                self.assertFalse(bot.live_trading.startup_rearmed)
+                self.assertTrue(bot.live_trading.startup_rearm_skipped_active_lock)
+                self.assertEqual(bot.live_trading.last_error, LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE)
+                persisted = json.loads(live_settings_path.read_text(encoding="utf-8"))
+                self.assertTrue(persisted["enabled"])
+                settings_file = bot.live_trading.settings_store.file_status(bot.live_trading.config)
+                self.assertTrue(settings_file["enabled"])
+                self.assertFalse(settings_file["runtime_enabled"])
+                self.assertFalse(settings_file["enabled_matches_runtime"])
+            finally:
+                lock.release()
 
     def test_bot_reload_live_credentials_reloads_env_and_clears_client_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

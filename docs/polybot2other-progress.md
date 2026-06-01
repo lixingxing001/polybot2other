@@ -1,5 +1,83 @@
 # polybot2other-progress
 
+## 2026-06-01 v4.29
+
+### 已完成
+
+1. 修复实盘配置文件与运行中状态可能不一致的问题：`LiveStrategyRunner` 启动时会先探测实盘进程锁，若已有 runner 持锁，则新 runner 不再把 `live-settings.json` 的 `enabled=true` 改写为 `false`。
+2. 新增 `settings_file` 诊断字段，暴露运行中 `enabled` 与磁盘配置文件 `enabled` 是否一致。
+3. 新增 `startup_rearm_skipped_active_lock` 诊断字段，用于说明本 runner 因已有实盘锁而跳过磁盘安全重置。
+4. 保留原有安全行为：无活跃实盘锁的正常服务启动，如果磁盘中 `enabled=true`，仍会自动写回 `enabled=false`，避免重启后无人值守自动实盘。
+5. 已通过 `/api/live-settings` 将当前运行中实盘配置重新保存到 `data/live/live-settings.json`，恢复页面/API 与磁盘文件一致。
+
+### 已确认决策
+
+1. 页面/API 的运行中状态是实时下单判断依据；磁盘配置用于持久化和下次启动。
+2. 不改变实盘下单策略、阈值、订单提交、结算和风控逻辑。
+3. 不重启当前 dashboard，避免触发启动安全重置导致实盘开关被关闭。
+
+### 待办和后期优化
+
+1. 后续可以在前端设置面板直接展示 `settings_file.enabled_matches_runtime`，让配置一致性问题可视化。
+
+### 已知坑位
+
+1. 当前运行中的 dashboard 进程仍是修复前启动的代码；本次代码修复会在下次启动后生效。为避免停机后自动关闭实盘，本轮没有重启服务。
+2. 如果未来需要重启后自动继续实盘，必须单独设计更明确的人工确认和恢复流程，不能直接移除启动安全重置。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "live_startup_auto_disables_persisted_enabled_flag or live_startup_does_not_disable_settings_file_when_lock_is_held or trade_store_schema_creates_hot_path_indexes"`，2 条匹配测试通过。
+2. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "live_startup or live_enable_requires_single_process_lock or live_once_requires_live_switch_off or live_once_runs_one_order_and_disables_after or live_enable_stays_off_when_readiness_fails"`，6 条实盘启停相关回归通过。
+3. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py`，182 条核心回归全部通过。
+4. 已通过 `/api/live-settings` 重新保存当前运行中配置，确认 API `enabled=true`、磁盘文件 `enabled=true`、实盘进程锁仍持有。
+5. 已用新代码模拟第二个 runner 初始化，确认其 `startup_rearm_skipped_active_lock=true`，且没有改写 `live-settings.json`。
+
+### 回滚建议
+
+1. 如需回滚代码，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档 v4.29 改动。
+2. 不建议回滚已重新保存的 `live-settings.json`；若需要关闭实盘，应通过页面或 `/api/live-settings` 明确关闭，而不是手动编辑文件。
+
+## 2026-06-01 v4.28
+
+### 已完成
+
+1. 将 SQLite schema 版本从 8 提升到 9。
+2. 新增页面和后台热点查询索引：
+   - `idx_equity_curve_created_at`
+   - `idx_price_ticks_symbol_created_at`
+   - `idx_trades_status_opened_at`
+   - `idx_trades_symbol_activity_at`
+   - `idx_paper_orders_symbol_created_at`
+3. 新增回归测试，确认新建 `TradeStore` 会自动创建这些索引并写入最新 `schema_version`。
+
+### 已确认决策
+
+1. 只补热点路径索引，不一次性给所有字段加索引。
+2. 索引用于优化页面状态、资金曲线、最近价格、订单列表和交易列表查询，不改变交易策略、下单阈值或订单提交逻辑。
+
+### 待办和后期优化
+
+1. 后续如果 `equity_curve` 或 `price_ticks` 继续快速增长，可再评估是否需要归档或周期性清理旧样本。
+
+### 已知坑位
+
+1. 创建索引会对 SQLite 写入产生短暂写锁；实盘开启时不建议直接在线建索引或重启服务。
+2. 本次索引降低读查询和排序成本，但不替代 `/api/status` 与 `/api/live-snapshot` 的缓存和后台刷新隔离。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "trade_store_schema_creates_hot_path_indexes or dashboard_live_snapshot_refreshes_in_background or status_snapshot_does_not_hold_bot_lock"`，3 条定向测试通过。
+2. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py`，181 条核心回归全部通过。
+3. 已核对现有 22 个 SQLite 库，确认热点索引均已存在且 `schema_version` 均为 9。
+4. 已只读验证主库查询计划，`equity_curve`、`price_ticks`、`paper_orders` 和 `trades` 热点查询均命中新索引。
+5. 已对 `/api/status` 做 60 次本机采样，最大 24.3ms，平均 4.9ms，超过 100ms 为 0。
+
+### 回滚建议
+
+1. 如需回滚代码，撤销 `src/polybot2other/storage.py`、`tests/test_core.py` 和本进度文档 v4.28 改动。
+2. 如索引已经应用到 SQLite 文件且需要回滚，可在停服维护窗口执行对应 `DROP INDEX IF EXISTS ...`；不建议实盘运行中删除索引。
+
 ## 2026-05-31 v4.27
 
 ### 已完成
