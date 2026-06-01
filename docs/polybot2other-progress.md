@@ -1,5 +1,166 @@
 # polybot2other-progress
 
+## 2026-06-01 v4.33
+
+### 已完成
+
+1. 将 `SINGLE_FAK_REAL_PAPER_STOP_WIN` 的止盈口径从“入场价上涨百分比”改为“最大可盈利空间百分比”。
+2. 新口径按 `最大可盈利 = 终局赢时 shares payout - 入场 stake` 计算；止盈配置 `8%` 表示当前 bid 卖出后的净 PnL 达到最大可盈利的 `8%` 才退出。
+3. `100%` 仍表示关闭止盈，只等官方终局结算。
+4. 止盈记录 reason 改为写入 `max_profit_pct`、`target_pnl/max_profit`、触发 bid、卖出均价、手续费和净 PnL，便于后续复盘。
+5. 前端实盘配置里的止盈估算改为展示估算入场、最大盈利、目标盈利和触发卖一价，避免再被误解为入场价涨幅。
+
+### 已确认决策
+
+1. 止盈阈值必须以最大盈利为基准，而不是以入场价格涨幅为基准。
+2. 本轮仍只影响 `SINGLE_FAK_REAL_PAPER_STOP_WIN`，不影响真实 `SINGLE_FAK_REAL` 自动卖出。
+
+### 待办和后期优化
+
+1. 跑出样本后，需要对比止盈 Paper 和普通 Paper 的“减少归零损失”和“提前卖飞终局胜单”两类记录。
+2. 如需更强审计，可后续为 Paper 止盈退出补一条持久化卖出订单记录。
+
+### 已知坑位
+
+1. 按最大盈利占比后，同样的百分比在不同入场价下会对应不同 bid 触发价，这是预期行为。
+2. 越接近 `100%` 的止盈目标越可能接近终局价，扣除卖出手续费后可能在盘口上很难提前触发。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real_paper_stop_win" -v`，2 条止盈定向测试通过。
+4. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real" -v`，20 条实盘、普通 Paper 和止盈 Paper 回归通过。
+5. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py`，189 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/live.py src/polybot2other/static/index.html src/polybot2other/static/app.js tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+7. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+8. 已执行 `/api/status` 烟测，返回 `SINGLE_FAK_REAL_PAPER_STOP_WIN` 默认止盈 `8.0%`，且真实实盘 `live_enabled=false`。
+
+### 回滚建议
+
+1. 如需仅回滚本轮止盈口径变更，撤销 `src/polybot2other/live.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档 v4.33 改动。
+2. 回滚后，`SINGLE_FAK_REAL_PAPER_STOP_WIN` 会恢复为按入场价涨幅百分比触发止盈。
+
+## 2026-06-01 v4.32
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_REAL_PAPER_STOP_WIN` 对照策略组合，独立 SQLite 路径为 `data/live/single_fak_real_paper_stop_win.sqlite3`。
+2. 新组合复用 `SINGLE_FAK_REAL_PAPER` 的实盘信号、Chainlink 基差确认、SINGLE/FAK 入场、持仓限制和官方终局结算。
+3. 仅在 `SINGLE_FAK_REAL_PAPER_STOP_WIN` 的 Paper 账本中模拟止盈卖出，不接入真实实盘自动卖出，不影响 `SINGLE_FAK_REAL` 和普通 `SINGLE_FAK_REAL_PAPER`。
+4. 实盘配置新增 `paper_stop_win_take_profit_pct`，默认 `8%`；配置为 `100%` 时表示关闭止盈、只等终局结算。
+5. 前端实盘配置面板新增止盈百分比输入和盈利估算，按当前 stake、参考入场价、手续费估算触发卖一价格、单笔预估盈利和 ROI。
+6. 账户口径和表格 scope 可区分普通影子账户与止盈对照账户，`live_paper` 未传 `variant_id` 时仍默认查看普通 `SINGLE_FAK_REAL_PAPER`，避免兼容性破坏。
+
+### 已确认决策
+
+1. 本轮只做 Paper 止盈对照，不让真实实盘持仓自动卖出。
+2. 止盈以持仓入场均价为基准，计算触发 bid 价格；只有盘口 bid 深度足够且扣除卖出手续费后预估 PnL 为正，才记录 Paper 提前退出。
+3. 同一市场一旦止盈退出，不再允许该止盈对照账户在同一 round 重新开仓，避免止盈后反复进出放大噪音。
+
+### 待办和后期优化
+
+1. 等 `SINGLE_FAK_REAL_PAPER_STOP_WIN` 跑出足够样本后，再比较普通 Paper 与止盈 Paper 的胜率、净 PnL、错失终局盈利和减少终局归零损失。
+2. 如果后续要把止盈引入真实实盘，必须单独设计真实卖出价格保护、订单状态回查、失败重试、滑点、最小成交量和人工确认开关。
+
+### 已知坑位
+
+1. 止盈 Paper 使用当前本地 bid 深度模拟，不能保证真实实盘在同一时刻一定能成交。
+2. 百分比止盈不是稳定盈利保证；它能减少“中途有盈利但终局归零”的损失，但也可能提前卖飞本来终局会赢的仓位。
+3. 前端盈利估算使用当前可见配置和参考入场价做即时估算，实际 Paper 平仓仍以真实持仓入场均价、盘口 bid 和手续费为准。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real_paper" -v`，4 条普通 Paper 和止盈 Paper 定向测试通过。
+4. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real" -v`，20 条实盘、普通 Paper 和止盈 Paper 回归通过。
+5. 已执行 `rtk proxy .venv/bin/python -m pytest tests/test_core.py`，189 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/live.py src/polybot2other/bot.py src/polybot2other/static/index.html src/polybot2other/static/app.js src/polybot2other/static/styles.css tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+7. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+8. 已执行 `/api/status` 烟测，返回 `runtime.live_paper_stop_win_trading.variant.variant_id=SINGLE_FAK_REAL_PAPER_STOP_WIN`、默认止盈 `8.0%`，且真实实盘 `live_enabled=false`。
+
+### 回滚建议
+
+1. 如需回滚本轮止盈对照策略，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档 v4.32 改动。
+2. 如本地已生成 `data/live/single_fak_real_paper_stop_win.sqlite3`，可在停服后单独归档或删除；不会影响真实 `SINGLE_FAK_REAL` 账本。
+
+## 2026-06-01 v4.31
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_REAL_PAPER` 影子 Paper 账户，独立 SQLite 路径为 `data/live/single_fak_real_paper.sqlite3`。
+2. 影子账户复用 `SINGLE_FAK_REAL` 的价格源选择、Chainlink 基差确认、SINGLE/FAK 入场、持仓/亏损限制和官方结算逻辑。
+3. 影子账户不读取钱包、不检查官方 open orders、不持实盘进程锁、不调用真实 `place_market_buy/sell`，只写本地 Paper 账本。
+4. 页面账户和表格 scope 新增 `live_paper`，可直接查看 `SINGLE_FAK_REAL_PAPER` 的持仓、订单、交易记录和资金曲线。
+5. 新增回归测试覆盖影子账户纸盘开仓且不触发真实 client，以及 Chainlink 单源同样阻断。
+
+### 已确认决策
+
+1. `SINGLE_FAK_REAL_PAPER` 是“实盘逻辑复刻的影子账本”，不是新的真实下单通道。
+2. 影子账户跟随实盘配置文件中的 stake、max open、亏损线、max entry、fallback sources 等策略参数；但不要求实盘开关开启，也不要求风险确认、钱包余额、官方挂单检查通过。
+3. 全局 Paper 暂停时，影子账户也停止模拟新开仓，避免页面上的 Paper 暂停语义失效。
+
+### 待办和后期优化
+
+1. 如果后续要把影子账户作为实盘候选评估，需要增加与 `SINGLE_FAK_REAL` 的同窗口对比报表，直接显示“实盘会下/影子下了/影子没下”的差异。
+2. 可继续增加官方钱包余额占比限制、盈利峰值回撤停止和连亏暂停，再让影子账户先跑一段时间验证。
+
+### 已知坑位
+
+1. 影子账户跳过钱包、地区和官方 open orders 这类真实资金前置条件，所以它衡量的是策略信号与盘口模拟效果，不等同于真实订单一定能成交。
+2. 影子账户使用本地盘口深度模拟 FAK，真实成交仍可能受 Polymarket 撮合延迟、订单状态回查和官方返回金额影响。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real_paper or live_gate_blocks_chainlink_single_source_entry or live_gate_allows_chainlink_when_basis_confirms_direction" -v`，4 条定向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k single_fak_real -v`，18 条实盘/影子账户相关回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，187 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/live.py src/polybot2other/bot.py src/polybot2other/static/app.js tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+
+### 回滚建议
+
+1. 如需回滚本轮影子账户，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/app.js`、`tests/test_core.py` 和本进度文档 v4.31 改动。
+2. 如本地已生成 `data/live/single_fak_real_paper.sqlite3`，可在停服后单独归档或删除；不影响真实 `SINGLE_FAK_REAL` 账本。
+
+## 2026-06-01 v4.30
+
+### 已完成
+
+1. 收紧 `SINGLE_FAK_REAL` 实盘价格源选择：选择 Chainlink 时不再允许 Chainlink 单源直接入场。
+2. 当 Chainlink 新鲜且被选中时，必须至少有一个已选择且 ready 的 OKX/Binance 基差校正价同向确认；否则返回 `NO_TRADE`。
+3. 如果只选择 Chainlink、基差样本不足或 Chainlink 与基差校正方向冲突，实盘 gate 会阻断并给出明确原因。
+4. 保留非 Chainlink 配置行为：只选择 OKX/Binance 时继续沿用 `basis_adjusted` 入场逻辑。
+5. 新增回归测试覆盖 Chainlink 单源阻断、Chainlink 与基差同向允许、方向冲突阻断，以及原 OKX 基差路径不回退。
+
+### 已确认决策
+
+1. 本轮只收紧实盘 `SINGLE_FAK_REAL` 入场确认，不修改 Paper、策略实验、订单提交、官方结算、钱包对账和数据库结构。
+2. Chainlink 仍可作为实盘信号来源，但必须被 OKX/Binance 基差校正价确认，不能单独拍板真实下单。
+
+### 待办和后期优化
+
+1. 后续仍需要补充官方钱包余额占比限制、自然日亏损停止、盈利峰值回撤停止和连亏暂停，避免单源过滤之外的连续亏损。
+
+### 已知坑位
+
+1. 该改动会降低下单频率；如果 OKX/Binance 基差样本不足，实盘会直接 `NO_TRADE`。
+2. 多源同向确认只能降低单源误判风险，不能保证策略稳定盈利。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "live_gate_blocks_chainlink_single_source_entry or live_gate_allows_chainlink_when_basis_confirms_direction or live_gate_blocks_chainlink_when_basis_direction_conflicts or live_gate_uses_selected_okx_basis_adjusted_price or live_gate_blocks_selected_basis_fallback_when_samples_are_insufficient" -v`，5 条定向测试通过。
+2. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k single_fak_real -v`，16 条实盘回归通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，185 条核心回归全部通过。
+
+### 回滚建议
+
+1. 如需回滚本轮实盘价格源确认逻辑，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档 v4.30 改动。
+2. 本轮没有修改 SQLite 数据、实盘配置文件或官方订单状态，无需数据回滚。
+
 ## 2026-06-01 v4.29
 
 ### 已完成

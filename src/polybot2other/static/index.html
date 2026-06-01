@@ -73,6 +73,18 @@
             <label><input type="checkbox" data-live-fallback-source="binance">Binance基差校正</label>
             <small>空选时沿用 SINGLE_FAK_REAL 默认 fallback；多选时按 Chainlink 优先，其次基差校正价。</small>
           </div>
+          <div class="live-stop-win-settings">
+            <div class="live-stop-win-head">
+              <span>SINGLE_FAK_REAL_PAPER_STOP_WIN 止盈</span>
+              <small>按最大盈利占比计算，仅影响止盈 Paper 对照组合，100% 表示不止盈。</small>
+            </div>
+            <div class="live-stop-win-body">
+              <label><span>止盈百分比</span><input id="live-paper-stop-win-take-profit-pct" type="number" min="0" max="100" step="0.1"></label>
+              <div id="live-paper-stop-win-estimate" class="live-stop-win-estimate" aria-live="polite">
+                <span>等待估算</span>
+              </div>
+            </div>
+          </div>
           <div class="live-settings-footer">
             <label class="live-ack"><input id="live-compliance-ack" type="checkbox">确认地区/账户合规且承担真实资金风险</label>
             <button id="live-save-settings" type="button">保存配置</button>

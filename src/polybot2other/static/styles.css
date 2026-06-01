@@ -605,6 +605,92 @@ button.danger-button:hover:not(:disabled) {
   line-height: 1.35;
 }
 
+.live-stop-win-settings {
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #111820;
+}
+
+.live-stop-win-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.live-stop-win-head span {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.live-stop-win-head small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: right;
+}
+
+.live-stop-win-body {
+  display: grid;
+  grid-template-columns: minmax(150px, 190px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: stretch;
+}
+
+.live-stop-win-body label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.live-stop-win-body input[type="number"] {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0 8px;
+}
+
+.live-stop-win-estimate {
+  min-height: 54px;
+  padding: 9px 10px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  border: 1px solid rgba(99, 179, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(99, 179, 255, 0.08);
+}
+
+.live-stop-win-estimate span {
+  display: grid;
+  gap: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.live-stop-win-estimate strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.live-stop-win-estimate.is-disabled {
+  border-color: var(--line);
+  background: var(--panel-2);
+}
+
 .live-ack input[type="checkbox"] {
   width: 16px;
   height: 16px;
@@ -2358,6 +2444,20 @@ tbody tr:hover {
 
   .live-actions {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .live-stop-win-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .live-stop-win-head small {
+    text-align: left;
+  }
+
+  .live-stop-win-body,
+  .live-stop-win-estimate {
+    grid-template-columns: 1fr;
   }
 
   .live-settings-footer {

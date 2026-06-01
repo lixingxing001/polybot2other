@@ -48,7 +48,17 @@ from .llm_agent import (
     build_llm_market_features,
     route_execution_modes,
 )
-from .live import LIVE_COMBO, LIVE_VARIANT_ID, LiveStrategyRunner
+from .live import (
+    LIVE_COMBO,
+    LIVE_PAPER_COMBO,
+    LIVE_PAPER_STOP_WIN_COMBO,
+    LIVE_PAPER_STOP_WIN_VARIANT_ID,
+    LIVE_PAPER_VARIANT_ID,
+    LIVE_VARIANT_ID,
+    LivePaperStrategyRunner,
+    LivePaperStopWinStrategyRunner,
+    LiveStrategyRunner,
+)
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
 from .polymarket import PolymarketClient, market_to_payload
@@ -268,6 +278,12 @@ class PaperTradingBot:
             else None
         )
         self.live_trading = LiveStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+        self.live_paper_trading = (
+            LivePaperStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+        )
+        self.live_paper_stop_win_trading = (
+            LivePaperStopWinStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+        )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1043,6 +1059,14 @@ class PaperTradingBot:
                 final_price=final_price,
                 target_price=target_price,
             )
+        for runner in self._live_paper_runners():
+            runner.apply_official_resolution(
+                round_id,
+                outcome,
+                now,
+                final_price=final_price,
+                target_price=target_price,
+            )
 
     def _run_strategy_from_state(self) -> None:
         with self._lock:
@@ -1114,13 +1138,37 @@ class PaperTradingBot:
         price: dict[str, Any],
         quotes: dict[str, dict[str, Any]],
     ) -> None:
+        live_paper_runners = self._live_paper_runners()
+        if self.live_trading is None and not live_paper_runners:
+            return
         try:
-            if self.live_trading is not None:
-                live_price, live_quotes, _source = self._execution_market_data()
-                self.live_trading.run_from_state(market, live_price, live_quotes)
+            live_price, live_quotes, _source = self._execution_market_data()
         except Exception as exc:  # noqa: BLE001 - 实盘错误必须暴露但不能阻塞 Paper 采样。
             if self.live_trading is not None:
+                self.live_trading.last_error = f"live market data error {type(exc).__name__}: {exc}"
+            for runner in live_paper_runners:
+                runner.last_error = f"live paper market data error {type(exc).__name__}: {exc}"
+            return
+        if self.live_trading is not None:
+            try:
+                self.live_trading.run_from_state(market, live_price, live_quotes)
+            except Exception as exc:  # noqa: BLE001 - 实盘错误必须暴露但不能阻塞 Paper 采样。
                 self.live_trading.last_error = f"{type(exc).__name__}: {exc}"
+        for runner in live_paper_runners:
+            try:
+                with self._lock:
+                    paper_paused = self.paper_trading_paused
+                if paper_paused:
+                    runner.last_error = PAPER_PAUSE_REASON
+                    continue
+                runner.run_from_state(
+                    market,
+                    live_price,
+                    live_quotes,
+                    live_config=self.live_trading.config if self.live_trading is not None else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - 影子 Paper 不允许影响主循环和真实实盘。
+                runner.last_error = f"{type(exc).__name__}: {exc}"
 
     def _run_llm_super_agent_strategy_from_state(
         self,
@@ -2182,6 +2230,8 @@ class PaperTradingBot:
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             live_runner = self.live_trading
+            live_paper_runner = self.live_paper_trading
+            live_paper_stop_win_runner = self.live_paper_stop_win_trading
             current_market = self.current_market
             execution_price = dict(self.execution_price)
             execution_quotes = _copy_quotes(self.execution_quotes)
@@ -2216,9 +2266,20 @@ class PaperTradingBot:
                 "pair_strategy": self._pair_strategy_runtime_locked(),
                 "strategy_experiments": {"enabled": False, "variants": []},
                 "live_trading": {},
+                "live_paper_trading": {},
+                "live_paper_stop_win_trading": {},
             }
         strategy_experiments_snapshot = self.strategy_experiments_snapshot()
         live_snapshot = live_runner.snapshot(refresh_external=False) if live_runner is not None else _disabled_live_snapshot()
+        live_paper_snapshot = live_paper_runner.snapshot() if live_paper_runner is not None else _disabled_live_paper_snapshot()
+        live_paper_stop_win_snapshot = (
+            live_paper_stop_win_runner.snapshot()
+            if live_paper_stop_win_runner is not None
+            else _disabled_live_paper_snapshot(
+                variant_id=LIVE_PAPER_STOP_WIN_VARIANT_ID,
+                combo=LIVE_PAPER_STOP_WIN_COMBO,
+            )
+        )
         if live_runner is not None:
             live_snapshot["gate_status"] = live_runner.gate_status(
                 current_market,
@@ -2231,6 +2292,8 @@ class PaperTradingBot:
             )
         runtime["strategy_experiments"] = strategy_experiments_snapshot
         runtime["live_trading"] = live_snapshot
+        runtime["live_paper_trading"] = live_paper_snapshot
+        runtime["live_paper_stop_win_trading"] = live_paper_stop_win_snapshot
         if live_runner is not None:
             live_snapshot["open_trades"] = self._decorate_open_trades(live_runner.open_trades(), runtime)
             live_metrics = self._metrics_with_open_marks(
@@ -2244,6 +2307,58 @@ class PaperTradingBot:
             for variant in live_variants:
                 if isinstance(variant, dict) and variant.get("variant_id") == LIVE_VARIANT_ID:
                     variant["metrics"] = live_metrics
+        if live_paper_runner is not None:
+            live_paper_snapshot["open_trades"] = self._decorate_open_trades(
+                live_paper_runner.open_trades(),
+                {
+                    "current_market": market_to_payload(current_market),
+                    "latest_price": execution_price,
+                    "latest_quotes": execution_quotes,
+                },
+            )
+            live_paper_metrics = self._metrics_with_open_marks(
+                live_paper_runner.store.metrics(),
+                live_paper_snapshot["open_trades"],
+            )
+            live_paper_variant = (
+                live_paper_snapshot.get("variant") if isinstance(live_paper_snapshot.get("variant"), dict) else None
+            )
+            if live_paper_variant is not None:
+                live_paper_variant["metrics"] = live_paper_metrics
+            live_paper_variants = (
+                live_paper_snapshot.get("variants") if isinstance(live_paper_snapshot.get("variants"), list) else []
+            )
+            for variant in live_paper_variants:
+                if isinstance(variant, dict) and variant.get("variant_id") == LIVE_PAPER_VARIANT_ID:
+                    variant["metrics"] = live_paper_metrics
+        if live_paper_stop_win_runner is not None:
+            live_paper_stop_win_snapshot["open_trades"] = self._decorate_open_trades(
+                live_paper_stop_win_runner.open_trades(),
+                {
+                    "current_market": market_to_payload(current_market),
+                    "latest_price": execution_price,
+                    "latest_quotes": execution_quotes,
+                },
+            )
+            live_paper_stop_win_metrics = self._metrics_with_open_marks(
+                live_paper_stop_win_runner.store.metrics(),
+                live_paper_stop_win_snapshot["open_trades"],
+            )
+            live_paper_stop_win_variant = (
+                live_paper_stop_win_snapshot.get("variant")
+                if isinstance(live_paper_stop_win_snapshot.get("variant"), dict)
+                else None
+            )
+            if live_paper_stop_win_variant is not None:
+                live_paper_stop_win_variant["metrics"] = live_paper_stop_win_metrics
+            live_paper_stop_win_variants = (
+                live_paper_stop_win_snapshot.get("variants")
+                if isinstance(live_paper_stop_win_snapshot.get("variants"), list)
+                else []
+            )
+            for variant in live_paper_stop_win_variants:
+                if isinstance(variant, dict) and variant.get("variant_id") == LIVE_PAPER_STOP_WIN_VARIANT_ID:
+                    variant["metrics"] = live_paper_stop_win_metrics
         open_trades = self._decorate_open_trades(
             [row for row in self.store.open_trades() if row["symbol"] == "BTC"],
             runtime,
@@ -2274,6 +2389,22 @@ class PaperTradingBot:
                 "live_trading": _live_settings_from_snapshot(live_snapshot)
                 if live_runner is not None
                 else _disabled_live_settings(),
+                "live_paper_trading": {
+                    "enabled": bool(live_paper_snapshot.get("enabled")),
+                    "variant_id": live_paper_snapshot.get("variant_id") or LIVE_PAPER_VARIANT_ID,
+                    "combo": live_paper_snapshot.get("combo") or LIVE_PAPER_COMBO,
+                    "db_path": live_paper_snapshot.get("db_path"),
+                    "mirrors_variant_id": LIVE_VARIANT_ID,
+                    "settings": live_paper_snapshot.get("settings"),
+                },
+                "live_paper_stop_win_trading": {
+                    "enabled": bool(live_paper_stop_win_snapshot.get("enabled")),
+                    "variant_id": live_paper_stop_win_snapshot.get("variant_id") or LIVE_PAPER_STOP_WIN_VARIANT_ID,
+                    "combo": live_paper_stop_win_snapshot.get("combo") or LIVE_PAPER_STOP_WIN_COMBO,
+                    "db_path": live_paper_stop_win_snapshot.get("db_path"),
+                    "mirrors_variant_id": LIVE_VARIANT_ID,
+                    "settings": live_paper_stop_win_snapshot.get("settings"),
+                },
                 "llm_super_agent": {
                     "enabled": self.settings.llm_super_agent_enabled,
                     "api_key_present": bool(self.settings.llm_super_agent_api_key),
@@ -2358,6 +2489,24 @@ class PaperTradingBot:
             return {"enabled": False, "variants": []}
         return self.strategy_experiments.snapshot()
 
+    def _live_paper_runners(self) -> list[LivePaperStrategyRunner]:
+        return [
+            runner
+            for runner in (self.live_paper_trading, self.live_paper_stop_win_trading)
+            if runner is not None
+        ]
+
+    def _live_paper_runner_for_variant(self, variant_id: str | None = None) -> LivePaperStrategyRunner:
+        runners = self._live_paper_runners()
+        if not runners:
+            raise ValueError("live paper trading is disabled in this runtime")
+        normalized = str(variant_id or LIVE_PAPER_VARIANT_ID).strip().upper()
+        for runner in runners:
+            if runner.variant_id.upper() == normalized:
+                return runner
+        allowed = ", ".join(runner.variant_id for runner in runners)
+        raise ValueError(f"unknown live paper variant_id: {normalized or '-'}; allowed: {allowed}")
+
     def strategy_experiment_detail(
         self,
         variant_id: str,
@@ -2377,6 +2526,8 @@ class PaperTradingBot:
         if self.live_trading is None:
             raise ValueError("live trading is disabled in this runtime")
         settings_payload = self.live_trading.update_settings(payload)
+        for runner in self._live_paper_runners():
+            runner.sync_config(self.live_trading.config)
         return {"live_trading": settings_payload, "snapshot": self.snapshot()}
 
     def reload_live_credentials(self) -> dict[str, Any]:
@@ -2395,12 +2546,16 @@ class PaperTradingBot:
         if self.live_trading is None:
             raise ValueError("live trading is disabled in this runtime")
         settings_payload = self.live_trading.set_enabled(enabled)
+        for runner in self._live_paper_runners():
+            runner.sync_config(self.live_trading.config)
         return {"live_trading": settings_payload, "snapshot": self.snapshot()}
 
     def live_emergency_stop(self) -> dict[str, Any]:
         if self.live_trading is None:
             raise ValueError("live trading is disabled in this runtime")
         result = self.live_trading.emergency_stop()
+        for runner in self._live_paper_runners():
+            runner.sync_config(self.live_trading.config)
         result["snapshot"] = self.snapshot()
         return result
 
@@ -2649,6 +2804,21 @@ class PaperTradingBot:
             page = self.live_trading.recent_trades_page(limit, offset, start_at, end_at)
             page["recent_trades"] = self._decorate_recent_trades(page["recent_trades"])
             return page
+        if scope in {
+            "live_paper",
+            "paper_live",
+            "single_fak_real_paper",
+            "single_fak_real_paper_stop_win",
+        }:
+            runner_variant_id = LIVE_PAPER_STOP_WIN_VARIANT_ID if scope == "single_fak_real_paper_stop_win" else variant_id
+            page = self._live_paper_runner_for_variant(runner_variant_id).recent_trades_page(
+                limit,
+                offset,
+                start_at,
+                end_at,
+            )
+            page["recent_trades"] = self._decorate_recent_trades(page["recent_trades"])
+            return page
         if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
             if not variant_id:
                 raise ValueError("variant_id is required for strategy_experiment scope")
@@ -2689,6 +2859,14 @@ class PaperTradingBot:
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
             return self.live_trading.orders_page(limit, offset, status_key)
+        if scope in {
+            "live_paper",
+            "paper_live",
+            "single_fak_real_paper",
+            "single_fak_real_paper_stop_win",
+        }:
+            runner_variant_id = LIVE_PAPER_STOP_WIN_VARIANT_ID if scope == "single_fak_real_paper_stop_win" else variant_id
+            return self._live_paper_runner_for_variant(runner_variant_id).orders_page(limit, offset, status_key)
         if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
             if not variant_id:
                 raise ValueError("variant_id is required for strategy_experiment scope")
@@ -2719,6 +2897,17 @@ class PaperTradingBot:
             return {
                 "order_id": order_id,
                 "fills": self.live_trading.store.paper_order_fills(order_id),
+            }
+        if scope in {
+            "live_paper",
+            "paper_live",
+            "single_fak_real_paper",
+            "single_fak_real_paper_stop_win",
+        }:
+            runner_variant_id = LIVE_PAPER_STOP_WIN_VARIANT_ID if scope == "single_fak_real_paper_stop_win" else variant_id
+            return {
+                "order_id": order_id,
+                "fills": self._live_paper_runner_for_variant(runner_variant_id).store.paper_order_fills(order_id),
             }
         if scope in {"strategy_experiment", "experiment", "strategy_experiments"}:
             if not variant_id:
@@ -2803,7 +2992,17 @@ class PaperTradingBot:
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
             return self.live_trading.equity_curve_window(days, max_points)
-        raise ValueError("account_scope must be main, strategy_experiment, or live")
+        if normalized_scope in {
+            "live_paper",
+            "paper_live",
+            "single_fak_real_paper",
+            "single_fak_real_paper_stop_win",
+        }:
+            runner_variant_id = (
+                LIVE_PAPER_STOP_WIN_VARIANT_ID if normalized_scope == "single_fak_real_paper_stop_win" else variant_id
+            )
+            return self._live_paper_runner_for_variant(runner_variant_id).equity_curve_window(days, max_points)
+        raise ValueError("account_scope must be main, strategy_experiment, live, or live_paper")
 
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
         _price, quotes, _source = self._paper_market_data_locked()
@@ -3561,6 +3760,26 @@ def _disabled_live_snapshot() -> dict[str, Any]:
         "open_trades": [],
         "readiness": {"ready": False, "errors": ["live trading disabled in this runtime"]},
         "open_orders": _disabled_live_open_orders()["open_orders"],
+        "settings": {"enabled": False},
+        "variants": [],
+    }
+
+
+def _disabled_live_paper_snapshot(
+    *,
+    variant_id: str = LIVE_PAPER_VARIANT_ID,
+    combo: str = LIVE_PAPER_COMBO,
+) -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "variant_id": variant_id,
+        "combo": combo,
+        "execution_mode": "PAPER",
+        "account_scope": "live_paper",
+        "mirrors_variant_id": LIVE_VARIANT_ID,
+        "last_signal": {},
+        "last_error": "live paper trading disabled in this runtime",
+        "open_trades": [],
         "settings": {"enabled": False},
         "variants": [],
     }

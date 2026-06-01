@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import hashlib
+import math
 import os
 import re
 import threading
@@ -50,6 +51,19 @@ except ImportError:  # pragma: no cover - production target is Linux, this keeps
 LIVE_VARIANT_ID = "SINGLE_FAK_REAL"
 LIVE_COMBO = "SINGLE + FAK REAL"
 LIVE_ENTRY_MARKER = "SINGLE_FAK_REAL"
+LIVE_PAPER_VARIANT_ID = "SINGLE_FAK_REAL_PAPER"
+LIVE_PAPER_COMBO = "SINGLE + FAK REAL PAPER"
+LIVE_PAPER_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER"
+LIVE_PAPER_STOP_WIN_VARIANT_ID = "SINGLE_FAK_REAL_PAPER_STOP_WIN"
+LIVE_PAPER_STOP_WIN_COMBO = "SINGLE + FAK REAL PAPER STOP WIN"
+LIVE_PAPER_STOP_WIN_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER_STOP_WIN"
+LIVE_PAPER_STOP_WIN_MARKER = "PAPER_STOP_WIN"
+LIVE_PAPER_STOP_WIN_DEFAULT_TAKE_PROFIT_PCT = 8.0
+LIVE_PAPER_STOP_WIN_DISABLE_PCT = 100.0
+LIVE_PAPER_STOP_WIN_MIN_HOLD_SECONDS = 10.0
+LIVE_PAPER_STOP_WIN_CHECK_SECONDS = 10.0
+LIVE_PAPER_STOP_WIN_FINAL_WINDOW_SECONDS = 60.0
+LIVE_PAPER_STOP_WIN_FINAL_CHECK_SECONDS = 3.0
 LIVE_MANUAL_SELL_MARKER = "LIVE_MANUAL_SELL"
 LIVE_OFFICIAL_RECHECK_INTERVAL_SECONDS = 10.0
 LIVE_OFFICIAL_RECHECK_WINDOW_SECONDS = 24 * 60 * 60
@@ -90,6 +104,7 @@ class LiveRuntimeConfig:
     fallback_sources: tuple[str, ...]
     retry_count: int
     retry_delay_ms: int
+    paper_stop_win_take_profit_pct: float
     compliance_acknowledged: bool
     updated_at: float
 
@@ -105,6 +120,13 @@ class LiveRuntimeConfig:
             fallback_sources=_normalize_live_fallback_sources(self.fallback_sources),
             retry_count=max(0, min(10, int(self.retry_count))),
             retry_delay_ms=max(0, min(10_000, int(self.retry_delay_ms))),
+            paper_stop_win_take_profit_pct=max(
+                0.0,
+                min(
+                    LIVE_PAPER_STOP_WIN_DISABLE_PCT,
+                    round(float(self.paper_stop_win_take_profit_pct), 2),
+                ),
+            ),
             compliance_acknowledged=bool(self.compliance_acknowledged),
             updated_at=float(self.updated_at or time.time()),
         )
@@ -138,6 +160,10 @@ class LiveSettingsStore:
             ),
             retry_count=_int(payload.get("retry_count"), self.defaults.retry_count),
             retry_delay_ms=_int(payload.get("retry_delay_ms"), self.defaults.retry_delay_ms),
+            paper_stop_win_take_profit_pct=_float(
+                payload.get("paper_stop_win_take_profit_pct"),
+                self.defaults.paper_stop_win_take_profit_pct,
+            ),
             compliance_acknowledged=bool(
                 payload.get("compliance_acknowledged", self.defaults.compliance_acknowledged)
             ),
@@ -1484,6 +1510,7 @@ class LiveStrategyRunner:
             fallback_sources=(),
             retry_count=settings.live_trading_default_retry_count,
             retry_delay_ms=settings.live_trading_default_retry_delay_ms,
+            paper_stop_win_take_profit_pct=LIVE_PAPER_STOP_WIN_DEFAULT_TAKE_PROFIT_PCT,
             compliance_acknowledged=False,
             updated_at=time.time(),
         )
@@ -1595,6 +1622,7 @@ class LiveStrategyRunner:
             price,
             self.config.fallback_sources,
             self.settings.max_quote_age_ms,
+            market.target_price,
         )
         if price_selection.get("blocked"):
             reason = str(price_selection.get("message") or "LIVE fallback price source blocked")
@@ -1895,6 +1923,10 @@ class LiveStrategyRunner:
             ),
             retry_count=_int(payload.get("retry_count"), current.retry_count),
             retry_delay_ms=_int(payload.get("retry_delay_ms"), current.retry_delay_ms),
+            paper_stop_win_take_profit_pct=_float(
+                payload.get("paper_stop_win_take_profit_pct"),
+                current.paper_stop_win_take_profit_pct,
+            ),
             compliance_acknowledged=_bool(
                 payload.get("compliance_acknowledged"),
                 current.compliance_acknowledged,
@@ -3581,6 +3613,461 @@ class LiveStrategyRunner:
         self.last_signal = signal
 
 
+class LivePaperStrategyRunner(LiveStrategyRunner):
+    """实盘策略影子账户：复用实盘信号和风控，但只写本地 Paper 账本。"""
+
+    def __init__(
+        self,
+        settings: Settings,
+        polymarket: PolymarketClient,
+        *,
+        variant_id: str = LIVE_PAPER_VARIANT_ID,
+        combo: str = LIVE_PAPER_COMBO,
+        entry_marker: str = LIVE_PAPER_ENTRY_MARKER,
+        role: str = "SINGLE_FAK_REAL 的 Paper 影子账户，不触发真实下单",
+        db_path: Path | None = None,
+        stop_win_enabled: bool = False,
+    ) -> None:
+        self.settings = settings
+        self.polymarket = polymarket
+        self.variant_id = variant_id
+        self.combo = combo
+        self.entry_marker = entry_marker
+        self.stop_win_enabled = bool(stop_win_enabled)
+        self.variant = StrategyVariant(
+            self.variant_id,
+            STRATEGY_FAMILY_SINGLE,
+            ORDER_TYPE_FAK,
+            "85%",
+            "25%-35%",
+            role,
+            SINGLE_ENTRY_MODE_LEGACY,
+        )
+        self.settings_store = LiveSettingsStore(settings.live_trading_settings_path, self._default_config(settings))
+        self.config = self.settings_store.load().normalized()
+        self.store = TradeStore(db_path or _live_paper_db_path(settings), self.config.initial_balance)
+        self.store.rebase_initial_balance(self.config.initial_balance)
+        self.strategy = RealBtcFiveMinuteStrategy(settings)
+        self.last_signal: dict[str, Any] | None = None
+        self.last_error: str | None = None
+        self.last_order_at: float | None = None
+        self.last_order: dict[str, Any] | None = None
+        self.run_count = 0
+        self.last_run_at: float | None = None
+        self.overlap_skip_count = 0
+        self.official_broadcast_count = 0
+        self.last_official_broadcast_at: float | None = None
+        self._official_recheck_next_at: dict[str, float] = {}
+        self._official_price_backfill_next_at: dict[str, float] = {}
+        self._stop_win_next_check_at: dict[int, float] = {}
+        self._stop_win_closed_rounds: dict[str, float] = {}
+        self.last_stop_win: dict[str, Any] | None = None
+        self._run_lock = threading.Lock()
+
+    def sync_config(self, config: LiveRuntimeConfig | None = None) -> LiveRuntimeConfig:
+        next_config = (config or self.settings_store.load()).normalized()
+        if next_config != self.config:
+            self.config = next_config
+            self.store.rebase_initial_balance(self.config.initial_balance)
+        return self.config
+
+    def run_from_state(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        *,
+        live_config: LiveRuntimeConfig | None = None,
+    ) -> None:
+        if not self._run_lock.acquire(blocking=False):
+            self.overlap_skip_count += 1
+            self.last_error = "live paper runner busy; skipped overlapping tick"
+            return
+        try:
+            self.sync_config(live_config)
+            self._run_from_state_unlocked(market, price, quotes)
+        finally:
+            self._run_lock.release()
+
+    def _run_from_state_unlocked(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> None:
+        now = time.time()
+        self.run_count += 1
+        self.last_run_at = now
+        self.store.upsert_round(market)
+        self._save_price_tick(price, now)
+        self._settle_due(price, now)
+        self._reconcile_official_settlements(now)
+        self._backfill_official_final_prices(now)
+        self._run_stop_win(market, quotes, now)
+        signal, _signal_price, price_selection = self._signal_from_state(market, price, quotes)
+        self.last_signal = {
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "confidence": signal.confidence,
+            "entry_price": signal.entry_price,
+            "move_bps": signal.move_bps,
+            "reason": signal.reason,
+            "price_selection": price_selection,
+        }
+        block_reason = self._paper_entry_block_reason(market, signal)
+        if block_reason:
+            self._append_last_signal_reason(block_reason)
+            return
+        if signal.side not in {"Up", "Down"}:
+            return
+        quote = self._quote_with_depth(market, signal.side, quotes.get(signal.side) or {})
+        limit_price = self._entry_limit_price(signal)
+        account = self.store.account()
+        stake, stake_source = self._entry_stake_for_market(market, account)
+        min_order_size = _float(quote.get("min_order_size"), 0.0)
+        if min_order_size and stake + LIVE_EPSILON < min_order_size:
+            self._append_last_signal_reason(f"实盘复刻 Paper 预算 {stake:.2f} 低于市场最小订单 {min_order_size:.2f}，跳过")
+            return
+        intent = TradeIntent(
+            market=market,
+            signal=replace(
+                signal,
+                reason=_append_reason(
+                    signal.reason,
+                    (
+                        f"{self.entry_marker} paper FAK stake locked to current market"
+                        if stake_source == "current_market_open_trade"
+                        else f"{self.entry_marker} paper FAK"
+                    ),
+                ),
+            ),
+            stake_dollars=stake,
+        )
+        sweep = sweep_taker_buy_by_budget(
+            quote,
+            limit_price=limit_price,
+            budget=stake,
+            taker_fee_rate=self.settings.paper_taker_fee_rate,
+        )
+        if sweep.shares < self.settings.min_ask_size:
+            self._append_last_signal_reason("实盘复刻 Paper FAK 可成交份额不足，跳过模拟下单")
+            return
+        fill = build_taker_buy_fill_from_sweep(
+            intent,
+            side=signal.side,
+            order_type=ORDER_TYPE_FAK,
+            status=STATUS_FILLED,
+            limit_price=limit_price,
+            sweep=sweep,
+        )
+        trade_ids = self.store.place_fills([fill])
+        self.last_order_at = time.time()
+        self.last_order = {
+            "execution_mode": "PAPER",
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "status": fill.status,
+            "side": fill.side,
+            "limit_price": fill.limit_price,
+            "filled_shares": fill.shares,
+            "avg_fill_price": fill.fill_price,
+            "cash_spent": fill.cash_spent,
+            "trade_ids": trade_ids,
+            "simulated": True,
+        }
+        self.last_error = None
+
+    def _paper_entry_block_reason(self, market: MarketRound, signal: Signal) -> str | None:
+        if signal.side not in {"Up", "Down"}:
+            return None
+        if market.target_price <= 0:
+            return f"{self.variant_id} 缺少官方 market.target_price，停止模拟开仓"
+        if self.stop_win_enabled and self._stop_win_closed_rounds.get(market.round_id):
+            return f"{self.variant_id} 当前市场已触发止盈退出，跳过重新开仓"
+        if self.store.daily_realized_pnl() <= -abs(self.config.max_daily_loss):
+            return f"{self.variant_id} 单日亏损达到 {self.config.max_daily_loss:.2f} USDC，停止开新仓"
+        metrics = self.store.metrics()
+        total_pnl = _float(metrics.get("total_pnl"), 0.0)
+        if total_pnl <= -abs(self.config.max_total_drawdown):
+            return f"{self.variant_id} 总回撤达到 {self.config.max_total_drawdown:.2f} USDC，停止开新仓"
+        round_open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        if any(row.get("side") == signal.side for row in round_open_rows):
+            return f"{self.variant_id} 当前市场已有同方向持仓，跳过重复开仓"
+        if self.store.active_paper_order_exists(market.round_id, signal.side):
+            return f"{self.variant_id} 已有同方向 Paper 订单，等待状态确认"
+        if self.store.open_trade_count("BTC") >= self.config.max_open_trades:
+            return f"{self.variant_id} 最大同时持仓 {self.config.max_open_trades} 笔已满"
+        if float(self.store.account()["cash_balance"]) < LIVE_MIN_USDC:
+            return f"{self.variant_id} 隔离预算可用资金不足"
+        return None
+
+    def _run_stop_win(self, market: MarketRound, quotes: dict[str, dict[str, Any]], now: float) -> list[dict[str, Any]]:
+        if not self.stop_win_enabled:
+            return []
+        take_profit_pct = _float(self.config.paper_stop_win_take_profit_pct, LIVE_PAPER_STOP_WIN_DISABLE_PCT)
+        if take_profit_pct >= LIVE_PAPER_STOP_WIN_DISABLE_PCT - LIVE_EPSILON:
+            return []
+        if market.ends_at <= now:
+            return []
+        open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        closed: list[dict[str, Any]] = []
+        for row in open_rows:
+            trade_id = int(row.get("id") or 0)
+            if trade_id <= 0:
+                continue
+            opened_at = _float(row.get("opened_at"), 0.0)
+            if now - opened_at < LIVE_PAPER_STOP_WIN_MIN_HOLD_SECONDS:
+                continue
+            next_check_at = self._stop_win_next_check_at.get(trade_id, 0.0)
+            if now < next_check_at:
+                continue
+            seconds_left = max(0.0, market.ends_at - now)
+            interval = (
+                LIVE_PAPER_STOP_WIN_FINAL_CHECK_SECONDS
+                if seconds_left <= LIVE_PAPER_STOP_WIN_FINAL_WINDOW_SECONDS
+                else LIVE_PAPER_STOP_WIN_CHECK_SECONDS
+            )
+            self._stop_win_next_check_at[trade_id] = now + interval
+            side = str(row.get("side") or "")
+            if side not in {"Up", "Down"}:
+                continue
+            quote = self._quote_with_bid(market, side, quotes.get(side) or {})
+            entry_price = _float(row.get("entry_price"), 0.0)
+            shares = _float(row.get("shares"), 0.0)
+            stake = _float(row.get("stake"), 0.0)
+            if entry_price <= 0 or shares <= 0 or stake <= 0:
+                continue
+            max_profit = _paper_stop_win_max_profit(stake, shares)
+            if max_profit <= LIVE_EPSILON:
+                continue
+            target_pnl = _paper_stop_win_target_pnl(stake, shares, take_profit_pct)
+            trigger_bid = _paper_stop_win_trigger_bid(
+                stake,
+                shares,
+                target_pnl,
+                self.settings.paper_taker_fee_rate,
+            )
+            if trigger_bid is None:
+                continue
+            exit_fill = _paper_sell_sweep_from_bid_quote(quote, shares, trigger_bid)
+            if exit_fill is None:
+                continue
+            exit_price = exit_fill["exit_price"]
+            notional = exit_fill["notional"]
+            fee = taker_fee(shares, exit_price, self.settings.paper_taker_fee_rate)
+            expected_pnl = round(notional - fee - stake, 6)
+            if expected_pnl + LIVE_EPSILON < target_pnl or expected_pnl <= LIVE_EPSILON:
+                continue
+            reason = (
+                f"{LIVE_PAPER_STOP_WIN_MARKER} max_profit_pct {take_profit_pct:.2f}% "
+                f"target_pnl {target_pnl:.6f}/{max_profit:.6f}, "
+                f"trigger {trigger_bid:.4f}, sell {shares:.6f} @ {exit_price:.4f}, "
+                f"gross {notional:.6f}, fee {fee:.6f}, pnl {expected_pnl:.6f}"
+            )
+            item = self.store.close_trade_shares(
+                trade_id,
+                shares,
+                exit_price,
+                now,
+                reason,
+                fee=fee,
+            )
+            if not item:
+                continue
+            self._stop_win_closed_rounds[market.round_id] = now
+            self._stop_win_next_check_at.pop(trade_id, None)
+            self.last_order_at = time.time()
+            self.last_order = {
+                "execution_mode": "PAPER",
+                "variant_id": self.variant_id,
+                "combo": self.combo,
+                "status": STATUS_FILLED,
+                "side": side,
+                "order_type": "FAK_SELL",
+                "limit_price": trigger_bid,
+                "avg_fill_price": exit_price,
+                "filled_shares": shares,
+                "notional": notional,
+                "fee": fee,
+                "pnl": expected_pnl,
+                "trade_ids": [int(item["id"])],
+                "simulated": True,
+                "reason": reason,
+            }
+            self.last_stop_win = dict(self.last_order)
+            closed.append(item)
+        return closed
+
+    def snapshot(self) -> dict[str, Any]:
+        order_summary = self.store.paper_order_summary("BTC")
+        trade_summary = self.store.recent_trade_summary("BTC")
+        metrics = self.store.metrics()
+        settings_payload = asdict(self.config)
+        settings_payload["paper_shadow_enabled"] = True
+        settings_payload["mirrors_live_enabled"] = self.config.enabled
+        settings_payload["paper_stop_win_enabled"] = self.stop_win_enabled
+        settings_payload["paper_stop_win_disabled"] = not self.stop_win_enabled or (
+            self.config.paper_stop_win_take_profit_pct >= LIVE_PAPER_STOP_WIN_DISABLE_PCT - LIVE_EPSILON
+        )
+        return {
+            "enabled": True,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "execution_mode": "PAPER",
+            "account_scope": "live_paper",
+            "mirrors_variant_id": LIVE_VARIANT_ID,
+            "db_path": str(self.store.db_path),
+            "settings_path": str(self.settings.live_trading_settings_path),
+            "run_count": self.run_count,
+            "last_run_at": self.last_run_at,
+            "overlap_skip_count": self.overlap_skip_count,
+            "official_broadcast_count": self.official_broadcast_count,
+            "last_official_broadcast_at": self.last_official_broadcast_at,
+            "last_signal": dict(self.last_signal or {}),
+            "last_error": self.last_error,
+            "last_order_at": self.last_order_at,
+            "last_order": dict(self.last_order or {}),
+            "last_stop_win": dict(self.last_stop_win or {}),
+            "settings": settings_payload,
+            "variant": self.variant_payload(metrics, trade_summary, order_summary),
+            "variants": [self.variant_payload(metrics, trade_summary, order_summary)],
+        }
+
+    def variant_payload(
+        self,
+        metrics: dict[str, Any] | None = None,
+        trade_summary: dict[str, Any] | None = None,
+        order_summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "strategy_family": self.variant.strategy_family,
+            "order_type": self.variant.order_type,
+            "single_entry_mode": self.variant.single_entry_mode,
+            "target_code_completion": self.variant.target_code_completion,
+            "target_report_alignment": self.variant.target_report_alignment,
+            "role": self.variant.role,
+            "account_scope": "live_paper",
+            "execution_mode": "PAPER",
+            "mirrors_variant_id": LIVE_VARIANT_ID,
+            "db_path": str(self.store.db_path),
+            "last_signal": dict(self.last_signal or {}),
+            "last_error": self.last_error,
+            "last_stop_win": dict(self.last_stop_win or {}),
+            "active_orders": len(self.store.active_paper_orders("BTC")),
+            "order_summary": order_summary or self.store.paper_order_summary("BTC"),
+            "metrics": metrics or self.store.metrics(),
+            "recent_trades_summary": trade_summary or self.store.recent_trade_summary("BTC"),
+        }
+
+    def orders_page(self, limit: int, offset: int, status_filter: str = "all") -> dict[str, Any]:
+        status_key = normalize_paper_order_status_filter(status_filter)
+        total = self.store.paper_order_count("BTC", status_key)
+        rows = self._tag_rows(self.store.recent_paper_orders(limit, offset, "BTC", status_key))
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_orders": rows,
+            "recent_orders_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "status_filter": status_key,
+            },
+        }
+
+    def open_trades(self) -> list[dict[str, Any]]:
+        return self._tag_rows([row for row in self.store.open_trades() if row["symbol"] == "BTC"])
+
+    def recent_trades_page(
+        self,
+        limit: int,
+        offset: int,
+        start_at: float | None,
+        end_at: float | None,
+    ) -> dict[str, Any]:
+        total = self.store.recent_trade_count("BTC", start_at, end_at)
+        rows = self._tag_rows(self.store.recent_trades(limit, offset, "BTC", start_at, end_at))
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_trades": rows,
+            "recent_trades_summary": self.store.recent_trade_summary("BTC", start_at, end_at),
+            "recent_trades_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        }
+
+    def equity_curve_window(self, days: int, max_points: int) -> dict[str, Any]:
+        rows = self.store.equity_curve_window(days, max_points)
+        return {
+            "equity_curve": rows,
+            "equity_curve_meta": {
+                "account_scope": "live_paper",
+                "variant_id": self.variant_id,
+                "combo": self.combo,
+                "label": self.combo,
+                "days": days,
+                "max_points": max_points,
+                "points": len(rows),
+                "initial_balance": self.config.initial_balance,
+            },
+        }
+
+    def apply_official_resolution(
+        self,
+        round_id: str,
+        outcome: str,
+        now: float,
+        *,
+        final_price: float | None = None,
+        target_price: float | None = None,
+    ) -> None:
+        super().apply_official_resolution(
+            round_id,
+            outcome,
+            now,
+            final_price=final_price,
+            target_price=target_price,
+        )
+        self.official_broadcast_count += 1
+        self.last_official_broadcast_at = now
+
+    def _tag_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return _tag_live_paper_rows(rows, variant_id=self.variant_id, combo=self.combo)
+
+
+class LivePaperStopWinStrategyRunner(LivePaperStrategyRunner):
+    """实盘策略止盈影子账户：只在 Paper 里模拟按 bid 百分比止盈。"""
+
+    def __init__(self, settings: Settings, polymarket: PolymarketClient) -> None:
+        super().__init__(
+            settings,
+            polymarket,
+            variant_id=LIVE_PAPER_STOP_WIN_VARIANT_ID,
+            combo=LIVE_PAPER_STOP_WIN_COMBO,
+            entry_marker=LIVE_PAPER_STOP_WIN_ENTRY_MARKER,
+            role="SINGLE_FAK_REAL 的 Paper 止盈对照账户，不触发真实下单",
+            db_path=_live_paper_stop_win_db_path(settings),
+            stop_win_enabled=True,
+        )
+
+
 def _order_response(raw: Any, side: str = "BUY") -> LiveOrderResponse:
     data = raw if isinstance(raw, dict) else {"raw": raw}
     success = bool(data.get("success") if "success" in data else data.get("orderID") or data.get("orderId"))
@@ -3809,6 +4296,7 @@ def _live_signal_price_payload(
     price: dict[str, Any],
     fallback_sources: tuple[str, ...],
     max_age_ms: int,
+    target_price: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     now_ms = int(time.time() * 1000)
     selected = _normalize_live_fallback_sources(fallback_sources)
@@ -3852,20 +4340,6 @@ def _live_signal_price_payload(
         and chainlink_age_ms is not None
         and chainlink_age_ms <= max_age_ms
     )
-    if LIVE_FALLBACK_SOURCE_CHAINLINK in selected and chainlink_fresh:
-        payload = dict(price)
-        selection.update(
-            {
-                "selected_source": LIVE_FALLBACK_SOURCE_CHAINLINK,
-                "selected_sources": [LIVE_FALLBACK_SOURCE_CHAINLINK],
-                "selected_price": chainlink,
-                "selected_age_ms": chainlink_age_ms,
-                "message": "已选择 Chainlink，当前 Chainlink 新鲜，优先使用 Chainlink",
-                "note": "LIVE_FALLBACK selected Chainlink",
-            }
-        )
-        return payload, selection
-
     selected_basis_sources = [source for source in selected if source in LIVE_BASIS_FALLBACK_SOURCES]
     ready_rows = [
         row
@@ -3874,6 +4348,67 @@ def _live_signal_price_payload(
         and row.get("ready")
         and _float_or_none(row.get("adjusted_price")) is not None
     ]
+    target = _float_or_none(target_price)
+    if LIVE_FALLBACK_SOURCE_CHAINLINK in selected and chainlink_fresh and target and target > 0:
+        if not selected_basis_sources:
+            selection.update(
+                {
+                    "blocked": True,
+                    "message": "Chainlink 单源不允许实盘入场；请选择 OKX 或 Binance 基差校正确认",
+                }
+            )
+            return dict(price), selection
+        if not ready_rows:
+            reasons = [
+                str(row.get("reason") or "")
+                for row in basis_rows
+                if row.get("source") in selected_basis_sources
+            ]
+            message = "Chainlink 已选择但缺少可用基差确认，NO_TRADE"
+            if reasons:
+                message = f"{message}: {'; '.join(item for item in reasons if item)}"
+            selection.update({"blocked": True, "message": message})
+            return dict(price), selection
+        chainlink_direction = _price_target_direction(chainlink, target)
+        confirming_rows = [
+            row
+            for row in ready_rows
+            if _price_target_direction(_float_or_none(row.get("adjusted_price")), target) == chainlink_direction
+        ]
+        opposing_rows = [
+            row
+            for row in ready_rows
+            if _price_target_direction(_float_or_none(row.get("adjusted_price")), target) not in {None, chainlink_direction}
+        ]
+        if chainlink_direction is None or not confirming_rows or opposing_rows:
+            basis_text = ", ".join(
+                f"{row.get('source')} {_float_or_none(row.get('adjusted_price')) or 0.0:.2f}"
+                for row in ready_rows
+            )
+            selection.update(
+                {
+                    "blocked": True,
+                    "message": f"Chainlink 与基差校正方向不一致，NO_TRADE: Chainlink {chainlink:.2f}, target {target:.2f}, basis {basis_text}",
+                }
+            )
+            return dict(price), selection
+        selected_names = [str(row.get("source")) for row in confirming_rows]
+        median_text = ", ".join(
+            f"{row.get('source')} {float(row.get('median_bps') or 0.0):+.2f}bps" for row in confirming_rows
+        )
+        payload = dict(price)
+        selection.update(
+            {
+                "selected_source": LIVE_FALLBACK_SOURCE_CHAINLINK,
+                "selected_sources": [LIVE_FALLBACK_SOURCE_CHAINLINK, *selected_names],
+                "selected_price": chainlink,
+                "selected_age_ms": chainlink_age_ms,
+                "message": f"已选择 Chainlink，且基差校正价同向确认: {','.join(selected_names)}",
+                "note": f"LIVE_FALLBACK selected Chainlink basis_confirmed {','.join(selected_names)} median {median_text}",
+            }
+        )
+        return payload, selection
+
     if ready_rows:
         adjusted_price = sum(float(row["adjusted_price"]) for row in ready_rows) / len(ready_rows)
         updated_ms = max(int(row.get("updated_ms") or 0) for row in ready_rows)
@@ -3907,6 +4442,16 @@ def _live_signal_price_payload(
         message = f"{message}: {'; '.join(item for item in reasons if item)}"
     selection.update({"blocked": True, "message": message})
     return dict(price), selection
+
+
+def _price_target_direction(price: float | None, target_price: float | None) -> str | None:
+    if price is None or target_price is None or target_price <= 0:
+        return None
+    if price > target_price:
+        return "Up"
+    if price < target_price:
+        return "Down"
+    return None
 
 
 def _live_basis_rows(price: dict[str, Any], now_ms: int, selected: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -4479,6 +5024,108 @@ def _exit_fill_from_response(
     }
 
 
+def _live_paper_db_path(settings: Settings) -> Path:
+    return settings.live_trading_db_path.parent / f"{LIVE_PAPER_VARIANT_ID.lower()}.sqlite3"
+
+
+def _live_paper_stop_win_db_path(settings: Settings) -> Path:
+    return settings.live_trading_db_path.parent / f"{LIVE_PAPER_STOP_WIN_VARIANT_ID.lower()}.sqlite3"
+
+
+def _paper_stop_win_max_profit(stake: float, shares: float) -> float:
+    return round(max(0.0, float(shares or 0.0) - float(stake or 0.0)), 6)
+
+
+def _paper_stop_win_target_pnl(stake: float, shares: float, take_profit_pct: float) -> float:
+    max_profit = _paper_stop_win_max_profit(stake, shares)
+    return round(max_profit * max(0.0, min(LIVE_PAPER_STOP_WIN_DISABLE_PCT, float(take_profit_pct))) / 100.0, 6)
+
+
+def _paper_stop_win_trigger_bid(
+    stake: float,
+    shares: float,
+    target_pnl: float,
+    taker_fee_rate: float,
+) -> float | None:
+    normalized_stake = max(0.0, float(stake or 0.0))
+    normalized_shares = max(0.0, float(shares or 0.0))
+    required_cash = normalized_stake + max(0.0, float(target_pnl or 0.0))
+    if normalized_shares <= 0 or required_cash <= 0:
+        return None
+
+    def net_cash(price: float) -> float:
+        return normalized_shares * price - taker_fee(normalized_shares, price, taker_fee_rate)
+
+    if net_cash(0.99) + LIVE_EPSILON < required_cash:
+        return None
+
+    low = 0.01
+    high = 0.99
+    for _ in range(40):
+        mid = (low + high) / 2.0
+        if net_cash(mid) + LIVE_EPSILON >= required_cash:
+            high = mid
+        else:
+            low = mid
+    return round(max(0.01, min(0.99, math.ceil(high * 10000.0 - LIVE_EPSILON) / 10000.0)), 4)
+
+
+def _paper_sell_sweep_from_bid_quote(
+    quote: dict[str, Any],
+    shares: float,
+    min_price: float,
+) -> dict[str, float | str] | None:
+    target_shares = round(max(0.0, float(shares or 0.0)), 6)
+    if target_shares <= 0:
+        return None
+    threshold = max(0.01, min(0.99, round(float(min_price or 0.0), 4)))
+    raw_bids = quote.get("bids")
+    levels: list[tuple[float, float]] = []
+    if isinstance(raw_bids, list):
+        for row in raw_bids:
+            if not isinstance(row, dict):
+                continue
+            price = _float_or_none(row.get("price"))
+            size = _float_or_none(row.get("size"))
+            if price is None or size is None or price <= 0 or price >= 1 or size <= 0:
+                continue
+            levels.append((round(float(price), 4), round(float(size), 6)))
+    if levels:
+        by_price: dict[float, float] = {}
+        for price, size in levels:
+            by_price[price] = round(by_price.get(price, 0.0) + size, 6)
+        remaining = target_shares
+        notional = 0.0
+        for price, size in sorted(by_price.items(), reverse=True):
+            if price + LIVE_EPSILON < threshold:
+                break
+            take = min(remaining, size)
+            notional += take * price
+            remaining = round(remaining - take, 6)
+            if remaining <= LIVE_EPSILON:
+                exit_price = round(notional / target_shares, 6)
+                return {
+                    "shares": target_shares,
+                    "notional": round(notional, 6),
+                    "exit_price": exit_price,
+                    "depth_source": "bids",
+                }
+        return None
+    best_bid = _float_or_none(quote.get("best_bid"))
+    if best_bid is None or best_bid + LIVE_EPSILON < threshold:
+        return None
+    bid_size = _float_or_none(quote.get("bid_size"))
+    if bid_size is not None and bid_size + LIVE_EPSILON < target_shares:
+        return None
+    exit_price = round(max(0.01, min(0.99, float(best_bid))), 6)
+    return {
+        "shares": target_shares,
+        "notional": round(target_shares * exit_price, 6),
+        "exit_price": exit_price,
+        "depth_source": "best_bid",
+    }
+
+
 def _tag_live_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     tagged: list[dict[str, Any]] = []
     for row in rows:
@@ -4492,6 +5139,31 @@ def _tag_live_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
                 "account_scope": "live",
                 "execution_mode": "LIVE",
+            }
+        )
+        tagged.append(item)
+    return tagged
+
+
+def _tag_live_paper_rows(
+    rows: list[dict[str, Any]],
+    *,
+    variant_id: str = LIVE_PAPER_VARIANT_ID,
+    combo: str = LIVE_PAPER_COMBO,
+) -> list[dict[str, Any]]:
+    tagged: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.update(
+            {
+                "variant_id": variant_id,
+                "combo": combo,
+                "strategy_family": STRATEGY_FAMILY_SINGLE,
+                "experiment_order_type": ORDER_TYPE_FAK,
+                "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
+                "account_scope": "live_paper",
+                "execution_mode": "PAPER",
+                "mirrors_variant_id": LIVE_VARIANT_ID,
             }
         )
         tagged.append(item)

@@ -31,6 +31,8 @@ const ids = {
   liveMaxTotalDrawdown: document.getElementById("live-max-total-drawdown"),
   liveRetryCount: document.getElementById("live-retry-count"),
   liveRetryDelayMs: document.getElementById("live-retry-delay-ms"),
+  livePaperStopWinTakeProfitPct: document.getElementById("live-paper-stop-win-take-profit-pct"),
+  livePaperStopWinEstimate: document.getElementById("live-paper-stop-win-estimate"),
   liveComplianceAck: document.getElementById("live-compliance-ack"),
   liveFallbackSources: Array.from(document.querySelectorAll("[data-live-fallback-source]")),
   liveSettingsToggle: document.getElementById("live-settings-toggle"),
@@ -392,6 +394,89 @@ function percentText(value) {
   return `${number.format(toNumber(value) || 0)}%`;
 }
 
+function liveStopWinFeePerShare(price) {
+  const feeRate = toNumber(latestStatus?.settings?.paper_taker_fee_rate) ?? 0.07;
+  const clamped = Math.max(0.01, Math.min(0.99, toNumber(price) ?? 0));
+  return feeRate * clamped * (1 - clamped);
+}
+
+function liveStopWinExitNet(shares, price) {
+  const normalizedShares = Math.max(0, toNumber(shares) ?? 0);
+  const clampedPrice = Math.max(0.01, Math.min(0.99, toNumber(price) ?? 0));
+  return normalizedShares * clampedPrice - normalizedShares * liveStopWinFeePerShare(clampedPrice);
+}
+
+function liveStopWinTriggerPrice(stake, shares, targetPnl) {
+  const normalizedStake = Math.max(0, toNumber(stake) ?? 0);
+  const normalizedShares = Math.max(0, toNumber(shares) ?? 0);
+  const requiredCash = normalizedStake + Math.max(0, toNumber(targetPnl) ?? 0);
+  if (!normalizedShares || !requiredCash) return null;
+  if (liveStopWinExitNet(normalizedShares, 0.99) + 0.000001 < requiredCash) return null;
+  let low = 0.01;
+  let high = 0.99;
+  for (let i = 0; i < 40; i += 1) {
+    const mid = (low + high) / 2;
+    if (liveStopWinExitNet(normalizedShares, mid) + 0.000001 >= requiredCash) {
+      high = mid;
+    } else {
+      low = mid;
+    }
+  }
+  return Math.max(0.01, Math.min(0.99, Math.ceil(high * 10000 - 0.000001) / 10000));
+}
+
+function liveStopWinEstimate(settings = {}) {
+  const pct = Math.max(0, Math.min(100, toNumber(ids.livePaperStopWinTakeProfitPct?.value) ?? toNumber(settings.paper_stop_win_take_profit_pct) ?? 8));
+  const stake = Math.max(0.1, toNumber(ids.liveStakeDollars?.value) ?? toNumber(settings.stake_dollars) ?? 2);
+  const liveSignalEntry = toNumber(latestStatus?.runtime?.live_trading?.last_signal?.entry_price);
+  const maxEntry = toNumber(ids.liveMaxEntryPrice?.value) ?? toNumber(settings.max_entry_price) ?? 0.5;
+  const entry = Math.max(0.01, Math.min(0.99, liveSignalEntry && liveSignalEntry > 0 ? liveSignalEntry : maxEntry));
+  if (pct >= 100) {
+    return { disabled: true, pct, stake, entry };
+  }
+  const entryCashPerShare = entry + liveStopWinFeePerShare(entry);
+  const shares = entryCashPerShare > 0 ? stake / entryCashPerShare : 0;
+  const maxProfit = Math.max(0, shares - stake);
+  const targetPnl = maxProfit * pct / 100;
+  const exitPrice = liveStopWinTriggerPrice(stake, shares, targetPnl);
+  if (!exitPrice) {
+    return { disabled: false, unreachable: true, pct, stake, entry, shares, maxProfit, targetPnl };
+  }
+  const grossExit = shares * exitPrice;
+  const exitFee = shares * liveStopWinFeePerShare(exitPrice);
+  const estimatedPnl = grossExit - exitFee - stake;
+  const estimatedRoi = stake > 0 ? (estimatedPnl / stake) * 100 : 0;
+  return { disabled: false, pct, stake, entry, exitPrice, shares, maxProfit, targetPnl, grossExit, exitFee, estimatedPnl, estimatedRoi };
+}
+
+function renderLiveStopWinEstimate(settings = {}) {
+  if (!ids.livePaperStopWinEstimate) return;
+  const estimate = liveStopWinEstimate(settings);
+  ids.livePaperStopWinEstimate.classList.toggle("is-disabled", estimate.disabled);
+  if (estimate.disabled) {
+    ids.livePaperStopWinEstimate.innerHTML = `
+      <span>状态<strong>关闭止盈</strong></span>
+      <span>配置<strong>${fmtNumberCell(estimate.pct, 1)}%</strong></span>
+      <span>说明<strong>只终局结算</strong></span>
+    `;
+    return;
+  }
+  if (estimate.unreachable) {
+    ids.livePaperStopWinEstimate.innerHTML = `
+      <span>最大盈利<strong>${signedMoney(estimate.maxProfit)}</strong></span>
+      <span>目标盈利<strong>${signedMoney(estimate.targetPnl)}</strong></span>
+      <span>状态<strong>接近终局价才可能触发</strong></span>
+    `;
+    return;
+  }
+  ids.livePaperStopWinEstimate.innerHTML = `
+    <span>估算入场<strong>${fmtNumberCell(estimate.entry, 4)}</strong></span>
+    <span>最大盈利<strong>${signedMoney(estimate.maxProfit)}</strong></span>
+    <span>目标盈利<strong>${signedMoney(estimate.targetPnl)}</strong></span>
+    <span>触发卖一<strong>${fmtNumberCell(estimate.exitPrice, 4)}</strong></span>
+  `;
+}
+
 function fmtTime(seconds) {
   if (!seconds) return "-";
   return new Date(seconds * 1000).toLocaleTimeString("zh-CN", { hour12: false });
@@ -451,6 +536,7 @@ function liveSettingsFormControls() {
     ids.liveMaxTotalDrawdown,
     ids.liveRetryCount,
     ids.liveRetryDelayMs,
+    ids.livePaperStopWinTakeProfitPct,
     ids.liveComplianceAck,
     ...(ids.liveFallbackSources || []),
   ].filter(Boolean);
@@ -460,6 +546,13 @@ function bindLiveSettingsDirtyTracking() {
   for (const input of liveSettingsFormControls()) {
     input.addEventListener("input", () => markLiveSettingsDirty(input));
     input.addEventListener("change", () => markLiveSettingsDirty(input));
+  }
+}
+
+function bindLiveStopWinEstimate() {
+  for (const input of [ids.livePaperStopWinTakeProfitPct, ids.liveStakeDollars, ids.liveMaxEntryPrice].filter(Boolean)) {
+    input.addEventListener("input", () => renderLiveStopWinEstimate(latestStatus?.settings?.live_trading || {}));
+    input.addEventListener("change", () => renderLiveStopWinEstimate(latestStatus?.settings?.live_trading || {}));
   }
 }
 
@@ -1509,6 +1602,7 @@ function renderDataScopeOptions(data = latestStatus) {
 function accountScopeOptions(data = latestStatus) {
   const variants = strategyExperimentVariants(data);
   const live = liveVariant(data);
+  const livePapers = livePaperVariants(data);
   return [
     { value: "main", label: "主账户" },
     ...variants.map((row) => ({
@@ -1516,12 +1610,17 @@ function accountScopeOptions(data = latestStatus) {
       label: row.combo || row.variant_id,
     })),
     ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
+    ...livePapers.map((row) => ({
+      value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
+      label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
+    })),
   ];
 }
 
 function tableScopeOptions(data = latestStatus) {
   const variants = strategyExperimentVariants(data);
   const live = liveVariant(data);
+  const livePapers = livePaperVariants(data);
   return [
     { value: "main", label: "主账户" },
     { value: "experiment", label: "策略实验全部" },
@@ -1530,6 +1629,10 @@ function tableScopeOptions(data = latestStatus) {
       label: row.combo || row.variant_id,
     })),
     ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
+    ...livePapers.map((row) => ({
+      value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
+      label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
+    })),
   ];
 }
 
@@ -1543,9 +1646,32 @@ function liveVariant(data = latestStatus) {
   return variant && typeof variant === "object" ? variant : null;
 }
 
+function livePaperVariants(data = latestStatus) {
+  const candidates = [
+    data?.runtime?.live_paper_trading?.variant,
+    data?.runtime?.live_paper_stop_win_trading?.variant,
+  ];
+  const seen = new Set();
+  return candidates.filter((variant) => {
+    if (!variant || typeof variant !== "object") return false;
+    const key = String(variant.variant_id || "");
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function livePaperVariant(data = latestStatus, variantId = null) {
+  const variants = livePaperVariants(data);
+  if (!variantId) return variants[0] || null;
+  const normalized = String(variantId || "").toUpperCase();
+  return variants.find((row) => String(row.variant_id || "").toUpperCase() === normalized) || null;
+}
+
 function selectedAccountVariant(data = latestStatus) {
   const selection = parseAccountScope(accountScope);
   if (selection.scope === "live") return liveVariant(data);
+  if (selection.scope === "live_paper") return livePaperVariant(data, selection.variantId);
   if (selection.scope !== "experiment") return null;
   return strategyExperimentVariants(data).find((row) => row.variant_id === selection.variantId) || null;
 }
@@ -1556,9 +1682,21 @@ function selectedAccountMetrics(data = latestStatus) {
   return data?.metrics || {};
 }
 
+function selectedAccountSignal(data = latestStatus) {
+  const variant = selectedAccountVariant(data);
+  if (variant?.last_signal && typeof variant.last_signal === "object") return variant.last_signal;
+  return data?.runtime?.last_signal || {};
+}
+
 function accountScopeMeta(data = latestStatus) {
   const variant = selectedAccountVariant(data);
   if (variant) {
+    if (variant.account_scope === "live_paper" || parseAccountScope(accountScope).scope === "live_paper") {
+      return {
+        label: variant.combo || variant.variant_id,
+        source: `实盘复刻 Paper 隔离账户 · ${variant.variant_id}`,
+      };
+    }
     if (variant.account_scope === "live" || parseAccountScope(accountScope).scope === "live") {
       return {
         label: variant.combo || variant.variant_id,
@@ -1585,6 +1723,10 @@ function parseAccountScope(value) {
     const variantId = text.includes(":") ? text.slice("live:".length).toUpperCase() : "SINGLE_FAK_REAL";
     return { scope: "live", variantId };
   }
+  if (text.startsWith("live_paper:") || text === "live_paper") {
+    const variantId = text.includes(":") ? text.slice("live_paper:".length).toUpperCase() : "SINGLE_FAK_REAL_PAPER";
+    return { scope: "live_paper", variantId };
+  }
   return { scope: "main", variantId: null };
 }
 
@@ -1600,6 +1742,10 @@ function isLiveScope(value) {
   return parseAccountScope(value).scope === "live";
 }
 
+function isLivePaperScope(value) {
+  return parseAccountScope(value).scope === "live_paper";
+}
+
 function isMainScope(value) {
   return parseAccountScope(value).scope === "main";
 }
@@ -1609,6 +1755,7 @@ function scopeLabel(value) {
   if (parsed.scope === "main") return "主账户";
   if (parsed.scope === "experiment_all") return "策略实验";
   if (parsed.scope === "live") return liveVariant()?.combo || "SINGLE_FAK_REAL";
+  if (parsed.scope === "live_paper") return livePaperVariant(latestStatus, parsed.variantId)?.combo || parsed.variantId || "SINGLE_FAK_REAL_PAPER";
   const variant = strategyExperimentVariants().find((row) => row.variant_id === parsed.variantId);
   return variant?.combo || parsed.variantId || "策略实验";
 }
@@ -1617,6 +1764,9 @@ function appendScopeParams(params, value) {
   const parsed = parseAccountScope(value);
   if (parsed.scope === "live") {
     params.set("account_scope", "live");
+  } else if (parsed.scope === "live_paper") {
+    params.set("account_scope", "live_paper");
+    params.set("variant_id", parsed.variantId);
   } else if (parsed.scope === "experiment") {
     params.set("account_scope", "strategy_experiment");
     params.set("variant_id", parsed.variantId);
@@ -1657,7 +1807,9 @@ function renderLivePanel(data = latestStatus) {
   setInputIfIdle(ids.liveMaxTotalDrawdown, settings.max_total_drawdown, { preserveDirty: true });
   setInputIfIdle(ids.liveRetryCount, settings.retry_count, { preserveDirty: true });
   setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms, { preserveDirty: true });
+  setInputIfIdle(ids.livePaperStopWinTakeProfitPct, settings.paper_stop_win_take_profit_pct ?? 8, { preserveDirty: true });
   setLiveFallbackSourcesIfIdle(settings.fallback_sources || [], { preserveDirty: true });
+  renderLiveStopWinEstimate(settings);
   const enabled = Boolean(settings.enabled ?? live.enabled);
   const ready = Boolean(readiness.ready);
   if (ids.liveStatus) {
@@ -2363,9 +2515,10 @@ function displayTargetState(market) {
   return { value: null, fallback: false, source: null };
 }
 
-function renderMarket(runtime) {
+function renderMarket(data = latestStatus) {
+  const runtime = data?.runtime || {};
   const market = activeMarket || runtime.current_market;
-  const signal = runtime.last_signal || {};
+  const signal = selectedAccountSignal(data);
   const pair = runtime.pair_strategy || {};
   const lastPairEvent = pair.last_event || {};
   const up = quotes.Up || runtime.latest_quotes?.Up || {};
@@ -2804,7 +2957,7 @@ function orderToggleText(row) {
 }
 
 function canCancelOrder(row) {
-  if (row?.account_scope === "strategy_experiment" || row?.account_scope === "live") return false;
+  if (row?.account_scope === "strategy_experiment" || row?.account_scope === "live" || row?.account_scope === "live_paper") return false;
   return row?.status === "RESTING" || row?.status === "PARTIAL_RESTING";
 }
 
@@ -3400,6 +3553,9 @@ async function loadEquityCurve(force = false) {
     } else if (selection.scope === "live") {
       params.set("account_scope", "live");
       params.set("variant_id", selection.variantId);
+    } else if (selection.scope === "live_paper") {
+      params.set("account_scope", "live_paper");
+      params.set("variant_id", selection.variantId);
     } else {
       params.set("account_scope", "main");
     }
@@ -3825,7 +3981,7 @@ async function loadRecentTradesPage(replace = false, options = {}) {
 }
 
 function recentScopeNeedsDirectRefresh(scope = recentDataScope) {
-  return isLiveScope(scope) || isExperimentVariantScope(scope);
+  return isLiveScope(scope) || isLivePaperScope(scope) || isExperimentVariantScope(scope);
 }
 
 async function refreshVisibleScopedRecentTrades() {
@@ -3904,6 +4060,7 @@ function liveSettingsPayload(overrides = {}) {
     max_total_drawdown: toNumber(ids.liveMaxTotalDrawdown?.value) ?? 12,
     retry_count: Math.max(0, Math.round(toNumber(ids.liveRetryCount?.value) ?? 2)),
     retry_delay_ms: Math.max(0, Math.round(toNumber(ids.liveRetryDelayMs?.value) ?? 250)),
+    paper_stop_win_take_profit_pct: Math.max(0, Math.min(100, toNumber(ids.livePaperStopWinTakeProfitPct?.value) ?? 8)),
     fallback_sources: (ids.liveFallbackSources || [])
       .filter((input) => input.checked)
       .map((input) => String(input.dataset.liveFallbackSource || "").toLowerCase())
@@ -4165,7 +4322,7 @@ function renderAllNow(data = latestStatus, options = {}) {
   renderLlmTerminalLogs(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));
-  renderMarket(data.runtime);
+  renderMarket(data);
   renderStrategyExperiments(data.runtime);
   if (strategyExperimentViewActive() && !strategyTablesLoading) {
     loadStrategyExperimentTables(false).catch(showError);
@@ -4209,6 +4366,13 @@ function renderAllNow(data = latestStatus, options = {}) {
 function scopedOpenRows(scope, data = latestStatus) {
   if (isLiveScope(scope)) {
     return data?.runtime?.live_trading?.open_trades || [];
+  }
+  if (isLivePaperScope(scope)) {
+    const parsed = parseAccountScope(scope);
+    if (parsed.variantId === "SINGLE_FAK_REAL_PAPER_STOP_WIN") {
+      return data?.runtime?.live_paper_stop_win_trading?.open_trades || [];
+    }
+    return data?.runtime?.live_paper_trading?.open_trades || [];
   }
   if (isExperimentAggregateScope(scope)) {
     return strategyTables?.open_trades || [];
@@ -4704,6 +4868,7 @@ for (const navItem of ids.navItems || []) {
   navItem.addEventListener("click", () => setActiveAppPage(navItem.dataset.navPage));
 }
 bindLiveSettingsDirtyTracking();
+bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 setActiveAppPage(locationAppPage(), { syncHash: false });
