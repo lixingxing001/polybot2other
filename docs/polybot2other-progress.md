@@ -5627,3 +5627,227 @@
 
 1. 当前目录不是 Git 仓库。如需撤销本次新增项目，可删除本次新增文件和目录：`pyproject.toml`、`README.md`、`src/`、`tests/`、`docs/`、`data/`。
 2. 如果只想清空运行数据，可停止服务后删除 `data/polybot2other.sqlite3` 及 SQLite WAL/SHM 文件。
+
+## 2026-06-01 v1.0
+
+### 已完成
+
+1. 淘汰策略实验中的全部 `PAIR_*` 组合：`PAIR_FAK`、`PAIR_FAK_MULTI_CONFIRM`、`PAIR_FAK_MULTI_LEAD`、`PAIR_GTC`、`PAIR_GTD`、`PAIR_POST_ONLY`。
+2. 调整 `selected_strategy_variants`：旧配置里如果仍包含 `PAIR_*`，启动时会忽略这些已淘汰组合，避免因未知组合直接失败。
+3. 移除 LLM 超级智能体路由里的 `PAIR_FAK` 可选项；当出现“低 pair_cost”场景时，改为回退到 `SINGLE_FAK_STOP_AND_FLIP`。
+4. 更新前端路由说明文案，移除 `PAIR_FAK` 执行路径展示。
+5. 更新策略实验相关测试断言，改为“无 `PAIR_*` 组合”的新基线。
+6. 更新 README 示例接口，将 `variant_id=PAIR_GTD` 改为 `variant_id=SINGLE_GTD`。
+
+### 已确认决策
+
+1. 本次执行 A 方案：先做“逻辑淘汰 + 路由封禁 + 文案/测试同步”。
+2. 保留主链路 PAIR 运行时代码与历史 SQLite 文件，不做物理删除和不可逆清理。
+3. 历史数据可读，但新实验组合和 LLM 路由不再引入 `PAIR_*`。
+
+### 待办和后期优化
+
+1. 如需彻底下线 PAIR，可在后续 B 方案中删除主链路 PAIR 逻辑、PAIR 专项测试与历史文档内容。
+2. 可补充“已淘汰组合告警”到运行时状态页，提升配置可观测性。
+3. 可提供一次性历史清理脚本，安全归档 `data/strategy-experiments/pair_*.sqlite3`。
+
+### 已知坑位
+
+1. 若外部系统仍传 `variant_id=PAIR_*` 查询详情接口，会因组合不存在返回错误（属于预期的淘汰后行为）。
+2. 历史报告 HTML 文件中仍可能包含旧的 PAIR 文案与历史结果；这不代表新版本继续执行 PAIR 组合。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，190 个测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py -k live_manual_sell_closes_only_official_partial_fill -v`，单测通过。
+3. 已执行 `rtk rg -n "LLM_ROUTE_PAIR_FAK|PAIR_FAK" src/polybot2other/llm_agent.py src/polybot2other/static/app.js`，确认核心路由代码已移除 `PAIR_FAK`。
+
+### 回滚建议
+
+1. 回退本次代码修改：`rtk git restore src/polybot2other/experiments.py src/polybot2other/llm_agent.py src/polybot2other/static/app.js src/polybot2other/web.py tests/test_core.py README.md docs/polybot2other-progress.md`。
+2. 如只需恢复 PAIR 组合定义，可优先回退 `src/polybot2other/experiments.py` 与 `src/polybot2other/llm_agent.py`。
+
+## 2026-06-01 v1.1
+
+### 已完成
+
+1. 删除前端分析页面：移除导航中的“分析”入口和整块 `analysis-page` DOM。
+2. 前端页面路由改为仅保留 `bot`，`#analysis` hash 会自动回落到 `bot`。
+3. 物理删除 `data/strategy-experiments/` 下全部 `pair_*.sqlite3*` 文件（含 `-wal/-shm`）。
+
+### 已确认决策
+
+1. 本轮继续按“放弃 PAIR 全部能力”的方向执行，优先清理用户可见页面和实验数据文件。
+2. 保留后端 PAIR 运行时代码作为历史兼容，不再通过实验组合和分析页暴露给日常操作。
+
+### 待办和后期优化
+
+1. 如需彻底根除 PAIR 运行时代码，可追加一次 B 方案，删除 `PaperTradingBot` 内部 PAIR 主链路与相关 API。
+2. 可在启动日志加入“PAIR 组合已下线”提示，帮助排查旧配置。
+
+### 已知坑位
+
+1. 历史文档（非运行页面）仍可能出现 PAIR 文字，这是历史记录，不影响当前运行逻辑。
+2. 若外部脚本仍访问旧分析页 hash，不会报错，但会落回 `bot` 页。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，190 个测试通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，通过。
+3. 已执行 `rtk node --check src/polybot2other/static/app.js`，通过。
+4. 已执行 `rtk ls -1 data/strategy-experiments | rtk rg '^pair_'`，无匹配结果，PAIR 数据库文件已清空。
+5. 已执行 `rtk rg -n "nav-analysis|analysis-page" src/polybot2other/static/index.html`，无匹配结果，分析页入口与页面已移除。
+
+### 回滚建议
+
+1. 回滚本轮改动：`rtk git restore src/polybot2other/static/index.html src/polybot2other/static/app.js docs/polybot2other-progress.md`。
+2. 如需恢复 PAIR 数据库，请从备份或历史归档重新导入 `data/strategy-experiments/pair_*.sqlite3*` 文件。
+
+## 2026-06-01 v1.2
+
+### 已完成
+
+1. 修复账户/表格下拉列表仍显示 PAIR 组合的问题。
+2. 在前端 `strategyExperimentVariants` 增加淘汰 PAIR 组合过滤：匹配 `variant_id=PAIR_*`、`strategy_family=PAIR`、`combo` 以 `PAIR +` 开头的旧运行态数据都会被隐藏。
+3. 清理分析页前端残留：删除 `app.js` 中分析页 DOM 引用、渲染函数、刷新事件和定时轮询入口。
+4. 删除 `styles.css` 中未使用的分析页样式块和分析页滚动条选择器。
+
+### 已确认决策
+
+1. 下拉列表不信任运行态旧 payload，前端增加兜底过滤，避免旧服务进程或浏览器缓存继续暴露 PAIR。
+2. 保留实时概率计算所需的轻量状态，用于 `/api/live-snapshot` 上报；删除的是用户可见分析页和相关 UI 代码。
+
+### 待办和后期优化
+
+1. 如果后续要彻底删除 PAIR 运行时代码，需要单独清理后端 PAIR 主链路与相关测试。
+
+### 已知坑位
+
+1. 修改静态资源后，浏览器需要刷新页面；如果服务进程仍是旧版本，也需要重启后端服务。
+
+### 验证记录
+
+1. 已执行 `rtk node --check src/polybot2other/static/app.js`，通过。
+2. 已执行 `rtk rg -n -i "analysis" src/polybot2other/static`，无匹配结果。
+
+### 回滚建议
+
+1. 回滚本轮改动：`rtk git restore src/polybot2other/static/app.js src/polybot2other/static/styles.css docs/polybot2other-progress.md`。
+
+## 2026-06-01 v1.3
+
+### 已完成
+
+1. 删除 `data/strategy-experiments/backups/settlement-fix-20260531-150914/` 下残留的 6 个 `pair_*.sqlite3` 备份库。
+2. 清理 LLM 策略实验库中历史 PAIR 数据：当前库 `llm_super_agent_paper.sqlite3` 删除 237 条 `llm_decisions` 和 8 条 `trades`。
+3. 同步清理归档/备份 LLM 实验库中的 PAIR 数据：归档库删除 1 条 `llm_decisions`，备份库删除 212 条 `llm_decisions` 和 8 条 `trades`。
+4. 重新生成 `docs/strategy-experiments-retrospective-latest.html`，策略实验复盘报告只包含当前 14 个非 PAIR 组合。
+5. LLM 本地 fallback 文案和 reason code 不再输出大写 `PAIR`。
+
+### 已确认决策
+
+1. 策略实验数据层不再保留 PAIR 历史数据库和含 PAIR 的 LLM 历史决策/成交行。
+2. 本轮只清理策略实验数据与用户可见复盘输出，不删除主 Bot 内部历史 PAIR 运行时代码。
+
+### 待办和后期优化
+
+1. 如果要源码层完全无 PAIR 字符，需要另起一轮删除 `PaperTradingBot` 内部 PAIR 运行时代码、PAIR 专项测试和历史进度文档。
+
+### 已知坑位
+
+1. 若 dashboard 进程清理前已启动，内存里可能仍缓存旧状态；需要刷新浏览器并重启 dashboard 才能保证页面加载新静态资源和新数据。
+2. `docs/polybot2other-progress.md` 作为历史进度文档仍保留旧 PAIR 记录，这是审计历史，不是当前策略实验数据。
+
+### 验证记录
+
+1. 已执行 `rtk proxy sh -lc '! rg -a -n "PAIR" data/strategy-experiments docs/strategy-experiments-retrospective-latest.html'`，无匹配结果。
+2. 已执行离线接口校验，`strategy_experiments_snapshot`、`strategy_experiments_tables`、`strategy_experiments_retrospective` 序列化后 `contains_PAIR=False`。
+3. 已执行 `rtk node --check src/polybot2other/static/app.js`，通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，190 个测试通过。
+
+### 回滚建议
+
+1. 代码和报告回滚：`rtk git restore src/polybot2other/llm_agent.py docs/strategy-experiments-retrospective-latest.html docs/polybot2other-progress.md`。
+2. 已删除的 PAIR 备份库和已清理的 PAIR 历史行需要从外部备份恢复；本轮不在仓库内保留 PAIR 数据副本。
+
+## 2026-06-01 v1.4
+
+### 已完成
+
+1. 淘汰 5 个策略实验组合：`REALTIME_MAKER_POST_ONLY`、`SINGLE_POST_ONLY`、`SINGLE_GTD`、`LLM_SUPER_AGENT_PAPER`、`SINGLE_GTC`。
+2. 从 `STRATEGY_VARIANTS` 删除上述 5 个组合，策略实验新基线只保留 9 个 FAK 系列组合。
+3. 将上述 5 个组合加入已淘汰兼容列表，旧环境变量显式传入时会被静默忽略。
+4. 前端下拉列表增加兜底过滤，旧运行态 payload 中的上述组合不会继续渲染。
+5. 删除策略实验数据目录中上述 5 个组合的当前库、WAL/SHM、归档库和备份库，共 21 个文件。
+6. 删除前端实盘终端里针对 `LLM_SUPER_AGENT_PAPER` 的策略实验日志入口。
+7. 重新生成 `docs/strategy-experiments-retrospective-latest.html`，报告只包含当前 9 个策略实验组合。
+8. 更新 README 和测试基线，避免继续把已淘汰组合作为有效策略实验示例。
+
+### 已确认决策
+
+1. 本轮按“彻底移除策略实验下拉和数据”的范围执行，不删除主 Bot 内部的 GTC/GTD/POST_ONLY、Realtime Maker 或 LLM 通用代码。
+2. 当前策略实验保留组合为：`SINGLE_FAK`、`SINGLE_FAK_CHAINLINK_ONLY`、`SINGLE_FAK_ANTI_BOT_GUARD`、`SINGLE_FAK_FALLBACK_ONLY`、`SINGLE_FAK_MULTI_CONFIRM`、`SINGLE_FAK_MULTI_LEAD`、`SINGLE_FAK_STRICT`、`SINGLE_FAK_REVERSAL`、`SINGLE_FAK_STOP_AND_FLIP`。
+
+### 待办和后期优化
+
+1. 如果后续要源码层完全删除 maker、GTC、GTD、POST_ONLY、LLM 通用能力，需要单独做主 Bot 运行时代码清理。
+
+### 已知坑位
+
+1. 删除的 SQLite 文件不在仓库内保留副本，恢复只能依赖外部备份。
+2. 历史进度文档仍保留旧组合名称，这是审计记录，不代表当前策略实验仍启用。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.report_snapshot --output docs/strategy-experiments-retrospective-latest.html`，生成报告 `variant_count=9`。
+2. 已执行数据/报告扫描，确认 `data/strategy-experiments` 和最新复盘 HTML 不含 5 个已淘汰组合。
+3. 已执行离线接口校验，`strategy_experiments_snapshot`、`strategy_experiments_tables`、`strategy_experiments_retrospective` 序列化后不含 5 个已淘汰组合。
+4. 已执行 `rtk node --check src/polybot2other/static/app.js`，通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，通过。
+6. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，190 个测试通过。
+
+### 回滚建议
+
+1. 代码和报告回滚：`rtk git restore src/polybot2other/experiments.py src/polybot2other/static/app.js README.md tests/test_core.py docs/strategy-experiments-retrospective-latest.html docs/polybot2other-progress.md`。
+2. 已删除的 21 个策略实验 SQLite/WAL/SHM 文件需要从外部备份恢复。
+
+## 2026-06-01 v1.5
+
+### 已完成
+
+1. 淘汰 3 个策略实验组合：`SINGLE_FAK_STRICT`、`SINGLE_FAK_MULTI_LEAD`、`SINGLE_FAK_MULTI_CONFIRM`。
+2. 从 `STRATEGY_VARIANTS` 删除上述 3 个组合，策略实验新基线只保留 6 个组合。
+3. 将上述 3 个组合加入已淘汰兼容列表，旧环境变量显式传入时会被静默忽略。
+4. 前端下拉列表增加兜底过滤，旧运行态 payload 中的上述组合不会继续渲染。
+5. 删除策略实验数据目录中上述 3 个组合的当前库、WAL/SHM 和备份库，共 12 个文件。
+6. 从 LLM route 白名单、执行映射和 system prompt 中删除 `SINGLE_FAK_MULTI_LEAD` 与 `SINGLE_FAK_MULTI_CONFIRM`。
+7. 重新生成 `docs/strategy-experiments-retrospective-latest.html`，报告只包含当前 6 个策略实验组合。
+8. 更新测试基线，避免继续把已淘汰组合作为有效策略实验或 LLM route。
+
+### 已确认决策
+
+1. 本轮执行“连 LLM route 一起删”：策略实验与 LLM 路由都不再暴露 `MULTI_LEAD/MULTI_CONFIRM`。
+2. 当前策略实验保留组合为：`SINGLE_FAK`、`SINGLE_FAK_CHAINLINK_ONLY`、`SINGLE_FAK_ANTI_BOT_GUARD`、`SINGLE_FAK_FALLBACK_ONLY`、`SINGLE_FAK_REVERSAL`、`SINGLE_FAK_STOP_AND_FLIP`。
+
+### 待办和后期优化
+
+1. 如果后续要源码层完全删除 `MULTI_CONFIRM/MULTI_LEAD` 底层价格模式，需要单独清理 `strategy.py`、主 Bot 辅助函数和相关测试。
+
+### 已知坑位
+
+1. 删除的 SQLite 文件不在仓库内保留副本，恢复只能依赖外部备份。
+2. 底层多源价格计算仍保留，用于历史兼容和非策略实验路径；当前策略实验和 LLM route 不再使用这些组合。
+
+### 验证记录
+
+1. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.report_snapshot --output docs/strategy-experiments-retrospective-latest.html`，生成报告 `variant_count=6`。
+2. 已执行数据/报告扫描，确认 `data/strategy-experiments` 和最新复盘 HTML 不含 3 个已淘汰组合。
+3. 已执行 `rtk node --check src/polybot2other/static/app.js`，通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m compileall -q src tests`，通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p test_core.py`，190 个测试通过。
+
+### 回滚建议
+
+1. 代码和报告回滚：`rtk git restore src/polybot2other/experiments.py src/polybot2other/llm_agent.py src/polybot2other/static/app.js tests/test_core.py docs/strategy-experiments-retrospective-latest.html docs/polybot2other-progress.md`。
+2. 已删除的 12 个策略实验 SQLite/WAL/SHM 文件需要从外部备份恢复。

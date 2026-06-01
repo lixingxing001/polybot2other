@@ -149,7 +149,7 @@ GET /api/live-evidence?external_order_id=live-order-id&force=true&include_snapsh
 GET /api/live-doctor?refresh=true&include_snapshot=false
 POST /api/live-once
 GET /api/strategy-experiments
-GET /api/strategy-experiments?variant_id=PAIR_GTD&trade_limit=50&order_limit=50
+GET /api/strategy-experiments?variant_id=SINGLE_FAK&trade_limit=50&order_limit=50
 GET /api/strategy-experiments-retrospective?start_at=1779870000&end_at=1779873600
 GET /api/strategy-experiments-tables?trade_limit=100&order_limit=20&status=all
 GET /strategy-experiments-retrospective.html?start_at=1779870000&end_at=1779873600
@@ -241,7 +241,7 @@ POLYBOT2OTHER_CLOB_URL=https://clob.polymarket.com
 
 Set `POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED=false` when you want a process to run Paper collection only. This is stronger than turning off the dashboard live switch because the live runner is not instantiated at all.
 
-`LLM_SUPER_AGENT_PAPER` is Paper-only. It uses a non-blocking LLM router when `POLYBOT2OTHER_LLM_API_KEY` or `HAOAI_API_KEY` is present, otherwise it falls back to the local fast router. The LLM can only recommend whitelisted Paper strategy routes; hard risk checks and execution remain deterministic.
+LLM routing is no longer part of strategy experiments. If enabled for the main bot, it remains a non-blocking router guarded by deterministic risk checks.
 
 For the end-to-end live setup checklist, use `docs/live-trading-runbook.md`. Copy `.env.live.example` to `.env.live`, run `chmod 600 .env.live`, then fill the private values locally. `.env.live` is ignored and must hold the real private values only on the local machine.
 

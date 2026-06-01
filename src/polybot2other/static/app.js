@@ -4,21 +4,6 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 const ids = {
   navItems: Array.from(document.querySelectorAll("[data-nav-page]")),
   botPage: document.getElementById("bot-page"),
-  analysisPage: document.getElementById("analysis-page"),
-  analysisRefresh: document.getElementById("analysis-refresh"),
-  analysisStatus: document.getElementById("analysis-status"),
-  analysisAffectsTrading: document.getElementById("analysis-affects-trading"),
-  analysisDataScope: document.getElementById("analysis-data-scope"),
-  analysisLlmPath: document.getElementById("analysis-llm-path"),
-  analysisWallets: document.getElementById("analysis-wallets"),
-  analysisSummary: document.getElementById("analysis-summary"),
-  analysisProbability: document.getElementById("analysis-probability"),
-  analysisRiskTags: document.getElementById("analysis-risk-tags"),
-  analysisLlmReview: document.getElementById("analysis-llm-review"),
-  analysisLlmReviewRefresh: document.getElementById("analysis-llm-review-refresh"),
-  analysisRealtimeCard: document.getElementById("analysis-realtime-card"),
-  analysisRealtime: document.getElementById("analysis-realtime"),
-  analysisRealtimeToggle: document.getElementById("analysis-realtime-toggle"),
   runtime: document.getElementById("runtime-pill"),
   paperPauseToggle: document.getElementById("paper-pause-toggle"),
   liveEnabled: document.getElementById("live-enabled"),
@@ -118,15 +103,13 @@ const CHART_RENDER_INTERVAL_MS = 5_000;
 const EQUITY_CURVE_DAYS = 90;
 const EQUITY_CURVE_MAX_POINTS = 1200;
 const EQUITY_CURVE_REFRESH_MS = 30_000;
-const ACTOR_ANALYSIS_REFRESH_MS = 5_000;
-const LLM_REVIEW_REFRESH_MS = 15_000;
 const METRIC_ANIMATION_MS = 360;
 const RECENT_SKELETON_ROWS = 8;
 const LIVE_LOG_LIMIT = 80;
-const ANALYSIS_REALTIME_EVENT_LIMIT = 80;
-const ANALYSIS_RECENT_WINDOW_MS = 10_000;
+const REALTIME_SIGNAL_EVENT_LIMIT = 80;
+const REALTIME_SIGNAL_RECENT_WINDOW_MS = 10_000;
 const TABLE_INTERACTION_HOLD_MS = 500;
-const ANALYSIS_REALTIME_VISIBILITY_KEY = "polybot2other:analysis-realtime-visible";
+const LIVE_COPY_HOLD_MS = 900;
 const SNAPSHOT_LEADER_KEY = "polybot2other:snapshot-leader";
 const SNAPSHOT_LEADER_TTL_MS = 2_500;
 const TAB_ID = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -135,7 +118,23 @@ const FIELD_STORAGE_KEYS = {
   order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
 };
-const APP_PAGE_KEYS = new Set(["bot", "analysis"]);
+const APP_PAGE_KEYS = new Set(["bot"]);
+const DEPRECATED_STRATEGY_VARIANT_IDS = new Set([
+  "PAIR_FAK",
+  "PAIR_FAK_MULTI_CONFIRM",
+  "PAIR_FAK_MULTI_LEAD",
+  "PAIR_GTC",
+  "PAIR_GTD",
+  "PAIR_POST_ONLY",
+  "REALTIME_MAKER_POST_ONLY",
+  "SINGLE_POST_ONLY",
+  "SINGLE_GTD",
+  "LLM_SUPER_AGENT_PAPER",
+  "SINGLE_GTC",
+  "SINGLE_FAK_STRICT",
+  "SINGLE_FAK_MULTI_LEAD",
+  "SINGLE_FAK_MULTI_CONFIRM",
+]);
 const ORDER_STATUS_LABELS = {
   PENDING: "待官方确认",
   RESTING: "挂单中",
@@ -195,17 +194,7 @@ let strategyTablesLoading = false;
 let lastStrategyTablesFetchMs = 0;
 let strategyOrderLimit = ORDER_PAGE_SIZE;
 let strategyTradeLimit = RECENT_PAGE_SIZE;
-let actorAnalysis = null;
-let actorAnalysisLoading = false;
-let actorAnalysisError = "";
-let lastActorAnalysisFetchMs = 0;
-let llmReview = null;
-let llmReviewLoading = false;
-let llmReviewError = "";
-let lastLlmReviewFetchMs = 0;
-let analysisRealtime = createRealtimeAnalysisState();
-let analysisRealtimeRenderQueued = false;
-let analysisRealtimeVisible = loadAnalysisRealtimeVisible();
+let realtimeSignalState = createRealtimeSignalState();
 let recentTransitionTimer = null;
 let orderRows = [];
 let orderStatusFilter = "all";
@@ -232,8 +221,12 @@ let lastOpenRenderedScope = "";
 let lastOpenRenderedCount = 0;
 let pendingOpenRender = false;
 let pendingOrderRender = false;
+let pendingLiveGateRender = false;
+let pendingLiveGateData = null;
+let pendingLiveTerminalRender = false;
 let scopedRecentRefreshInFlight = false;
 const tableInteractionHoldUntil = { open: 0, order: 0 };
+const liveCopyHoldUntil = { gate: 0, terminal: 0 };
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
 let equityCurveMeta = {};
@@ -589,6 +582,12 @@ function appendLiveLog({ key = "", level = "info", title = "", message = "", det
 
 function renderLiveTerminal() {
   if (!ids.liveTerminalLines) return;
+  if (isLiveCopyInteractionActive("terminal")) {
+    pendingLiveTerminalRender = true;
+    scheduleProtectedLiveCopyFlush();
+    return;
+  }
+  pendingLiveTerminalRender = false;
   if (!liveLogRows.length) {
     ids.liveTerminalLines.innerHTML = `<div class="live-terminal-empty">等待实盘事件</div>`;
     return;
@@ -605,98 +604,6 @@ function renderLiveTerminal() {
         `${row.message ? `<span class="live-log-message">${safe(row.message)}</span>` : ""}` +
       `</div>${details}${code}</div>`;
   }).join("");
-}
-
-function renderLlmTerminalLogs(data = latestStatus) {
-  if (!ids.liveTerminalLines) return;
-  const settings = data?.settings?.llm_super_agent || {};
-  const variant = strategyExperimentVariants(data).find((row) => row.variant_id === "LLM_SUPER_AGENT_PAPER") || null;
-  if (!settings.enabled && !variant) return;
-  const apiKeyPresent = Boolean(settings.api_key_present);
-  appendLiveLog({
-    key: "llm:config",
-    level: settings.enabled === false ? "warn" : apiKeyPresent ? "pass" : "warn",
-    title: "[LLM] config",
-    message: `${settings.model || "-"} · ${settings.base_url || "-"} · key:${apiKeyPresent ? "present" : "missing"}`,
-    details: [
-      `paper_only_variant:${variant ? "ready" : "missing"}`,
-      `timeout:${fmtNumberCell(settings.timeout_seconds, 1)}s · interval:${fmtNumberCell(settings.min_interval_seconds, 1)}s`,
-      "secrets:hidden · prompt:hidden · raw_response:hidden",
-    ],
-  });
-  if (!variant) return;
-  const decisions = Array.isArray(variant.recent_llm_decisions) ? variant.recent_llm_decisions : [];
-  if (!decisions.length) {
-    appendLiveLog({
-      key: "llm:waiting",
-      level: "info",
-      title: "[LLM] waiting",
-      message: "等待下一次 LLM_SUPER_AGENT_PAPER tick 产生路由决策",
-      details: [
-        `variant:${variant.variant_id}`,
-        variant.last_signal?.reason ? `last_signal:${variant.last_signal.reason}` : "",
-      ],
-    });
-    return;
-  }
-  for (const row of decisions.slice(0, 10)) {
-    appendLlmDecisionLog(row);
-  }
-}
-
-function appendLlmDecisionLog(row = {}) {
-  const route = row.route || "NO_ROUTE";
-  const source = row.source || "-";
-  const allowTrade = row.allow_trade === true || toNumber(row.allow_trade) === 1;
-  const confidence = toNumber(row.confidence);
-  const error = String(row.error || "");
-  const codes = parseJsonArray(row.reason_codes_json).map((item) => String(item)).filter(Boolean);
-  appendLiveLog({
-    key: `llm:decision:${row.id || row.created_at || route}`,
-    at_ms: row.created_at || null,
-    level: error ? "error" : allowTrade ? "pass" : "warn",
-    title: `[LLM] ${source} ${route}`,
-    message: `${allowTrade ? "ALLOW" : "BLOCK"} · conf ${confidence === null ? "-" : fmtNumberCell(confidence, 3)} · ${row.market_regime || "-"}`,
-    details: [
-      `round:${compactText(row.round_id, 42)}`,
-      `execution:${llmRouteExecutionLabel(route, allowTrade)}`,
-      row.reason ? `reason:${row.reason}` : "",
-      codes.length ? `codes:${codes.join(", ")}` : "",
-      row.valid_until ? `valid_until:${fmtTime(row.valid_until)}` : "",
-      error ? `error:${error}` : "",
-    ],
-  });
-}
-
-function llmRouteExecutionLabel(route, allowTrade) {
-  if (!allowTrade || route === "NO_TRADE") return "NO_TRADE";
-  const labels = {
-    PAIR_FAK: "PAIR + FAK paper path",
-    SINGLE_FAK: "SINGLE + FAK paper path",
-    SINGLE_FAK_REVERSAL: "SINGLE + FAK REVERSAL paper path",
-    SINGLE_FAK_STOP_AND_FLIP: "SINGLE + FAK STOP_AND_FLIP paper path",
-    SINGLE_FAK_MULTI_LEAD: "SINGLE + FAK MULTI_LEAD paper path",
-    SINGLE_FAK_MULTI_CONFIRM: "SINGLE + FAK MULTI_CONFIRM paper path",
-    SINGLE_FAK_ANTI_BOT_GUARD: "SINGLE + FAK ANTI_BOT_GUARD paper path",
-  };
-  return labels[route] || "whitelisted paper path";
-}
-
-function parseJsonArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (_) {
-    return [];
-  }
-}
-
-function compactText(value, maxLength = 36) {
-  const text = String(value || "-");
-  if (text.length <= maxLength) return text;
-  return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 async function withButtonLoading(button, task, after = null) {
@@ -794,10 +701,7 @@ function setActiveAppPage(page, options = {}) {
     if (selected) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  for (const [key, element] of [
-    ["bot", ids.botPage],
-    ["analysis", ids.analysisPage],
-  ]) {
+  for (const [key, element] of [["bot", ids.botPage]]) {
     if (!element) continue;
     const selected = key === nextPage;
     element.classList.toggle("is-active", selected);
@@ -814,21 +718,9 @@ function setActiveAppPage(page, options = {}) {
   if (nextPage === "bot" && latestStatus) {
     window.setTimeout(() => renderAll(latestStatus, { force: true, forceChart: true }), 210);
   }
-  if (nextPage === "analysis") {
-    applyAnalysisRealtimeVisibility();
-    renderActorAnalysis(actorAnalysis);
-    renderLlmReview(llmReview);
-    renderRealtimeAnalysis();
-    if (!actorAnalysis || Date.now() - lastActorAnalysisFetchMs > 5_000) {
-      loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
-    }
-    if (!llmReview || Date.now() - lastLlmReviewFetchMs > 15_000) {
-      loadLlmReview({ force: false }).catch(renderLlmReviewError);
-    }
-  }
 }
 
-function createRealtimeAnalysisState() {
+function createRealtimeSignalState() {
   return {
     market_slug: "",
     started_at_ms: null,
@@ -850,51 +742,22 @@ function createRealtimeAnalysisState() {
   };
 }
 
-function loadAnalysisRealtimeVisible() {
-  try {
-    const raw = localStorage.getItem(ANALYSIS_REALTIME_VISIBILITY_KEY);
-    return raw === null ? true : raw !== "false";
-  } catch (_) {
-    return true;
-  }
-}
-
-function setAnalysisRealtimeVisible(visible) {
-  analysisRealtimeVisible = Boolean(visible);
-  try {
-    localStorage.setItem(ANALYSIS_REALTIME_VISIBILITY_KEY, analysisRealtimeVisible ? "true" : "false");
-  } catch (_) {
-    // localStorage may be unavailable in private or restricted contexts.
-  }
-  applyAnalysisRealtimeVisibility();
-  if (analysisRealtimeVisible) renderRealtimeAnalysis();
-}
-
-function applyAnalysisRealtimeVisibility() {
-  if (ids.analysisRealtimeToggle) ids.analysisRealtimeToggle.checked = analysisRealtimeVisible;
-  if (ids.analysisRealtimeCard) {
-    ids.analysisRealtimeCard.hidden = !analysisRealtimeVisible;
-    ids.analysisRealtimeCard.setAttribute("aria-hidden", analysisRealtimeVisible ? "false" : "true");
-  }
-}
-
-function resetRealtimeAnalysisForMarket(market = activeMarket) {
-  analysisRealtime = createRealtimeAnalysisState();
-  analysisRealtime.market_slug = market?.slug || market?.round_id || "";
-  analysisRealtime.started_at_ms = Date.now();
-  queueRealtimeAnalysisRender();
+function resetRealtimeSignalForMarket(market = activeMarket) {
+  realtimeSignalState = createRealtimeSignalState();
+  realtimeSignalState.market_slug = market?.slug || market?.round_id || "";
+  realtimeSignalState.started_at_ms = Date.now();
 }
 
 function recordRealtimeMarketEvent(message, details = {}) {
   if (!message?.event_type) return;
-  if (analysisRealtime.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
-    resetRealtimeAnalysisForMarket(activeMarket);
+  if (realtimeSignalState.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
+    resetRealtimeSignalForMarket(activeMarket);
   }
   const now = Date.now();
   const type = String(message.event_type || "");
-  analysisRealtime.last_event_at_ms = now;
-  analysisRealtime.market_event_count += 1;
-  analysisRealtime.counts[type] = (analysisRealtime.counts[type] || 0) + 1;
+  realtimeSignalState.last_event_at_ms = now;
+  realtimeSignalState.market_event_count += 1;
+  realtimeSignalState.counts[type] = (realtimeSignalState.counts[type] || 0) + 1;
   const side = details.side || tokenSide(message.asset_id) || "";
   const eventRow = {
     at_ms: now,
@@ -913,23 +776,22 @@ function recordRealtimeMarketEvent(message, details = {}) {
       notional: (toNumber(message.price) || 0) * (toNumber(message.size) || 0),
       action: String(message.side || "").toUpperCase(),
     };
-    analysisRealtime.last_trade = trade;
-    analysisRealtime.trades.unshift(trade);
-    analysisRealtime.trades = analysisRealtime.trades.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
+    realtimeSignalState.last_trade = trade;
+    realtimeSignalState.trades.unshift(trade);
+    realtimeSignalState.trades = realtimeSignalState.trades.slice(0, REALTIME_SIGNAL_EVENT_LIMIT);
     eventRow.price = trade.price;
     eventRow.size = trade.size;
     eventRow.action = trade.action;
   }
-  analysisRealtime.events.unshift(eventRow);
-  analysisRealtime.events = analysisRealtime.events.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
-  queueRealtimeAnalysisRender();
+  realtimeSignalState.events.unshift(eventRow);
+  realtimeSignalState.events = realtimeSignalState.events.slice(0, REALTIME_SIGNAL_EVENT_LIMIT);
 }
 
 function recordRealtimePriceEvent(source, value, updatedAtMs = Date.now()) {
   const parsed = toNumber(value);
   if (parsed == null) return;
-  if (analysisRealtime.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
-    resetRealtimeAnalysisForMarket(activeMarket);
+  if (realtimeSignalState.market_slug !== (activeMarket?.slug || activeMarket?.round_id || "")) {
+    resetRealtimeSignalForMarket(activeMarket);
   }
   const now = Date.now();
   const row = {
@@ -939,81 +801,20 @@ function recordRealtimePriceEvent(source, value, updatedAtMs = Date.now()) {
     source,
     value: parsed,
   };
-  analysisRealtime.last_event_at_ms = now;
-  analysisRealtime.price_event_count += 1;
-  analysisRealtime.counts.price_tick = (analysisRealtime.counts.price_tick || 0) + 1;
-  analysisRealtime.price_ticks.unshift(row);
-  analysisRealtime.price_ticks = analysisRealtime.price_ticks.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
-  analysisRealtime.events.unshift(row);
-  analysisRealtime.events = analysisRealtime.events.slice(0, ANALYSIS_REALTIME_EVENT_LIMIT);
-  queueRealtimeAnalysisRender();
-}
-
-function queueRealtimeAnalysisRender() {
-  if (!analysisRealtimeVisible || activeAppPage !== "analysis" || !pageVisible || analysisRealtimeRenderQueued) return;
-  analysisRealtimeRenderQueued = true;
-  window.requestAnimationFrame(() => {
-    analysisRealtimeRenderQueued = false;
-    renderRealtimeAnalysis();
-  });
-}
-
-function renderRealtimeAnalysis() {
-  applyAnalysisRealtimeVisibility();
-  if (!analysisRealtimeVisible) return;
-  if (!ids.analysisRealtime) return;
-  if (!activeMarket) {
-    setAnalysisBlock(ids.analysisRealtime, `<div class="analysis-empty">等待当前市场</div>`, true);
-    return;
-  }
-  const now = Date.now();
-  const up = quotes.Up || {};
-  const down = quotes.Down || {};
-  const pressure = realtimeTradePressure(now);
-  const external = realtimeExternalState();
-  const eventRows = analysisRealtime.events.slice(0, 18).map((row) => realtimeEventHtml(row, now)).join("");
-  const html = `
-    <div class="analysis-body realtime-analysis">
-      <div class="analysis-mini-grid realtime-metrics">
-        ${analysisMetric("Market WS", realtimeStatusText(marketWsStatus, analysisRealtime.last_event_at_ms))}
-        ${analysisMetric("RTDS/OKX/Binance", `${safe(priceWsStatus)} / ${safe(okxWsStatus)} / ${safe(binanceMarketWsStatus)}`)}
-        ${analysisMetric("盘口事件", fmtNumberCell(analysisRealtime.market_event_count, 0))}
-        ${analysisMetric("价格事件", fmtNumberCell(analysisRealtime.price_event_count, 0))}
-        ${analysisMetric("Up 买/卖", `${fmtQuotePrice(up.best_bid)} / ${fmtQuotePrice(up.best_ask)}`)}
-        ${analysisMetric("Down 买/卖", `${fmtQuotePrice(down.best_bid)} / ${fmtQuotePrice(down.best_ask)}`)}
-        ${analysisMetric("Up/Down spread", `${fmtSpread(up)} / ${fmtSpread(down)}`)}
-        ${analysisMetric("成交压力 10s", realtimePressureHtml(pressure))}
-        ${analysisMetric("Chainlink 距目标", fmtSignedBpsCell(external.chainlink_target_bps))}
-        ${analysisMetric("OKX-Chainlink", fmtSignedBpsCell(external.okx_chainlink_bps))}
-        ${analysisMetric("Binance-Chainlink", fmtSignedBpsCell(external.binance_chainlink_bps))}
-        ${analysisMetric("最新成交", realtimeLastTradeText(now))}
-      </div>
-      <div class="analysis-realtime-split">
-        <div class="analysis-realtime-book">
-          ${realtimeBookSideHtml("Up", up)}
-          ${realtimeBookSideHtml("Down", down)}
-        </div>
-        <div class="analysis-event-tape">
-          <div class="analysis-event-title">实时事件流</div>
-          <div class="analysis-event-list">${eventRows || "<div class=\"analysis-event-empty\">等待 WebSocket 事件</div>"}</div>
-        </div>
-      </div>
-    </div>
-  `;
-  setAnalysisBlock(ids.analysisRealtime, html);
-  renderAnalysisProbability((actorAnalysis?.actor_analysis || actorAnalysis || {}).probability || {});
-}
-
-function realtimeStatusText(status, lastAtMs) {
-  const age = lastAtMs ? `${Math.max(0, Date.now() - lastAtMs)}ms` : "-";
-  return `${safe(status || "-")} · ${age}`;
+  realtimeSignalState.last_event_at_ms = now;
+  realtimeSignalState.price_event_count += 1;
+  realtimeSignalState.counts.price_tick = (realtimeSignalState.counts.price_tick || 0) + 1;
+  realtimeSignalState.price_ticks.unshift(row);
+  realtimeSignalState.price_ticks = realtimeSignalState.price_ticks.slice(0, REALTIME_SIGNAL_EVENT_LIMIT);
+  realtimeSignalState.events.unshift(row);
+  realtimeSignalState.events = realtimeSignalState.events.slice(0, REALTIME_SIGNAL_EVENT_LIMIT);
 }
 
 function realtimeTradePressure(now = Date.now()) {
-  const cutoff = now - ANALYSIS_RECENT_WINDOW_MS;
+  const cutoff = now - REALTIME_SIGNAL_RECENT_WINDOW_MS;
   let up = 0;
   let down = 0;
-  for (const trade of analysisRealtime.trades) {
+  for (const trade of realtimeSignalState.trades) {
     if (!trade.at_ms || trade.at_ms < cutoff) continue;
     const notional = Number(trade.notional || 0);
     if (!Number.isFinite(notional) || notional <= 0) continue;
@@ -1073,8 +874,8 @@ function realtimeDirectionProbability(now = Date.now()) {
     target_price: target,
     distance_bps: distanceBps,
     seconds_left: secondsLeft,
-    latency_ms: analysisRealtime.last_event_at_ms ? Math.max(0, now - analysisRealtime.last_event_at_ms) : null,
-    updated_at_ms: analysisRealtime.last_event_at_ms,
+    latency_ms: realtimeSignalState.last_event_at_ms ? Math.max(0, now - realtimeSignalState.last_event_at_ms) : null,
+    updated_at_ms: realtimeSignalState.last_event_at_ms,
   };
 }
 
@@ -1112,445 +913,6 @@ function clamp01(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return 0;
   return Math.max(0, Math.min(1, parsed));
-}
-
-function realtimePressureHtml(pressure) {
-  const clsName = sideClass(pressure.direction);
-  const score = pressure.total > 0 ? `${pressure.score > 0 ? "+" : ""}${number.format(pressure.score * 100)}%` : "-";
-  return `<span class="${clsName}">${safe(pressure.direction)}</span> <span class="muted">${safe(score)}</span>`;
-}
-
-function realtimeLastTradeText(now = Date.now()) {
-  const trade = analysisRealtime.last_trade;
-  if (!trade) return "-";
-  const age = trade.at_ms ? `${Math.max(0, now - trade.at_ms)}ms` : "-";
-  return `${safe(trade.side || "-")} ${safe(trade.action || "")} @ ${fmtQuotePrice(trade.price)} · ${fmtNumberCell(trade.size, 3)} · ${age}`;
-}
-
-function realtimeBookSideHtml(side, quote) {
-  const bids = Array.isArray(quote.bids) ? quote.bids.slice(0, 5) : [];
-  const asks = Array.isArray(quote.asks) ? quote.asks.slice(0, 5) : [];
-  const rows = Array.from({ length: Math.max(bids.length, asks.length, 5) }).map((_, index) => {
-    const bid = bids[index] || {};
-    const ask = asks[index] || {};
-    return `
-      <tr>
-        <td>${fmtQuotePrice(bid.price)}</td>
-        <td>${fmtNumberCell(bid.size, 2)}</td>
-        <td>${fmtQuotePrice(ask.price)}</td>
-        <td>${fmtNumberCell(ask.size, 2)}</td>
-      </tr>
-    `;
-  }).join("");
-  return `
-    <div class="analysis-book-side">
-      <div class="analysis-book-title"><span class="${sideClass(side)}">${safe(side)}</span><small>${safe(quote.source || "-")}</small></div>
-      <table class="analysis-book-table">
-        <thead><tr><th>Bid</th><th>Size</th><th>Ask</th><th>Size</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-  `;
-}
-
-function realtimeEventHtml(row, now = Date.now()) {
-  const age = row.at_ms ? `${Math.max(0, now - row.at_ms)}ms` : "-";
-  let text = row.type;
-  if (row.type === "price_tick") {
-    text = `${row.source} ${fmtNumberCell(row.value, 2)}`;
-  } else if (row.type === "last_trade_price") {
-    text = `${row.side || "-"} ${row.action || ""} @ ${fmtQuotePrice(row.price)} · ${fmtNumberCell(row.size, 3)}`;
-  } else if (row.type === "price_change" || row.type === "best_bid_ask") {
-    text = `${row.side || "-"} ${row.type} @ ${fmtQuotePrice(row.price)}`;
-  } else if (row.type === "book") {
-    text = `${row.side || "-"} book snapshot`;
-  }
-  return `
-    <div class="analysis-event-row">
-      <span>${safe(age)}</span>
-      <strong>${safe(text)}</strong>
-    </div>
-  `;
-}
-
-function fmtQuotePrice(value) {
-  const parsed = toNumber(value);
-  return parsed == null ? "-" : parsed.toFixed(3);
-}
-
-function fmtSpread(quote) {
-  const bid = toNumber(quote.best_bid);
-  const ask = toNumber(quote.best_ask);
-  if (bid == null || ask == null) return "-";
-  return `${number.format((ask - bid) * 100)}c`;
-}
-
-function renderActorAnalysis(payload) {
-  const analysis = payload?.actor_analysis || payload || {};
-  const summary = analysis.summary || {};
-  const probability = analysis.probability || {};
-  const status = analysis.status || (actorAnalysisLoading ? "LOADING" : "EMPTY");
-  if (ids.analysisStatus) ids.analysisStatus.textContent = actorStatusLabel(status);
-  if (ids.analysisAffectsTrading) ids.analysisAffectsTrading.textContent = analysis.affects_trading ? "是" : "否";
-  if (ids.analysisDataScope) {
-    const walletCount = summary.wallet_count ?? 0;
-    const positionCount = summary.position_count ?? 0;
-    const tradeCount = summary.trade_count ?? 0;
-    ids.analysisDataScope.textContent = `${walletCount} 地址 / ${positionCount} 仓位 / ${tradeCount} 成交`;
-  }
-  if (ids.analysisLlmPath) {
-    ids.analysisLlmPath.textContent = analysis.analysis_only === false ? "接入执行链路" : "复盘旁路";
-  }
-  renderAnalysisSummary(analysis, summary);
-  renderAnalysisWallets(analysis.wallets || []);
-  renderAnalysisProbability(probability);
-  renderAnalysisRiskTags(analysis.risk_tags || [], analysis.notes || []);
-}
-
-function renderActorAnalysisError(error) {
-  actorAnalysisError = error?.message || String(error || "分析接口异常");
-  if (ids.analysisStatus) ids.analysisStatus.textContent = "异常";
-  setAnalysisBlock(ids.analysisSummary, `<div class="analysis-alert">${safe(actorAnalysisError)}</div>`);
-  setAnalysisBlock(ids.analysisWallets, `<div class="analysis-empty">暂无地址数据</div>`, true);
-  renderAnalysisProbability((actorAnalysis?.actor_analysis || actorAnalysis || {}).probability || {});
-  setAnalysisBlock(ids.analysisRiskTags, `<div class="analysis-empty">暂无风险标签</div>`, true);
-}
-
-function actorStatusLabel(status) {
-  const labels = {
-    READY: "已接入",
-    PARTIAL: "部分数据",
-    EMPTY: "暂无样本",
-    NO_MARKET: "无当前市场",
-    NO_CONDITION_ID: "缺少市场ID",
-    LOADING: "加载中",
-  };
-  return labels[status] || safe(status || "-");
-}
-
-function renderAnalysisSummary(analysis, summary) {
-  if (!ids.analysisSummary) return;
-  const market = analysis.market || {};
-  const sources = analysis.sources || {};
-  const sourceRows = Object.entries(sources).map(([name, source]) => `
-    <div class="analysis-source ${source.ok ? "is-ok" : "is-error"}">
-      <span>${safe(name)}</span>
-      <strong>${source.ok ? "OK" : "ERR"} · ${safe(source.count ?? 0)}</strong>
-    </div>
-  `).join("");
-  const html = `
-    <div class="analysis-body">
-      <div class="analysis-mini-grid">
-        ${analysisMetric("市场", market.slug || market.round_id || "-")}
-        ${analysisMetric("检查时间", fmtTime(analysis.checked_at))}
-        ${analysisMetric("Top 地址占比", fmtPctLike(summary.top_wallet_share_pct))}
-        ${analysisMetric("活跃地址", summary.active_wallet_count ?? 0)}
-      </div>
-      <div class="analysis-sources">${sourceRows || "<span class=\"muted\">暂无来源</span>"}</div>
-      <div class="analysis-note">订单簿当前挂单地址不可见，本页只用公开持仓、持有人和成交数据做旁路观察。</div>
-    </div>
-  `;
-  setAnalysisBlock(ids.analysisSummary, html);
-}
-
-function renderAnalysisWallets(wallets) {
-  if (!ids.analysisWallets) return;
-  if (!wallets.length) {
-    setAnalysisBlock(ids.analysisWallets, `<div class="analysis-empty">暂无地址数据</div>`, true);
-    return;
-  }
-  const rows = wallets.slice(0, 10).map((row) => `
-    <tr>
-      <td><span class="mono">${safe(row.short_address || row.address)}</span><small>${safe(row.name || "")}</small></td>
-      <td><span class="${sideClass(row.bias)}">${safe(row.bias || "Balanced")}</span></td>
-      <td>${fmtMoneyCell(row.up_value)}</td>
-      <td>${fmtMoneyCell(row.down_value)}</td>
-      <td>${fmtSignedMoneyCell(row.pnl)}</td>
-      <td>${fmtNumberCell(row.trade_count, 0)}</td>
-      <td>${analysisTagsHtml(row.tags || [])}</td>
-    </tr>
-  `).join("");
-  setAnalysisBlock(ids.analysisWallets, `
-    <div class="analysis-table-wrap">
-      <table class="analysis-table">
-        <thead><tr><th>地址</th><th>偏向</th><th>Up</th><th>Down</th><th>PnL</th><th>成交</th><th>标签</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-  `);
-}
-
-function renderAnalysisProbability(probability) {
-  if (!ids.analysisProbability) return;
-  const actorProbability = probability && Object.keys(probability).length ? probability : {};
-  const realtime = realtimeDirectionProbability();
-  const hasRealtime = Boolean(activeMarket && (
-    realtime.combined_up != null
-    || realtime.market_up != null
-    || realtime.target_up != null
-    || realtime.pressure_up != null
-  ));
-  const hasActorProbability = Object.keys(actorProbability).length > 0;
-  if (!hasRealtime && !hasActorProbability && !actorAnalysisError) {
-    setAnalysisBlock(ids.analysisProbability, `<div class="analysis-empty">暂无概率数据</div>`, true);
-    return;
-  }
-  const actorAnalysisPayload = actorAnalysis?.actor_analysis || actorAnalysis || {};
-  const actorCheckedAt = actorAnalysisPayload.checked_at ? fmtTime(actorAnalysisPayload.checked_at) : "-";
-  const actorCacheLabel = actorAnalysisPayload.cached ? "缓存" : "近实时";
-  const actorHtml = actorAnalysisError
-    ? `<div class="analysis-alert">${safe(actorAnalysisError)}</div>`
-    : hasActorProbability
-      ? `
-        <div class="analysis-probability-main analysis-probability-slow">
-          <span>地址修正概率 <small>Data API ${safe(actorCacheLabel)} · ${safe(actorCheckedAt)}</small></span>
-          <strong class="${sideClass(actorProbability.direction)}">${safe(actorProbability.direction || "Balanced")}</strong>
-          ${probabilityBarHtml(actorProbability.combined_up)}
-        </div>
-        <div class="analysis-mini-grid">
-          ${analysisMetric("地址修正 Up", fmtProb(actorProbability.combined_up))}
-          ${analysisMetric("市场隐含 Up", fmtProb(actorProbability.market_implied_up))}
-          ${analysisMetric("价格模型 Up", fmtProb(actorProbability.price_model_up))}
-          ${analysisMetric("地址敞口 Up", fmtProb(actorProbability.actor_up_ratio))}
-          ${analysisMetric("Data API 当前价", fmtNumberCell(actorProbability.current_price, 2))}
-          ${analysisMetric("Data API 目标价", fmtNumberCell(actorProbability.target_price, 2))}
-          ${analysisMetric("Data API 距离", fmtSignedBpsCell(actorProbability.distance_bps))}
-          ${analysisMetric("Data API 剩余秒", fmtNumberCell(actorProbability.seconds_left, 1))}
-        </div>
-      `
-      : `<div class="analysis-note">地址修正概率等待 Data API 返回；实时方向概率不依赖地址画像。</div>`;
-  const html = `
-    <div class="analysis-body probability-body">
-      <div class="analysis-probability-main analysis-probability-live">
-        <span>实时方向概率 <small>WebSocket · ${safe(realtime.latency_ms == null ? "-" : `${Math.round(realtime.latency_ms)}ms`)}</small></span>
-        <strong class="${sideClass(realtime.direction)}">${safe(realtime.direction || "Balanced")}</strong>
-        ${probabilityBarHtml(realtime.combined_up)}
-      </div>
-      <div class="analysis-mini-grid">
-        ${analysisMetric("实时 Up", fmtProb(realtime.combined_up))}
-        ${analysisMetric("盘口隐含 Up", fmtProb(realtime.market_up))}
-        ${analysisMetric("目标价模型 Up", fmtProb(realtime.target_up))}
-        ${analysisMetric("成交压力 Up", fmtProb(realtime.pressure_up))}
-        ${analysisMetric("外部领先 Up", fmtProb(realtime.external_lead_up))}
-        ${analysisMetric("实时当前价", fmtNumberCell(realtime.current_price, 2))}
-        ${analysisMetric("实时距离", fmtSignedBpsCell(realtime.distance_bps))}
-        ${analysisMetric("实时剩余秒", fmtNumberCell(realtime.seconds_left, 1))}
-      </div>
-      <div class="analysis-probability-divider">地址修正概率</div>
-      ${actorHtml}
-    </div>
-  `;
-  setAnalysisBlock(ids.analysisProbability, html);
-}
-
-function probabilityBarHtml(value) {
-  const parsed = toNumber(value);
-  const pct = parsed == null ? 50 : clamp01(parsed) * 100;
-  return `
-    <div class="analysis-probability-bar" aria-hidden="true">
-      <span style="width: ${pct.toFixed(2)}%"></span>
-    </div>
-  `;
-}
-
-function renderAnalysisRiskTags(tags, notes) {
-  if (!ids.analysisRiskTags) return;
-  const tagHtml = tags.length
-    ? tags.map((tag) => `
-        <div class="analysis-risk ${safe(tag.severity || "info")}">
-          <strong>${safe(tag.label || tag.code)}</strong>
-          <span>${safe(tag.message || "")}</span>
-        </div>
-      `).join("")
-    : `<div class="analysis-empty">暂无风险标签</div>`;
-  const noteHtml = notes.length
-    ? `<div class="analysis-notes">${notes.map((note) => `<p>${safe(note)}</p>`).join("")}</div>`
-    : "";
-  setAnalysisBlock(ids.analysisRiskTags, `<div class="analysis-body">${tagHtml}${noteHtml}</div>`);
-}
-
-function renderLlmReview(payload) {
-  if (!ids.analysisLlmReview) return;
-  const root = payload?.llm_review || payload || {};
-  const review = root.primary || (Array.isArray(root.variants) ? root.variants[0] : null) || root;
-  if (!review || review.status === "DISABLED") {
-    const text = llmReviewLoading ? "加载中" : (root.message || "LLM SUPER AGENT + PAPER 未启用");
-    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">${safe(text)}</div>`, true);
-    return;
-  }
-  if (review.status === "EMPTY") {
-    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">暂无 LLM 决策样本</div>`, true);
-    return;
-  }
-  if (llmReviewError) {
-    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-alert">${safe(llmReviewError)}</div>`);
-    return;
-  }
-  const summary = review.summary || {};
-  const routeRows = (review.route_stats || []).slice(0, 12).map((row) => `
-    <tr>
-      <td><span class="mono">${safe(row.key)}</span></td>
-      <td>${fmtNumberCell(row.decision_count, 0)}</td>
-      <td>${fmtPctCell(row.allow_rate)}</td>
-      <td>${fmtNumberCell(row.trade_count, 0)}</td>
-      <td>${fmtNumberCell(row.settled_trade_count, 0)}</td>
-      <td>${fmtSignedMoneyCell(row.total_pnl)}</td>
-      <td>${fmtSignedMoneyCell(row.no_trade_direction_estimated_pnl)}</td>
-      <td>${fmtPctCell(row.no_trade_direction_win_rate)}</td>
-    </tr>
-  `).join("");
-  const reasonRows = (review.reason_stats || []).slice(0, 18).map((row) => `
-    <tr>
-      <td><span class="analysis-tag">${safe(row.key)}</span></td>
-      <td>${fmtNumberCell(row.decision_count, 0)}</td>
-      <td>${fmtNumberCell(row.block_count, 0)}</td>
-      <td>${fmtNumberCell(row.trade_count, 0)}</td>
-      <td>${fmtSignedMoneyCell(row.total_pnl)}</td>
-      <td>${fmtSignedMoneyCell(row.no_trade_direction_estimated_pnl)}</td>
-      <td>${fmtPctCell(row.no_trade_direction_win_rate)}</td>
-    </tr>
-  `).join("");
-  const decisionRows = (review.recent_decisions || []).slice(0, 30).map((row) => `
-    <tr>
-      <td>${fmtTime(row.created_at)}<small>${safe(row.round_id)}</small></td>
-      <td><span class="mono">${safe(row.route)}</span><small>${safe(row.source)}</small></td>
-      <td>${row.allow_trade ? "<span class=\"positive\">ALLOW</span>" : "<span class=\"negative\">BLOCK</span>"}</td>
-      <td>${fmtNumberCell(row.confidence, 4)}</td>
-      <td><span class="${sideClass(row.feature_direction_side)}">${safe(row.feature_direction_side || "-")}</span><small>${fmtSignedBpsCell(row.feature_distance_bps)}</small></td>
-      <td><span class="${sideClass(row.outcome)}">${safe(row.outcome || "-")}</span><small>${safe(row.settlement_source || "-")}</small></td>
-      <td>${fmtSignedMoneyCell(row.matched_trade_pnl)}<small>${fmtNumberCell(row.matched_settled_trade_count, 0)} settled</small></td>
-      <td>${llmNoTradeEstimateHtml(row.no_trade_estimate)}</td>
-      <td>${analysisTagsHtml(row.reason_codes || [])}<small>${safe(row.market_regime || "")}</small></td>
-    </tr>
-  `).join("");
-  const html = `
-    <div class="analysis-body">
-      <div class="analysis-mini-grid">
-        ${analysisMetric("组合", `${review.combo || review.variant_id || "-"}`)}
-        ${analysisMetric("样本决策", `${fmtNumberCell(summary.decision_count, 0)} / ${fmtNumberCell(summary.total_decision_count, 0)}`)}
-        ${analysisMetric("允许下单率", fmtPctCell(summary.allow_rate))}
-        ${analysisMetric("LLM/本地来源", `${fmtNumberCell(summary.llm_source_count, 0)} / ${fmtNumberCell(summary.local_source_count, 0)}`)}
-        ${analysisMetric("归因成交PnL", fmtSignedMoneyCell(summary.total_pnl))}
-        ${analysisMetric("归因成交胜率", fmtPctCell(summary.win_rate))}
-        ${analysisMetric("NO_TRADE方向胜率", fmtPctCell(summary.no_trade_direction_win_rate))}
-        ${analysisMetric("NO_TRADE估算PnL", fmtSignedMoneyCell(summary.no_trade_direction_estimated_pnl))}
-      </div>
-      <div class="analysis-note">
-        ${safe(review.attribution_note || "NO_TRADE 机会成本为估算值；实盘可成交价格、滑点和手续费不在此估算内。")}
-        ${root.generated_at ? ` · 更新 ${safe(fmtTime(root.generated_at))}` : ""}
-      </div>
-      <div class="analysis-review-section">
-        <div class="analysis-review-heading"><strong>Route 归因</strong><span>按 LLM route 汇总实际成交和 NO_TRADE 估算</span></div>
-        <div class="analysis-table-wrap">
-          <table class="analysis-table">
-            <thead><tr><th>Route</th><th>决策</th><th>允许率</th><th>成交</th><th>已结算</th><th>实际PnL</th><th>NO_TRADE估算</th><th>NO_TRADE命中</th></tr></thead>
-            <tbody>${routeRows || "<tr><td colspan=\"8\">暂无 route 数据</td></tr>"}</tbody>
-          </table>
-        </div>
-      </div>
-      <div class="analysis-review-section">
-        <div class="analysis-review-heading"><strong>Reason Code 归因</strong><span>用于看哪些理由在赚钱或错过机会</span></div>
-        <div class="analysis-table-wrap">
-          <table class="analysis-table">
-            <thead><tr><th>Code</th><th>决策</th><th>阻止</th><th>成交</th><th>实际PnL</th><th>NO_TRADE估算</th><th>NO_TRADE命中</th></tr></thead>
-            <tbody>${reasonRows || "<tr><td colspan=\"7\">暂无 reason code 数据</td></tr>"}</tbody>
-          </table>
-        </div>
-      </div>
-      <div class="analysis-review-section analysis-review-table">
-        <div class="analysis-review-heading"><strong>最近决策</strong><span>用于核对 LLM 具体判断是否有效</span></div>
-        <div class="analysis-table-wrap">
-          <table class="analysis-table">
-            <thead><tr><th>时间</th><th>Route</th><th>动作</th><th>置信</th><th>方向</th><th>结算</th><th>实际PnL</th><th>NO_TRADE估算</th><th>Codes</th></tr></thead>
-            <tbody>${decisionRows || "<tr><td colspan=\"9\">暂无最近决策</td></tr>"}</tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  `;
-  setAnalysisBlock(ids.analysisLlmReview, html);
-}
-
-function renderLlmReviewError(error) {
-  llmReviewError = error?.message || String(error || "LLM 复盘接口异常");
-  setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-alert">${safe(llmReviewError)}</div>`);
-}
-
-function llmNoTradeEstimateHtml(estimate) {
-  if (!estimate || !estimate.evaluated) return "-";
-  const result = estimate.direction_would_win ? "命中" : "未命中";
-  return `${fmtSignedMoneyCell(estimate.direction_estimated_pnl)}<small>${safe(estimate.direction_side || "-")} -> ${safe(estimate.outcome || "-")} · ${safe(result)}</small>`;
-}
-
-function analysisMetric(label, value) {
-  const raw = value === null || value === undefined ? "-" : String(value);
-  const content = raw.startsWith("<span ") ? raw : safe(raw);
-  return `<div class="analysis-metric"><span>${safe(label)}</span><strong>${content}</strong></div>`;
-}
-
-function analysisTagsHtml(tags) {
-  return tags.map((tag) => `<span class="analysis-tag">${safe(tag)}</span>`).join(" ");
-}
-
-function fmtProb(value) {
-  const parsed = toNumber(value);
-  return parsed == null ? "-" : `${number.format(parsed * 100)}%`;
-}
-
-function fmtPctLike(value) {
-  const parsed = toNumber(value);
-  return parsed == null ? "-" : `${number.format(parsed)}%`;
-}
-
-function setAnalysisBlock(element, html, empty = false) {
-  if (!element) return;
-  element.classList.toggle("analysis-empty", empty);
-  element.classList.toggle("analysis-body-wrap", !empty);
-  element.innerHTML = html;
-}
-
-async function loadActorAnalysis({ force = false } = {}) {
-  if (actorAnalysisLoading) return;
-  actorAnalysisLoading = true;
-  ids.analysisRefresh?.classList.add("is-loading");
-  if (ids.analysisRefresh) ids.analysisRefresh.disabled = true;
-  if (!actorAnalysis && ids.analysisStatus) ids.analysisStatus.textContent = "加载中";
-  try {
-    const params = new URLSearchParams({ refresh: force ? "true" : "false" });
-    const res = await fetch(`/api/actor-analysis?${params.toString()}`);
-    if (!res.ok) throw new Error(`actor analysis HTTP ${res.status}`);
-    actorAnalysis = await res.json();
-    actorAnalysisError = "";
-    lastActorAnalysisFetchMs = Date.now();
-    renderActorAnalysis(actorAnalysis);
-  } finally {
-    actorAnalysisLoading = false;
-    ids.analysisRefresh?.classList.remove("is-loading");
-    if (ids.analysisRefresh) ids.analysisRefresh.disabled = false;
-  }
-}
-
-async function loadLlmReview({ force = false } = {}) {
-  if (llmReviewLoading) return;
-  llmReviewLoading = true;
-  ids.analysisLlmReviewRefresh?.classList.add("is-loading");
-  if (ids.analysisLlmReviewRefresh) ids.analysisLlmReviewRefresh.disabled = true;
-  if (!llmReview && ids.analysisLlmReview) {
-    setAnalysisBlock(ids.analysisLlmReview, `<div class="analysis-empty">加载中</div>`, true);
-  }
-  try {
-    const params = new URLSearchParams({ limit: "80", refresh: force ? "true" : "false" });
-    const res = await fetch(`/api/llm-review?${params.toString()}`);
-    if (!res.ok) throw new Error(`llm review HTTP ${res.status}`);
-    llmReview = await res.json();
-    llmReviewError = "";
-    lastLlmReviewFetchMs = Date.now();
-    renderLlmReview(llmReview);
-  } finally {
-    llmReviewLoading = false;
-    ids.analysisLlmReviewRefresh?.classList.remove("is-loading");
-    if (ids.analysisLlmReviewRefresh) ids.analysisLlmReviewRefresh.disabled = false;
-  }
 }
 
 function renderMetrics(metrics = {}) {
@@ -1645,7 +1007,28 @@ function tableScopeOptions(data = latestStatus) {
 
 function strategyExperimentVariants(data = latestStatus) {
   const variants = data?.runtime?.strategy_experiments?.variants;
-  return Array.isArray(variants) ? variants : [];
+  if (!Array.isArray(variants)) return [];
+  return variants.filter((variant) => variant && typeof variant === "object" && !isDeprecatedStrategyVariant(variant));
+}
+
+function isDeprecatedStrategyVariant(variant) {
+  const variantId = String(variant?.variant_id || "").toUpperCase();
+  const family = String(variant?.strategy_family || "").toUpperCase();
+  const combo = String(variant?.combo || "").toUpperCase();
+  if (DEPRECATED_STRATEGY_VARIANT_IDS.has(variantId)) return true;
+  return (
+    variantId.startsWith("PAIR_") ||
+    family === "PAIR" ||
+    combo.startsWith("PAIR +") ||
+    combo === "SINGLE + GTC" ||
+    combo === "SINGLE + GTD" ||
+    combo === "SINGLE + POST_ONLY" ||
+    combo.startsWith("REALTIME MAKER + POST_ONLY") ||
+    combo.startsWith("LLM SUPER AGENT + PAPER") ||
+    combo === "SINGLE + FAK STRICT" ||
+    combo === "SINGLE + FAK MULTI_LEAD" ||
+    combo === "SINGLE + FAK MULTI_CONFIRM"
+  );
 }
 
 function liveVariant(data = latestStatus) {
@@ -1904,6 +1287,14 @@ function renderLivePanel(data = latestStatus) {
 
 function renderLiveGateStatus(live = {}) {
   if (!ids.liveGateStatus) return;
+  if (isLiveCopyInteractionActive("gate")) {
+    pendingLiveGateRender = true;
+    pendingLiveGateData = live;
+    scheduleProtectedLiveCopyFlush();
+    return;
+  }
+  pendingLiveGateRender = false;
+  pendingLiveGateData = null;
   const gate = live.gate_status || {};
   const checks = Array.isArray(gate.checks) ? gate.checks : [];
   if (!checks.length) {
@@ -2885,6 +2276,12 @@ function tableWrap(kind) {
   return null;
 }
 
+function liveCopyRoot(kind) {
+  if (kind === "gate") return ids.liveGateStatus;
+  if (kind === "terminal") return ids.liveTerminalLines?.closest(".live-terminal") || ids.liveTerminalLines;
+  return null;
+}
+
 function orderRoot() {
   return tableRoot("order");
 }
@@ -2910,6 +2307,13 @@ function tableSelectionActive(kind) {
   return nodeInside(root, selection.anchorNode) || nodeInside(root, selection.focusNode);
 }
 
+function liveCopySelectionActive(kind) {
+  const selection = window.getSelection ? window.getSelection() : null;
+  if (!selection || selection.isCollapsed || !selection.toString().trim()) return false;
+  const root = liveCopyRoot(kind);
+  return nodeInside(root, selection.anchorNode) || nodeInside(root, selection.focusNode);
+}
+
 function isTableInteractionActive(kind) {
   const root = tableRoot(kind);
   const active = document.activeElement;
@@ -2921,6 +2325,19 @@ function isTableInteractionActive(kind) {
 
 function markTableInteraction(kind) {
   tableInteractionHoldUntil[kind] = Date.now() + TABLE_INTERACTION_HOLD_MS;
+}
+
+function isLiveCopyInteractionActive(kind) {
+  const root = liveCopyRoot(kind);
+  const active = document.activeElement;
+  if (Date.now() < (liveCopyHoldUntil[kind] || 0)) return true;
+  if (!root) return false;
+  if (active && active !== document.body && root.contains(active)) return true;
+  return liveCopySelectionActive(kind);
+}
+
+function markLiveCopyInteraction(kind) {
+  liveCopyHoldUntil[kind] = Date.now() + LIVE_COPY_HOLD_MS;
 }
 
 function orderSelectionActive() {
@@ -2955,6 +2372,16 @@ function flushPendingOrderRender() {
   renderRecentOrders(currentOrderRows(), { force: true });
 }
 
+function flushPendingLiveGateRender() {
+  if (!pendingLiveGateRender || isLiveCopyInteractionActive("gate")) return;
+  renderLiveGateStatus(pendingLiveGateData || latestStatus?.runtime?.live_trading || {});
+}
+
+function flushPendingLiveTerminalRender() {
+  if (!pendingLiveTerminalRender || isLiveCopyInteractionActive("terminal")) return;
+  renderLiveTerminal();
+}
+
 function flushPendingTableRenders() {
   flushPendingOpenRender();
   flushPendingOrderRender();
@@ -2965,10 +2392,34 @@ function scheduleProtectedTableFlush() {
   window.setTimeout(flushPendingTableRenders, TABLE_INTERACTION_HOLD_MS + 80);
 }
 
+function flushPendingLiveCopyRenders() {
+  flushPendingLiveGateRender();
+  flushPendingLiveTerminalRender();
+}
+
+function scheduleProtectedLiveCopyFlush() {
+  window.setTimeout(flushPendingLiveCopyRenders, 120);
+  window.setTimeout(flushPendingLiveCopyRenders, LIVE_COPY_HOLD_MS + 80);
+}
+
 function bindProtectedTableInteraction(kind) {
   const root = tableRoot(kind);
   if (!root) return;
   const mark = () => markTableInteraction(kind);
+  root.addEventListener("pointerdown", mark, true);
+  root.addEventListener("mousedown", mark, true);
+  root.addEventListener("copy", mark, true);
+  root.addEventListener("keydown", (event) => {
+    if (event.key === "Shift" || event.key.startsWith("Arrow") || event.ctrlKey || event.metaKey) {
+      mark();
+    }
+  }, true);
+}
+
+function bindProtectedLiveCopyInteraction(kind) {
+  const root = liveCopyRoot(kind);
+  if (!root) return;
+  const mark = () => markLiveCopyInteraction(kind);
   root.addEventListener("pointerdown", mark, true);
   root.addEventListener("mousedown", mark, true);
   root.addEventListener("copy", mark, true);
@@ -4424,7 +3875,6 @@ function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   renderRuntime(data.runtime);
   renderLivePanel(data);
-  renderLlmTerminalLogs(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));
   renderMarket(data);
@@ -4465,7 +3915,6 @@ function renderAllNow(data = latestStatus, options = {}) {
     drawChart(currentChartRows);
     lastChartRenderMs = now;
   }
-  if (activeAppPage === "analysis") queueRealtimeAnalysisRender();
 }
 
 function scopedOpenRows(scope, data = latestStatus) {
@@ -4521,7 +3970,7 @@ function applyMarket(market) {
 
   if (!sameMarket || tokenChanged) {
     quotes = {};
-    resetRealtimeAnalysisForMarket(activeMarket);
+    resetRealtimeSignalForMarket(activeMarket);
     connectMarketSocket();
   }
 }
@@ -4886,15 +4335,7 @@ async function postSnapshot() {
 }
 
 function snapshotActorProbability() {
-  const payload = actorAnalysis?.actor_analysis || actorAnalysis || {};
-  const probability = payload.probability;
-  if (!probability || typeof probability !== "object" || !Object.keys(probability).length) return null;
-  return {
-    ...probability,
-    checked_at: payload.checked_at || null,
-    status: payload.status || null,
-    cached: Boolean(payload.cached),
-  };
+  return null;
 }
 
 function toNumber(value) {
@@ -4928,10 +4369,6 @@ function handleVisibilityChange() {
   if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer);
   renderAll(latestStatus, { force: true, forceChart: true });
   loadEquityCurve(false).catch(showError);
-  if (activeAppPage === "analysis") {
-    loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
-    loadLlmReview({ force: false }).catch(renderLlmReviewError);
-  }
   foregroundRefreshTimer = setTimeout(() => {
     loadStatus().catch(showError);
   }, 150);
@@ -4977,7 +4414,6 @@ bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 setActiveAppPage(locationAppPage(), { syncHash: false });
-applyAnalysisRealtimeVisibility();
 
 ids.tickButton.addEventListener("click", () => runManualTick().catch(showError));
 ids.paperPauseToggle?.addEventListener("click", () => togglePaperPause().catch(showError));
@@ -4994,9 +4430,6 @@ ids.liveDoctor?.addEventListener("click", () => runLiveDoctor().catch(showError)
 ids.liveOnce?.addEventListener("click", () => runLiveOnce().catch(showError));
 ids.liveOpenOrdersRefresh?.addEventListener("click", () => refreshLiveOpenOrders().catch(showError));
 ids.liveEmergencyStop?.addEventListener("click", () => liveEmergencyStop().catch(showError));
-ids.analysisRefresh?.addEventListener("click", () => loadActorAnalysis({ force: true }).catch(renderActorAnalysisError));
-ids.analysisLlmReviewRefresh?.addEventListener("click", () => loadLlmReview({ force: true }).catch(renderLlmReviewError));
-ids.analysisRealtimeToggle?.addEventListener("change", () => setAnalysisRealtimeVisible(ids.analysisRealtimeToggle.checked));
 document.addEventListener("click", () => {
   if (liveSettingsOpen) setLiveSettingsOpen(false);
 });
@@ -5053,10 +4486,16 @@ ids.chart.addEventListener("mousemove", handleChartMove);
 ids.chart.addEventListener("mouseleave", handleChartLeave);
 bindProtectedTableInteraction("open");
 bindProtectedTableInteraction("order");
+bindProtectedLiveCopyInteraction("gate");
+bindProtectedLiveCopyInteraction("terminal");
 document.addEventListener("selectionchange", scheduleProtectedTableFlush);
+document.addEventListener("selectionchange", scheduleProtectedLiveCopyFlush);
 document.addEventListener("focusout", scheduleProtectedTableFlush);
+document.addEventListener("focusout", scheduleProtectedLiveCopyFlush);
 document.addEventListener("mouseup", scheduleProtectedTableFlush);
+document.addEventListener("mouseup", scheduleProtectedLiveCopyFlush);
 document.addEventListener("pointerup", scheduleProtectedTableFlush);
+document.addEventListener("pointerup", scheduleProtectedLiveCopyFlush);
 
 initFieldOptions();
 	setRecentLoading(true);
@@ -5072,14 +4511,6 @@ initFieldOptions();
 	  loadStatus().catch(showError);
 	}, STATUS_POLL_MS);
 setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
-setInterval(() => {
-  if (!pageVisible || activeAppPage !== "analysis") return;
-  loadActorAnalysis({ force: false }).catch(renderActorAnalysisError);
-}, ACTOR_ANALYSIS_REFRESH_MS);
-setInterval(() => {
-  if (!pageVisible || activeAppPage !== "analysis") return;
-  loadLlmReview({ force: false }).catch(renderLlmReviewError);
-}, LLM_REVIEW_REFRESH_MS);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));
 window.addEventListener("beforeunload", releaseSnapshotLeadership);

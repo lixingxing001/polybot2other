@@ -687,7 +687,7 @@ def _strategy_experiments_retrospective_report_html(report: dict[str, Any], gene
       <header>
         <div>
           <h1>{_html(title)}</h1>
-          <p>{len(variants)} 组 SINGLE/PAIR 策略实验隔离 Paper 复盘。</p>
+          <p>{len(variants)} 组策略实验隔离 Paper 复盘。</p>
           <p>窗口：{_html(_format_report_window(window))}</p>
         </div>
         <div class="stamp">

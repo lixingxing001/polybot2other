@@ -19,7 +19,6 @@
         </div>
         <nav class="app-nav" aria-label="页面导航">
           <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">Bot</button>
-          <button id="nav-analysis" class="app-nav-item" type="button" data-nav-page="analysis">分析</button>
         </nav>
         <div class="top-actions">
           <button id="paper-pause-toggle" class="paper-pause-button" type="button" aria-pressed="false">暂停Paper</button>
@@ -329,107 +328,6 @@
           </div>
         </div>
       </section>
-      </section>
-
-      <section id="analysis-page" class="app-page is-hidden" data-page="analysis" aria-labelledby="nav-analysis">
-        <section class="panel analysis-panel">
-          <div class="panel-head analysis-head">
-            <div>
-              <h2>市场参与者分析</h2>
-              <span>analysis_only=true</span>
-            </div>
-            <div class="analysis-actions">
-              <label class="analysis-stream-toggle" title="控制实时盘口流卡片是否展示">
-                <input id="analysis-realtime-toggle" type="checkbox" checked>
-                <span></span>
-                <strong>实时盘口流</strong>
-              </label>
-              <span class="analysis-badge">只读</span>
-            </div>
-          </div>
-          <div class="analysis-hero">
-            <div class="analysis-status">
-              <span>当前状态</span>
-              <strong id="analysis-status">待加载</strong>
-            </div>
-            <div class="analysis-status">
-              <span>影响下单</span>
-              <strong id="analysis-affects-trading">否</strong>
-            </div>
-            <div class="analysis-status">
-              <span>数据范围</span>
-              <strong id="analysis-data-scope">地址 / 持仓 / 成交</strong>
-            </div>
-            <div class="analysis-status">
-              <span>LLM 路径</span>
-              <strong id="analysis-llm-path">复盘旁路</strong>
-            </div>
-          </div>
-        </section>
-
-        <section class="analysis-grid">
-          <div id="analysis-realtime-card" class="panel analysis-card analysis-realtime-card">
-            <div class="panel-head">
-              <div>
-                <h2>实时盘口流</h2>
-                <span>market WebSocket / RTDS / OKX / Binance</span>
-              </div>
-            </div>
-            <div id="analysis-realtime" class="analysis-empty">等待 WebSocket 数据</div>
-          </div>
-
-          <div class="panel analysis-card">
-            <div class="panel-head">
-              <div>
-                <h2>当前市场地址</h2>
-                <span>Top holders / active wallets</span>
-              </div>
-            </div>
-            <div id="analysis-wallets" class="analysis-empty">待采集</div>
-          </div>
-
-          <div class="panel analysis-card">
-            <div class="panel-head">
-              <div>
-                <h2>地址画像</h2>
-                <span>behavior fingerprint</span>
-              </div>
-            </div>
-            <div id="analysis-summary" class="analysis-empty">待采集</div>
-          </div>
-
-          <div class="panel analysis-card">
-            <div class="panel-head">
-              <div>
-                <h2>方向概率</h2>
-                <span>realtime probability / actor adjustment</span>
-              </div>
-              <button id="analysis-refresh" class="analysis-card-action" type="button">刷新分析</button>
-            </div>
-            <div id="analysis-probability" class="analysis-empty">待采集</div>
-          </div>
-
-          <div class="panel analysis-card">
-            <div class="panel-head">
-              <div>
-                <h2>风险标签</h2>
-                <span>market actor signals</span>
-              </div>
-            </div>
-            <div id="analysis-risk-tags" class="analysis-empty">待采集</div>
-          </div>
-
-          <div class="panel analysis-card analysis-wide-card">
-            <div class="panel-head">
-              <div>
-                <h2>LLM 决策复盘</h2>
-                <span>reason code PnL / NO_TRADE opportunity</span>
-              </div>
-              <button id="analysis-llm-review-refresh" class="analysis-card-action" type="button">刷新复盘</button>
-            </div>
-            <div id="analysis-llm-review" class="analysis-empty">待采集</div>
-          </div>
-        </section>
       </section>
       </div>
     </main>

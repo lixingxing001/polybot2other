@@ -44,6 +44,7 @@ from polybot2other.experiments import (
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
     SINGLE_ENTRY_MODE_STRICT,
     STRATEGY_VARIANTS,
+    selected_strategy_variants,
 )
 from polybot2other.live import (
     LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE,
@@ -661,7 +662,7 @@ class TradingCoreTest(unittest.TestCase):
             store.upsert_round(market)
             store.record_llm_decision(
                 round_id=market.round_id,
-                variant_id="LLM_SUPER_AGENT_PAPER",
+                variant_id="MAIN",
                 decision={
                     "route": "NO_TRADE",
                     "allow_trade": False,
@@ -677,7 +678,7 @@ class TradingCoreTest(unittest.TestCase):
             )
             store.record_llm_decision(
                 round_id=market.round_id,
-                variant_id="LLM_SUPER_AGENT_PAPER",
+                variant_id="MAIN",
                 decision={
                     "route": "SINGLE_FAK",
                     "allow_trade": True,
@@ -705,7 +706,7 @@ class TradingCoreTest(unittest.TestCase):
             review = store.llm_decision_review(
                 limit=10,
                 opportunity_stake=5.0,
-                variant_id="LLM_SUPER_AGENT_PAPER",
+                variant_id="MAIN",
             )
 
             self.assertEqual(review["status"], "READY")
@@ -1845,7 +1846,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_POST_ONLY",
+                strategy_experiments_variants="SINGLE_FAK",
                 stake_dollars=5.0,
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
@@ -1878,15 +1879,15 @@ class TradingCoreTest(unittest.TestCase):
                 },
             }
             bot.strategy_experiments.run_from_state(market, price, quotes)
-            variant_bot = bot.strategy_experiments._bots["SINGLE_POST_ONLY"]
-            self.assertEqual(len(variant_bot.store.active_paper_orders("BTC")), 1)
+            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            self.assertEqual(variant_bot.store.open_trade_count("BTC"), 1)
 
             payload = bot.set_paper_trading_paused(True)
 
             self.assertTrue(payload["paper_trading"]["paused"])
             self.assertEqual(
-                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["SINGLE_POST_ONLY"]["canceled_count"],
-                1,
+                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["SINGLE_FAK"]["canceled_count"],
+                0,
             )
             self.assertTrue(variant_bot.paper_trading_runtime()["paused"])
             self.assertEqual(variant_bot.store.active_paper_orders("BTC"), [])
@@ -3088,24 +3089,17 @@ class TradingCoreTest(unittest.TestCase):
                 "SINGLE + FAK CHAINLINK_ONLY",
                 "SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD",
                 "SINGLE + FAK FALLBACK_ONLY",
-                "SINGLE + FAK MULTI_CONFIRM",
-                "SINGLE + FAK MULTI_LEAD",
-                "SINGLE + FAK STRICT",
                 "SINGLE + FAK REVERSAL",
                 "SINGLE + FAK STOP_AND_FLIP",
-                "SINGLE + GTC",
-                "SINGLE + GTD",
-                "SINGLE + POST_ONLY",
-                "REALTIME MAKER + POST_ONLY MULTI_LEAD",
-                "LLM SUPER AGENT + PAPER",
-                "PAIR + FAK",
-                "PAIR + FAK MULTI_CONFIRM",
-                "PAIR + FAK MULTI_LEAD",
-                "PAIR + GTC",
-                "PAIR + GTD",
-                "PAIR + POST_ONLY",
             ],
         )
+
+    def test_selected_strategy_variants_ignore_deprecated_variants(self) -> None:
+        selected = selected_strategy_variants("PAIR_GTD,SINGLE_FAK,SINGLE_GTD,SINGLE_FAK_MULTI_LEAD")
+        self.assertEqual([variant.variant_id for variant in selected], ["SINGLE_FAK"])
+
+        selected_only_deprecated = selected_strategy_variants("PAIR_GTD,PAIR_POST_ONLY,SINGLE_GTC,SINGLE_FAK_STRICT")
+        self.assertEqual(selected_only_deprecated, tuple())
 
     def test_pair_strategy_gtd_places_two_resting_pair_orders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3433,7 +3427,6 @@ class TradingCoreTest(unittest.TestCase):
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
             bot.llm_super_agent_enabled = True
-            bot.llm_super_agent_variant_id = "LLM_SUPER_AGENT_PAPER"
             now = time.time()
             market = MarketRound(
                 round_id="btc-updown-5m-llm-super-agent",
@@ -3467,15 +3460,15 @@ class TradingCoreTest(unittest.TestCase):
 
             bot._run_strategy_from_state()
 
-            self.assertEqual(bot.last_signal["side"], "PAIR_OPEN")
-            self.assertIn("LLM_SUPER_AGENT route PAIR_FAK", bot.last_signal["reason"])
-            self.assertEqual(len(store.open_trades()), 2)
+            self.assertEqual(bot.last_signal["side"], "Up")
+            self.assertIn("LLM_SUPER_AGENT route SINGLE_FAK_STOP_AND_FLIP", bot.last_signal["reason"])
+            self.assertEqual(len(store.open_trades()), 1)
             orders = store.recent_paper_orders(10, 0, "BTC")
-            self.assertEqual(len([row for row in orders if row["status"] == STATUS_FILLED]), 2)
+            self.assertEqual(len([row for row in orders if row["status"] == STATUS_FILLED]), 1)
             decisions = store.recent_llm_decisions(5)
             self.assertEqual(len(decisions), 1)
-            self.assertEqual(decisions[0]["variant_id"], "LLM_SUPER_AGENT_PAPER")
-            self.assertEqual(decisions[0]["route"], "PAIR_FAK")
+            self.assertEqual(decisions[0]["variant_id"], "MAIN")
+            self.assertEqual(decisions[0]["route"], "SINGLE_FAK_STOP_AND_FLIP")
             self.assertEqual(decisions[0]["allow_trade"], 1)
             self.assertIn("pair_cost", decisions[0]["features_json"])
 
@@ -3549,7 +3542,8 @@ class TradingCoreTest(unittest.TestCase):
 
             snapshot = bot.strategy_experiments_snapshot()
             variants = {row["variant_id"]: row for row in snapshot["variants"]}
-            self.assertEqual(len(variants), 20)
+            self.assertEqual(len(variants), len(STRATEGY_VARIANTS))
+            self.assertTrue(all(not key.startswith("PAIR_") for key in variants))
             self.assertEqual(snapshot["run_count"], 1)
             self.assertIn("profit_summary", snapshot)
             self.assertEqual(snapshot["profit_summary"]["status"], "WAITING_FOR_SAMPLE")
@@ -3557,7 +3551,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertFalse(snapshot["decision_summary"]["comparison_ready"])
             self.assertEqual(snapshot["decision_summary"]["status"], "WAITING_FOR_SAMPLE")
             self.assertEqual(snapshot["decision_summary"]["ready_count"], 0)
-            self.assertEqual(snapshot["decision_summary"]["total_count"], 20)
+            self.assertEqual(snapshot["decision_summary"]["total_count"], len(STRATEGY_VARIANTS))
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
@@ -3566,7 +3560,6 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variants["SINGLE_FAK"]["review_score"]["sample_status"], "INSUFFICIENT")
             self.assertIn("结算样本不足", variants["SINGLE_FAK"]["review_score"]["reasons"][0])
             self.assertEqual(variants["SINGLE_FAK"]["metrics"]["open_trades"], 1)
-            self.assertEqual(variants["SINGLE_FAK_STRICT"]["single_entry_mode"], "STRICT")
             self.assertEqual(variants["SINGLE_FAK_REVERSAL"]["single_entry_mode"], "REVERSAL")
             self.assertEqual(variants["SINGLE_FAK_STOP_AND_FLIP"]["single_entry_mode"], "STOP_AND_FLIP")
             self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["price_source_mode"], "CHAINLINK_ONLY")
@@ -3577,34 +3570,25 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["price_source_mode"], "FALLBACK_ONLY")
             self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["side"], "NO_TRADE")
             self.assertIn("当前有新鲜 Chainlink", variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["reason"])
-            self.assertEqual(variants["SINGLE_FAK_MULTI_CONFIRM"]["market_data_mode"], "MULTI_CONFIRM")
-            self.assertEqual(variants["SINGLE_FAK_MULTI_LEAD"]["market_data_mode"], "MULTI_LEAD")
-            self.assertEqual(variants["REALTIME_MAKER_POST_ONLY"]["strategy_family"], "REALTIME_MAKER")
-            self.assertEqual(variants["REALTIME_MAKER_POST_ONLY"]["order_summary"]["active_count"], 1)
-            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["strategy_family"], "LLM_SUPER_AGENT")
-            self.assertTrue(variants["LLM_SUPER_AGENT_PAPER"]["llm_super_agent_enabled"])
-            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["metrics"]["open_trades"], 2)
-            self.assertEqual(variants["LLM_SUPER_AGENT_PAPER"]["order_summary"]["filled_count"], 2)
-            self.assertTrue(variants["LLM_SUPER_AGENT_PAPER"]["recent_llm_decisions"])
-            self.assertEqual(variants["PAIR_FAK"]["metrics"]["open_trades"], 2)
-            self.assertEqual(variants["PAIR_GTD"]["active_orders"], 2)
-            self.assertEqual(variants["PAIR_POST_ONLY"]["active_orders"], 2)
-            self.assertEqual(variants["PAIR_FAK"]["order_summary"]["filled_count"], 2)
-            self.assertEqual(variants["PAIR_FAK"]["order_summary"]["fill_rate"], 100.0)
-            self.assertEqual(variants["PAIR_GTD"]["order_summary"]["active_count"], 2)
-            self.assertEqual(variants["PAIR_GTD"]["order_summary"]["fill_rate"], 0.0)
-            self.assertNotEqual(variants["SINGLE_FAK"]["db_path"], variants["PAIR_FAK"]["db_path"])
+            self.assertNotIn("REALTIME_MAKER_POST_ONLY", variants)
+            self.assertNotIn("LLM_SUPER_AGENT_PAPER", variants)
+            self.assertNotIn("SINGLE_GTC", variants)
+            self.assertNotIn("SINGLE_GTD", variants)
+            self.assertNotIn("SINGLE_POST_ONLY", variants)
+            self.assertNotIn("SINGLE_FAK_STRICT", variants)
+            self.assertNotIn("SINGLE_FAK_MULTI_CONFIRM", variants)
+            self.assertNotIn("SINGLE_FAK_MULTI_LEAD", variants)
 
-            detail = bot.strategy_experiment_detail("PAIR_GTD", trade_limit=5, order_limit=5)
-            self.assertEqual(detail["variant"]["variant_id"], "PAIR_GTD")
-            self.assertEqual(detail["variant"]["order_summary"]["total_count"], 2)
-            self.assertEqual(detail["recent_orders_page"]["recent_orders_meta"]["total"], 2)
-            self.assertEqual(detail["recent_trades_page"]["recent_trades_meta"]["total"], 0)
+            detail = bot.strategy_experiment_detail("SINGLE_FAK", trade_limit=5, order_limit=5)
+            self.assertEqual(detail["variant"]["variant_id"], "SINGLE_FAK")
+            self.assertEqual(detail["variant"]["order_summary"]["total_count"], 1)
+            self.assertEqual(detail["recent_orders_page"]["recent_orders_meta"]["total"], 1)
+            self.assertEqual(detail["recent_trades_page"]["recent_trades_meta"]["total"], 1)
 
             retrospective = bot.strategy_experiments_retrospective()
             self.assertTrue(retrospective["enabled"])
-            self.assertEqual(len(retrospective["variants"]), 20)
-            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), 20)
+            self.assertEqual(len(retrospective["variants"]), len(STRATEGY_VARIANTS))
+            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), len(STRATEGY_VARIANTS))
             self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
 
             tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)
@@ -3612,10 +3596,10 @@ class TradingCoreTest(unittest.TestCase):
             self.assertGreaterEqual(len(tables["open_trades"]), 3)
             self.assertTrue(all("combo" in row for row in tables["open_trades"]))
             self.assertTrue(any(row["variant_id"] == "SINGLE_FAK" for row in tables["open_trades"]))
-            self.assertTrue(any(row["variant_id"] == "PAIR_FAK" for row in tables["open_trades"]))
-            self.assertGreaterEqual(tables["recent_orders_meta"]["total"], 8)
+            self.assertTrue(all(not str(row["variant_id"]).startswith("PAIR_") for row in tables["open_trades"]))
+            self.assertGreaterEqual(tables["recent_orders_meta"]["total"], 5)
             self.assertTrue(all("combo" in row for row in tables["recent_orders"]))
-            self.assertGreaterEqual(tables["recent_trades_meta"]["total"], 3)
+            self.assertGreaterEqual(tables["recent_trades_meta"]["total"], 1)
             self.assertEqual(tables["recent_trades_summary"]["total_count"], tables["recent_trades_meta"]["total"])
 
             with self.assertRaises(ValueError):
@@ -3654,15 +3638,15 @@ class TradingCoreTest(unittest.TestCase):
     def test_strategy_experiment_decision_can_finish_with_disqualified_variants(self) -> None:
         variants = [
             {
-                "variant_id": "PAIR_POST_ONLY",
-                "combo": "PAIR + POST_ONLY",
+                "variant_id": "SINGLE_FAK_STOP_AND_FLIP",
+                "combo": "SINGLE + FAK STOP_AND_FLIP",
                 "review_score": {"score": 82.0, "eligible_for_decision": True, "disqualified": False},
                 "recent_trades_summary": {"settled_count": 40, "total_pnl": 12.0},
                 "order_summary": {"total_count": 90, "fill_rate": 58.0},
             },
             {
-                "variant_id": "PAIR_GTC",
-                "combo": "PAIR + GTC",
+                "variant_id": "SINGLE_FAK_FALLBACK_ONLY",
+                "combo": "SINGLE + FAK FALLBACK_ONLY",
                 "review_score": {
                     "score": 18.0,
                     "eligible_for_decision": False,
@@ -3678,11 +3662,11 @@ class TradingCoreTest(unittest.TestCase):
 
         self.assertTrue(summary["comparison_ready"])
         self.assertEqual(summary["status"], "READY")
-        self.assertEqual(summary["recommended_variant_id"], "PAIR_POST_ONLY")
+        self.assertEqual(summary["recommended_variant_id"], "SINGLE_FAK_STOP_AND_FLIP")
         self.assertEqual(summary["ready_count"], 1)
         self.assertEqual(summary["pending_count"], 0)
         self.assertEqual(summary["disqualified_count"], 1)
-        self.assertEqual(summary["disqualified_variants"][0]["variant_id"], "PAIR_GTC")
+        self.assertEqual(summary["disqualified_variants"][0]["variant_id"], "SINGLE_FAK_FALLBACK_ONLY")
 
     def test_strategy_experiment_profit_summary_separates_leader_from_final_winner(self) -> None:
         variants = [
@@ -3694,8 +3678,8 @@ class TradingCoreTest(unittest.TestCase):
                 "order_summary": {"fill_rate": 100.0},
             },
             {
-                "variant_id": "PAIR_POST_ONLY",
-                "combo": "PAIR + POST_ONLY",
+                "variant_id": "SINGLE_FAK_STOP_AND_FLIP",
+                "combo": "SINGLE + FAK STOP_AND_FLIP",
                 "review_score": {"score": 82.0, "eligible_for_decision": True, "disqualified": False},
                 "recent_trades_summary": {"settled_count": 40, "total_pnl": 12.0, "roi_pct": 24.0, "win_rate": 62.5},
                 "order_summary": {"fill_rate": 58.0},
@@ -3714,7 +3698,7 @@ class TradingCoreTest(unittest.TestCase):
 
         self.assertEqual(ready["status"], "READY")
         self.assertEqual(ready["current_profit_leader_variant_id"], "SINGLE_FAK")
-        self.assertEqual(ready["winner_variant_id"], "PAIR_POST_ONLY")
+        self.assertEqual(ready["winner_variant_id"], "SINGLE_FAK_STOP_AND_FLIP")
         self.assertTrue(ready["comparison_ready"])
         self.assertTrue(ready["profitable_winner_ready"])
 
@@ -3724,7 +3708,7 @@ class TradingCoreTest(unittest.TestCase):
         self.assertEqual(no_profit["status"], "NO_PROFIT")
         self.assertTrue(no_profit["comparison_ready"])
         self.assertFalse(no_profit["profitable_winner_ready"])
-        self.assertEqual(no_profit["best_eligible_variant_id"], "PAIR_POST_ONLY")
+        self.assertEqual(no_profit["best_eligible_variant_id"], "SINGLE_FAK_STOP_AND_FLIP")
         self.assertIsNone(no_profit["winner_variant_id"])
 
     def test_strategy_experiment_html_report_escapes_and_summarizes_variants(self) -> None:
@@ -3735,7 +3719,7 @@ class TradingCoreTest(unittest.TestCase):
             "profit_summary": {
                 "status_label": "等待盈利样本",
                 "winner_combo": None,
-                "current_profit_leader_combo": "PAIR + POST_ONLY",
+                "current_profit_leader_combo": "SINGLE + FAK STOP_AND_FLIP",
                 "ready_count": 1,
                 "total_count": 2,
                 "disqualified_count": 0,
@@ -3756,8 +3740,8 @@ class TradingCoreTest(unittest.TestCase):
             },
             "variants": [
                 {
-                    "variant_id": "PAIR_POST_ONLY",
-                    "combo": "PAIR + POST_ONLY",
+                    "variant_id": "SINGLE_FAK_STOP_AND_FLIP",
+                    "combo": "SINGLE + FAK STOP_AND_FLIP",
                     "role": "最核心目标",
                     "target_code_completion": "90%+",
                     "target_report_alignment": "90%+",
@@ -3785,7 +3769,7 @@ class TradingCoreTest(unittest.TestCase):
         html = _strategy_experiments_retrospective_report_html(report, generated_at=1_779_871_200)
 
         self.assertIn("策略实验复盘报告", html)
-        self.assertIn("PAIR + POST_ONLY", html)
+        self.assertIn("SINGLE + FAK STOP_AND_FLIP", html)
         self.assertIn("+$3.25", html)
         self.assertIn("reason &lt;script&gt;alert(1)&lt;/script&gt;", html)
         self.assertNotIn("reason <script>alert(1)</script>", html)

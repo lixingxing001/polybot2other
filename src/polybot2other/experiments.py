@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .execution import ORDER_TYPE_FAK, ORDER_TYPE_GTC, ORDER_TYPE_GTD, ORDER_TYPE_POST_ONLY
+from .execution import ORDER_TYPE_FAK
 
 
 STRATEGY_FAMILY_SINGLE = "SINGLE"
@@ -54,10 +54,6 @@ class StrategyVariant:
             and self.single_entry_mode != SINGLE_ENTRY_MODE_LEGACY
         ):
             return f"{self.strategy_family} + {self.order_type} {self.single_entry_mode}{data_suffix}"
-        if self.strategy_family == STRATEGY_FAMILY_REALTIME_MAKER:
-            return f"REALTIME MAKER + {self.order_type}{data_suffix}"
-        if self.strategy_family == STRATEGY_FAMILY_LLM_SUPER_AGENT:
-            return f"LLM SUPER AGENT + PAPER{data_suffix}"
         return f"{self.strategy_family} + {self.order_type}{data_suffix}"
 
 
@@ -92,33 +88,6 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
         price_source_mode=PRICE_SOURCE_MODE_FALLBACK_ONLY,
     ),
     StrategyVariant(
-        "SINGLE_FAK_MULTI_CONFIRM",
-        STRATEGY_FAMILY_SINGLE,
-        ORDER_TYPE_FAK,
-        "85%",
-        "25%-35%",
-        "OKX/Binance 残差确认实验",
-        market_data_mode=MARKET_DATA_MODE_MULTI_CONFIRM,
-    ),
-    StrategyVariant(
-        "SINGLE_FAK_MULTI_LEAD",
-        STRATEGY_FAMILY_SINGLE,
-        ORDER_TYPE_FAK,
-        "75%-80%",
-        "30%-40%",
-        "OKX/Binance 残差领先修正实验",
-        market_data_mode=MARKET_DATA_MODE_MULTI_LEAD,
-    ),
-    StrategyVariant(
-        "SINGLE_FAK_STRICT",
-        STRATEGY_FAMILY_SINGLE,
-        ORDER_TYPE_FAK,
-        "85%",
-        "25%-35%",
-        "小资金实盘保守候选",
-        SINGLE_ENTRY_MODE_STRICT,
-    ),
-    StrategyVariant(
         "SINGLE_FAK_REVERSAL",
         STRATEGY_FAMILY_SINGLE,
         ORDER_TYPE_FAK,
@@ -136,48 +105,25 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
         "真实止损反手实验",
         SINGLE_ENTRY_MODE_STOP_AND_FLIP,
     ),
-    StrategyVariant("SINGLE_GTC", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_GTC, "75%-80%", "30%-40%", "单边挂单实验"),
-    StrategyVariant("SINGLE_GTD", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_GTD, "75%-80%", "30%-40%", "单边限时挂单实验"),
-    StrategyVariant("SINGLE_POST_ONLY", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_POST_ONLY, "75%-80%", "35%-45%", "单边 maker 实验"),
-    StrategyVariant(
-        "REALTIME_MAKER_POST_ONLY",
-        STRATEGY_FAMILY_REALTIME_MAKER,
-        ORDER_TYPE_POST_ONLY,
-        "采样",
-        "待验证",
-        "Paper-only 实时 fair value 做市实验，实盘禁止直接沿用",
-        market_data_mode=MARKET_DATA_MODE_MULTI_LEAD,
-    ),
-    StrategyVariant(
-        "LLM_SUPER_AGENT_PAPER",
-        STRATEGY_FAMILY_LLM_SUPER_AGENT,
-        ORDER_TYPE_FAK,
-        "采样",
-        "待验证",
-        "Paper-only LLM 超级下注智能体路由实验，实盘禁止直接沿用",
-    ),
-    StrategyVariant("PAIR_FAK", STRATEGY_FAMILY_PAIR, ORDER_TYPE_FAK, "80%-85%", "55%-65%", "配对 taker / 补单 / 应急"),
-    StrategyVariant(
+)
+
+DEPRECATED_STRATEGY_VARIANT_IDS: frozenset[str] = frozenset(
+    {
+        "PAIR_FAK",
         "PAIR_FAK_MULTI_CONFIRM",
-        STRATEGY_FAMILY_PAIR,
-        ORDER_TYPE_FAK,
-        "80%-85%",
-        "55%-65%",
-        "OKX/Binance 残差确认配对实验",
-        market_data_mode=MARKET_DATA_MODE_MULTI_CONFIRM,
-    ),
-    StrategyVariant(
         "PAIR_FAK_MULTI_LEAD",
-        STRATEGY_FAMILY_PAIR,
-        ORDER_TYPE_FAK,
-        "75%-80%",
-        "55%-65%",
-        "OKX/Binance 残差领先配对实验",
-        market_data_mode=MARKET_DATA_MODE_MULTI_LEAD,
-    ),
-    StrategyVariant("PAIR_GTC", STRATEGY_FAMILY_PAIR, ORDER_TYPE_GTC, "90%+", "85%-90%", "核心候选"),
-    StrategyVariant("PAIR_GTD", STRATEGY_FAMILY_PAIR, ORDER_TYPE_GTD, "90%+", "85%-90%", "核心候选，尤其适合 5m 市场"),
-    StrategyVariant("PAIR_POST_ONLY", STRATEGY_FAMILY_PAIR, ORDER_TYPE_POST_ONLY, "90%+", "90%+", "最核心目标"),
+        "PAIR_GTC",
+        "PAIR_GTD",
+        "PAIR_POST_ONLY",
+        "REALTIME_MAKER_POST_ONLY",
+        "SINGLE_POST_ONLY",
+        "SINGLE_GTD",
+        "LLM_SUPER_AGENT_PAPER",
+        "SINGLE_GTC",
+        "SINGLE_FAK_STRICT",
+        "SINGLE_FAK_MULTI_LEAD",
+        "SINGLE_FAK_MULTI_CONFIRM",
+    }
 )
 
 
@@ -190,6 +136,10 @@ def selected_strategy_variants(raw_variant_ids: str | None) -> tuple[StrategyVar
     wanted = {item.strip().upper().replace("-", "_") for item in raw.split(",") if item.strip()}
     if not wanted:
         return STRATEGY_VARIANTS
+    # 已淘汰组合：为兼容旧配置，这里静默忽略历史 variant_id。
+    wanted = wanted.difference(DEPRECATED_STRATEGY_VARIANT_IDS)
+    if not wanted:
+        return tuple()
     by_id = {variant.variant_id: variant for variant in STRATEGY_VARIANTS}
     unknown = sorted(wanted.difference(by_id))
     if unknown:

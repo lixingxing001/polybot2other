@@ -13,8 +13,6 @@ from .config import Settings
 from .experiments import (
     ANTI_BOT_GUARD_MODE_ENABLED,
     MARKET_DATA_MODE_BASE,
-    MARKET_DATA_MODE_MULTI_CONFIRM,
-    MARKET_DATA_MODE_MULTI_LEAD,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
@@ -27,20 +25,14 @@ LLM_ROUTE_NO_TRADE = "NO_TRADE"
 LLM_ROUTE_SINGLE_FAK = "SINGLE_FAK"
 LLM_ROUTE_SINGLE_FAK_STOP_AND_FLIP = "SINGLE_FAK_STOP_AND_FLIP"
 LLM_ROUTE_SINGLE_FAK_REVERSAL = "SINGLE_FAK_REVERSAL"
-LLM_ROUTE_SINGLE_FAK_MULTI_LEAD = "SINGLE_FAK_MULTI_LEAD"
-LLM_ROUTE_SINGLE_FAK_MULTI_CONFIRM = "SINGLE_FAK_MULTI_CONFIRM"
 LLM_ROUTE_SINGLE_FAK_ANTI_BOT_GUARD = "SINGLE_FAK_ANTI_BOT_GUARD"
-LLM_ROUTE_PAIR_FAK = "PAIR_FAK"
 
 LLM_ALLOWED_ROUTES = {
     LLM_ROUTE_NO_TRADE,
     LLM_ROUTE_SINGLE_FAK,
     LLM_ROUTE_SINGLE_FAK_STOP_AND_FLIP,
     LLM_ROUTE_SINGLE_FAK_REVERSAL,
-    LLM_ROUTE_SINGLE_FAK_MULTI_LEAD,
-    LLM_ROUTE_SINGLE_FAK_MULTI_CONFIRM,
     LLM_ROUTE_SINGLE_FAK_ANTI_BOT_GUARD,
-    LLM_ROUTE_PAIR_FAK,
 }
 LLM_TRADE_ROUTES = LLM_ALLOWED_ROUTES - {LLM_ROUTE_NO_TRADE}
 LLM_MIN_CONFIDENCE_TO_TRADE = 0.58
@@ -277,7 +269,16 @@ def local_llm_router_decision(features: dict[str, Any], now: float | None = None
     if distance < 2.0:
         return _decision(LLM_ROUTE_NO_TRADE, False, 0.35, "NEAR_TARGET_NOISY", "贴近目标价，噪声占比高", ["near_target"], "local", now)
     if pair_cost is not None and pair_cost <= 0.94 and time_left >= 55:
-        return _decision(LLM_ROUTE_PAIR_FAK, True, 0.68, "PAIR_ARBITRAGE_WINDOW", "双边 ask 合成成本较低，优先配对 FAK", ["pair_cost_low"], "local", now)
+        return _decision(
+            LLM_ROUTE_SINGLE_FAK_STOP_AND_FLIP,
+            True,
+            0.66,
+            "DUAL_LEG_COST_FALLBACK_SINGLE",
+            "双边 ask 合成成本较低，但双边组合已淘汰，回退单边 FAK 止损反手路径",
+            ["synthetic_cost_low", "dual_leg_route_removed"],
+            "local",
+            now,
+        )
     if side_ask is not None and side_ask > 0.72:
         return _decision(LLM_ROUTE_NO_TRADE, False, 0.42, "RICH_CONTRACT", "当前方向价格过贵", ["entry_too_high"], "local", now)
     if open_sides and any(item != side for item in open_sides):
@@ -379,33 +380,12 @@ def route_execution_modes(route: str) -> dict[str, str]:
             "market_data_mode": MARKET_DATA_MODE_BASE,
             "anti_bot_guard_mode": "",
         }
-    if route == LLM_ROUTE_SINGLE_FAK_MULTI_LEAD:
-        return {
-            "strategy_family": "SINGLE",
-            "single_entry_mode": SINGLE_ENTRY_MODE_STOP_AND_FLIP,
-            "market_data_mode": MARKET_DATA_MODE_MULTI_LEAD,
-            "anti_bot_guard_mode": "",
-        }
-    if route == LLM_ROUTE_SINGLE_FAK_MULTI_CONFIRM:
-        return {
-            "strategy_family": "SINGLE",
-            "single_entry_mode": SINGLE_ENTRY_MODE_STOP_AND_FLIP,
-            "market_data_mode": MARKET_DATA_MODE_MULTI_CONFIRM,
-            "anti_bot_guard_mode": "",
-        }
     if route == LLM_ROUTE_SINGLE_FAK_ANTI_BOT_GUARD:
         return {
             "strategy_family": "SINGLE",
             "single_entry_mode": SINGLE_ENTRY_MODE_STOP_AND_FLIP,
             "market_data_mode": MARKET_DATA_MODE_BASE,
             "anti_bot_guard_mode": ANTI_BOT_GUARD_MODE_ENABLED,
-        }
-    if route == LLM_ROUTE_PAIR_FAK:
-        return {
-            "strategy_family": "PAIR",
-            "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
-            "market_data_mode": MARKET_DATA_MODE_BASE,
-            "anti_bot_guard_mode": "",
         }
     return {
         "strategy_family": "SINGLE",
@@ -459,7 +439,7 @@ def _llm_system_prompt() -> str:
         "You are a risk-controlled strategy router for BTC 5-minute Polymarket paper trading. "
         "Return JSON only. You must choose exactly one route from: "
         "NO_TRADE, SINGLE_FAK, SINGLE_FAK_STOP_AND_FLIP, SINGLE_FAK_REVERSAL, "
-        "SINGLE_FAK_MULTI_LEAD, SINGLE_FAK_MULTI_CONFIRM, SINGLE_FAK_ANTI_BOT_GUARD, PAIR_FAK. "
+        "SINGLE_FAK_ANTI_BOT_GUARD. "
         "Never invent a new strategy. Prefer NO_TRADE when data is stale, near target, expensive, or uncertain. "
         "Output keys: market_regime, recommended_strategy, allow_trade, confidence, reason_codes, reason, valid_until_ms."
     )
