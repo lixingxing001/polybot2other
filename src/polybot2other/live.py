@@ -51,6 +51,10 @@ except ImportError:  # pragma: no cover - production target is Linux, this keeps
 LIVE_VARIANT_ID = "SINGLE_FAK_REAL"
 LIVE_COMBO = "SINGLE + FAK REAL"
 LIVE_ENTRY_MARKER = "SINGLE_FAK_REAL"
+LIVE_STOP_WIN_VARIANT_ID = "SINGLE_FAK_REAL_STOP_WIN"
+LIVE_STOP_WIN_COMBO = "SINGLE + FAK REAL STOP WIN"
+LIVE_STOP_WIN_ENTRY_MARKER = "SINGLE_FAK_REAL_STOP_WIN"
+LIVE_STOP_WIN_MARKER = "LIVE_STOP_WIN"
 LIVE_PAPER_VARIANT_ID = "SINGLE_FAK_REAL_PAPER"
 LIVE_PAPER_COMBO = "SINGLE + FAK REAL PAPER"
 LIVE_PAPER_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER"
@@ -88,6 +92,22 @@ LIVE_FALLBACK_SOURCE_ORDER = (
     LIVE_FALLBACK_SOURCE_BINANCE,
 )
 LIVE_BASIS_FALLBACK_SOURCES = (LIVE_FALLBACK_SOURCE_OKX, LIVE_FALLBACK_SOURCE_BINANCE)
+LIVE_STRATEGY_OPTIONS = (
+    {
+        "variant_id": LIVE_VARIANT_ID,
+        "combo": LIVE_COMBO,
+        "entry_marker": LIVE_ENTRY_MARKER,
+        "role": "实盘隔离账户，沿用 SINGLE_FAK LEGACY 反转双边逻辑",
+        "stop_win_enabled": False,
+    },
+    {
+        "variant_id": LIVE_STOP_WIN_VARIANT_ID,
+        "combo": LIVE_STOP_WIN_COMBO,
+        "entry_marker": LIVE_STOP_WIN_ENTRY_MARKER,
+        "role": "实盘隔离账户，沿用 SINGLE_FAK 并在真实仓位上执行止盈卖出",
+        "stop_win_enabled": True,
+    },
+)
 
 
 @dataclass(frozen=True)
@@ -95,6 +115,7 @@ class LiveRuntimeConfig:
     """实盘运行配置；enabled 为 true 时才允许真实买入和手动卖出。"""
 
     enabled: bool
+    live_strategy_id: str
     initial_balance: float
     stake_dollars: float
     max_open_trades: int
@@ -111,6 +132,7 @@ class LiveRuntimeConfig:
     def normalized(self) -> "LiveRuntimeConfig":
         return LiveRuntimeConfig(
             enabled=bool(self.enabled),
+            live_strategy_id=_normalize_live_strategy_id(self.live_strategy_id),
             initial_balance=max(1.0, round(float(self.initial_balance), 2)),
             stake_dollars=max(LIVE_MIN_USDC, round(float(self.stake_dollars), 2)),
             max_open_trades=max(1, int(self.max_open_trades)),
@@ -149,6 +171,9 @@ class LiveSettingsStore:
         return replace(
             self.defaults,
             enabled=bool(payload.get("enabled", self.defaults.enabled)),
+            live_strategy_id=_normalize_live_strategy_id(
+                payload.get("live_strategy_id", self.defaults.live_strategy_id)
+            ),
             initial_balance=_float(payload.get("initial_balance"), self.defaults.initial_balance),
             stake_dollars=_float(payload.get("stake_dollars"), self.defaults.stake_dollars),
             max_open_trades=_int(payload.get("max_open_trades"), self.defaults.max_open_trades),
@@ -1447,15 +1472,7 @@ class LiveStrategyRunner:
     def __init__(self, settings: Settings, polymarket: PolymarketClient) -> None:
         self.settings = settings
         self.polymarket = polymarket
-        self.variant = StrategyVariant(
-            LIVE_VARIANT_ID,
-            STRATEGY_FAMILY_SINGLE,
-            ORDER_TYPE_FAK,
-            "85%",
-            "25%-35%",
-            "实盘隔离账户，沿用 SINGLE_FAK LEGACY 反转双边逻辑",
-            SINGLE_ENTRY_MODE_LEGACY,
-        )
+        self.variant = _live_strategy_variant(LIVE_VARIANT_ID)
         self.settings_store = LiveSettingsStore(settings.live_trading_settings_path, self._default_config(settings))
         self.process_lock = LiveProcessLock(
             settings.live_trading_settings_path.with_name(f"{settings.live_trading_settings_path.name}.lock")
@@ -1473,7 +1490,11 @@ class LiveStrategyRunner:
                 if self.startup_rearmed
                 else loaded_config
             )
-        self.store = TradeStore(settings.live_trading_db_path, self.config.initial_balance)
+        self.variant = _live_strategy_variant(self.config.live_strategy_id)
+        self.store = TradeStore(
+            _live_strategy_db_path(settings, self.config.live_strategy_id),
+            self.config.initial_balance,
+        )
         self.store.rebase_initial_balance(self.config.initial_balance)
         self.client = PolymarketLiveClient(settings)
         self.strategy = RealBtcFiveMinuteStrategy(settings)
@@ -1493,14 +1514,60 @@ class LiveStrategyRunner:
         self._official_recheck_next_at: dict[str, float] = {}
         self._official_price_backfill_next_at: dict[str, float] = {}
         self._live_order_reconcile_next_at: dict[str, float] = {}
+        self._stop_win_next_check_at: dict[int, float] = {}
+        self._stop_win_closed_rounds: dict[str, float] = {}
+        self.last_stop_win: dict[str, Any] | None = None
         self._run_lock = threading.Lock()
         self._status_refresh_lock = threading.Lock()
         self._status_refresh_thread: threading.Thread | None = None
+
+    @property
+    def variant_id(self) -> str:
+        override = getattr(self, "_variant_id_override", None)
+        return str(override if override is not None else self.variant.variant_id)
+
+    @variant_id.setter
+    def variant_id(self, value: str) -> None:
+        self._variant_id_override = str(value)
+
+    @property
+    def combo(self) -> str:
+        override = getattr(self, "_combo_override", None)
+        if override is not None:
+            return str(override)
+        return str(_live_strategy_meta(self.variant_id).get("combo") or LIVE_COMBO)
+
+    @combo.setter
+    def combo(self, value: str) -> None:
+        self._combo_override = str(value)
+
+    @property
+    def entry_marker(self) -> str:
+        override = getattr(self, "_entry_marker_override", None)
+        if override is not None:
+            return str(override)
+        return str(_live_strategy_meta(self.variant_id).get("entry_marker") or LIVE_ENTRY_MARKER)
+
+    @entry_marker.setter
+    def entry_marker(self, value: str) -> None:
+        self._entry_marker_override = str(value)
+
+    @property
+    def stop_win_enabled(self) -> bool:
+        override = getattr(self, "_stop_win_enabled_override", None)
+        if override is not None:
+            return bool(override)
+        return bool(_live_strategy_meta(self.variant_id).get("stop_win_enabled"))
+
+    @stop_win_enabled.setter
+    def stop_win_enabled(self, value: bool) -> None:
+        self._stop_win_enabled_override = bool(value)
 
     @staticmethod
     def _default_config(settings: Settings) -> LiveRuntimeConfig:
         return LiveRuntimeConfig(
             enabled=False,
+            live_strategy_id=LIVE_VARIANT_ID,
             initial_balance=settings.live_trading_default_initial_balance,
             stake_dollars=settings.live_trading_default_stake_dollars,
             max_open_trades=settings.max_open_trades,
@@ -1517,8 +1584,14 @@ class LiveStrategyRunner:
 
     def settings_payload(self) -> dict[str, Any]:
         payload = asdict(self.config)
-        payload["variant_id"] = LIVE_VARIANT_ID
-        payload["combo"] = LIVE_COMBO
+        payload["variant_id"] = self.variant_id
+        payload["combo"] = self.combo
+        payload["live_strategy_id"] = self.variant_id
+        payload["live_strategy"] = {
+            **_live_strategy_meta(self.variant_id),
+            "paper_stop_win_take_profit_pct": self.config.paper_stop_win_take_profit_pct,
+        }
+        payload["live_strategy_options"] = _live_strategy_options_payload(self.settings)
         payload["db_path"] = str(self.store.db_path)
         payload["process_lock_path"] = str(self.process_lock.path)
         payload["process_lock_acquired"] = self.process_lock.locked
@@ -1540,8 +1613,8 @@ class LiveStrategyRunner:
     def open_orders_payload(self, *, force: bool = False) -> dict[str, Any]:
         return {
             "execution_mode": "LIVE",
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
             "open_orders": self.client.open_orders_state(
                 force=force,
                 retry_count=self.config.retry_count,
@@ -1571,8 +1644,8 @@ class LiveStrategyRunner:
         return {
             "checked_at": time.time(),
             "execution_mode": "LIVE",
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
             "db_path": str(self.store.db_path),
             "settings_path": str(self.settings.live_trading_settings_path),
             "process_lock": self.process_lock.payload(),
@@ -1584,6 +1657,7 @@ class LiveStrategyRunner:
             "last_error": self.last_error,
             "last_order_at": self.last_order_at,
             "last_order": dict(self.last_order or {}),
+            "last_stop_win": dict(self.last_stop_win or {}),
             "settings": asdict(self.config),
             "software_account": {
                 "account": self.store.account(),
@@ -1595,8 +1669,8 @@ class LiveStrategyRunner:
             "wallet": readiness.get("wallet") if isinstance(readiness.get("wallet"), dict) else None,
             "official_open_orders": official_open_orders,
             "open_trades": self.open_trades(),
-            "pending_orders": _public_evidence_orders(pending_orders),
-            "recent_orders": _public_evidence_orders(recent_orders),
+            "pending_orders": _public_evidence_orders(pending_orders, variant_id=self.variant_id, combo=self.combo),
+            "recent_orders": _public_evidence_orders(recent_orders, variant_id=self.variant_id, combo=self.combo),
             "recent_orders_meta": {
                 "limit": 20,
                 "offset": 0,
@@ -1608,7 +1682,7 @@ class LiveStrategyRunner:
             "recent_trades": recent_trades_page["recent_trades"],
             "recent_trades_summary": recent_trades_page["recent_trades_summary"],
             "recent_trades_meta": recent_trades_page["recent_trades_meta"],
-            "order": _public_evidence_order(order),
+            "order": _public_evidence_order(order, variant_id=self.variant_id, combo=self.combo),
             "requested_external_order_id": order_id or None,
         }
 
@@ -1643,8 +1717,10 @@ class LiveStrategyRunner:
         now = time.time()
         payload: dict[str, Any] = {
             "checked_at": now,
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "live_strategy_id": self.variant_id,
+            "live_strategy": _live_strategy_meta(self.variant_id),
             "execution_mode": "LIVE",
             "enabled": self.config.enabled,
             "checks": checks,
@@ -1909,9 +1985,17 @@ class LiveStrategyRunner:
 
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.config
+        requested_strategy_id = _normalize_live_strategy_id(
+            payload.get("live_strategy_id", current.live_strategy_id)
+        )
+        switch_block_reason = self._live_strategy_switch_block_reason(current.live_strategy_id, requested_strategy_id)
+        if switch_block_reason:
+            self.last_error = switch_block_reason
+            raise ValueError(switch_block_reason)
         next_config = replace(
             current,
             enabled=_bool(payload.get("enabled"), current.enabled),
+            live_strategy_id=requested_strategy_id,
             initial_balance=_float(payload.get("initial_balance"), current.initial_balance),
             stake_dollars=_float(payload.get("stake_dollars"), current.stake_dollars),
             max_open_trades=_int(payload.get("max_open_trades"), current.max_open_trades),
@@ -1933,7 +2017,8 @@ class LiveStrategyRunner:
             ),
         ).normalized()
         self.config = self.settings_store.save(next_config)
-        self.store.rebase_initial_balance(self.config.initial_balance)
+        self.variant = _live_strategy_variant(self.config.live_strategy_id)
+        self._sync_strategy_store()
         if self.config.enabled:
             block_reason = self._enable_block_reason()
             if block_reason:
@@ -1951,6 +2036,19 @@ class LiveStrategyRunner:
     def set_enabled(self, enabled: bool) -> dict[str, Any]:
         return self.update_settings({"enabled": bool(enabled)})
 
+    def _sync_strategy_store(self) -> None:
+        db_path = _live_strategy_db_path(self.settings, self.config.live_strategy_id)
+        if getattr(self.store, "db_path", None) == db_path:
+            self.store.rebase_initial_balance(self.config.initial_balance)
+            return
+        previous_store = self.store
+        self.store = TradeStore(db_path, self.config.initial_balance)
+        self.store.rebase_initial_balance(self.config.initial_balance)
+        try:
+            previous_store.conn.close()
+        except Exception:
+            pass
+
     def emergency_stop(self) -> dict[str, Any]:
         was_enabled = self.config.enabled
         self.config = self.settings_store.save(replace(self.config, enabled=False).normalized())
@@ -1967,8 +2065,8 @@ class LiveStrategyRunner:
             self.last_error = None
         return {
             "execution_mode": "LIVE",
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
             "was_enabled": was_enabled,
             "enabled": self.config.enabled,
             "cancel_all": cancel_result,
@@ -2025,8 +2123,8 @@ class LiveStrategyRunner:
             order_id = self.last_order.get("order_id") if isinstance(self.last_order, dict) else None
             payload = {
                 "execution_mode": "LIVE",
-                "variant_id": LIVE_VARIANT_ID,
-                "combo": LIVE_COMBO,
+                "variant_id": self.variant_id,
+                "combo": self.combo,
                 "submitted": submitted,
                 "enabled_before": enabled_before,
                 "disabled_after": bool(disable_after),
@@ -2108,6 +2206,10 @@ class LiveStrategyRunner:
         self._reconcile_official_settlements(now)
         self._backfill_official_final_prices(now)
         self._reconcile_live_orders(now)
+        if self.config.enabled and self.stop_win_enabled:
+            stop_win_actions = self._run_live_stop_win(market, quotes, now)
+            if stop_win_actions:
+                return
         signal, _signal_price, price_selection = self._signal_from_state(market, price, quotes)
         self.last_signal = {
             "symbol": signal.symbol,
@@ -2149,9 +2251,9 @@ class LiveStrategyRunner:
                 reason=_append_reason(
                     signal.reason,
                     (
-                        f"{LIVE_ENTRY_MARKER} live FAK stake locked to current market"
+                        f"{self.entry_marker} live FAK stake locked to current market"
                         if stake_source == "current_market_open_trade"
-                        else f"{LIVE_ENTRY_MARKER} live FAK"
+                        else f"{self.entry_marker} live FAK"
                     ),
                 ),
             ),
@@ -2189,6 +2291,7 @@ class LiveStrategyRunner:
         )
         self.last_order_at = time.time()
         self.last_order = _response_public_payload(response)
+        self.last_order.update({"variant_id": self.variant_id, "combo": self.combo})
         client_order_id = _client_order_id()
         token_id = market.up_token if signal.side == "Up" else market.down_token
         pending_order_id: int | None = None
@@ -2239,6 +2342,7 @@ class LiveStrategyRunner:
             ):
                 resolved_response = fetched
                 self.last_order = _response_public_payload(resolved_response)
+                self.last_order.update({"variant_id": self.variant_id, "combo": self.combo})
         if (
             pending_order_id is not None
             and _response_indicates_fill(resolved_response)
@@ -2359,7 +2463,138 @@ class LiveStrategyRunner:
             raise
         self.last_error = None
 
-    def sell_trade(self, trade_id: int, quotes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def _run_live_stop_win(
+        self,
+        market: MarketRound,
+        quotes: dict[str, dict[str, Any]],
+        now: float,
+    ) -> list[dict[str, Any]]:
+        take_profit_pct = _float(self.config.paper_stop_win_take_profit_pct, LIVE_PAPER_STOP_WIN_DISABLE_PCT)
+        if take_profit_pct >= LIVE_PAPER_STOP_WIN_DISABLE_PCT - LIVE_EPSILON:
+            return []
+        if market.ends_at <= now:
+            return []
+        open_rows = [
+            row
+            for row in self.store.open_trades()
+            if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
+        ]
+        actions: list[dict[str, Any]] = []
+        for row in open_rows:
+            trade_id = int(row.get("id") or 0)
+            if trade_id <= 0:
+                continue
+            if self.store.active_live_exit_order_for_trade(trade_id) is not None:
+                continue
+            opened_at = _float(row.get("opened_at"), 0.0)
+            if now - opened_at < LIVE_PAPER_STOP_WIN_MIN_HOLD_SECONDS:
+                continue
+            next_check_at = self._stop_win_next_check_at.get(trade_id, 0.0)
+            if now < next_check_at:
+                continue
+            seconds_left = max(0.0, market.ends_at - now)
+            interval = (
+                LIVE_PAPER_STOP_WIN_FINAL_CHECK_SECONDS
+                if seconds_left <= LIVE_PAPER_STOP_WIN_FINAL_WINDOW_SECONDS
+                else LIVE_PAPER_STOP_WIN_CHECK_SECONDS
+            )
+            self._stop_win_next_check_at[trade_id] = now + interval
+            side = str(row.get("side") or "")
+            if side not in {"Up", "Down"}:
+                continue
+            quote = self._quote_with_bid(market, side, quotes.get(side) or {})
+            shares = _float(row.get("shares"), 0.0)
+            stake = _float(row.get("stake"), 0.0)
+            entry_price = _float(row.get("entry_price"), 0.0)
+            if shares <= 0 or stake <= 0 or entry_price <= 0:
+                continue
+            max_profit = _paper_stop_win_max_profit(stake, shares)
+            if max_profit <= LIVE_EPSILON:
+                continue
+            target_pnl = _paper_stop_win_target_pnl(stake, shares, take_profit_pct)
+            trigger_bid = _paper_stop_win_trigger_bid(
+                stake,
+                shares,
+                target_pnl,
+                self.settings.paper_taker_fee_rate,
+            )
+            if trigger_bid is None:
+                continue
+            exit_fill = _paper_sell_sweep_from_bid_quote(quote, shares, trigger_bid)
+            if exit_fill is None:
+                continue
+            expected_exit_price = _float(exit_fill.get("exit_price"), 0.0)
+            expected_notional = _float(exit_fill.get("notional"), 0.0)
+            expected_fee = taker_fee(shares, expected_exit_price, self.settings.paper_taker_fee_rate)
+            expected_pnl = round(expected_notional - expected_fee - stake, 6)
+            if expected_pnl + LIVE_EPSILON < target_pnl or expected_pnl <= LIVE_EPSILON:
+                continue
+            reason = (
+                f"max_profit_pct {take_profit_pct:.2f}% "
+                f"target_pnl {target_pnl:.6f}/{max_profit:.6f}, "
+                f"trigger {trigger_bid:.4f}, expected sell {shares:.6f} @ {expected_exit_price:.4f}, "
+                f"expected gross {expected_notional:.6f}, fee {expected_fee:.6f}, pnl {expected_pnl:.6f}"
+            )
+            try:
+                result = self.sell_trade(
+                    trade_id,
+                    quotes,
+                    marker=LIVE_STOP_WIN_MARKER,
+                    min_price=trigger_bid,
+                    reason_detail=reason,
+                )
+                self._stop_win_closed_rounds[market.round_id] = now
+                self._stop_win_next_check_at.pop(trade_id, None)
+                self.last_stop_win = {
+                    "variant_id": self.variant_id,
+                    "combo": self.combo,
+                    "trade_id": trade_id,
+                    "round_id": market.round_id,
+                    "side": side,
+                    "trigger_bid": trigger_bid,
+                    "expected_pnl": expected_pnl,
+                    "reason": reason,
+                    "result": result.get("closed_trade"),
+                    "order": result.get("order"),
+                    "at": time.time(),
+                }
+                actions.append(self.last_stop_win)
+            except Exception as exc:  # noqa: BLE001 - 自动止盈失败必须留仓并暴露原因。
+                active_exit = self.store.active_live_exit_order_for_trade(trade_id)
+                if active_exit is not None:
+                    self._stop_win_closed_rounds[market.round_id] = now
+                    self.last_stop_win = {
+                        "variant_id": self.variant_id,
+                        "combo": self.combo,
+                        "trade_id": trade_id,
+                        "round_id": market.round_id,
+                        "side": side,
+                        "trigger_bid": trigger_bid,
+                        "expected_pnl": expected_pnl,
+                        "reason": reason,
+                        "pending_exit_order": dict(active_exit),
+                        "error": str(exc),
+                        "at": time.time(),
+                    }
+                    actions.append(self.last_stop_win)
+                self.last_error = f"{LIVE_STOP_WIN_MARKER} 自动止盈失败 trade={trade_id}: {type(exc).__name__}: {exc}"
+        return actions
+
+    def sell_trade(
+        self,
+        trade_id: int,
+        quotes: dict[str, dict[str, Any]],
+        *,
+        marker: str = LIVE_MANUAL_SELL_MARKER,
+        min_price: float | None = None,
+        reason_detail: str | None = None,
+    ) -> dict[str, Any]:
+        reason_marker = str(marker or LIVE_MANUAL_SELL_MARKER)
+        reason_prefix = (
+            f"{reason_marker} {str(reason_detail).strip()}"
+            if reason_detail
+            else reason_marker
+        )
         temporary_process_lock = False
         if not self.process_lock.locked:
             lock_error = self._ensure_process_lock()
@@ -2385,6 +2620,9 @@ class LiveStrategyRunner:
             bid = _float_or_none(quote.get("best_bid"))
             if bid is None or bid <= 0:
                 raise ValueError(f"missing {side} bid for live sell")
+            limit_price = round(max(0.01, min(0.99, _float(min_price, bid))), 4)
+            if bid + LIVE_EPSILON < limit_price:
+                raise RuntimeError(f"{side} bid {bid:.4f} 低于卖出保护价 {limit_price:.4f}，停止实盘卖出")
             shares = _float(row.get("shares"), 0.0)
             if shares <= 0:
                 raise ValueError("live trade has no shares")
@@ -2403,11 +2641,11 @@ class LiveStrategyRunner:
                     trade_id=int(trade_id),
                     side=side,
                     status=STATUS_REJECTED,
-                    limit_price=bid,
+                    limit_price=limit_price,
                     shares=0.0,
                     notional=0.0,
                     fee=0.0,
-                    reason=f"{LIVE_MANUAL_SELL_MARKER} token precheck rejected {reason}",
+                    reason=f"{reason_prefix} token precheck rejected {reason}",
                     external_order_id=None,
                     client_order_id=client_order_id,
                     external_status="TOKEN_PRECHECK_FAILED",
@@ -2417,7 +2655,7 @@ class LiveStrategyRunner:
             response = self.client.place_market_sell(
                 token_id=token_id,
                 shares=shares,
-                min_price=bid,
+                min_price=limit_price,
                 tick_size=str(quote.get("tick_size") or "0.01"),
                 neg_risk=quote.get("neg_risk") if isinstance(quote.get("neg_risk"), bool) else None,
                 retry_count=self.config.retry_count,
@@ -2425,6 +2663,7 @@ class LiveStrategyRunner:
             )
             self.last_order_at = time.time()
             self.last_order = _response_public_payload(response)
+            self.last_order.update({"variant_id": self.variant_id, "combo": self.combo, "marker": reason_marker})
             pending_exit_order_id: int | None = None
             if response.order_id:
                 try:
@@ -2433,11 +2672,11 @@ class LiveStrategyRunner:
                         trade_id=int(trade_id),
                         side=side,
                         status=STATUS_PENDING,
-                        limit_price=bid,
+                        limit_price=limit_price,
                         shares=0.0,
                         notional=0.0,
                         fee=0.0,
-                        reason=f"{LIVE_MANUAL_SELL_MARKER} 已提交官方卖出订单，等待本地成交确认: {response.status}",
+                        reason=f"{reason_prefix} 已提交官方卖出订单，等待本地成交确认: {response.status}",
                         external_order_id=response.order_id,
                         client_order_id=client_order_id,
                         external_status=response.status,
@@ -2466,6 +2705,7 @@ class LiveStrategyRunner:
                 if fetched is not None and (_response_has_fill_amounts(fetched) or _response_terminal_no_fill(fetched)):
                     resolved_response = fetched
                     self.last_order = _response_public_payload(resolved_response)
+                    self.last_order.update({"variant_id": self.variant_id, "combo": self.combo, "marker": reason_marker})
             if not resolved_response.success:
                 try:
                     if pending_exit_order_id is not None:
@@ -2474,7 +2714,7 @@ class LiveStrategyRunner:
                             status=STATUS_REJECTED,
                             external_status=resolved_response.status,
                             raw_response=_json_dumps(resolved_response.raw),
-                            reason=f"{LIVE_MANUAL_SELL_MARKER} rejected {resolved_response.error or resolved_response.status}",
+                            reason=f"{reason_prefix} rejected {resolved_response.error or resolved_response.status}",
                         )
                     else:
                         self.store.record_external_exit_order(
@@ -2482,11 +2722,11 @@ class LiveStrategyRunner:
                             trade_id=int(trade_id),
                             side=side,
                             status=STATUS_REJECTED,
-                            limit_price=bid,
+                            limit_price=limit_price,
                             shares=0.0,
                             notional=0.0,
                             fee=0.0,
-                            reason=f"{LIVE_MANUAL_SELL_MARKER} rejected {resolved_response.error or resolved_response.status}",
+                            reason=f"{reason_prefix} rejected {resolved_response.error or resolved_response.status}",
                             external_order_id=resolved_response.order_id,
                             client_order_id=client_order_id,
                             external_status=resolved_response.status,
@@ -2506,7 +2746,7 @@ class LiveStrategyRunner:
                             status=status,
                             external_status=resolved_response.status,
                             raw_response=_json_dumps(resolved_response.raw),
-                            reason=f"{LIVE_MANUAL_SELL_MARKER} not confirmed filled {resolved_response.status}",
+                            reason=f"{reason_prefix} not confirmed filled {resolved_response.status}",
                         )
                     else:
                         self.store.record_external_exit_order(
@@ -2514,11 +2754,11 @@ class LiveStrategyRunner:
                             trade_id=int(trade_id),
                             side=side,
                             status=status,
-                            limit_price=bid,
+                            limit_price=limit_price,
                             shares=0.0,
                             notional=0.0,
                             fee=0.0,
-                            reason=f"{LIVE_MANUAL_SELL_MARKER} not confirmed filled {resolved_response.status}",
+                            reason=f"{reason_prefix} not confirmed filled {resolved_response.status}",
                             external_order_id=resolved_response.order_id,
                             client_order_id=client_order_id,
                             external_status=resolved_response.status,
@@ -2540,7 +2780,7 @@ class LiveStrategyRunner:
                             status=STATUS_PENDING,
                             external_status=resolved_response.status,
                             raw_response=_json_dumps(resolved_response.raw),
-                            reason=f"{LIVE_MANUAL_SELL_MARKER} 成交状态缺少官方金额，等待 order/trade 回查: {resolved_response.status}",
+                            reason=f"{reason_prefix} 成交状态缺少官方金额，等待 order/trade 回查: {resolved_response.status}",
                         )
                 except Exception as exc:  # noqa: BLE001
                     self._disable_after_live_accounting_failure(resolved_response, exc)
@@ -2573,7 +2813,7 @@ class LiveStrategyRunner:
                         fee=fee,
                         external_status=resolved_response.status,
                         raw_response=_json_dumps(resolved_response.raw),
-                        reason=f"{LIVE_MANUAL_SELL_MARKER} filled {sell_shares:.6f} @ {exit_price:.4f}",
+                        reason=f"{reason_prefix} filled {sell_shares:.6f} @ {exit_price:.4f}",
                     )
                     closed = (filled_order or {}).get("closed_trade")
                     if resolved_response.order_id:
@@ -2584,7 +2824,7 @@ class LiveStrategyRunner:
                         sell_shares,
                         exit_price,
                         time.time(),
-                        f"{LIVE_MANUAL_SELL_MARKER} FAK sell @ {exit_price:.4f}",
+                        f"{reason_prefix} FAK sell @ {exit_price:.4f}",
                         fee=fee,
                     )
                     self.store.record_external_exit_order(
@@ -2596,7 +2836,7 @@ class LiveStrategyRunner:
                         shares=sell_shares,
                         notional=notional,
                         fee=fee,
-                        reason=f"{LIVE_MANUAL_SELL_MARKER} filled {sell_shares:.6f} @ {exit_price:.4f}",
+                        reason=f"{reason_prefix} filled {sell_shares:.6f} @ {exit_price:.4f}",
                         external_order_id=resolved_response.order_id,
                         client_order_id=client_order_id,
                         external_status=resolved_response.status,
@@ -2619,8 +2859,10 @@ class LiveStrategyRunner:
             self._start_status_refresh_if_needed()
         return {
             "enabled": self.config.enabled,
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "live_strategy_id": self.variant_id,
+            "live_strategy": _live_strategy_meta(self.variant_id),
             "execution_mode": "LIVE",
             "db_path": str(self.store.db_path),
             "settings_path": str(self.settings.live_trading_settings_path),
@@ -2636,9 +2878,11 @@ class LiveStrategyRunner:
             "startup_rearm_skipped_active_lock": self.startup_rearm_skipped_active_lock,
             "last_order_at": self.last_order_at,
             "last_order": dict(self.last_order or {}),
+            "last_stop_win": dict(self.last_stop_win or {}),
             "readiness": readiness,
             "open_orders": open_orders,
             "settings": asdict(self.config),
+            "live_strategy_options": _live_strategy_options_payload(self.settings),
             "settings_file": self.settings_store.file_status(self.config),
             "variant": self.variant_payload(metrics, trade_summary, order_summary),
             "variants": [self.variant_payload(metrics, trade_summary, order_summary)],
@@ -2709,8 +2953,10 @@ class LiveStrategyRunner:
         open_trade_count = self.store.open_trade_count("BTC")
         payload: dict[str, Any] = {
             "checked_at": now,
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
+            "live_strategy_id": self.variant_id,
+            "live_strategy": _live_strategy_meta(self.variant_id),
             "execution_mode": "LIVE",
             "checks": checks,
             "enabled": self.config.enabled,
@@ -3089,8 +3335,8 @@ class LiveStrategyRunner:
         order_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": self.variant_id,
+            "combo": self.combo,
             "strategy_family": self.variant.strategy_family,
             "order_type": self.variant.order_type,
             "single_entry_mode": self.variant.single_entry_mode,
@@ -3102,6 +3348,7 @@ class LiveStrategyRunner:
             "db_path": str(self.store.db_path),
             "last_signal": dict(self.last_signal or {}),
             "last_error": self.last_error,
+            "last_stop_win": dict(self.last_stop_win or {}),
             "active_orders": len(self.store.active_paper_orders("BTC")),
             "order_summary": order_summary or self.store.paper_order_summary("BTC"),
             "metrics": metrics or self.store.metrics(),
@@ -3111,7 +3358,11 @@ class LiveStrategyRunner:
     def orders_page(self, limit: int, offset: int, status_filter: str = "all") -> dict[str, Any]:
         status_key = normalize_paper_order_status_filter(status_filter)
         total = self.store.paper_order_count("BTC", status_key)
-        rows = _tag_live_rows(self.store.recent_paper_orders(limit, offset, "BTC", status_key))
+        rows = _tag_live_rows(
+            self.store.recent_paper_orders(limit, offset, "BTC", status_key),
+            variant_id=self.variant_id,
+            combo=self.combo,
+        )
         loaded = min(total, offset + len(rows))
         return {
             "recent_orders": rows,
@@ -3126,7 +3377,11 @@ class LiveStrategyRunner:
         }
 
     def open_trades(self) -> list[dict[str, Any]]:
-        rows = _tag_live_rows([row for row in self.store.open_trades() if row["symbol"] == "BTC"])
+        rows = _tag_live_rows(
+            [row for row in self.store.open_trades() if row["symbol"] == "BTC"],
+            variant_id=self.variant_id,
+            combo=self.combo,
+        )
         active_exit_by_trade_id = {
             int(row["trade_id"]): row
             for row in self.store.active_live_exit_orders("BTC")
@@ -3148,7 +3403,11 @@ class LiveStrategyRunner:
         end_at: float | None,
     ) -> dict[str, Any]:
         total = self.store.recent_trade_count("BTC", start_at, end_at)
-        rows = _tag_live_rows(self.store.recent_trades(limit, offset, "BTC", start_at, end_at))
+        rows = _tag_live_rows(
+            self.store.recent_trades(limit, offset, "BTC", start_at, end_at),
+            variant_id=self.variant_id,
+            combo=self.combo,
+        )
         loaded = min(total, offset + len(rows))
         return {
             "recent_trades": rows,
@@ -3170,9 +3429,9 @@ class LiveStrategyRunner:
             "equity_curve": rows,
             "equity_curve_meta": {
                 "account_scope": "live",
-                "variant_id": LIVE_VARIANT_ID,
-                "combo": LIVE_COMBO,
-                "label": LIVE_COMBO,
+                "variant_id": self.variant_id,
+                "combo": self.combo,
+                "label": self.combo,
                 "days": days,
                 "max_points": max_points,
                 "points": len(rows),
@@ -3231,12 +3490,14 @@ class LiveStrategyRunner:
             for row in self.store.open_trades()
             if row.get("symbol") == "BTC" and row.get("round_id") == market.round_id
         ]
+        if self.stop_win_enabled and self._stop_win_closed_rounds.get(market.round_id):
+            return f"{self.variant_id} 当前市场已触发止盈退出，跳过重新开仓"
         if any(row.get("side") == signal.side for row in round_open_rows):
-            return "SINGLE_FAK_REAL 当前市场已有同方向持仓，跳过重复开仓"
+            return f"{self.variant_id} 当前市场已有同方向持仓，跳过重复开仓"
         if self.store.active_paper_order_exists(market.round_id, signal.side):
-            return "SINGLE_FAK_REAL 已有同方向实盘订单，等待状态确认"
+            return f"{self.variant_id} 已有同方向实盘订单，等待状态确认"
         if self.store.active_live_entry_order_exists_for_round(market.round_id):
-            return "SINGLE_FAK_REAL 当前市场已有待确认实盘买入订单，等待官方确认后再开新仓"
+            return f"{self.variant_id} 当前市场已有待确认实盘买入订单，等待官方确认后再开新仓"
         if self.store.open_trade_count("BTC") >= self.config.max_open_trades:
             return f"实盘最大同时持仓 {self.config.max_open_trades} 笔已满"
         if float(self.store.account()["cash_balance"]) < LIVE_MIN_USDC:
@@ -3270,6 +3531,48 @@ class LiveStrategyRunner:
             return "实盘进程锁未持有，停止真实下单"
         if not self.config.compliance_acknowledged:
             return "实盘风险确认已撤销，停止真实下单"
+        return None
+
+    def _live_strategy_switch_block_reason(self, current_strategy_id: str, next_strategy_id: str) -> str | None:
+        current = _normalize_live_strategy_id(current_strategy_id)
+        next_id = _normalize_live_strategy_id(next_strategy_id)
+        if current == next_id:
+            return None
+        if self.config.enabled:
+            return "实盘开启中禁止切换实盘策略，请先关闭实盘"
+        if self.process_lock.locked:
+            return "实盘进程锁仍被当前 runner 持有，禁止切换实盘策略"
+        current_block = self._strategy_store_block_reason(self.store, current, "当前策略")
+        if current_block:
+            return current_block
+        target_path = _live_strategy_db_path(self.settings, next_id)
+        if target_path != self.store.db_path and target_path.exists():
+            target_store = TradeStore(target_path, self.config.initial_balance)
+            try:
+                target_block = self._strategy_store_block_reason(target_store, next_id, "目标策略")
+                if target_block:
+                    return target_block
+            finally:
+                try:
+                    target_store.conn.close()
+                except Exception:
+                    pass
+        return None
+
+    def _strategy_store_block_reason(self, store: TradeStore, strategy_id: str, label: str) -> str | None:
+        open_count = store.open_trade_count("BTC")
+        if open_count > 0:
+            return f"{label} {strategy_id} 仍有 {open_count} 笔实盘持仓未结束，禁止切换实盘策略"
+        pending_orders = store.pending_external_orders(1, "BTC")
+        if pending_orders:
+            return f"{label} {strategy_id} 仍有实盘订单等待官方确认，禁止切换实盘策略"
+        active_orders = [
+            row
+            for row in store.active_paper_orders("BTC")
+            if row.get("execution_mode") == "LIVE"
+        ]
+        if active_orders:
+            return f"{label} {strategy_id} 仍有活跃实盘订单，禁止切换实盘策略"
         return None
 
     def _enable_block_reason(self) -> str | None:
@@ -4202,14 +4505,19 @@ def _public_reconciled_order(row: dict[str, Any] | None) -> dict[str, Any] | Non
     }
 
 
-def _public_evidence_order(row: dict[str, Any] | None) -> dict[str, Any] | None:
+def _public_evidence_order(
+    row: dict[str, Any] | None,
+    *,
+    variant_id: str = LIVE_VARIANT_ID,
+    combo: str = LIVE_COMBO,
+) -> dict[str, Any] | None:
     payload = _public_reconciled_order(row)
     if payload is None:
         return None
     payload.update(
         {
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": variant_id,
+            "combo": combo,
             "strategy_family": STRATEGY_FAMILY_SINGLE,
             "experiment_order_type": ORDER_TYPE_FAK,
             "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
@@ -4222,8 +4530,17 @@ def _public_evidence_order(row: dict[str, Any] | None) -> dict[str, Any] | None:
     return payload
 
 
-def _public_evidence_orders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [payload for payload in (_public_evidence_order(row) for row in rows) if payload is not None]
+def _public_evidence_orders(
+    rows: list[dict[str, Any]],
+    *,
+    variant_id: str = LIVE_VARIANT_ID,
+    combo: str = LIVE_COMBO,
+) -> list[dict[str, Any]]:
+    return [
+        payload
+        for payload in (_public_evidence_order(row, variant_id=variant_id, combo=combo) for row in rows)
+        if payload is not None
+    ]
 
 
 def _signed_order_hash(client: Any, signed_order: Any) -> str | None:
@@ -4290,6 +4607,48 @@ def _normalize_live_fallback_sources(value: Any) -> tuple[str, ...]:
         raw_values = []
     selected = {item for item in raw_values if item in LIVE_FALLBACK_SOURCE_ORDER}
     return tuple(source for source in LIVE_FALLBACK_SOURCE_ORDER if source in selected)
+
+
+def _normalize_live_strategy_id(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    allowed = {str(item["variant_id"]).upper() for item in LIVE_STRATEGY_OPTIONS}
+    return text if text in allowed else LIVE_VARIANT_ID
+
+
+def _live_strategy_meta(variant_id: Any) -> dict[str, Any]:
+    normalized = _normalize_live_strategy_id(variant_id)
+    for item in LIVE_STRATEGY_OPTIONS:
+        if str(item["variant_id"]).upper() == normalized:
+            return dict(item)
+    return dict(LIVE_STRATEGY_OPTIONS[0])
+
+
+def _live_strategy_options_payload(settings: Settings | None = None) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for item in LIVE_STRATEGY_OPTIONS:
+        row = {
+            "variant_id": str(item["variant_id"]),
+            "combo": str(item["combo"]),
+            "stop_win_enabled": bool(item.get("stop_win_enabled")),
+            "role": str(item.get("role") or ""),
+        }
+        if settings is not None:
+            row["db_path"] = str(_live_strategy_db_path(settings, item["variant_id"]))
+        payload.append(row)
+    return payload
+
+
+def _live_strategy_variant(variant_id: Any) -> StrategyVariant:
+    meta = _live_strategy_meta(variant_id)
+    return StrategyVariant(
+        str(meta["variant_id"]),
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "85%",
+        "25%-35%",
+        str(meta.get("role") or ""),
+        SINGLE_ENTRY_MODE_LEGACY,
+    )
 
 
 def _live_signal_price_payload(
@@ -5032,6 +5391,13 @@ def _live_paper_stop_win_db_path(settings: Settings) -> Path:
     return settings.live_trading_db_path.parent / f"{LIVE_PAPER_STOP_WIN_VARIANT_ID.lower()}.sqlite3"
 
 
+def _live_strategy_db_path(settings: Settings, variant_id: Any) -> Path:
+    normalized = _normalize_live_strategy_id(variant_id)
+    if normalized == LIVE_VARIANT_ID:
+        return settings.live_trading_db_path
+    return settings.live_trading_db_path.parent / f"{normalized.lower()}.sqlite3"
+
+
 def _paper_stop_win_max_profit(stake: float, shares: float) -> float:
     return round(max(0.0, float(shares or 0.0) - float(stake or 0.0)), 6)
 
@@ -5126,14 +5492,19 @@ def _paper_sell_sweep_from_bid_quote(
     }
 
 
-def _tag_live_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _tag_live_rows(
+    rows: list[dict[str, Any]],
+    *,
+    variant_id: str = LIVE_VARIANT_ID,
+    combo: str = LIVE_COMBO,
+) -> list[dict[str, Any]]:
     tagged: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         item.update(
             {
-                "variant_id": LIVE_VARIANT_ID,
-                "combo": LIVE_COMBO,
+                "variant_id": variant_id,
+                "combo": combo,
                 "strategy_family": STRATEGY_FAMILY_SINGLE,
                 "experiment_order_type": ORDER_TYPE_FAK,
                 "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,

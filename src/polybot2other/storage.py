@@ -1563,7 +1563,19 @@ class TradeStore:
         if open_shares <= 0:
             return None
         close_shares = min(open_shares, round(float(shares_to_close), 6))
+        if close_shares <= 0:
+            return None
         close_all = close_shares >= open_shares - 0.000001
+        dust_reason = ""
+        if not close_all:
+            remaining_shares_candidate = round(open_shares - close_shares, 6)
+            remaining_stake_candidate = round(float(trade["stake"]) * (remaining_shares_candidate / open_shares), 6)
+            if remaining_stake_candidate < PAPER_MIN_OPEN_TRADE_STAKE:
+                close_all = True
+                dust_reason = (
+                    f"DUST_CLOSE remaining stake {remaining_stake_candidate:.6f}, "
+                    f"shares {remaining_shares_candidate:.6f} below min {PAPER_MIN_OPEN_TRADE_STAKE:.2f}"
+                )
         close_ratio = 1.0 if close_all else close_shares / open_shares
         close_stake = round(float(trade["stake"]) * close_ratio, 6)
         close_fee = max(0.0, round(float(fee), 6))
@@ -1571,12 +1583,16 @@ class TradeStore:
         pnl = round(payout - close_stake, 6)
         fee_reason = f"{reason} fee {close_fee:.6f}" if close_fee > 0 else reason
         close_reason = _append_reason(str(trade["reason"] or ""), fee_reason)
+        if dust_reason:
+            close_reason = _append_reason(close_reason, dust_reason)
         with self.conn:
             if close_all:
                 self.conn.execute(
                     """
                     UPDATE trades
-                    SET status = 'SETTLED',
+                    SET stake = ?,
+                        shares = ?,
+                        status = 'SETTLED',
                         settled_at = ?,
                         exit_price = ?,
                         payout = ?,
@@ -1585,7 +1601,17 @@ class TradeStore:
                         reason = ?
                     WHERE id = ?
                     """,
-                    (now, exit_price, payout, pnl, SETTLEMENT_SOURCE_EARLY_EXIT, close_reason, trade_id),
+                    (
+                        close_stake,
+                        close_shares,
+                        now,
+                        exit_price,
+                        payout,
+                        pnl,
+                        SETTLEMENT_SOURCE_EARLY_EXIT,
+                        close_reason,
+                        trade_id,
+                    ),
                 )
                 closed_id = trade_id
                 remaining_stake = 0.0

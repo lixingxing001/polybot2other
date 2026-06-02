@@ -1,5 +1,212 @@
 # polybot2other-progress
 
+## 2026-06-02 v4.38
+
+### 已完成
+
+1. 修正交易记录、订单记录等表格“数据范围”下拉只显示当前激活真实策略的问题。
+2. 前端表格 scope 改为读取 `live_strategy_options`，同时展示 `SINGLE + FAK REAL` 和 `SINGLE + FAK REAL STOP WIN` 两个真实账本。
+3. `appendScopeParams()` 对 live scope 补传 `variant_id`，让后端知道要读取哪个真实策略库。
+4. 后端 `account_scope=live&variant_id=...` 改为按真实策略 ID 打开对应 SQLite，只读查询交易记录、订单记录、订单成交和资金曲线。
+5. 当前激活实盘 runner 仍只负责当前策略执行，不因为查看另一个策略历史而切换 runner 或触发下单。
+6. 补充测试覆盖切到 STOP WIN 后仍能通过 `variant_id=SINGLE_FAK_REAL` 读取原实盘历史记录。
+
+### 已确认决策
+
+1. 实盘执行仍保持单 runner、单当前策略；交易记录下拉只是历史账本查询入口。
+2. 非当前激活真实策略的 open rows 默认显示为空；策略切换本身要求目标和当前策略都无未平持仓。
+
+### 待办和后期优化
+
+1. 如果后续要在页面同时展示两个真实策略的 open rows 和 active exit 状态，需要增加独立的 live 策略只读聚合接口。
+2. 如果真实策略继续增加，前端下拉无需再写死，沿用 `live_strategy_options` 扩展即可。
+
+### 已知坑位
+
+1. 查看另一个真实策略历史不会切换当前实盘策略，也不会改变 `live-settings.json`。
+2. 后端临时打开非当前策略 SQLite 是只读查询用途，但 `TradeStore` 初始化会确保 schema 存在；这对已有库无影响。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "can_select_stop_win_live_strategy_when_flat or places_live_order_and_live_scope_pages or live_basis_rows_allow_four_and_half_second_source_age" -v`，3 条定向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，195 条核心回归全部通过。
+5. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+6. 已执行 `/api/status` 和 `/api/recent-trades?account_scope=live&variant_id=...` 烟测，`SINGLE_FAK_REAL` 返回 136 条、`SINGLE_FAK_REAL_STOP_WIN` 返回 12 条，且首行 `variant_id` 分别正确。
+7. 已执行 `rtk proxy git diff --check -- src/polybot2other/static/app.js src/polybot2other/bot.py tests/test_core.py docs/polybot2other-progress.md src/polybot2other/strategy.py src/polybot2other/storage.py src/polybot2other/live.py src/polybot2other/static/index.html src/polybot2other/static/styles.css`，补丁格式检查通过。
+
+### 回滚建议
+
+1. 如需回滚本轮下拉修正，撤销 `src/polybot2other/static/app.js`、`src/polybot2other/bot.py`、`tests/test_core.py` 和本进度文档 v4.38 改动。
+
+## 2026-06-02 v4.37
+
+### 已完成
+
+1. 将 OKX/Binance 基差源 ready 的最大年龄窗口从 `3000ms` 放宽到 `4500ms`。
+2. `MULTI_SOURCE_MAX_AGE_MS` 改为 `4500ms`，影响策略信号和前端基差源 ready/过期原因展示。
+3. `PriceBasisTracker.settings_max_age_ms` 同步改为 `4500ms`，避免采样侧仍按 3000ms 丢弃 OKX/Binance 样本。
+4. 补充 `_live_basis_rows()` 边界测试，覆盖 `4200ms` 可用、`4600ms` 过期。
+
+### 已确认决策
+
+1. 本轮只放宽 OKX/Binance 基差源 ready/采样窗口，不改 `max_quote_age_ms`。
+2. `max_quote_age_ms=3000ms` 仍作为整体行情报价有效期风控保留，避免把 Polymarket 报价和当前 BTC 价格都放宽。
+
+### 待办和后期优化
+
+1. 如果后续 4500ms 仍频繁卡 `NO_TRADE`，优先看是否是数据源刷新线程或网络延迟问题，而不是继续无上限放宽阈值。
+2. 可后续把基差源年龄窗口做成独立配置项，但本轮不新增配置结构，降低实盘改动面。
+
+### 已知坑位
+
+1. 放宽到 4500ms 会增加 OKX/Binance 源可用率，但也允许稍旧一点的交易所价格参与判断。
+2. 这个改动不代表 `avg` 或 Polymarket quote 允许过期到 4500ms；它只覆盖 OKX/Binance 基差源。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "live_basis_rows_allow_four_and_half_second_source_age or price_basis_tracker_keeps_median or single_fak_real" -v`，25 条定向测试通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，195 条核心回归全部通过。
+4. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+5. 已执行 `/api/status` 烟测，服务返回正常，当前实盘策略为 `SINGLE_FAK_REAL_STOP_WIN`，实盘开关为 `false`。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/strategy.py src/polybot2other/bot.py tests/test_core.py docs/polybot2other-progress.md src/polybot2other/storage.py src/polybot2other/live.py src/polybot2other/static/index.html src/polybot2other/static/app.js src/polybot2other/static/styles.css`，补丁格式检查通过。
+
+### 回滚建议
+
+1. 如需回滚，将 `src/polybot2other/strategy.py` 的 `MULTI_SOURCE_MAX_AGE_MS` 和 `src/polybot2other/bot.py` 的 `settings_max_age_ms` 改回 `3000ms`，并撤销本轮测试和进度文档 v4.37 改动。
+
+## 2026-06-02 v4.36
+
+### 已完成
+
+1. 修正真实卖出后官方成交份额略小于本地持仓时留下 `$0.01` 以下 dust 残仓的问题。
+2. `TradeStore.close_trade_shares()` 增加 dust 收口：卖出后剩余 stake 低于 `PAPER_MIN_OPEN_TRADE_STAKE` 时，直接把该仓位按 `DUST_CLOSE` 结清，不再保留 `OPEN` 小尾巴。
+3. dust 收口使用真实卖出已成交份额计算 payout，不把未卖出的 dust 按卖出价虚增收益；剩余 dust stake 会被保守计入本地损益。
+4. 对当前 `data/live/single_fak_real_stop_win.sqlite3` 执行定向 dust 修复检查，未发现仍处于 `OPEN` 的 `$0.01` 以下残仓，未写入任何行。
+5. 补充测试覆盖 `$0.01` 以下残仓自动结清，且不影响正常部分平仓和真实手动部分卖出。
+
+### 已确认决策
+
+1. 对真实资金账本，低于最小持仓金额的 dust 不继续作为可交易持仓展示。
+2. 不为了美化收益把未成交 dust 按卖出价计入 payout，避免本地账本高估。
+
+### 待办和后期优化
+
+1. 如果后续发现交易记录中 settled dust 行仍影响阅读，可在前端增加 dust 标识或默认折叠。
+2. 可后续增加后台维护接口，专门列出和处理历史 dust，而不是手工脚本。
+
+### 已知坑位
+
+1. Polymarket 官方可能会在市场终局后结算极小残仓；本地 dust 收口是为了避免它在持仓视图中长期显示为 `OPEN`。
+2. dust 金额极小，本轮处理会让本地账本更保守，但与链上最终极小 payout 可能有几毫差异。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "partial_close_dust_remainder or partial_close_keeps_account or live_manual_sell_closes_only_official_partial_fill or stop_win_strategy_places_live_sell" -v`，4 条定向测试通过。
+3. 已执行 dust 修复脚本，输出 `matched_open_dust=0`、`closed_ids=[]`。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real or partial_close_dust_remainder" -v`，24 条实盘和 dust 回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，194 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/storage.py src/polybot2other/live.py src/polybot2other/bot.py src/polybot2other/static/index.html src/polybot2other/static/app.js src/polybot2other/static/styles.css tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+7. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+8. 已执行 `/api/status` 和 SQLite 烟测，`SINGLE_FAK_REAL_STOP_WIN` 当前 `open_trades_metric=0`、`open_trades_payload_len=0`，数据库无 `OPEN` 残仓。
+
+### 回滚建议
+
+1. 如需回滚本轮 dust 收口，撤销 `src/polybot2other/storage.py`、`tests/test_core.py` 和本进度文档 v4.36 改动。
+2. 本轮修复脚本未改动当前真实库数据，因此没有数据库回滚项。
+
+## 2026-06-02 v4.35
+
+### 已完成
+
+1. 修正真实 `SINGLE_FAK_REAL_STOP_WIN` 的账本隔离：不再共用 `data/live/single_fak_real.sqlite3`。
+2. `SINGLE_FAK_REAL` 继续使用配置里的 `live_trading_db_path`，默认是 `data/live/single_fak_real.sqlite3`。
+3. `SINGLE_FAK_REAL_STOP_WIN` 使用独立 SQLite：`data/live/single_fak_real_stop_win.sqlite3`。
+4. `LiveStrategyRunner` 在 `live_strategy_id` 切换后会重绑定 `TradeStore`，指标、订单、持仓、交易记录和资金曲线都来自当前策略自己的库。
+5. 策略选项 payload 增加 `db_path`，前端和 `/api/status` 可直接看到当前策略对应的真实账本路径。
+6. 策略切换安全检查同时覆盖当前策略库和目标策略库，目标库若存在未平持仓、pending 官方订单或活跃实盘订单，也禁止切换。
+7. 回归测试补充验证：普通实盘库已有历史成交时，切到 STOP WIN 后 STOP WIN 库仍为空；切回普通实盘后历史成交仍在。
+
+### 已确认决策
+
+1. 真实 STOP WIN 必须是独立账本，不能只用当前策略标签覆盖原 `SINGLE_FAK_REAL` 历史数据。
+2. 仍保持同一时刻只激活一个真实实盘策略，不做两个真实策略并行。
+
+### 待办和后期优化
+
+1. 如果以后要在同一页面同时展示两个真实策略的历史对比，需要增加多真实策略聚合视图，而不是切换当前 runner 的 store。
+2. 如生产环境已经误把 STOP WIN 视图指向旧库，本次重启后会自动切到新库；旧数据仍留在普通实盘库。
+
+### 已知坑位
+
+1. 新 STOP WIN 库初始为空是预期行为；第一次切换会创建空 SQLite 文件。
+2. `live-settings.json` 只保存当前策略 ID，不保存每个策略的独立资金配置；当前 stake、止盈百分比等配置仍是全局实盘配置。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "can_select_stop_win_live_strategy_when_flat or stop_win_strategy_places_live_sell or blocks_strategy_switch" -v`，3 条策略切换和真实止盈定向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real" -v`，23 条实盘、普通 Paper 和止盈 Paper 回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，193 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/live.py src/polybot2other/bot.py src/polybot2other/static/index.html src/polybot2other/static/app.js src/polybot2other/static/styles.css tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+7. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+8. 已执行 `/api/status` 烟测，当前 `SINGLE_FAK_REAL_STOP_WIN` 指向 `data/live/single_fak_real_stop_win.sqlite3`，`settled_trades=0`、`open_trades=0`、`total_pnl=0.0`。
+
+### 回滚建议
+
+1. 如需回滚本轮独立库修正，撤销 `src/polybot2other/live.py`、`tests/test_core.py` 和本进度文档 v4.35 改动。
+2. 回滚后 STOP WIN 会重新读取普通实盘库，这是不推荐状态，容易再次把旧实盘数据误看成 STOP WIN 数据。
+
+## 2026-06-02 v4.34
+
+### 已完成
+
+1. 新增真实实盘策略 `SINGLE_FAK_REAL_STOP_WIN`，通过 `live_strategy_id` 在同一个实盘 runner 中选择当前唯一激活策略。
+2. 保留原 `SINGLE_FAK_REAL` 实盘策略，新增 `LIVE_STRATEGY_OPTIONS` 向前端暴露可选实盘策略、展示名称、入场 marker 和是否启用止盈。
+3. `SINGLE_FAK_REAL_STOP_WIN` 复用现有真实 `sell_trade` 安全链路，在达到最大盈利占比止盈条件时提交真实 FAK 卖出，并记录 `LIVE_STOP_WIN` reason、`last_stop_win`、订单证据和策略标识。
+4. `sell_trade` 支持传入卖出 marker、卖出保护价和 reason 明细；手动卖出仍默认走 `LIVE_MANUAL_SELL`，自动止盈走 `LIVE_STOP_WIN`。
+5. 策略切换加入硬阻断：实盘开启中、进程锁仍持有、有未平实盘持仓、有待官方确认订单或活跃实盘订单时禁止切换。
+6. 前端实盘头部改为策略下拉框，支持从 `SINGLE + FAK REAL` 和 `SINGLE + FAK REAL STOP WIN` 之间切换；STOP WIN 策略才显示止盈配置。
+7. 账户口径和表格 scope 在实盘策略切换后保持 live 口径，不会因为 variant_id 变化自动跳回主账户。
+
+### 已确认决策
+
+1. 本轮采用“单一真实实盘 runner + 当前策略选择器”，不同时运行两个真实实盘策略，避免两个真实策略并发抢同一账户、同一进程锁和同一市场持仓。
+2. v4.34 初版曾让 `SINGLE_FAK_REAL_STOP_WIN` 共用原真实实盘 SQLite 账本；该设计已在 v4.35 修正为独立真实账本。
+3. 止盈参数继续使用 `paper_stop_win_take_profit_pct` 的最大盈利占比口径；普通 `SINGLE_FAK_REAL` 不读取该止盈参数。
+
+### 待办和后期优化
+
+1. 如果后续要同时保留两个真实策略的独立资金曲线，需要拆成多 runner、多 DB、多锁和明确资金分配。
+2. 可后续把 `paper_stop_win_take_profit_pct` 字段改名为更中性的 `stop_win_take_profit_pct`，但需要兼容旧配置文件。
+3. 实盘跑出样本后，需要单独统计 `LIVE_STOP_WIN` 提前止盈后终局输/赢的比例，判断是否真的减少终局归零损失。
+
+### 已知坑位
+
+1. 自动止盈是真实卖出，不再是 Paper 对照；触发后可能卖飞终局会赢的仓位。
+2. 当前止盈只处理当前 market 的真实持仓，不会追溯旧 round 的历史持仓。
+3. 策略切换必须在完全空仓、无 pending 订单、实盘关闭时做；这是刻意的安全限制。
+
+### 验证记录
+
+1. 已执行 `rtk proxy .venv/bin/python -m compileall -q src tests`，编译检查通过。
+2. 已执行 `rtk proxy node --check src/polybot2other/static/app.js`，前端脚本语法检查通过。
+3. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "stop_win_live_strategy or blocks_strategy_switch or places_live_sell" -v`，3 条新增定向测试通过。
+4. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py -k "single_fak_real" -v`，23 条实盘、普通 Paper 和止盈 Paper 回归通过。
+5. 已执行 `rtk proxy env PYTHONPATH=src .venv/bin/python -m pytest tests/test_core.py`，193 条核心回归全部通过。
+6. 已执行 `rtk proxy git diff --check -- src/polybot2other/live.py src/polybot2other/bot.py src/polybot2other/static/index.html src/polybot2other/static/app.js src/polybot2other/static/styles.css tests/test_core.py docs/polybot2other-progress.md`，补丁格式检查通过。
+7. 已执行 `rtk proxy ./restart-dashboard.sh`，dashboard 已重启到 `http://127.0.0.1:8791`。
+8. 已执行 `/api/status` 烟测，返回实盘策略选项 `SINGLE_FAK_REAL` 和 `SINGLE_FAK_REAL_STOP_WIN`，当前真实实盘 `enabled=false`。
+
+### 回滚建议
+
+1. 如需回滚本轮真实 STOP WIN 策略，撤销 `src/polybot2other/live.py`、`src/polybot2other/bot.py`、`src/polybot2other/static/index.html`、`src/polybot2other/static/app.js`、`src/polybot2other/static/styles.css`、`tests/test_core.py` 和本进度文档 v4.34 改动。
+2. 回滚前如配置文件已写入 `live_strategy_id=SINGLE_FAK_REAL_STOP_WIN`，需要先停服并把 `data/live/live-settings.json` 中 `live_strategy_id` 改回 `SINGLE_FAK_REAL`，再恢复旧代码。
+
 ## 2026-06-01 v4.33
 
 ### 已完成

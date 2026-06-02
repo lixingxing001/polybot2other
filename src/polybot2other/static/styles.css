@@ -451,6 +451,31 @@ button.danger-button:hover:not(:disabled) {
 
 .live-title {
   min-width: 160px;
+  display: grid;
+  gap: 4px;
+}
+
+.live-strategy-selector {
+  display: grid;
+  gap: 4px;
+}
+
+.live-strategy-selector span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.live-strategy-selector select {
+  width: min(320px, 44vw);
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0 34px 0 10px;
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .live-head-actions {
@@ -612,6 +637,10 @@ button.danger-button:hover:not(:disabled) {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #111820;
+}
+
+.live-stop-win-settings.is-hidden {
+  display: none;
 }
 
 .live-stop-win-head {

@@ -48,13 +48,18 @@ from polybot2other.experiments import (
 )
 from polybot2other.live import (
     LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE,
+    LIVE_COMBO,
     LIVE_PAPER_STOP_WIN_VARIANT_ID,
     LIVE_PAPER_VARIANT_ID,
     LIVE_STARTUP_REARM_MESSAGE,
+    LIVE_STOP_WIN_COMBO,
+    LIVE_STOP_WIN_MARKER,
+    LIVE_STOP_WIN_VARIANT_ID,
     LIVE_VARIANT_ID,
     LiveOrderResponse,
     LiveProcessLock,
     PolymarketLiveClient,
+    _live_basis_rows,
     _response_terminal_no_fill_local_status,
 )
 from polybot2other.live_doctor import build_live_doctor_from_bot, main as live_doctor_main
@@ -1081,6 +1086,42 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["cash_balance"], 102.5, places=5)
             self.assertAlmostEqual(metrics["realized_pnl"], 2.5, places=5)
             self.assertAlmostEqual(metrics["open_risk"], 0.0, places=5)
+
+    def test_partial_close_dust_remainder_settles_without_open_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-dust-close",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "test dust close")
+            trade_id = store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 10.0})())
+
+            closed = store.close_trade_shares(trade_id, 19.99, 0.25, now + 1, "test dust sell")
+
+            self.assertIsNotNone(closed)
+            self.assertEqual(store.open_trades(), [])
+            self.assertAlmostEqual(closed["stake"], 10.0, places=6)
+            self.assertAlmostEqual(closed["shares"], 19.99, places=6)
+            self.assertAlmostEqual(closed["payout"], 4.9975, places=6)
+            self.assertAlmostEqual(closed["pnl"], -5.0025, places=6)
+            self.assertEqual(closed["remaining_stake"], 0.0)
+            self.assertEqual(closed["remaining_shares"], 0.0)
+            self.assertIn("DUST_CLOSE", closed["reason"])
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["id"], trade_id)
+            self.assertEqual(recent[0]["status"], "SETTLED")
+            self.assertIn("DUST_CLOSE", recent[0]["reason"])
+            metrics = store.metrics()
+            self.assertAlmostEqual(metrics["cash_balance"], 94.9975, places=6)
+            self.assertAlmostEqual(metrics["realized_pnl"], -5.0025, places=6)
+            self.assertAlmostEqual(metrics["open_risk"], 0.0, places=6)
 
     def test_recent_trades_supports_count_and_offset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4144,6 +4185,28 @@ class TradingCoreTest(unittest.TestCase):
         self.assertAlmostEqual(without_chainlink["okx_basis_median_bps"], 100.0, places=6)
         self.assertEqual(without_chainlink["binance_basis_samples"], 1)
 
+    def test_live_basis_rows_allow_four_and_half_second_source_age(self) -> None:
+        now_ms = int(time.time() * 1000)
+        price = {
+            "chainlink": 100.0,
+            "chainlink_updated_ms": now_ms,
+            "okx": 101.0,
+            "okx_updated_ms": now_ms - 4_200,
+            "okx_basis_median_bps": 100.0,
+            "okx_basis_samples": 5,
+        }
+
+        rows = _live_basis_rows(price, now_ms, ("okx",))
+
+        okx = next(row for row in rows if row["source"] == "okx")
+        self.assertTrue(okx["ready"])
+        self.assertEqual(okx["age_ms"], 4_200)
+
+        stale_rows = _live_basis_rows({**price, "okx_updated_ms": now_ms - 4_600}, now_ms, ("okx",))
+        stale_okx = next(row for row in stale_rows if row["source"] == "okx")
+        self.assertFalse(stale_okx["ready"])
+        self.assertIn("age=4600ms", stale_okx["reason"])
+
     def test_parse_real_btc_5m_market(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
         raw = {
@@ -6625,6 +6688,278 @@ class TradingCoreTest(unittest.TestCase):
                 places=6,
             )
             self.assertEqual(live_snapshot["variants"][0]["metrics"]["unrealized_pnl"], live_metrics["unrealized_pnl"])
+
+    def test_single_fak_real_can_select_stop_win_live_strategy_when_flat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-switch-history",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            quotes = {
+                "Up": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "bid_size": 100,
+                    "ask_size": 100,
+                    "bids": [{"price": 0.50, "size": 100}],
+                    "asks": [{"price": 0.52, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                }
+            }
+            bot.live_trading.run_from_state(
+                market,
+                {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)},
+                quotes,
+            )
+            self.assertEqual(bot.live_trading.store.db_path, settings.live_trading_db_path)
+            self.assertEqual(len(bot.live_trading.store.open_trades()), 1)
+            bot.live_trading.apply_official_resolution(
+                market.round_id,
+                "Up",
+                time.time(),
+                final_price=102.0,
+                target_price=100.0,
+            )
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+            self.assertGreater(bot.live_trading.store.recent_trade_count("BTC", None, None), 0)
+            bot.live_trading.update_settings({"enabled": False})
+
+            payload = bot.update_live_settings(
+                {
+                    "live_strategy_id": LIVE_STOP_WIN_VARIANT_ID,
+                    "paper_stop_win_take_profit_pct": 70.0,
+                }
+            )
+
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_STOP_WIN_COMBO)
+            self.assertTrue(bot.live_trading.stop_win_enabled)
+            stop_win_db_path = Path(tmp) / "single_fak_real_stop_win.sqlite3"
+            self.assertEqual(bot.live_trading.store.db_path, stop_win_db_path)
+            self.assertTrue(stop_win_db_path.exists())
+            self.assertEqual(bot.live_trading.store.recent_trade_count("BTC", None, None), 0)
+            self.assertEqual(payload["live_trading"]["live_strategy_id"], LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(payload["live_trading"]["db_path"], str(stop_win_db_path))
+            self.assertEqual(payload["snapshot"]["runtime"]["live_trading"]["variant"]["variant_id"], LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(payload["snapshot"]["settings"]["live_trading"]["combo"], LIVE_STOP_WIN_COMBO)
+            self.assertEqual(
+                payload["snapshot"]["runtime"]["live_trading"]["variant"]["metrics"]["settled_trades"],
+                0,
+            )
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            self.assertIn(LIVE_STOP_WIN_VARIANT_ID, {row["variant_id"] for row in options})
+            option_by_id = {row["variant_id"]: row for row in options}
+            self.assertEqual(option_by_id[LIVE_VARIANT_ID]["db_path"], str(settings.live_trading_db_path))
+            self.assertEqual(option_by_id[LIVE_STOP_WIN_VARIANT_ID]["db_path"], str(stop_win_db_path))
+            default_stop_page = bot.recent_trades_page(account_scope="live")
+            self.assertEqual(default_stop_page["recent_trades_meta"]["total"], 0)
+            legacy_live_page = bot.recent_trades_page(account_scope="live", variant_id=LIVE_VARIANT_ID)
+            self.assertGreater(legacy_live_page["recent_trades_meta"]["total"], 0)
+            self.assertEqual(legacy_live_page["recent_trades"][0]["variant_id"], LIVE_VARIANT_ID)
+            self.assertEqual(legacy_live_page["recent_trades"][0]["combo"], LIVE_COMBO)
+            stop_win_page = bot.recent_trades_page(account_scope="live", variant_id=LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(stop_win_page["recent_trades_meta"]["total"], 0)
+            legacy_orders = bot.orders_page(account_scope="live", variant_id=LIVE_VARIANT_ID)
+            self.assertGreater(legacy_orders["recent_orders_meta"]["total"], 0)
+            self.assertEqual(legacy_orders["recent_orders"][0]["variant_id"], LIVE_VARIANT_ID)
+            legacy_equity = bot.equity_curve_window(account_scope="live", variant_id=LIVE_VARIANT_ID)
+            self.assertEqual(legacy_equity["equity_curve_meta"]["variant_id"], LIVE_VARIANT_ID)
+            self.assertEqual(legacy_equity["equity_curve_meta"]["combo"], LIVE_COMBO)
+            persisted = json.loads(settings.live_trading_settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["live_strategy_id"], LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(bot.live_paper_trading.config.live_strategy_id, LIVE_STOP_WIN_VARIANT_ID)
+            bot.live_trading.update_settings({"live_strategy_id": LIVE_VARIANT_ID})
+            self.assertEqual(bot.live_trading.store.db_path, settings.live_trading_db_path)
+            self.assertGreater(bot.live_trading.store.recent_trade_count("BTC", None, None), 0)
+
+    def test_single_fak_real_blocks_strategy_switch_with_open_live_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-switch-open",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            quotes = {
+                "Up": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.52, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                }
+            }
+
+            bot.live_trading.run_from_state(
+                market,
+                {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)},
+                quotes,
+            )
+            self.assertEqual(len(bot.live_trading.store.open_trades()), 1)
+            bot.live_trading.update_settings({"enabled": False})
+
+            with self.assertRaisesRegex(ValueError, "持仓"):
+                bot.live_trading.update_settings({"live_strategy_id": LIVE_STOP_WIN_VARIANT_ID})
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_VARIANT_ID)
+
+    def test_single_fak_real_stop_win_strategy_places_live_sell_and_blocks_reentry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            fake_client = FakeLiveClient()
+            fake_client.sell_response = LiveOrderResponse(
+                True,
+                "matched",
+                "live-sell-1",
+                None,
+                {"status": "matched", "makingAmount": "9302810", "takingAmount": "5767742"},
+                filled_shares=9.30281,
+                cash_spent=5.767742,
+                avg_fill_price=0.62,
+            )
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_STOP_WIN_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                    "paper_stop_win_take_profit_pct": 8.0,
+                }
+            )
+            self.assertEqual(bot.live_trading.store.db_path, Path(tmp) / "single_fak_real_stop_win.sqlite3")
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-live-stop-win",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {"chainlink": 102.0, "chainlink_updated_ms": int(now * 1000)}
+            quotes = {
+                "Up": {
+                    "best_bid": 0.50,
+                    "best_ask": 0.52,
+                    "bid_size": 100,
+                    "ask_size": 100,
+                    "bids": [{"price": 0.50, "size": 100}],
+                    "asks": [{"price": 0.52, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+                "Down": {
+                    "best_bid": 0.45,
+                    "best_ask": 0.47,
+                    "bid_size": 100,
+                    "ask_size": 100,
+                    "bids": [{"price": 0.45, "size": 100}],
+                    "asks": [{"price": 0.47, "size": 100}],
+                    "updated_at_ms": int(now * 1000),
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+            open_rows = bot.live_trading.store.open_trades()
+            self.assertEqual(len(open_rows), 1)
+            trade_id = int(open_rows[0]["id"])
+            bot.live_trading.store.conn.execute(
+                "UPDATE trades SET opened_at = ? WHERE id = ?",
+                (time.time() - 20.0, trade_id),
+            )
+            bot.live_trading.store.conn.commit()
+            stop_quotes = dict(quotes)
+            stop_quotes["Up"] = {
+                **quotes["Up"],
+                "best_bid": 0.62,
+                "bid_size": 100,
+                "bids": [{"price": 0.62, "size": 100}],
+                "updated_at_ms": int(time.time() * 1000),
+            }
+
+            bot.live_trading.run_from_state(market, price, stop_quotes)
+
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(len(fake_client.sell_calls), 1)
+            self.assertEqual(fake_client.sell_calls[0]["token_id"], "up-token")
+            self.assertGreaterEqual(fake_client.sell_calls[0]["min_price"], 0.55)
+            recent = bot.recent_trades_page(account_scope="live")["recent_trades"]
+            self.assertEqual(recent[0]["variant_id"], LIVE_STOP_WIN_VARIANT_ID)
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_EARLY_EXIT)
+            self.assertGreater(recent[0]["pnl"], 0)
+            self.assertIn(LIVE_STOP_WIN_MARKER, recent[0]["reason"])
+            self.assertEqual(bot.live_trading.last_stop_win["trade_id"], trade_id)
+            self.assertEqual(bot.live_trading.last_order["marker"], LIVE_STOP_WIN_MARKER)
+
+            bot.live_trading.run_from_state(market, price, stop_quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertIn("已触发止盈退出", bot.live_trading.last_signal["reason"])
 
     def test_single_fak_real_stake_change_applies_next_market_when_current_market_has_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

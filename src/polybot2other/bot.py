@@ -58,6 +58,9 @@ from .live import (
     LivePaperStrategyRunner,
     LivePaperStopWinStrategyRunner,
     LiveStrategyRunner,
+    _live_strategy_db_path,
+    _live_strategy_meta,
+    _tag_live_rows,
 )
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
@@ -197,7 +200,7 @@ class PriceBasisTracker:
 
     @property
     def settings_max_age_ms(self) -> int:
-        return 3_000
+        return 4_500
 
 
 class PaperTradingBot:
@@ -2305,7 +2308,7 @@ class PaperTradingBot:
                 live_variant["metrics"] = live_metrics
             live_variants = live_snapshot.get("variants") if isinstance(live_snapshot.get("variants"), list) else []
             for variant in live_variants:
-                if isinstance(variant, dict) and variant.get("variant_id") == LIVE_VARIANT_ID:
+                if isinstance(variant, dict) and variant.get("variant_id") == live_runner.variant_id:
                     variant["metrics"] = live_metrics
         if live_paper_runner is not None:
             live_paper_snapshot["open_trades"] = self._decorate_open_trades(
@@ -2645,6 +2648,8 @@ class PaperTradingBot:
                     raise LiveOnceBlockedError(
                         _live_once_blocked_payload(
                             message,
+                            variant_id=self.live_trading.variant_id,
+                            combo=self.live_trading.combo,
                             blocked_keys=["market"],
                             fatal_keys=[],
                             waitable_keys=["market"],
@@ -2669,6 +2674,8 @@ class PaperTradingBot:
                 raise LiveOnceBlockedError(
                     _live_once_blocked_payload(
                         message,
+                        variant_id=self.live_trading.variant_id,
+                        combo=self.live_trading.combo,
                         blocked_keys=one_shot_blocked_keys or blocked_keys,
                         fatal_keys=fatal_keys,
                         waitable_keys=waitable_keys,
@@ -2801,7 +2808,7 @@ class PaperTradingBot:
         if scope == "live":
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
-            page = self.live_trading.recent_trades_page(limit, offset, start_at, end_at)
+            page = self._live_strategy_recent_trades_page(variant_id, limit, offset, start_at, end_at)
             page["recent_trades"] = self._decorate_recent_trades(page["recent_trades"])
             return page
         if scope in {
@@ -2858,7 +2865,7 @@ class PaperTradingBot:
         if scope == "live":
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
-            return self.live_trading.orders_page(limit, offset, status_key)
+            return self._live_strategy_orders_page(variant_id, limit, offset, status_key)
         if scope in {
             "live_paper",
             "paper_live",
@@ -2894,9 +2901,14 @@ class PaperTradingBot:
         if scope == "live":
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
+            store, _meta, close_store = self._live_strategy_read_store(variant_id)
+            try:
+                fills = store.paper_order_fills(order_id)
+            finally:
+                self._close_read_store(store, close_store)
             return {
                 "order_id": order_id,
-                "fills": self.live_trading.store.paper_order_fills(order_id),
+                "fills": fills,
             }
         if scope in {
             "live_paper",
@@ -2991,7 +3003,7 @@ class PaperTradingBot:
         if normalized_scope == "live":
             if self.live_trading is None:
                 raise ValueError("live trading is disabled in this runtime")
-            return self.live_trading.equity_curve_window(days, max_points)
+            return self._live_strategy_equity_curve_window(variant_id, days, max_points)
         if normalized_scope in {
             "live_paper",
             "paper_live",
@@ -3003,6 +3015,116 @@ class PaperTradingBot:
             )
             return self._live_paper_runner_for_variant(runner_variant_id).equity_curve_window(days, max_points)
         raise ValueError("account_scope must be main, strategy_experiment, live, or live_paper")
+
+    def _live_strategy_read_store(self, variant_id: str | None) -> tuple[TradeStore, dict[str, Any], bool]:
+        if self.live_trading is None:
+            raise ValueError("live trading is disabled in this runtime")
+        meta = _live_strategy_meta(variant_id or self.live_trading.variant_id)
+        normalized = str(meta["variant_id"])
+        if normalized == self.live_trading.variant_id:
+            return self.live_trading.store, meta, False
+        return TradeStore(_live_strategy_db_path(self.settings, normalized), self.live_trading.config.initial_balance), meta, True
+
+    @staticmethod
+    def _close_read_store(store: TradeStore, close_store: bool) -> None:
+        if close_store:
+            store.conn.close()
+
+    def _live_strategy_recent_trades_page(
+        self,
+        variant_id: str | None,
+        limit: int,
+        offset: int,
+        start_at: float | None,
+        end_at: float | None,
+    ) -> dict[str, Any]:
+        store, meta, close_store = self._live_strategy_read_store(variant_id)
+        try:
+            normalized = str(meta["variant_id"])
+            combo = str(meta.get("combo") or normalized)
+            total = store.recent_trade_count("BTC", start_at, end_at)
+            rows = _tag_live_rows(
+                store.recent_trades(limit, offset, "BTC", start_at, end_at),
+                variant_id=normalized,
+                combo=combo,
+            )
+            summary = store.recent_trade_summary("BTC", start_at, end_at)
+        finally:
+            self._close_read_store(store, close_store)
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_trades": rows,
+            "recent_trades_summary": summary,
+            "recent_trades_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "start_at": start_at,
+                "end_at": end_at,
+            },
+        }
+
+    def _live_strategy_orders_page(
+        self,
+        variant_id: str | None,
+        limit: int,
+        offset: int,
+        status_key: str,
+    ) -> dict[str, Any]:
+        store, meta, close_store = self._live_strategy_read_store(variant_id)
+        try:
+            normalized = str(meta["variant_id"])
+            combo = str(meta.get("combo") or normalized)
+            total = store.paper_order_count("BTC", status_key)
+            rows = _tag_live_rows(
+                store.recent_paper_orders(limit, offset, "BTC", status_key),
+                variant_id=normalized,
+                combo=combo,
+            )
+        finally:
+            self._close_read_store(store, close_store)
+        loaded = min(total, offset + len(rows))
+        return {
+            "recent_orders": rows,
+            "recent_orders_meta": {
+                "limit": limit,
+                "offset": offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": loaded < total,
+                "status_filter": status_key,
+            },
+        }
+
+    def _live_strategy_equity_curve_window(
+        self,
+        variant_id: str | None,
+        days: int,
+        max_points: int,
+    ) -> dict[str, Any]:
+        store, meta, close_store = self._live_strategy_read_store(variant_id)
+        try:
+            normalized = str(meta["variant_id"])
+            combo = str(meta.get("combo") or normalized)
+            rows = store.equity_curve_window(days, max_points)
+            account = store.account()
+        finally:
+            self._close_read_store(store, close_store)
+        return {
+            "equity_curve": rows,
+            "equity_curve_meta": {
+                "account_scope": "live",
+                "variant_id": normalized,
+                "combo": combo,
+                "label": combo,
+                "days": days,
+                "max_points": max_points,
+                "points": len(rows),
+                "initial_balance": float(account["initial_balance"]),
+            },
+        }
 
     def _pair_strategy_runtime_locked(self) -> dict[str, Any]:
         _price, quotes, _source = self._paper_market_data_locked()
@@ -3734,6 +3856,9 @@ def _live_settings_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         {
             "variant_id": snapshot.get("variant_id") or LIVE_VARIANT_ID,
             "combo": snapshot.get("combo") or LIVE_COMBO,
+            "live_strategy_id": snapshot.get("live_strategy_id") or settings.get("live_strategy_id") or LIVE_VARIANT_ID,
+            "live_strategy": snapshot.get("live_strategy"),
+            "live_strategy_options": snapshot.get("live_strategy_options"),
             "db_path": snapshot.get("db_path"),
             "process_lock_path": snapshot.get("process_lock_path"),
             "process_lock_acquired": snapshot.get("process_lock_acquired"),
@@ -4689,6 +4814,8 @@ def _round_float(value: float | None, digits: int) -> float | None:
 def _live_once_blocked_payload(
     message: str,
     *,
+    variant_id: str = LIVE_VARIANT_ID,
+    combo: str = LIVE_COMBO,
     blocked_keys: list[str],
     fatal_keys: list[str],
     waitable_keys: list[str],
@@ -4701,8 +4828,8 @@ def _live_once_blocked_payload(
         "error": message,
         "live_once": {
             "execution_mode": "LIVE",
-            "variant_id": LIVE_VARIANT_ID,
-            "combo": LIVE_COMBO,
+            "variant_id": variant_id,
+            "combo": combo,
             "submitted": False,
             "blocked": True,
             "blocked_keys": _unique_strings(blocked_keys),

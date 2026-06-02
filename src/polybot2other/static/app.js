@@ -8,6 +8,7 @@ const ids = {
   paperPauseToggle: document.getElementById("paper-pause-toggle"),
   liveEnabled: document.getElementById("live-enabled"),
   liveStatus: document.getElementById("live-status"),
+  liveStrategyId: document.getElementById("live-strategy-id"),
   liveInitialBalance: document.getElementById("live-initial-balance"),
   liveStakeDollars: document.getElementById("live-stake-dollars"),
   liveMaxOpenTrades: document.getElementById("live-max-open-trades"),
@@ -18,6 +19,7 @@ const ids = {
   liveRetryDelayMs: document.getElementById("live-retry-delay-ms"),
   livePaperStopWinTakeProfitPct: document.getElementById("live-paper-stop-win-take-profit-pct"),
   livePaperStopWinEstimate: document.getElementById("live-paper-stop-win-estimate"),
+  liveStopWinSettings: document.getElementById("live-stop-win-settings"),
   liveComplianceAck: document.getElementById("live-compliance-ack"),
   liveFallbackSources: Array.from(document.querySelectorAll("[data-live-fallback-source]")),
   liveSettingsToggle: document.getElementById("live-settings-toggle"),
@@ -150,6 +152,8 @@ const TRADE_STATUS_LABELS = {
   SETTLED: "已结算",
   PENDING_SETTLEMENT: "等待官方结算",
 };
+const LIVE_REAL_DEFAULT_STRATEGY_ID = "SINGLE_FAK_REAL";
+const LIVE_REAL_STOP_WIN_STRATEGY_ID = "SINGLE_FAK_REAL_STOP_WIN";
 
 let activeMarket = null;
 let activeAppPage = "bot";
@@ -521,13 +525,114 @@ function markLiveSettingsDirty(input) {
   syncLiveSaveDirtyState();
 }
 
-function clearLiveSettingsDirty() {
-  liveSettingsDirtyFields.clear();
+function clearLiveSettingsDirty(keys = null) {
+  if (Array.isArray(keys)) {
+    for (const key of keys) liveSettingsDirtyFields.delete(key);
+  } else {
+    liveSettingsDirtyFields.clear();
+  }
   syncLiveSaveDirtyState();
+}
+
+function normalizeLiveRealStrategyId(value) {
+  const text = String(value || "").trim().toUpperCase();
+  return text || LIVE_REAL_DEFAULT_STRATEGY_ID;
+}
+
+function liveStrategyOptions(settings = {}, live = {}) {
+  const raw = Array.isArray(settings.live_strategy_options)
+    ? settings.live_strategy_options
+    : Array.isArray(live.live_strategy_options)
+      ? live.live_strategy_options
+      : [];
+  const fallback = [
+    { variant_id: LIVE_REAL_DEFAULT_STRATEGY_ID, combo: "SINGLE + FAK REAL" },
+    { variant_id: LIVE_REAL_STOP_WIN_STRATEGY_ID, combo: "SINGLE + FAK REAL STOP WIN" },
+  ];
+  const rows = raw.length ? raw : fallback;
+  const seen = new Set();
+  return rows.map((row) => {
+    const value = normalizeLiveRealStrategyId(row?.variant_id);
+    return {
+      value,
+      label: String(row?.combo || value),
+    };
+  }).filter((row) => {
+    if (seen.has(row.value)) return false;
+    seen.add(row.value);
+    return true;
+  });
+}
+
+function liveStrategyTableOptions(data = latestStatus) {
+  const settings = data?.settings?.live_trading || {};
+  const live = data?.runtime?.live_trading || {};
+  const hasLiveConfig = Boolean(
+    live?.variant ||
+      live?.live_strategy_options ||
+      settings?.live_strategy_options ||
+      settings?.live_strategy_id
+  );
+  if (!hasLiveConfig) return [];
+  return liveStrategyOptions(settings, live).map((row) => ({
+    value: `live:${row.value}`,
+    label: row.label,
+  }));
+}
+
+function liveStrategyLabel(data = latestStatus, variantId = null) {
+  const normalized = normalizeLiveRealStrategyId(variantId);
+  const option = liveStrategyTableOptions(data).find((row) => {
+    const parsed = parseAccountScope(row.value);
+    return parsed.scope === "live" && parsed.variantId === normalized;
+  });
+  return option?.label || normalized || LIVE_REAL_DEFAULT_STRATEGY_ID;
+}
+
+function currentLiveStrategyId(settings = {}, live = {}) {
+  return normalizeLiveRealStrategyId(settings.live_strategy_id || live.live_strategy_id || live.variant_id);
+}
+
+function setLiveStrategyIfIdle(settings = {}, live = {}, { preserveDirty = false } = {}) {
+  const select = ids.liveStrategyId;
+  if (!select) return;
+  const options = liveStrategyOptions(settings, live);
+  const optionsKey = options.map((option) => `${option.value}:${option.label}`).join("|");
+  if (select.dataset.optionsKey !== optionsKey) {
+    select.replaceChildren(...options.map((option) => {
+      const node = document.createElement("option");
+      node.value = option.value;
+      node.textContent = option.label;
+      return node;
+    }));
+    select.dataset.optionsKey = optionsKey;
+  }
+  const selected = currentLiveStrategyId(settings, live);
+  const nextValue = options.some((option) => option.value === selected) ? selected : LIVE_REAL_DEFAULT_STRATEGY_ID;
+  select.dataset.serverValue = nextValue;
+  const key = liveSettingsFieldKey(select);
+  if (preserveDirty && key && liveSettingsDirtyFields.has(key)) return;
+  if (document.activeElement === select) return;
+  select.value = nextValue;
+  if (key) liveSettingsDirtyFields.delete(key);
+  syncLiveSaveDirtyState();
+}
+
+function updateLiveStrategyUi(settings = {}, live = {}) {
+  const strategyId = normalizeLiveRealStrategyId(ids.liveStrategyId?.value || currentLiveStrategyId(settings, live));
+  const enabled = Boolean(settings.enabled ?? live.enabled);
+  if (ids.liveStrategyId) {
+    ids.liveStrategyId.disabled = enabled;
+    ids.liveStrategyId.title = enabled ? "实盘开启中禁止切换策略，请先关闭实盘" : "";
+  }
+  if (ids.liveStopWinSettings) {
+    ids.liveStopWinSettings.classList.toggle("is-hidden", strategyId !== LIVE_REAL_STOP_WIN_STRATEGY_ID);
+  }
 }
 
 function liveSettingsFormControls() {
   return [
+    ids.liveStrategyId,
     ids.liveInitialBalance,
     ids.liveStakeDollars,
     ids.liveMaxOpenTrades,
@@ -929,7 +1034,9 @@ function renderMetrics(metrics = {}) {
 function renderAccountScope(data = latestStatus) {
   const options = accountScopeOptions(data);
   if (!options.some((option) => option.value === accountScope)) {
-    accountScope = "main";
+    const parsed = parseAccountScope(accountScope);
+    const live = parsed.scope === "live" ? liveVariant(data) : null;
+    accountScope = live ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}` : "main";
     equityCurveRows = [];
     equityCurveMeta = {};
     lastEquityCurveFetchMs = 0;
@@ -961,11 +1068,26 @@ function renderDataScopeOptions(data = latestStatus) {
   ]) {
     if (!select) continue;
     select.innerHTML = options.map((option) => `<option value="${safe(option.value)}">${safe(option.label)}</option>`).join("");
-    select.value = options.some((option) => option.value === current) ? current : "main";
+    const parsed = parseAccountScope(current);
+    const live = parsed.scope === "live" ? liveVariant(data) : null;
+    select.value = options.some((option) => option.value === current)
+      ? current
+      : live
+        ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}`
+        : "main";
   }
-  if (!options.some((option) => option.value === openDataScope)) openDataScope = "main";
-  if (!options.some((option) => option.value === orderDataScope)) orderDataScope = "main";
-  if (!options.some((option) => option.value === recentDataScope)) recentDataScope = "main";
+  if (!options.some((option) => option.value === openDataScope)) {
+    const live = parseAccountScope(openDataScope).scope === "live" ? liveVariant(data) : null;
+    openDataScope = live ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}` : "main";
+  }
+  if (!options.some((option) => option.value === orderDataScope)) {
+    const live = parseAccountScope(orderDataScope).scope === "live" ? liveVariant(data) : null;
+    orderDataScope = live ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}` : "main";
+  }
+  if (!options.some((option) => option.value === recentDataScope)) {
+    const live = parseAccountScope(recentDataScope).scope === "live" ? liveVariant(data) : null;
+    recentDataScope = live ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}` : "main";
+  }
 }
 
 function accountScopeOptions(data = latestStatus) {
@@ -978,7 +1100,7 @@ function accountScopeOptions(data = latestStatus) {
       value: `experiment:${row.variant_id}`,
       label: row.combo || row.variant_id,
     })),
-    ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
+    ...(live ? [{ value: `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}`, label: live.combo || LIVE_REAL_DEFAULT_STRATEGY_ID }] : []),
     ...livePapers.map((row) => ({
       value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
       label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
@@ -988,8 +1110,8 @@ function accountScopeOptions(data = latestStatus) {
 
 function tableScopeOptions(data = latestStatus) {
   const variants = strategyExperimentVariants(data);
-  const live = liveVariant(data);
   const livePapers = livePaperVariants(data);
+  const liveOptions = liveStrategyTableOptions(data);
   return [
     { value: "main", label: "主账户" },
     { value: "experiment", label: "策略实验全部" },
@@ -997,7 +1119,7 @@ function tableScopeOptions(data = latestStatus) {
       value: `experiment:${row.variant_id}`,
       label: row.combo || row.variant_id,
     })),
-    ...(live ? [{ value: `live:${live.variant_id || "SINGLE_FAK_REAL"}`, label: live.combo || "SINGLE_FAK_REAL" }] : []),
+    ...liveOptions,
     ...livePapers.map((row) => ({
       value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
       label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
@@ -1110,7 +1232,7 @@ function parseAccountScope(value) {
     return { scope: "experiment_all", variantId: null };
   }
   if (text.startsWith("live:") || text === "live") {
-    const variantId = text.includes(":") ? text.slice("live:".length).toUpperCase() : "SINGLE_FAK_REAL";
+    const variantId = text.includes(":") ? text.slice("live:".length).toUpperCase() : LIVE_REAL_DEFAULT_STRATEGY_ID;
     return { scope: "live", variantId };
   }
   if (text.startsWith("live_paper:") || text === "live_paper") {
@@ -1144,7 +1266,7 @@ function scopeLabel(value) {
   const parsed = parseAccountScope(value);
   if (parsed.scope === "main") return "主账户";
   if (parsed.scope === "experiment_all") return "策略实验";
-  if (parsed.scope === "live") return liveVariant()?.combo || "SINGLE_FAK_REAL";
+  if (parsed.scope === "live") return liveStrategyLabel(latestStatus, parsed.variantId);
   if (parsed.scope === "live_paper") return livePaperVariant(latestStatus, parsed.variantId)?.combo || parsed.variantId || "SINGLE_FAK_REAL_PAPER";
   const variant = strategyExperimentVariants().find((row) => row.variant_id === parsed.variantId);
   return variant?.combo || parsed.variantId || "策略实验";
@@ -1154,6 +1276,7 @@ function appendScopeParams(params, value) {
   const parsed = parseAccountScope(value);
   if (parsed.scope === "live") {
     params.set("account_scope", "live");
+    params.set("variant_id", parsed.variantId);
   } else if (parsed.scope === "live_paper") {
     params.set("account_scope", "live_paper");
     params.set("variant_id", parsed.variantId);
@@ -1187,6 +1310,7 @@ function renderLivePanel(data = latestStatus) {
   const live = data?.runtime?.live_trading || {};
   const settings = live.settings || data?.settings?.live_trading || {};
   const readiness = live.readiness || settings.readiness || {};
+  setLiveStrategyIfIdle(settings, live, { preserveDirty: true });
   if (ids.liveEnabled) ids.liveEnabled.checked = Boolean(settings.enabled ?? live.enabled);
   setCheckboxIfIdle(ids.liveComplianceAck, settings.compliance_acknowledged, { preserveDirty: true });
   setInputIfIdle(ids.liveInitialBalance, settings.initial_balance, { preserveDirty: true });
@@ -1199,6 +1323,7 @@ function renderLivePanel(data = latestStatus) {
   setInputIfIdle(ids.liveRetryDelayMs, settings.retry_delay_ms, { preserveDirty: true });
   setInputIfIdle(ids.livePaperStopWinTakeProfitPct, settings.paper_stop_win_take_profit_pct ?? 8, { preserveDirty: true });
   setLiveFallbackSourcesIfIdle(settings.fallback_sources || [], { preserveDirty: true });
+  updateLiveStrategyUi(settings, live);
   renderLiveStopWinEstimate(settings);
   const enabled = Boolean(settings.enabled ?? live.enabled);
   const ready = Boolean(readiness.ready);
@@ -3537,6 +3662,7 @@ async function togglePaperPause() {
 function liveSettingsPayload(overrides = {}) {
   return {
     enabled: ids.liveEnabled?.checked || false,
+    live_strategy_id: normalizeLiveRealStrategyId(ids.liveStrategyId?.value || LIVE_REAL_DEFAULT_STRATEGY_ID),
     initial_balance: toNumber(ids.liveInitialBalance?.value) ?? 20,
     stake_dollars: toNumber(ids.liveStakeDollars?.value) ?? 2,
     max_open_trades: Math.max(1, Math.round(toNumber(ids.liveMaxOpenTrades?.value) ?? 2)),
@@ -3564,8 +3690,8 @@ async function saveLiveSettings(overrides = {}) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(liveSettingsPayload(overrides)),
       });
-      if (!res.ok) throw new Error(`live settings HTTP ${res.status}`);
-      const payload = await res.json();
+      const payload = await res.json().catch(() => ({ error: `live settings HTTP ${res.status}` }));
+      if (!res.ok) throw new Error(payload.error || `live settings HTTP ${res.status}`);
       latestStatus = payload.snapshot || latestStatus;
       clearLiveSettingsDirty();
       if (!Object.keys(overrides || {}).length) setLiveSettingsOpen(false);
@@ -3576,6 +3702,31 @@ async function saveLiveSettings(overrides = {}) {
       throw error;
     }
   });
+}
+
+async function saveLiveStrategySelection() {
+  const strategyId = normalizeLiveRealStrategyId(ids.liveStrategyId?.value || LIVE_REAL_DEFAULT_STRATEGY_ID);
+  return withButtonLoading(ids.liveStrategyId, async () => {
+    appendLiveLog({ level: "info", title: "切换实盘策略", message: strategyId });
+    try {
+      const res = await fetch("/api/live-settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ live_strategy_id: strategyId }),
+      });
+      const payload = await res.json().catch(() => ({ error: `live strategy HTTP ${res.status}` }));
+      if (!res.ok) throw new Error(payload.error || `live strategy HTTP ${res.status}`);
+      latestStatus = payload.snapshot || latestStatus;
+      clearLiveSettingsDirty([liveSettingsFieldKey(ids.liveStrategyId)]);
+      appendLiveLog({ level: "pass", title: "切换实盘策略", message: strategyId });
+      renderAll(latestStatus, { force: true, forceChart: true, forceOrder: true });
+    } catch (error) {
+      appendLiveLog({ level: "error", title: "切换实盘策略", message: error.message || String(error) });
+      clearLiveSettingsDirty([liveSettingsFieldKey(ids.liveStrategyId)]);
+      renderLivePanel(latestStatus);
+      throw error;
+    }
+  }, () => updateLiveStrategyUi(latestStatus?.settings?.live_trading || {}, latestStatus?.runtime?.live_trading || {}));
 }
 
 async function toggleLiveEnabled(enabled) {
@@ -3919,7 +4070,9 @@ function renderAllNow(data = latestStatus, options = {}) {
 
 function scopedOpenRows(scope, data = latestStatus) {
   if (isLiveScope(scope)) {
-    return data?.runtime?.live_trading?.open_trades || [];
+    const parsed = parseAccountScope(scope);
+    const active = normalizeLiveRealStrategyId(data?.runtime?.live_trading?.variant_id || data?.runtime?.live_trading?.variant?.variant_id);
+    return parsed.variantId === active ? data?.runtime?.live_trading?.open_trades || [] : [];
   }
   if (isLivePaperScope(scope)) {
     const parsed = parseAccountScope(scope);
@@ -4418,6 +4571,7 @@ setActiveAppPage(locationAppPage(), { syncHash: false });
 ids.tickButton.addEventListener("click", () => runManualTick().catch(showError));
 ids.paperPauseToggle?.addEventListener("click", () => togglePaperPause().catch(showError));
 ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
+ids.liveStrategyId?.addEventListener("change", () => saveLiveStrategySelection().catch(showError));
 ids.liveSettingsToggle?.addEventListener("click", (event) => {
   event.stopPropagation();
   toggleLiveSettingsPanel();
