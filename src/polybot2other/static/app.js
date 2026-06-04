@@ -154,6 +154,7 @@ const TRADE_STATUS_LABELS = {
 };
 const LIVE_REAL_DEFAULT_STRATEGY_ID = "SINGLE_FAK_REAL";
 const LIVE_REAL_STOP_WIN_STRATEGY_ID = "SINGLE_FAK_REAL_STOP_WIN";
+const LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL";
 
 let activeMarket = null;
 let activeAppPage = "bot";
@@ -282,7 +283,7 @@ const openTradeFields = [
   { key: "opened_at", label: "开仓时间", render: (row) => fmtDateTimeCell(row.opened_at) },
   { key: "ends_at", label: "到期", render: (row) => fmtDateTimeCell(row.ends_at) },
   { key: "left", label: "剩余", render: (row) => safe(fmtLeft(row.ends_at)) },
-  { key: "round_id", label: "市场", render: (row) => safe(row.round_id), cellClass: "mono-cell" },
+  { key: "round_id", label: "市场", render: (row) => marketLinkCell(row), cellClass: "mono-cell" },
   { key: "quote_source", label: "报价源", render: (row) => safe(row.quote_source) },
   { key: "exit_note", label: "退出标记", render: (row) => safe(row.exit_note), cellClass: "reason-cell" },
   { key: "reason", label: "开仓原因", render: (row) => safe(row.reason), cellClass: "reason-cell" },
@@ -291,7 +292,7 @@ const openTradeFields = [
 const recentTradeFields = [
   { key: "opened_at", label: "开仓时间", render: (row) => fmtDateTimeCell(row.opened_at) },
   { key: "settled_at", label: "结算时间", render: (row) => fmtDateTimeCell(row.settled_at) },
-  { key: "round_id", label: "市场", render: (row) => safe(row.round_id), cellClass: "mono-cell" },
+  { key: "round_id", label: "市场", render: (row) => marketLinkCell(row), cellClass: "mono-cell" },
   { key: "strategy_type", label: "策略", render: (row) => safe(row.strategy_type) },
   { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
   { key: "status", label: "状态", render: (row) => tradeStatusText(row) },
@@ -319,7 +320,7 @@ const recentOrderFields = [
   { key: "detail_toggle", label: "明细", render: (row) => orderToggleText(row), cellClass: "mono-cell" },
   { key: "cancel_action", label: "操作", render: (row) => orderCancelButton(row) },
   { key: "created_at", label: "时间", render: (row) => fmtDateTimeCell(row.created_at) },
-  { key: "round_id", label: "市场", render: (row) => safe(row.round_id), cellClass: "mono-cell" },
+  { key: "round_id", label: "市场", render: (row) => marketLinkCell(row), cellClass: "mono-cell" },
   { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side)}</span>` },
   { key: "order_type", label: "类型", render: (row) => safe(row.order_type) },
   { key: "status", label: "状态", render: (row) => orderStatusText(row.status) },
@@ -548,6 +549,7 @@ function liveStrategyOptions(settings = {}, live = {}) {
   const fallback = [
     { variant_id: LIVE_REAL_DEFAULT_STRATEGY_ID, combo: "SINGLE + FAK REAL" },
     { variant_id: LIVE_REAL_STOP_WIN_STRATEGY_ID, combo: "SINGLE + FAK REAL STOP WIN" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge REAL" },
   ];
   const rows = raw.length ? raw : fallback;
   const seen = new Set();
@@ -2764,6 +2766,35 @@ function safe(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function marketLinkCell(row) {
+  const label = String(row?.round_id || "").trim();
+  if (!label) return "-";
+  const href = officialMarketUrl(row);
+  if (!href) return safe(label);
+  return `<a class="market-link" href="${safe(href)}" target="_blank" rel="noopener" title="打开 Polymarket 官方市场页">${safe(label)}</a>`;
+}
+
+function officialMarketUrl(row) {
+  // 市场字段优先使用后端保存的官方 URL，历史行缺 URL 时再按 slug 生成官方 event 地址。
+  const directUrl = safeHttpUrl(row?.url);
+  if (directUrl) return directUrl;
+  const slug = String(row?.round_id || "").trim();
+  if (!/^[a-z0-9][a-z0-9-]*$/i.test(slug)) return null;
+  return `https://polymarket.com/event/${encodeURIComponent(slug)}`;
+}
+
+function safeHttpUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  try {
+    const parsed = new URL(text);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+    return parsed.href;
+  } catch (_) {
+    return null;
+  }
 }
 
 function fmtMoneyCell(value) {

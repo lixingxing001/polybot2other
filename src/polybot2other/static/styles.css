@@ -1868,6 +1868,16 @@ th {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
+.market-link {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.market-link:hover,
+.market-link:focus-visible {
+  text-decoration: underline;
+}
+
 .reason-cell {
   min-width: 360px;
   max-width: 520px;

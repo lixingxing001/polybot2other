@@ -147,10 +147,12 @@ class PolymarketClient:
         if len(winners) != 1 or winners[0] not in {"Up", "Down"}:
             return None
         settlement_prices = _settlement_prices_from_market(market)
-        if settlement_prices.get("final_price") is None or settlement_prices.get("target_price") is None:
+        if settlement_prices.get("target_price") is None:
+            # 官方最终价只信 Gamma eventMetadata.finalPrice；页面 closePrice 在刚结算时可能还没有刷新。
             settlement_prices = _merge_settlement_prices(
                 settlement_prices,
                 self._settlement_prices_from_polymarket_page(slug),
+                allow_final_price=False,
             )
         return {
             "market_slug": slug,
@@ -376,12 +378,18 @@ def _settlement_prices_from_market(raw: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _merge_settlement_prices(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+def _merge_settlement_prices(
+    primary: dict[str, Any],
+    fallback: dict[str, Any],
+    *,
+    allow_final_price: bool = True,
+) -> dict[str, Any]:
     if not fallback:
         return dict(primary)
     merged = dict(primary)
     filled_from_fallback = False
-    for key in ("final_price", "target_price"):
+    keys = ("final_price", "target_price") if allow_final_price else ("target_price",)
+    for key in keys:
         if merged.get(key) is None and fallback.get(key) is not None:
             merged[key] = fallback[key]
             filled_from_fallback = True

@@ -13,6 +13,11 @@ SINGLE_ENTRY_MODE_LEGACY = "LEGACY"
 SINGLE_ENTRY_MODE_STRICT = "STRICT"
 SINGLE_ENTRY_MODE_REVERSAL = "REVERSAL"
 SINGLE_ENTRY_MODE_STOP_AND_FLIP = "STOP_AND_FLIP"
+SIGNAL_SIDE_MODE_BASE = "BASE"
+SIGNAL_SIDE_MODE_REVERSE = "REVERSE"
+SIGNAL_FILTER_MODE_NONE = "NONE"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE = "AGGRESSIVE_EDGE"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1 = "AGGRESSIVE_EDGE_V1"
 MARKET_DATA_MODE_BASE = "BASE"
 MARKET_DATA_MODE_MULTI_CONFIRM = "MULTI_CONFIRM"
 MARKET_DATA_MODE_MULTI_LEAD = "MULTI_LEAD"
@@ -34,6 +39,8 @@ class StrategyVariant:
     target_report_alignment: str
     role: str
     single_entry_mode: str = SINGLE_ENTRY_MODE_LEGACY
+    signal_side_mode: str = SIGNAL_SIDE_MODE_BASE
+    signal_filter_mode: str = SIGNAL_FILTER_MODE_NONE
     market_data_mode: str = MARKET_DATA_MODE_BASE
     price_source_mode: str = PRICE_SOURCE_MODE_MIXED
     anti_bot_guard_mode: str = ANTI_BOT_GUARD_MODE_NONE
@@ -53,12 +60,48 @@ class StrategyVariant:
             and self.order_type == ORDER_TYPE_FAK
             and self.single_entry_mode != SINGLE_ENTRY_MODE_LEGACY
         ):
-            return f"{self.strategy_family} + {self.order_type} {self.single_entry_mode}{data_suffix}"
-        return f"{self.strategy_family} + {self.order_type}{data_suffix}"
+            entry_suffix = f" {self.single_entry_mode}"
+        else:
+            entry_suffix = ""
+        signal_suffix = " Reverse" if self.signal_side_mode == SIGNAL_SIDE_MODE_REVERSE else ""
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE:
+            filter_suffix = " Aggressive Edge"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1:
+            filter_suffix = " Aggressive Edge V1"
+        else:
+            filter_suffix = ""
+        return f"{self.strategy_family} + {self.order_type}{entry_suffix}{data_suffix}{signal_suffix}{filter_suffix}"
 
 
 STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
     StrategyVariant("SINGLE_FAK", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK, "85%", "25%-35%", "当前基线，对照组"),
+    StrategyVariant(
+        "SINGLE_FAK_REVERSE",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only 基线信号反向下注对照",
+        signal_side_mode=SIGNAL_SIDE_MODE_REVERSE,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only Aggressive Edge 基准组，只保留基础激进入场过滤",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V1",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only Aggressive Edge V1，迁移输单反思后的学习过滤，和基准组隔离对照",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    ),
     StrategyVariant(
         "SINGLE_FAK_CHAINLINK_ONLY",
         STRATEGY_FAMILY_SINGLE,

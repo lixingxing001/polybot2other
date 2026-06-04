@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import hashlib
+import logging
 import math
 import os
 import re
@@ -27,9 +28,16 @@ from .execution import (
     sweep_taker_buy_by_budget,
     taker_fee,
 )
-from .experiments import SINGLE_ENTRY_MODE_LEGACY, STRATEGY_FAMILY_SINGLE, StrategyVariant
+from .experiments import (
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    SIGNAL_FILTER_MODE_NONE,
+    SINGLE_ENTRY_MODE_LEGACY,
+    STRATEGY_FAMILY_SINGLE,
+    StrategyVariant,
+)
 from .models import MarketRound, PaperFill, PaperFillLevel, Signal, TradeIntent
 from .polymarket import PolymarketClient
+from .signal_filters import aggressive_edge_block_reason, aggressive_edge_pass_note
 from .storage import (
     SETTLEMENT_SOURCE_POLYMARKET,
     TradeStore,
@@ -48,6 +56,7 @@ except ImportError:  # pragma: no cover - production target is Linux, this keeps
     fcntl = None  # type: ignore[assignment]
 
 
+logger = logging.getLogger(__name__)
 LIVE_VARIANT_ID = "SINGLE_FAK_REAL"
 LIVE_COMBO = "SINGLE + FAK REAL"
 LIVE_ENTRY_MARKER = "SINGLE_FAK_REAL"
@@ -55,6 +64,9 @@ LIVE_STOP_WIN_VARIANT_ID = "SINGLE_FAK_REAL_STOP_WIN"
 LIVE_STOP_WIN_COMBO = "SINGLE + FAK REAL STOP WIN"
 LIVE_STOP_WIN_ENTRY_MARKER = "SINGLE_FAK_REAL_STOP_WIN"
 LIVE_STOP_WIN_MARKER = "LIVE_STOP_WIN"
+LIVE_AGGRESSIVE_EDGE_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL"
+LIVE_AGGRESSIVE_EDGE_COMBO = "SINGLE + FAK Aggressive Edge REAL"
+LIVE_AGGRESSIVE_EDGE_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL"
 LIVE_PAPER_VARIANT_ID = "SINGLE_FAK_REAL_PAPER"
 LIVE_PAPER_COMBO = "SINGLE + FAK REAL PAPER"
 LIVE_PAPER_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER"
@@ -99,6 +111,7 @@ LIVE_STRATEGY_OPTIONS = (
         "entry_marker": LIVE_ENTRY_MARKER,
         "role": "实盘隔离账户，沿用 SINGLE_FAK LEGACY 反转双边逻辑",
         "stop_win_enabled": False,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_NONE,
     },
     {
         "variant_id": LIVE_STOP_WIN_VARIANT_ID,
@@ -106,6 +119,15 @@ LIVE_STRATEGY_OPTIONS = (
         "entry_marker": LIVE_STOP_WIN_ENTRY_MARKER,
         "role": "实盘隔离账户，沿用 SINGLE_FAK 并在真实仓位上执行止盈卖出",
         "stop_win_enabled": True,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_NONE,
+    },
+    {
+        "variant_id": LIVE_AGGRESSIVE_EDGE_VARIANT_ID,
+        "combo": LIVE_AGGRESSIVE_EDGE_COMBO,
+        "entry_marker": LIVE_AGGRESSIVE_EDGE_ENTRY_MARKER,
+        "role": "实盘隔离账户，沿用 SINGLE_FAK Aggressive Edge 过滤逻辑",
+        "stop_win_enabled": False,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
     },
 )
 
@@ -1702,10 +1724,26 @@ class LiveStrategyRunner:
             reason = str(price_selection.get("message") or "LIVE fallback price source blocked")
             return Signal("BTC", "NO_TRADE", 0.0, 0.0, 0.0, reason), signal_price, price_selection
         signal = self.strategy.signal(input_from_snapshot(market, {"price": signal_price, "quotes": quotes}))
+        signal = self._apply_signal_filter_mode(market, signal, signal_price)
         note = str(price_selection.get("note") or "").strip()
         if note:
             signal = replace(signal, reason=_append_reason(signal.reason, note))
         return signal, signal_price, price_selection
+
+    def _apply_signal_filter_mode(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+    ) -> Signal:
+        """按实盘组合过滤信号；Aggressive Edge REAL 复用 Paper 同一份过滤器。"""
+
+        if self.variant.signal_filter_mode != SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE or signal.side not in {"Up", "Down"}:
+            return signal
+        block_reason = aggressive_edge_block_reason(market, signal, price, self.settings.max_quote_age_ms)
+        if block_reason:
+            return replace(signal, side="NO_TRADE", reason=_append_reason(signal.reason, block_reason))
+        return replace(signal, reason=_append_reason(signal.reason, aggressive_edge_pass_note(signal)))
 
     def preflight(
         self,
@@ -3340,6 +3378,7 @@ class LiveStrategyRunner:
             "strategy_family": self.variant.strategy_family,
             "order_type": self.variant.order_type,
             "single_entry_mode": self.variant.single_entry_mode,
+            "signal_filter_mode": self.variant.signal_filter_mode,
             "target_code_completion": self.variant.target_code_completion,
             "target_report_alignment": self.variant.target_report_alignment,
             "role": self.variant.role,
@@ -3770,6 +3809,20 @@ class LiveStrategyRunner:
                 final_price = _float_or_none(resolution.get("final_price"))
                 target_price = _float_or_none(resolution.get("target_price"))
                 if outcome in {"Up", "Down"} and (final_price is not None or target_price is not None):
+                    local_final_price = _float_or_none(row.get("final_price"))
+                    if (
+                        final_price is not None
+                        and local_final_price is not None
+                        and abs(final_price - local_final_price) > 0.000001
+                    ):
+                        logger.debug(
+                            "实盘官方最终价回填更新 round_id=%s local_final=%s official_final=%s local_target=%s official_target=%s",
+                            round_id,
+                            local_final_price,
+                            final_price,
+                            row.get("target_price"),
+                            target_price,
+                        )
                     self.store.reconcile_round_official_outcome(
                         round_id,
                         str(outcome),
@@ -4514,6 +4567,7 @@ def _public_evidence_order(
     payload = _public_reconciled_order(row)
     if payload is None:
         return None
+    meta = _live_strategy_meta(variant_id)
     payload.update(
         {
             "variant_id": variant_id,
@@ -4521,6 +4575,7 @@ def _public_evidence_order(
             "strategy_family": STRATEGY_FAMILY_SINGLE,
             "experiment_order_type": ORDER_TYPE_FAK,
             "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
+            "signal_filter_mode": str(meta.get("signal_filter_mode") or SIGNAL_FILTER_MODE_NONE),
             "account_scope": "live",
             "execution_mode": "LIVE",
             "condition_id": row.get("condition_id"),
@@ -4630,6 +4685,7 @@ def _live_strategy_options_payload(settings: Settings | None = None) -> list[dic
             "variant_id": str(item["variant_id"]),
             "combo": str(item["combo"]),
             "stop_win_enabled": bool(item.get("stop_win_enabled")),
+            "signal_filter_mode": str(item.get("signal_filter_mode") or SIGNAL_FILTER_MODE_NONE),
             "role": str(item.get("role") or ""),
         }
         if settings is not None:
@@ -4647,7 +4703,8 @@ def _live_strategy_variant(variant_id: Any) -> StrategyVariant:
         "85%",
         "25%-35%",
         str(meta.get("role") or ""),
-        SINGLE_ENTRY_MODE_LEGACY,
+        single_entry_mode=SINGLE_ENTRY_MODE_LEGACY,
+        signal_filter_mode=str(meta.get("signal_filter_mode") or SIGNAL_FILTER_MODE_NONE),
     )
 
 
@@ -5498,6 +5555,8 @@ def _tag_live_rows(
     variant_id: str = LIVE_VARIANT_ID,
     combo: str = LIVE_COMBO,
 ) -> list[dict[str, Any]]:
+    meta = _live_strategy_meta(variant_id)
+    signal_filter_mode = str(meta.get("signal_filter_mode") or SIGNAL_FILTER_MODE_NONE)
     tagged: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -5508,6 +5567,7 @@ def _tag_live_rows(
                 "strategy_family": STRATEGY_FAMILY_SINGLE,
                 "experiment_order_type": ORDER_TYPE_FAK,
                 "single_entry_mode": SINGLE_ENTRY_MODE_LEGACY,
+                "signal_filter_mode": signal_filter_mode,
                 "account_scope": "live",
                 "execution_mode": "LIVE",
             }

@@ -39,6 +39,9 @@ from polybot2other.experiments import (
     MARKET_DATA_MODE_MULTI_LEAD,
     PRICE_SOURCE_MODE_CHAINLINK_ONLY,
     PRICE_SOURCE_MODE_FALLBACK_ONLY,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    SIGNAL_SIDE_MODE_REVERSE,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
@@ -48,6 +51,8 @@ from polybot2other.experiments import (
 )
 from polybot2other.live import (
     LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE,
+    LIVE_AGGRESSIVE_EDGE_COMBO,
+    LIVE_AGGRESSIVE_EDGE_VARIANT_ID,
     LIVE_COMBO,
     LIVE_PAPER_STOP_WIN_VARIANT_ID,
     LIVE_PAPER_VARIANT_ID,
@@ -76,6 +81,11 @@ from polybot2other.storage import (
     SETTLEMENT_SOURCE_EARLY_EXIT,
     SETTLEMENT_SOURCE_POLYMARKET,
     TradeStore,
+)
+from polybot2other.strategy_memory import (
+    append_strategy_memory_entry,
+    build_aggressive_edge_memory_entry,
+    load_strategy_memory,
 )
 from polybot2other.strategy import RealBtcFiveMinuteStrategy, input_from_snapshot
 from polybot2other.web import DashboardServer, Handler, _strategy_experiments_retrospective_report_html
@@ -1050,6 +1060,43 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(recent[0]["final_price"], 98.75, places=6)
             self.assertAlmostEqual(recent[0]["target_price"], 100.5, places=6)
 
+    def test_bot_backfills_suspicious_official_final_price_equal_to_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(db_path=Path(tmp) / "test.sqlite3")
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-official-backfill-equal-target",
+                symbol="BTC",
+                started_at=now - 301,
+                ends_at=now - 1,
+                target_price=100.0,
+            )
+            store.upsert_round(market)
+            signal = Signal("BTC", "Up", 0.7, 0.5, 10.0, "official equal target backfill")
+            store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            store.settle_round_outcome(
+                market.round_id,
+                "Up",
+                now,
+                final_price=100.0,
+                target_price=100.0,
+                settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+            )
+            bot.polymarket.get_resolution = (
+                lambda slug: {"outcome": "Up", "final_price": 101.25, "target_price": 100.0}
+                if slug == market.round_id
+                else None
+            )
+
+            bot._backfill_official_final_prices(now + 60)
+
+            recent = store.recent_trades(1)
+            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
+            self.assertAlmostEqual(recent[0]["final_price"], 101.25, places=6)
+            self.assertAlmostEqual(recent[0]["target_price"], 100.0, places=6)
+
     def test_partial_close_keeps_account_and_open_position_consistent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3")
@@ -1571,6 +1618,705 @@ class TradingCoreTest(unittest.TestCase):
             summary = store.trade_reason_summary("SINGLE_REVERSAL", "BTC")
             self.assertEqual(summary["total_count"], 1)
             self.assertEqual(summary["open_count"], 1)
+
+    def test_single_fak_reverse_flips_up_signal_to_down_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_side_mode = SIGNAL_SIDE_MODE_REVERSE
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-reverse-up", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Down")
+            self.assertAlmostEqual(rows[0]["entry_price"], 0.5)
+            self.assertLess(rows[0]["confidence"], 0.5)
+            self.assertIn("SINGLE_REVERSE", rows[0]["reason"])
+            self.assertIn("原始信号 Up->反向下单 Down", rows[0]["reason"])
+            self.assertEqual(bot.last_signal["side"], "Down")
+            self.assertIn("反向入场价 0.5000", bot.last_signal["reason"])
+
+    def test_single_fak_reverse_flips_down_signal_to_up_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_side_mode = SIGNAL_SIDE_MODE_REVERSE
+            now = time.time()
+            market = MarketRound("btc-updown-5m-single-reverse-down", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 99.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.49,
+                        "best_ask": 0.5,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.5, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                    "Down": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": int(now * 1000),
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Up")
+            self.assertAlmostEqual(rows[0]["entry_price"], 0.5)
+            self.assertLess(rows[0]["confidence"], 0.5)
+            self.assertIn("SINGLE_REVERSE", rows[0]["reason"])
+            self.assertIn("原始信号 Down->反向下单 Up", rows[0]["reason"])
+            self.assertEqual(bot.last_signal["side"], "Up")
+            self.assertIn("反向入场价 0.5000", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_allows_low_entry_high_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-pass", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 101.02,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 101.01,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.58,
+                        "best_ask": 0.6,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.6, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Up")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE PASS low_entry_high_edge", rows[0]["reason"])
+            self.assertEqual(bot.last_signal["side"], "Up")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE PASS", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_blocks_mid_entry_band(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=-0.5,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-block", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.03,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.03,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.03,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.6,
+                        "best_ask": 0.62,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.62, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.36,
+                        "best_ask": 0.38,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.38, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            self.assertEqual(bot.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE 过滤历史亏损价格带", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_v1_blocks_learned_false_breakout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-false-breakout", "BTC", now - 45, now + 240, 100.0)
+            store.upsert_round(market)
+            # 复盘记忆命中的形态：60 秒前贴近目标价，当前突然冲到 sweet_move 区间。
+            store.save_price_tick("BTC", 100.0, "strategy-experiment-chainlink", now - 60.0)
+            store.save_price_tick("BTC", 100.07, "strategy-experiment-chainlink", now)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.07,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.07,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.07,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.64,
+                        "best_ask": 0.66,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.66, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.32,
+                        "best_ask": 0.34,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.34, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            self.assertEqual(bot.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE 学习过滤V2 sweet Up负期望分支", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_base_keeps_sweet_up_as_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-baseline-sweet", "BTC", now - 45, now + 240, 100.0)
+            store.upsert_round(market)
+            store.save_price_tick("BTC", 100.0, "strategy-experiment-chainlink", now - 60.0)
+            store.save_price_tick("BTC", 100.07, "strategy-experiment-chainlink", now)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.07,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.07,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.07,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.64,
+                        "best_ask": 0.66,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.66, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.32,
+                        "best_ask": 0.34,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.34, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Up")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE PASS sweet_move_6_8bps", rows[0]["reason"])
+
+    def test_single_fak_aggressive_edge_v1_blocks_sweet_up_without_fast_jump(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-sweet-keep", "BTC", now - 45, now + 240, 100.0)
+            store.upsert_round(market)
+            store.save_price_tick("BTC", 100.05, "strategy-experiment-chainlink", now - 60.0)
+            store.save_price_tick("BTC", 100.07, "strategy-experiment-chainlink", now)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.07,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.07,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.07,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.64,
+                        "best_ask": 0.66,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.66, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.32,
+                        "best_ask": 0.34,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.34, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            self.assertEqual(bot.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE 学习过滤V2 sweet Up负期望分支", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_v1_blocks_high_entry_with_thin_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-high-thin-edge", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.058,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.058,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.058,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.69,
+                        "best_ask": 0.71,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.71, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.27,
+                        "best_ask": 0.29,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.29, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            self.assertEqual(store.open_trades(), [])
+            self.assertEqual(bot.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE 学习过滤V2 高价安全边际不足", bot.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_v1_allows_high_entry_with_v2_margin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-high-v2-pass", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 100.09,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 100.09,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 100.09,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.69,
+                        "best_ask": 0.71,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.71, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.27,
+                        "best_ask": 0.29,
+                        "ask_size": 100,
+                        "asks": [{"price": 0.29, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+
+            rows = store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["side"], "Up")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE PASS high_confidence_high_entry", rows[0]["reason"])
+
+    def test_single_fak_aggressive_edge_writes_loss_replay_for_official_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-loss-replay", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 101.02,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 101.01,
+                    "okx_updated_ms": now_ms,
+                    "source": "test",
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "bid_size": 90,
+                        "ask_size": 100,
+                        "bids": [{"price": 0.39, "size": 90}, {"price": 0.38, "size": 80}],
+                        "asks": [{"price": 0.4, "size": 70}, {"price": 0.41, "size": 30}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.58,
+                        "best_ask": 0.6,
+                        "bid_size": 85,
+                        "ask_size": 100,
+                        "bids": [{"price": 0.58, "size": 85}],
+                        "asks": [{"price": 0.6, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+            open_rows = store.open_trades()
+            self.assertEqual(len(open_rows), 1)
+            trade_id = int(open_rows[0]["id"])
+
+            store.settle_round_outcome(
+                market.round_id,
+                "Down",
+                now + 180,
+                final_price=99.0,
+                target_price=100.0,
+                settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+            )
+            bot._finalize_aggressive_edge_loss_replay(market.round_id, "Down", now + 180, 99.0, 100.0)
+
+            replay_path = Path(tmp) / "loss-replays" / "single_fak_aggressive_edge.jsonl"
+            packet = json.loads(replay_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(packet["variant_id"], "SINGLE_FAK_AGGRESSIVE_EDGE")
+            self.assertEqual(packet["round"]["round_id"], market.round_id)
+            self.assertEqual(packet["settlement"]["outcome"], "Down")
+            self.assertAlmostEqual(packet["settlement"]["final_distance_bps"], -100.0, places=6)
+            self.assertEqual(packet["loss_trades"][0]["id"], trade_id)
+            self.assertLess(packet["loss_trades"][0]["pnl"], 0)
+            self.assertGreaterEqual(packet["sample_count"], 1)
+            self.assertIn("entry_fill", packet["summary"]["events"])
+            self.assertEqual(packet["samples"][0]["quotes"]["Up"]["asks"][0]["price"], 0.4)
+            self.assertAlmostEqual(packet["samples"][0]["price"]["chainlink"]["distance_bps"], 100.0, places=6)
+
+    def test_single_fak_aggressive_edge_discards_win_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "test.sqlite3",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.8,
+                stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            store = TradeStore(settings.db_path, settings.initial_balance)
+            bot = PaperTradingBot(settings, store)
+            bot.signal_filter_mode = SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound("btc-updown-5m-single-aggressive-win-replay", "BTC", now - 60, now + 120, 100.0)
+            store.upsert_round(market)
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {
+                    "chainlink": 101.0,
+                    "chainlink_updated_ms": now_ms,
+                    "binance_market": 101.02,
+                    "binance_market_updated_ms": now_ms,
+                    "okx": 101.01,
+                    "okx_updated_ms": now_ms,
+                }
+                bot.latest_quotes = {
+                    "Up": {
+                        "best_bid": 0.39,
+                        "best_ask": 0.4,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "bids": [{"price": 0.39, "size": 100}],
+                        "asks": [{"price": 0.4, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                    "Down": {
+                        "best_bid": 0.58,
+                        "best_ask": 0.6,
+                        "bid_size": 100,
+                        "ask_size": 100,
+                        "bids": [{"price": 0.58, "size": 100}],
+                        "asks": [{"price": 0.6, "size": 100}],
+                        "updated_at_ms": now_ms,
+                    },
+                }
+
+            bot._run_strategy_from_state()
+            self.assertEqual(len(store.open_trades()), 1)
+
+            store.settle_round_outcome(
+                market.round_id,
+                "Up",
+                now + 180,
+                final_price=101.0,
+                target_price=100.0,
+                settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+            )
+            bot._finalize_aggressive_edge_loss_replay(market.round_id, "Up", now + 180, 101.0, 100.0)
+
+            replay_path = Path(tmp) / "loss-replays" / "single_fak_aggressive_edge.jsonl"
+            self.assertFalse(replay_path.exists())
+
+    def test_aggressive_edge_strategy_memory_records_loss_lessons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "single_fak_aggressive_edge.sqlite3"
+            memory_path = Path(tmp) / "single_fak_aggressive_edge.memory.jsonl"
+            store = TradeStore(db_path, 100.0)
+            con = store.conn
+            loss_round = MarketRound("btc-updown-5m-memory-loss", "BTC", 1_000.0, 1_300.0, 100.0)
+            win_round = MarketRound("btc-updown-5m-memory-win", "BTC", 2_000.0, 2_300.0, 100.0)
+            store.upsert_round(loss_round)
+            store.upsert_round(win_round)
+            with con:
+                con.execute(
+                    """
+                    UPDATE market_rounds
+                    SET final_price = ?, outcome = ?, settled_at = ?, settlement_source = ?
+                    WHERE round_id = ?
+                    """,
+                    (99.0, "Down", 1_305.0, SETTLEMENT_SOURCE_POLYMARKET, loss_round.round_id),
+                )
+                con.execute(
+                    """
+                    UPDATE market_rounds
+                    SET final_price = ?, outcome = ?, settled_at = ?, settlement_source = ?
+                    WHERE round_id = ?
+                    """,
+                    (101.0, "Up", 2_305.0, SETTLEMENT_SOURCE_POLYMARKET, win_round.round_id),
+                )
+                con.execute(
+                    """
+                    INSERT INTO trades(
+                        id, round_id, symbol, side, stake, entry_price, shares, confidence, move_bps,
+                        status, opened_at, settled_at, exit_price, payout, pnl, settlement_source, reason
+                    )
+                    VALUES (?, ?, 'BTC', 'Up', 5, 0.66, 7.4, 0.79, 7.0, 'SETTLED', 1045, 1305, 0, 0, -5, ?, ?)
+                    """,
+                    (
+                        1,
+                        loss_round.round_id,
+                        SETTLEMENT_SOURCE_POLYMARKET,
+                        "真实 BTC 5m Up: Chainlink 100.07 vs target 100.00, 距离 7.00bps, ask 0.66, edge 0.130 | "
+                        "SINGLE_AGGRESSIVE_EDGE PASS sweet_move_6_8bps: entry 0.6600, confidence 0.7900, edge 0.1300, abs_bps 7.00",
+                    ),
+                )
+                con.execute(
+                    """
+                    INSERT INTO trades(
+                        id, round_id, symbol, side, stake, entry_price, shares, confidence, move_bps,
+                        status, opened_at, settled_at, exit_price, payout, pnl, settlement_source, reason
+                    )
+                    VALUES (?, ?, 'BTC', 'Up', 5, 0.66, 7.4, 0.7978, 6.1, 'SETTLED', 2110, 2305, 1, 7.399646, 2.399646, ?, ?)
+                    """,
+                    (
+                        2,
+                        win_round.round_id,
+                        SETTLEMENT_SOURCE_CHAINLINK,
+                        "真实 BTC 5m Up: Chainlink 100.06 vs target 100.00, 距离 6.10bps, ask 0.66, edge 0.138 | "
+                        "SINGLE_AGGRESSIVE_EDGE PASS sweet_move_6_8bps: entry 0.6600, confidence 0.7978, edge 0.1378, abs_bps 6.10",
+                    ),
+                )
+                for created_at, price in [(1001.0, 100.0), (1045.0, 100.07), (1075.0, 100.08), (1105.0, 99.99), (1300.0, 99.0)]:
+                    con.execute(
+                        "INSERT INTO price_ticks(symbol, price, source, created_at) VALUES ('BTC', ?, 'test-chainlink', ?)",
+                        (price, created_at),
+                    )
+                for created_at, price in [(2001.0, 100.0), (2050.0, 99.95), (2110.0, 100.061), (2170.0, 100.12), (2300.0, 101.0)]:
+                    con.execute(
+                        "INSERT INTO price_ticks(symbol, price, source, created_at) VALUES ('BTC', ?, 'test-chainlink', ?)",
+                        (price, created_at),
+                    )
+
+            entry = build_aggressive_edge_memory_entry(db_path, memory_path=memory_path, created_at=1_234.0)
+
+            self.assertEqual(entry["strategy_id"], "SINGLE_FAK_AGGRESSIVE_EDGE")
+            self.assertEqual(entry["learning_target_strategy_id"], "SINGLE_FAK_AGGRESSIVE_EDGE_V1")
+            self.assertEqual(entry["real_strategy_id"], "SINGLE_FAK_AGGRESSIVE_EDGE_REAL")
+            self.assertEqual(entry["sample_window"]["settled_trades"], 2)
+            self.assertEqual(entry["sample_window"]["loss_count"], 1)
+            false_rule = entry["evidence"]["false_breakout_rule"]
+            self.assertEqual(false_rule["matched_loss_ids"], [1])
+            self.assertEqual(false_rule["matched_win_ids"], [])
+            hard_gate = entry["evidence"]["hard_gate_rejection"]
+            self.assertEqual(hard_gate["status"], "rejected_overfit_gate")
+            self.assertIn(2, hard_gate["blocked_win_ids"])
+            self.assertIn("sweet_up_false_breakout", entry["risk_tags"])
+            self.assertTrue(
+                any(
+                    item["action"] == "apply_paper_guard" and item["target"] == "SINGLE_FAK_AGGRESSIVE_EDGE_V1"
+                    for item in entry["parameter_recommendations"]
+                )
+            )
+            self.assertTrue(any(item["action"] == "do_not_apply" for item in entry["parameter_recommendations"]))
+
+            first = append_strategy_memory_entry(memory_path, entry)
+            second = append_strategy_memory_entry(memory_path, entry)
+            self.assertTrue(first["appended"])
+            self.assertFalse(second["appended"])
+            loaded = load_strategy_memory(memory_path)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0]["entry_id"], entry["entry_id"])
 
     def test_single_fak_stop_and_flip_closes_old_side_before_new_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3127,6 +3873,9 @@ class TradingCoreTest(unittest.TestCase):
             combos,
             [
                 "SINGLE + FAK",
+                "SINGLE + FAK Reverse",
+                "SINGLE + FAK Aggressive Edge",
+                "SINGLE + FAK Aggressive Edge V1",
                 "SINGLE + FAK CHAINLINK_ONLY",
                 "SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD",
                 "SINGLE + FAK FALLBACK_ONLY",
@@ -3601,6 +4350,25 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variants["SINGLE_FAK"]["review_score"]["sample_status"], "INSUFFICIENT")
             self.assertIn("结算样本不足", variants["SINGLE_FAK"]["review_score"]["reasons"][0])
             self.assertEqual(variants["SINGLE_FAK"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["signal_side_mode"], "REVERSE")
+            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["metrics"]["open_trades"], 1)
+            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["last_signal"]["side"], "Down")
+            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE"]["signal_filter_mode"], "AGGRESSIVE_EDGE")
+            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE"]["metrics"]["open_trades"], 1)
+            self.assertIn(
+                "SINGLE_AGGRESSIVE_EDGE PASS",
+                variants["SINGLE_FAK_AGGRESSIVE_EDGE"]["last_signal"]["reason"],
+            )
+            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V1"]["signal_filter_mode"], "AGGRESSIVE_EDGE_V1")
+            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V1"]["metrics"]["open_trades"], 1)
+            self.assertIn(
+                "SINGLE_AGGRESSIVE_EDGE PASS",
+                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V1"]["last_signal"]["reason"],
+            )
+            self.assertIn(
+                "single_fak_aggressive_edge_v1.jsonl",
+                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V1"]["loss_replay_path"],
+            )
             self.assertEqual(variants["SINGLE_FAK_REVERSAL"]["single_entry_mode"], "REVERSAL")
             self.assertEqual(variants["SINGLE_FAK_STOP_AND_FLIP"]["single_entry_mode"], "STOP_AND_FLIP")
             self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["price_source_mode"], "CHAINLINK_ONLY")
@@ -4251,7 +5019,7 @@ class TradingCoreTest(unittest.TestCase):
         self.assertAlmostEqual(resolution["target_price"], 100.5, places=6)
         self.assertEqual(resolution["settlement_price_source"], "Gamma:eventMetadata")
 
-    def test_polymarket_resolution_falls_back_to_page_prices(self) -> None:
+    def test_polymarket_resolution_falls_back_to_page_target_only(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
         slug = "btc-updown-5m-1779871200"
         client._get_event_by_slug = lambda _slug: {
@@ -4272,9 +5040,35 @@ class TradingCoreTest(unittest.TestCase):
 
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution["outcome"], "Down")
-        self.assertAlmostEqual(resolution["final_price"], 98.75, places=6)
+        self.assertIsNone(resolution["final_price"])
         self.assertAlmostEqual(resolution["target_price"], 100.5, places=6)
         self.assertEqual(resolution["settlement_price_source"], "PolymarketPage:eventMetadata")
+
+    def test_polymarket_resolution_ignores_page_final_when_gamma_final_missing(self) -> None:
+        client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
+        slug = "btc-updown-5m-1779871200"
+        client._get_event_by_slug = lambda _slug: {
+            "eventMetadata": {"priceToBeat": 100.5},
+            "markets": [
+                {
+                    "slug": slug,
+                    "closed": True,
+                    "outcomes": '["Up", "Down"]',
+                    "outcomePrices": '["1", "0"]',
+                }
+            ],
+        }
+        client._get_text = lambda _url: (
+            '<html><script>{"eventMetadata":{"finalPrice":999.0,"priceToBeat":100.5}}</script></html>'
+        )
+
+        resolution = client.get_resolution(slug)
+
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution["outcome"], "Up")
+        self.assertIsNone(resolution["final_price"])
+        self.assertAlmostEqual(resolution["target_price"], 100.5, places=6)
+        self.assertEqual(resolution["settlement_price_source"], "Gamma:eventMetadata")
 
     def test_polymarket_quote_keeps_sorted_orderbook_levels(self) -> None:
         client = PolymarketClient("https://gamma-api.polymarket.com", "https://clob.polymarket.com")
@@ -6799,6 +7593,178 @@ class TradingCoreTest(unittest.TestCase):
             bot.live_trading.update_settings({"live_strategy_id": LIVE_VARIANT_ID})
             self.assertEqual(bot.live_trading.store.db_path, settings.live_trading_db_path)
             self.assertGreater(bot.live_trading.store.recent_trade_count("BTC", None, None), 0)
+
+    def test_single_fak_aggressive_edge_real_selects_independent_live_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.live_trading.client = FakeLiveClient()
+
+            payload = bot.update_live_settings({"live_strategy_id": LIVE_AGGRESSIVE_EDGE_VARIANT_ID})
+
+            aggressive_db_path = Path(tmp) / "single_fak_aggressive_edge_real.sqlite3"
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_AGGRESSIVE_EDGE_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_AGGRESSIVE_EDGE_COMBO)
+            self.assertEqual(bot.live_trading.variant.signal_filter_mode, SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE)
+            self.assertEqual(bot.live_trading.store.db_path, aggressive_db_path)
+            self.assertTrue(aggressive_db_path.exists())
+            self.assertEqual(payload["live_trading"]["db_path"], str(aggressive_db_path))
+            self.assertEqual(payload["live_trading"]["live_strategy"]["signal_filter_mode"], SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE)
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            self.assertEqual(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_VARIANT_ID]["signal_filter_mode"],
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+            )
+            self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_VARIANT_ID]["db_path"], str(aggressive_db_path))
+
+    def test_single_fak_aggressive_edge_real_blocks_same_mid_entry_band_as_paper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_confidence=0.55,
+                min_edge=-0.5,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-aggressive-block",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.03,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.03,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.03,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.60,
+                    "best_ask": 0.62,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.62, "size": 100}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.36,
+                    "best_ask": 0.38,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.38, "size": 100}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE 过滤历史亏损价格带", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_real_places_live_order_when_filter_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-aggressive-pass",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 101.0,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 101.02,
+                "binance_market_updated_ms": now_ms,
+                "okx": 101.01,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.39,
+                    "best_ask": 0.40,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.40, "size": 100}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.58,
+                    "best_ask": 0.60,
+                    "ask_size": 100,
+                    "asks": [{"price": 0.60, "size": 100}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(fake_client.buy_calls[0]["token_id"], "up-token")
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_VARIANT_ID)
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE PASS low_entry_high_edge", bot.live_trading.last_signal["reason"])
+            rows = bot.live_trading.store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_REAL live FAK", rows[0]["reason"])
+            orders = bot.orders_page(account_scope="live", variant_id=LIVE_AGGRESSIVE_EDGE_VARIANT_ID)["recent_orders"]
+            self.assertEqual(orders[0]["variant_id"], LIVE_AGGRESSIVE_EDGE_VARIANT_ID)
+            self.assertEqual(orders[0]["signal_filter_mode"], SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE)
 
     def test_single_fak_real_blocks_strategy_switch_with_open_live_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

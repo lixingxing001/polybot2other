@@ -1,8 +1,8 @@
-# SINGLE_FAK_REAL Live Trading Runbook
+# Live Trading Runbook
 
 ## Scope
 
-This runbook is for `SINGLE_FAK_REAL`, the first live-trading variant. Paper trading and strategy experiments continue running for comparison. Live trading uses `data/live/single_fak_real.sqlite3` and `data/live/live-settings.json`.
+This runbook is for live-trading variants such as `SINGLE_FAK_REAL` and `SINGLE_FAK_AGGRESSIVE_EDGE_REAL`. Paper trading and strategy experiments continue running for comparison. Live trading uses `data/live/live-settings.json`; each live strategy has its own SQLite ledger, including `data/live/single_fak_real.sqlite3` and `data/live/single_fak_aggressive_edge_real.sqlite3`.
 
 ## Required Preconditions
 
@@ -152,7 +152,7 @@ If credentials, geoblock status, collateral/pUSD balance, collateral/pUSD allowa
 
 ## First Live Order One-Shot
 
-For the first real-money validation, prefer the one-shot path over leaving the dashboard loop enabled indefinitely. Start with the normal live switch off. It still uses the same `SINGLE_FAK_REAL` logic and official SDK path, but it requires an explicit confirmation string and a max stake cap, then disables live again by default after one live run.
+For the first real-money validation, prefer the one-shot path over leaving the dashboard loop enabled indefinitely. Start with the normal live switch off. It uses the currently selected live strategy and official SDK path, but it requires an explicit confirmation string and a max stake cap, then disables live again by default after one live run.
 
 From the dashboard, click `首单检查` first. The `执行首单` button remains disabled while fatal blockers exist. When the button unlocks, it refreshes doctor again, asks for the exact phrase `PLACE_REAL_ORDER`, posts `/api/live-once` with the doctor-recommended max stake, and renders the returned blocked/order/evidence fields. If you prefer terminal output and a machine-readable response, use the CLI below instead.
 
@@ -220,7 +220,7 @@ This evidence package does not submit, sell, or cancel orders. Prefer the `--ser
 6. `CANCELED(已取消)` means official order/trade state showed a no-fill cancellation, expiration, or unmatched FAK result.
 7. `REJECTED(已拒绝)` means official order/trade state showed `ORDER_STATUS_INVALID`, rejected, failed, or error. No local live position should be opened for that order.
 
-While a live buy order is `PENDING(待官方确认)`, do not expect the bot to submit another live buy for the same market, even if the signal reverses. `SINGLE_FAK_REAL` waits for the pending buy to become filled, canceled, or timed out before allowing another entry for that market.
+While a live buy order is `PENDING(待官方确认)`, do not expect the bot to submit another live buy for the same market, even if the signal reverses. The selected live strategy waits for the pending buy to become filled, canceled, or timed out before allowing another entry for that market.
 
 After a live BUY receives an official order id, the bot writes a local `PENDING(待官方确认)` order before extra order/trade reconciliation. If official status says matched but no official matched amounts are available and the immediate recheck fails, the order stays pending instead of opening a local position from the pre-order orderbook estimate. If local accounting fails after the official order may have reached CLOB, live trading is disabled immediately; check the pending order, official CLOB order id, and `/api/live-open-orders` before re-enabling.
 

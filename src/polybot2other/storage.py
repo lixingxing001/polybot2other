@@ -551,6 +551,38 @@ class TradeStore:
         return [dict(row) for row in reversed(rows)]
 
     @_locked
+    def closest_price_tick(
+        self,
+        symbol: str,
+        target_at: float,
+        *,
+        max_distance_seconds: float = 20.0,
+        source_contains: str = "",
+    ) -> dict[str, Any] | None:
+        """读取目标时间附近的价格 tick，供策略复盘和学习过滤使用。"""
+
+        distance = max(0.0, float(max_distance_seconds))
+        source_like = f"%{source_contains.lower()}%" if source_contains else ""
+        row = self.conn.execute(
+            """
+            SELECT
+                symbol,
+                price,
+                source,
+                created_at,
+                ABS(created_at - ?) AS distance_seconds
+            FROM price_ticks
+            WHERE symbol = ?
+              AND created_at BETWEEN ? AND ?
+              AND (? = '' OR LOWER(source) LIKE ?)
+            ORDER BY distance_seconds ASC, created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (target_at, symbol, target_at - distance, target_at + distance, source_like, source_like),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @_locked
     def upsert_round(self, market: MarketRound) -> None:
         self.conn.execute(
             """
@@ -1925,7 +1957,15 @@ class TradeStore:
               AND settled_at IS NOT NULL
               AND ends_at >= ?
               AND settlement_source = ?
-              AND (final_price IS NULL OR target_price <= 0)
+              AND (
+                    final_price IS NULL
+                    OR target_price <= 0
+                    OR (
+                        final_price IS NOT NULL
+                        AND target_price > 0
+                        AND ABS(final_price - target_price) <= 0.000001
+                    )
+                  )
             ORDER BY ends_at DESC, round_id DESC
             LIMIT ?
             """,
@@ -2133,6 +2173,49 @@ class TradeStore:
             OFFSET ?
             """,
             query_params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def trades_for_round(self, round_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+                t.id,
+                t.round_id,
+                t.symbol,
+                t.side,
+                t.stake,
+                t.entry_price,
+                t.shares,
+                t.confidence,
+                t.move_bps,
+                t.status,
+                t.opened_at,
+                t.settled_at,
+                t.exit_price,
+                t.payout,
+                t.pnl,
+                t.reason,
+                COALESCE(t.settlement_source, r.settlement_source) AS settlement_source,
+                t.settlement_source AS trade_settlement_source,
+                r.target_price,
+                r.started_at,
+                r.final_price,
+                r.outcome,
+                r.settlement_source AS market_settlement_source,
+                r.ends_at,
+                r.question,
+                r.condition_id,
+                r.up_token,
+                r.down_token,
+                r.url
+            FROM trades t
+            JOIN market_rounds r ON r.round_id = t.round_id
+            WHERE t.round_id = ?
+            ORDER BY t.id ASC
+            """,
+            (round_id,),
         ).fetchall()
         return [dict(row) for row in rows]
 

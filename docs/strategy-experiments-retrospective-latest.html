@@ -58,29 +58,29 @@
       <header>
         <div>
           <h1>策略实验复盘报告</h1>
-          <p>6 组策略实验隔离 Paper 复盘。</p>
+          <p>8 组策略实验隔离 Paper 复盘。</p>
           <p>窗口：全部历史</p>
         </div>
         <div class="stamp">
-          <div>生成时间：2026-06-01 16:32:57</div>
+          <div>生成时间：2026-06-03 18:28:41</div>
           <div>数据源：data/strategy-experiments</div>
         </div>
       </header>
       <section class="cards">
-        <div class="card"><span>盈利状态</span><strong>暂无盈利胜出</strong></div>
+        <div class="card"><span>盈利状态</span><strong>等待盈利样本</strong></div>
         <div class="card"><span>正式盈利胜出</span><strong>暂无</strong></div>
-        <div class="card"><span>当前盈利领先</span><strong>SINGLE + FAK</strong></div>
-        <div class="card"><span>样本</span><strong>6 / 6</strong></div>
+        <div class="card"><span>当前盈利领先</span><strong>SINGLE + FAK Aggressive Edge</strong></div>
+        <div class="card"><span>样本</span><strong>6 / 8</strong></div>
         <div class="card"><span>执行淘汰</span><strong>0</strong></div>
       </section>
       <section class="panel">
         <h2>复盘结论</h2>
-        <p>盈利口径：样本已可比较，但最高净盈亏未大于 0，暂不应切换主策略</p>
-        <p>评分口径：所有未淘汰组合达到样本阈值，可以按评分选择优先候选</p>
+        <p>盈利口径：还有 2 个组合未达到样本阈值，当前盈利领先只作为观察信号</p>
+        <p>评分口径：还有 2 个组合未达到样本阈值，0 个组合已淘汰</p>
         <p>正式决胜条件：未淘汰组合达到样本阈值，且最高净盈亏大于 0。当前 profitable_winner_ready=False。</p>
       </section>
       <section class="panel">
-        <h2>6 组合盈利排名</h2>
+        <h2>8 组合盈利排名</h2>
         <div class="table-wrap">
           <table>
             <thead>
@@ -93,122 +93,162 @@
             <tbody>
               <tr>
                 <td class="mono">1</td>
-                <td><strong>SINGLE + FAK</strong><br><span class="muted mono">SINGLE_FAK</span></td>
-                <td>当前基线，对照组</td>
-                <td>可比较</td>
-                <td class="bad">$-35.67</td>
-                <td>-1.37%</td>
-                <td>54.20%</td>
-                <td>524 / 524</td>
-                <td>522</td>
-                <td>524</td>
+                <td><strong>SINGLE + FAK Aggressive Edge</strong><br><span class="muted mono">SINGLE_FAK_AGGRESSIVE_EDGE</span></td>
+                <td>Paper-only 历史样本激进入场过滤，优先验证正收益价格带</td>
+                <td>样本不足</td>
+                <td class="good">+$0.59</td>
+                <td>3.94%</td>
+                <td>66.67%</td>
+                <td>3 / 3</td>
+                <td>2</td>
+                <td>3</td>
                 <td>100.00%</td>
-                <td>63.26</td>
-                <td>候选</td>
-                <td>85%</td>
-                <td>25%-35%</td>
-                <td>可决胜</td>
-                <td class="reason">仍有 2 笔兜底结算</td>
+                <td>61.92</td>
+                <td>继续观察</td>
+                <td>采样</td>
+                <td>待验证</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 3/30; 订单样本不足 3/60; 仍有 1 笔兜底结算</td>
               </tr>
 
               <tr>
                 <td class="mono">2</td>
-                <td><strong>SINGLE + FAK STOP_AND_FLIP</strong><br><span class="muted mono">SINGLE_FAK_STOP_AND_FLIP</span></td>
-                <td>真实止损反手实验</td>
-                <td>可比较</td>
-                <td class="bad">$-40.92</td>
-                <td>-2.49%</td>
-                <td>48.63%</td>
-                <td>329 / 329</td>
-                <td>271</td>
-                <td>329</td>
+                <td><strong>SINGLE + FAK Reverse</strong><br><span class="muted mono">SINGLE_FAK_REVERSE</span></td>
+                <td>Paper-only 基线信号反向下注对照</td>
+                <td>样本不足</td>
+                <td class="bad">$-21.10</td>
+                <td>-100.00%</td>
+                <td>0.00%</td>
+                <td>5 / 5</td>
+                <td>5</td>
+                <td>5</td>
                 <td>100.00%</td>
-                <td>58.10</td>
-                <td>谨慎观察</td>
-                <td>75%-80%</td>
-                <td>30%-40%</td>
-                <td>可决胜</td>
-                <td class="reason">仍有 4 笔兜底结算</td>
+                <td>32.00</td>
+                <td>继续观察</td>
+                <td>采样</td>
+                <td>待验证</td>
+                <td>-</td>
+                <td class="reason">结算样本不足 5/30; 订单样本不足 5/60</td>
               </tr>
 
               <tr>
                 <td class="mono">3</td>
-                <td><strong>SINGLE + FAK CHAINLINK_ONLY</strong><br><span class="muted mono">SINGLE_FAK_CHAINLINK_ONLY</span></td>
-                <td>Chainlink-only 价格源候选</td>
+                <td><strong>SINGLE + FAK STOP_AND_FLIP</strong><br><span class="muted mono">SINGLE_FAK_STOP_AND_FLIP</span></td>
+                <td>真实止损反手实验</td>
                 <td>可比较</td>
-                <td class="bad">$-44.59</td>
-                <td>-4.64%</td>
-                <td>58.55%</td>
-                <td>193 / 193</td>
-                <td>191</td>
-                <td>193</td>
-                <td>100.00%</td>
-                <td>63.53</td>
-                <td>候选</td>
-                <td>85%</td>
-                <td>25%-35%</td>
+                <td class="bad">$-60.94</td>
+                <td>-2.27%</td>
+                <td>53.90%</td>
+                <td>538 / 538</td>
+                <td>380</td>
+                <td>539</td>
+                <td>99.81%</td>
+                <td>59.82</td>
+                <td>谨慎观察</td>
+                <td>75%-80%</td>
+                <td>30%-40%</td>
                 <td>可决胜</td>
-                <td class="reason">仍有 2 笔兜底结算</td>
+                <td class="reason">仍有 76 笔兜底结算</td>
               </tr>
 
               <tr>
                 <td class="mono">4</td>
-                <td><strong>SINGLE + FAK FALLBACK_ONLY</strong><br><span class="muted mono">SINGLE_FAK_FALLBACK_ONLY</span></td>
-                <td>Paper-only fallback 负面对照，实盘禁止</td>
+                <td><strong>SINGLE + FAK</strong><br><span class="muted mono">SINGLE_FAK</span></td>
+                <td>当前基线，对照组</td>
                 <td>可比较</td>
-                <td class="bad">$-48.20</td>
-                <td>-3.69%</td>
-                <td>42.53%</td>
-                <td>261 / 261</td>
-                <td>253</td>
-                <td>261</td>
-                <td>100.00%</td>
-                <td>54.59</td>
-                <td>谨慎观察</td>
-                <td>采样</td>
-                <td>不适用</td>
+                <td class="bad">$-64.05</td>
+                <td>-1.99%</td>
+                <td>56.19%</td>
+                <td>646 / 646</td>
+                <td>616</td>
+                <td>647</td>
+                <td>99.85%</td>
+                <td>63.98</td>
+                <td>候选</td>
+                <td>85%</td>
+                <td>25%-35%</td>
                 <td>可决胜</td>
-                <td class="reason">仍有 8 笔兜底结算</td>
+                <td class="reason">仍有 30 笔兜底结算</td>
               </tr>
 
               <tr>
                 <td class="mono">5</td>
-                <td><strong>SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD</strong><br><span class="muted mono">SINGLE_FAK_ANTI_BOT_GUARD</span></td>
-                <td>Paper-only bot-trap 防守采样，实盘禁止直接沿用</td>
+                <td><strong>SINGLE + FAK CHAINLINK_ONLY</strong><br><span class="muted mono">SINGLE_FAK_CHAINLINK_ONLY</span></td>
+                <td>Chainlink-only 价格源候选</td>
                 <td>可比较</td>
-                <td class="bad">$-61.28</td>
-                <td>-9.44%</td>
-                <td>54.62%</td>
-                <td>130 / 130</td>
-                <td>128</td>
-                <td>130</td>
-                <td>100.00%</td>
-                <td>57.74</td>
-                <td>谨慎观察</td>
-                <td>采样</td>
-                <td>待验证</td>
+                <td class="bad">$-71.69</td>
+                <td>-4.65%</td>
+                <td>60.84%</td>
+                <td>309 / 309</td>
+                <td>282</td>
+                <td>310</td>
+                <td>99.68%</td>
+                <td>64.84</td>
+                <td>候选</td>
+                <td>85%</td>
+                <td>25%-35%</td>
                 <td>可决胜</td>
-                <td class="reason">仍有 2 笔兜底结算</td>
+                <td class="reason">仍有 27 笔兜底结算</td>
               </tr>
 
               <tr>
                 <td class="mono">6</td>
+                <td><strong>SINGLE + FAK FALLBACK_ONLY</strong><br><span class="muted mono">SINGLE_FAK_FALLBACK_ONLY</span></td>
+                <td>Paper-only fallback 负面对照，实盘禁止</td>
+                <td>可比较</td>
+                <td class="bad">$-97.39</td>
+                <td>-6.95%</td>
+                <td>41.64%</td>
+                <td>281 / 281</td>
+                <td>268</td>
+                <td>281</td>
+                <td>100.00%</td>
+                <td>51.73</td>
+                <td>谨慎观察</td>
+                <td>采样</td>
+                <td>不适用</td>
+                <td>可决胜</td>
+                <td class="reason">仍有 13 笔兜底结算</td>
+              </tr>
+
+              <tr>
+                <td class="mono">7</td>
+                <td><strong>SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD</strong><br><span class="muted mono">SINGLE_FAK_ANTI_BOT_GUARD</span></td>
+                <td>Paper-only bot-trap 防守采样，实盘禁止直接沿用</td>
+                <td>可比较</td>
+                <td class="bad">$-97.56</td>
+                <td>-9.24%</td>
+                <td>56.13%</td>
+                <td>212 / 212</td>
+                <td>173</td>
+                <td>212</td>
+                <td>100.00%</td>
+                <td>57.67</td>
+                <td>谨慎观察</td>
+                <td>采样</td>
+                <td>待验证</td>
+                <td>可决胜</td>
+                <td class="reason">仍有 39 笔兜底结算</td>
+              </tr>
+
+              <tr>
+                <td class="mono">8</td>
                 <td><strong>SINGLE + FAK REVERSAL</strong><br><span class="muted mono">SINGLE_FAK_REVERSAL</span></td>
                 <td>显式反转双边实验</td>
                 <td>可比较</td>
-                <td class="bad">$-85.21</td>
-                <td>-5.10%</td>
-                <td>49.85%</td>
-                <td>335 / 335</td>
-                <td>333</td>
-                <td>335</td>
-                <td>100.00%</td>
-                <td>57.98</td>
+                <td class="bad">$-100.00</td>
+                <td>-4.93%</td>
+                <td>52.68%</td>
+                <td>410 / 410</td>
+                <td>395</td>
+                <td>411</td>
+                <td>99.76%</td>
+                <td>59.76</td>
                 <td>谨慎观察</td>
                 <td>85%</td>
                 <td>25%-35%</td>
                 <td>可决胜</td>
-                <td class="reason">仍有 2 笔兜底结算</td>
+                <td class="reason">仍有 15 笔兜底结算</td>
               </tr></tbody>
           </table>
         </div>
@@ -218,7 +258,22 @@
         <div class="table-wrap">
           <table>
             <thead><tr><th>组合</th><th>样本状态</th><th>结算数</th><th>订单数</th><th>说明</th></tr></thead>
-            <tbody><tr><td colspan="5" class="empty">暂无待补样本组合</td></tr></tbody>
+            <tbody>
+              <tr>
+                <td>SINGLE + FAK Aggressive Edge</td>
+                <td>样本不足</td>
+                <td>3</td>
+                <td>3</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr>
+
+              <tr>
+                <td>SINGLE + FAK Reverse</td>
+                <td>样本不足</td>
+                <td>5</td>
+                <td>5</td>
+                <td>继续积累样本后再纳入正式决胜。</td>
+              </tr></tbody>
           </table>
         </div>
       </section>

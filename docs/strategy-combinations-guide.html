@@ -266,15 +266,15 @@
     <section class="hero">
       <h1>EdgePulse 策略组合和账户口径说明</h1>
       <p>
-        本文档用于区分 dashboard 里看到的主账户、实盘账户和 20 个 Paper 策略实验组合。
+        本文档用于区分 dashboard 里看到的主账户、实盘账户、8 个当前启用 Paper 组合，以及历史保留的组合说明。
         当前代码仍只跟踪 Polymarket BTC 5 分钟 Up/Down 市场；所有 Paper 组合都用隔离 SQLite 账户采样，不能把短期 Paper 表现直接等同于实盘可用性。
       </p>
       <div class="meta">
-        <span class="pill good">当前实验组合数：20</span>
-        <span class="pill warn">新增采样：LLM_SUPER_AGENT_PAPER</span>
-        <span class="pill danger">唯一实盘租户：SINGLE_FAK_REAL</span>
-        <span class="pill">文档版本：v1.1</span>
-        <span class="pill">更新日期：2026-05-29</span>
+        <span class="pill good">当前启用实验组合数：8</span>
+        <span class="pill warn">新增采样：SINGLE_FAK_AGGRESSIVE_EDGE</span>
+        <span class="pill danger">实盘租户：SINGLE_FAK_REAL / SINGLE_FAK_AGGRESSIVE_EDGE_REAL</span>
+        <span class="pill">文档版本：v1.2</span>
+        <span class="pill">更新日期：2026-06-03</span>
       </div>
       <nav class="toc" aria-label="目录">
         <a href="#account-scopes">账户口径</a>
@@ -306,16 +306,16 @@
           </tr>
           <tr>
             <td><strong>实盘账户</strong></td>
-            <td><code>live</code> / <code>SINGLE_FAK_REAL</code></td>
+            <td><code>live</code> / <code>SINGLE_FAK_REAL</code> / <code>SINGLE_FAK_AGGRESSIVE_EDGE_REAL</code></td>
             <td><span class="status live">Real</span></td>
             <td>真实 Polymarket 下单流程，用独立数据库和 dashboard 实盘开关控制。</td>
-            <td>目前只按 <code>SINGLE_FAK</code> 的 Paper 基线行为接入，其他实验组合没有自动接入实盘。</td>
+            <td><code>SINGLE_FAK_AGGRESSIVE_EDGE_REAL</code> 与 Paper 的 <code>SINGLE_FAK_AGGRESSIVE_EDGE</code> 共用过滤器，仍受实盘预检、钱包、地区和官方挂单硬门槛控制。</td>
           </tr>
           <tr>
             <td><strong>策略实验账户</strong></td>
             <td><code>strategy_experiment</code> + <code>variant_id</code></td>
             <td><span class="status paper">Paper</span></td>
-            <td>20 个隔离 Paper 对照组，每个组合有自己的 SQLite 数据库。</td>
+            <td>当前启用 8 个隔离 Paper 对照组，每个组合有自己的 SQLite 数据库；下方总表保留历史组合说明。</td>
             <td>用于采样和复盘。新增实验组合默认不代表推荐实盘。</td>
           </tr>
         </tbody>
@@ -337,7 +337,7 @@
         </div>
         <div class="card">
           <h3>REAL</h3>
-          <p><strong>实盘租户。</strong><code>SINGLE_FAK_REAL</code> 是真实调用 Polymarket CLOB 的账户，不属于 20 个 Paper 实验组合。</p>
+          <p><strong>实盘租户。</strong><code>SINGLE_FAK_REAL</code> 是真实调用 Polymarket CLOB 的账户，走独立数据库和实盘开关。</p>
           <p>它有独立预算、凭证、余额/授权检查、地理限制检查、进程锁、官方挂单检查和手动卖出流程。</p>
         </div>
       </div>
@@ -431,7 +431,7 @@
     </section>
 
     <section id="variants">
-      <h2>20 个 Paper 策略实验组合</h2>
+      <h2>22 个 Paper 策略组合说明</h2>
       <div class="note warn">
         <strong>阅读方式：</strong>优先看 <code>variant_id</code>，它是数据库和接口里的稳定标识；<code>combo</code> 是 dashboard 展示名。
         “建议用途”只代表当前开发定位，不代表长期结论。真正是否可实盘，需要等样本、回撤和订单质量复盘。
@@ -461,6 +461,24 @@
           </tr>
           <tr>
             <td>2</td>
+            <td><code>SINGLE_FAK_REVERSE</code></td>
+            <td><code>SINGLE + FAK Reverse</code></td>
+            <td><span class="status sample">方向反向对照</span></td>
+            <td>先按 <code>SINGLE_FAK</code> 生成原始 Up/Down 信号，再把最终下注方向反过来；原因里标记 <code>SINGLE_REVERSE</code>。</td>
+            <td>压力测试基线方向判断是否存在系统性反向价值，并单独观察反向下注样本。</td>
+            <td>Paper-only，对真实资金风险极高；必须先看样本胜率、PnL、回撤和盘口成交质量。</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><code>SINGLE_FAK_AGGRESSIVE_EDGE</code></td>
+            <td><code>SINGLE + FAK Aggressive Edge</code></td>
+            <td><span class="status sample">激进入场过滤</span></td>
+            <td>基于旧组合样本暴露出的价格带和 bps 区间，对基线信号做后置过滤；原因里标记 <code>SINGLE_AGGRESSIVE_EDGE</code>。</td>
+            <td>优先验证低价高 edge、6-8bps 甜点区、极高置信高价单能否形成新的正收益样本。</td>
+            <td>已映射到 <code>SINGLE_FAK_AGGRESSIVE_EDGE_REAL</code>，真实下单仍走独立 live 账户、预检和开关控制。</td>
+          </tr>
+          <tr>
+            <td>4</td>
             <td><code>SINGLE_FAK_CHAINLINK_ONLY</code></td>
             <td><code>SINGLE + FAK CHAINLINK_ONLY</code></td>
             <td><span class="status sample">价格源实验</span></td>
@@ -469,7 +487,7 @@
             <td>候选观察，不应直接替换实盘，需先看样本覆盖率和错过机会。</td>
           </tr>
           <tr>
-            <td>3</td>
+            <td>5</td>
             <td><code>SINGLE_FAK_ANTI_BOT_GUARD</code></td>
             <td><code>SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD</code></td>
             <td><span class="status sample">防守采样</span></td>
@@ -478,7 +496,7 @@
             <td>Paper-only，实盘禁止直接沿用；采样后再决定是否拆规则。</td>
           </tr>
           <tr>
-            <td>4</td>
+            <td>6</td>
             <td><code>SINGLE_FAK_FALLBACK_ONLY</code></td>
             <td><code>SINGLE + FAK FALLBACK_ONLY</code></td>
             <td><span class="status sample">负面对照</span></td>
@@ -487,7 +505,7 @@
             <td>严禁实盘，定位是负面对照和采样。</td>
           </tr>
           <tr>
-            <td>5</td>
+            <td>7</td>
             <td><code>SINGLE_FAK_MULTI_CONFIRM</code></td>
             <td><code>SINGLE + FAK MULTI_CONFIRM</code></td>
             <td><span class="status sample">外部确认</span></td>
@@ -496,7 +514,7 @@
             <td>未验证，不接实盘；若长时间不下单，多半是外部基差样本未 ready 或过滤过严。</td>
           </tr>
           <tr>
-            <td>6</td>
+            <td>8</td>
             <td><code>SINGLE_FAK_MULTI_LEAD</code></td>
             <td><code>SINGLE + FAK MULTI_LEAD</code></td>
             <td><span class="status sample">领先修正</span></td>
@@ -505,7 +523,7 @@
             <td>高不确定实验，不接实盘；要先看是否只是交易所固定基差造成错觉。</td>
           </tr>
           <tr>
-            <td>7</td>
+            <td>9</td>
             <td><code>SINGLE_FAK_STRICT</code></td>
             <td><code>SINGLE + FAK STRICT</code></td>
             <td><span class="status candidate">保守候选</span></td>
@@ -514,7 +532,7 @@
             <td>可作为未来实盘候选，但当前实盘仍是 <code>SINGLE_FAK_REAL</code> 的 legacy 行为。</td>
           </tr>
           <tr>
-            <td>8</td>
+            <td>10</td>
             <td><code>SINGLE_FAK_REVERSAL</code></td>
             <td><code>SINGLE + FAK REVERSAL</code></td>
             <td><span class="status sample">反转实验</span></td>
@@ -523,7 +541,7 @@
             <td>不是实盘止损逻辑；不应当作风险关闭手段。</td>
           </tr>
           <tr>
-            <td>9</td>
+            <td>11</td>
             <td><code>SINGLE_FAK_STOP_AND_FLIP</code></td>
             <td><code>SINGLE + FAK STOP_AND_FLIP</code></td>
             <td><span class="status sample">止损反手</span></td>
@@ -532,7 +550,7 @@
             <td>高风险实验；实盘前必须验证滑点、bid 深度、重复提交和未成交处理。</td>
           </tr>
           <tr>
-            <td>10</td>
+            <td>12</td>
             <td><code>SINGLE_GTC</code></td>
             <td><code>SINGLE + GTC</code></td>
             <td><span class="status paper">挂单实验</span></td>
@@ -541,7 +559,7 @@
             <td>仅 Paper。实盘 maker 需要更完整的撤单、排队和库存管理。</td>
           </tr>
           <tr>
-            <td>11</td>
+            <td>13</td>
             <td><code>SINGLE_GTD</code></td>
             <td><code>SINGLE + GTD</code></td>
             <td><span class="status paper">限时挂单</span></td>
@@ -550,7 +568,7 @@
             <td>仅 Paper，实盘前需要官方订单生命周期和撤单确认。</td>
           </tr>
           <tr>
-            <td>12</td>
+            <td>14</td>
             <td><code>SINGLE_POST_ONLY</code></td>
             <td><code>SINGLE + POST_ONLY</code></td>
             <td><span class="status paper">maker 实验</span></td>
@@ -559,7 +577,7 @@
             <td>仅 Paper，当前 maker 队列是模拟，不等于官方真实排队位置。</td>
           </tr>
           <tr>
-            <td>13</td>
+            <td>15</td>
             <td><code>REALTIME_MAKER_POST_ONLY</code></td>
             <td><code>REALTIME MAKER + POST_ONLY MULTI_LEAD</code></td>
             <td><span class="status sample">实时做市采样</span></td>
@@ -568,7 +586,7 @@
             <td>严禁直接接实盘。必须先复盘 maker fill rate、adverse selection、撤单次数、成交后胜率和 PnL。</td>
           </tr>
           <tr>
-            <td>14</td>
+            <td>16</td>
             <td><code>LLM_SUPER_AGENT_PAPER</code></td>
             <td><code>LLM SUPER AGENT + PAPER</code></td>
             <td><span class="status sample">智能路由采样</span></td>
@@ -577,7 +595,7 @@
             <td>严禁直接接实盘。LLM 只能做路由建议，不能绕过硬风控。</td>
           </tr>
           <tr>
-            <td>15</td>
+            <td>17</td>
             <td><code>PAIR_FAK</code></td>
             <td><code>PAIR + FAK</code></td>
             <td><span class="status sample">配对 taker</span></td>
@@ -586,7 +604,7 @@
             <td>不接实盘。双边 taker 对深度和手续费极敏感。</td>
           </tr>
           <tr>
-            <td>16</td>
+            <td>18</td>
             <td><code>PAIR_FAK_MULTI_CONFIRM</code></td>
             <td><code>PAIR + FAK MULTI_CONFIRM</code></td>
             <td><span class="status sample">配对确认</span></td>
@@ -595,7 +613,7 @@
             <td>不接实盘；样本不足时可能长时间没有订单。</td>
           </tr>
           <tr>
-            <td>17</td>
+            <td>19</td>
             <td><code>PAIR_FAK_MULTI_LEAD</code></td>
             <td><code>PAIR + FAK MULTI_LEAD</code></td>
             <td><span class="status sample">配对领先</span></td>
@@ -604,7 +622,7 @@
             <td>不接实盘；当前更多是采样标签和开仓门槛实验。</td>
           </tr>
           <tr>
-            <td>18</td>
+            <td>20</td>
             <td><code>PAIR_GTC</code></td>
             <td><code>PAIR + GTC</code></td>
             <td><span class="status candidate">配对核心候选</span></td>
@@ -613,7 +631,7 @@
             <td>仍是 Paper。实盘前要处理官方挂单撤单、单边成交残余和资金占用。</td>
           </tr>
           <tr>
-            <td>19</td>
+            <td>21</td>
             <td><code>PAIR_GTD</code></td>
             <td><code>PAIR + GTD</code></td>
             <td><span class="status candidate">5m 核心候选</span></td>
@@ -622,7 +640,7 @@
             <td>Paper 候选。实盘必须先验证限时撤单和残余库存处理。</td>
           </tr>
           <tr>
-            <td>20</td>
+            <td>22</td>
             <td><code>PAIR_POST_ONLY</code></td>
             <td><code>PAIR + POST_ONLY</code></td>
             <td><span class="status candidate">配对 maker 目标</span></td>
@@ -647,8 +665,13 @@
         <tbody>
           <tr>
             <td>当前单边策略是否还行</td>
-            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code></td>
-            <td>胜率、PnL、回撤、fallback 是否拉低表现。</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_AGGRESSIVE_EDGE</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code></td>
+            <td>胜率、PnL、回撤、fallback 是否拉低表现，以及激进过滤是否提高净盈亏。</td>
+          </tr>
+          <tr>
+            <td>基线方向判断是否可能反着做更好</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_REVERSE</code></td>
+            <td>同一信号窗口下的方向反差、成交价、胜率、PnL 和回撤。</td>
           </tr>
           <tr>
             <td>小资金是否要禁止反向双边买</td>
@@ -663,7 +686,7 @@
           <tr>
             <td>OKX/Binance 是否能提高准确率</td>
             <td><code>SINGLE_FAK_MULTI_CONFIRM</code>、<code>SINGLE_FAK_MULTI_LEAD</code>、<code>PAIR_FAK_MULTI_CONFIRM</code>、<code>PAIR_FAK_MULTI_LEAD</code></td>
-            <td>样本 ready 比例、过滤掉的单原本盈亏、残差不是固定基差而是真领先。</td>
+            <td>样本 ready 比例、过滤掉的单原本盈亏、残差是否存在真实领先价值。</td>
           </tr>
           <tr>
             <td>机器人/盘口异常防守是否有效</td>
@@ -692,8 +715,8 @@
     <section id="live-warning">
       <h2>实盘边界</h2>
       <div class="note danger">
-        <p><strong>当前只有 <code>SINGLE_FAK_REAL</code> 是实盘租户。</strong>它不是 20 个 Paper 实验组合之一，而是独立 live 数据库和实盘开关管理的真实交易路径。</p>
-        <p>当前实盘行为按 <code>SINGLE_FAK</code> 基线接入：FAK taker 买入，legacy 同市场反向双边买入行为保留。<code>STRICT</code>、<code>REVERSAL</code>、<code>STOP_AND_FLIP</code>、<code>MULTI_CONFIRM</code>、<code>MULTI_LEAD</code>、<code>ANTI_BOT_GUARD</code>、<code>LLM_SUPER_AGENT_PAPER</code> 和所有 <code>PAIR</code> 组合都没有自动接入实盘。</p>
+        <p><strong>当前实盘租户包括 <code>SINGLE_FAK_REAL</code> 和 <code>SINGLE_FAK_AGGRESSIVE_EDGE_REAL</code>。</strong>它们走独立 live 数据库和实盘开关管理的真实交易路径。</p>
+        <p><code>SINGLE_FAK_REAL</code> 按 <code>SINGLE_FAK</code> 基线接入：FAK taker 买入，legacy 同市场反向双边买入行为保留。<code>SINGLE_FAK_AGGRESSIVE_EDGE_REAL</code> 在同一套 live FAK 路径前增加 Aggressive Edge 共用过滤器。<code>STRICT</code>、<code>REVERSAL</code>、<code>STOP_AND_FLIP</code>、<code>MULTI_CONFIRM</code>、<code>MULTI_LEAD</code>、<code>ANTI_BOT_GUARD</code>、<code>LLM_SUPER_AGENT_PAPER</code> 和所有 <code>PAIR</code> 组合都没有自动接入实盘。</p>
         <p>尤其注意：<code>SINGLE_FAK_FALLBACK_ONLY</code> 和 <code>SINGLE_FAK_ANTI_BOT_GUARD</code> 明确是 Paper-only 采样，不应直接套到实盘。</p>
       </div>
 
@@ -709,13 +732,13 @@
         <tbody>
           <tr>
             <td>1</td>
-            <td>单边基线最近亏损是否来自 fallback、反向双边、还是盘口执行质量。</td>
-            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code>、<code>SINGLE_FAK_FALLBACK_ONLY</code></td>
+            <td>单边基线最近亏损是否来自价格带、fallback、反向双边、还是盘口执行质量。</td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_AGGRESSIVE_EDGE</code>、<code>SINGLE_FAK_CHAINLINK_ONLY</code>、<code>SINGLE_FAK_FALLBACK_ONLY</code></td>
           </tr>
           <tr>
             <td>2</td>
             <td>同市场反向买入到底贡献收益还是扩大回撤。</td>
-            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_STRICT</code>、<code>SINGLE_FAK_REVERSAL</code>、<code>SINGLE_FAK_STOP_AND_FLIP</code></td>
+            <td><code>SINGLE_FAK</code>、<code>SINGLE_FAK_REVERSE</code>、<code>SINGLE_FAK_STRICT</code>、<code>SINGLE_FAK_REVERSAL</code>、<code>SINGLE_FAK_STOP_AND_FLIP</code></td>
           </tr>
           <tr>
             <td>3</td>

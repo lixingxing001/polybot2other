@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -31,6 +32,11 @@ from .experiments import (
     MARKET_DATA_MODE_MULTI_CONFIRM,
     MARKET_DATA_MODE_MULTI_LEAD,
     PRICE_SOURCE_MODE_MIXED,
+    SIGNAL_SIDE_MODE_BASE,
+    SIGNAL_SIDE_MODE_REVERSE,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    SIGNAL_FILTER_MODE_NONE,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
     SINGLE_ENTRY_MODE_STOP_AND_FLIP,
@@ -48,6 +54,7 @@ from .llm_agent import (
     build_llm_market_features,
     route_execution_modes,
 )
+from .loss_replay import AggressiveEdgeLossReplayRecorder
 from .live import (
     LIVE_COMBO,
     LIVE_PAPER_COMBO,
@@ -62,6 +69,13 @@ from .live import (
     _live_strategy_meta,
     _tag_live_rows,
 )
+from .signal_filters import (
+    SINGLE_AGGRESSIVE_EDGE_MARKER,
+    aggressive_edge_block_reason,
+    aggressive_edge_false_breakout_block_reason,
+    aggressive_edge_paper_v2_block_reason,
+    aggressive_edge_pass_note,
+)
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
 from .polymarket import PolymarketClient, market_to_payload
@@ -75,6 +89,7 @@ from .storage import (
 from .strategy import MULTI_SOURCE_KEYS, RealBtcFiveMinuteStrategy, input_from_snapshot, multi_source_price_context
 
 
+logger = logging.getLogger(__name__)
 LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
 BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS = 1.0
 BACKEND_MARKET_DATA_REFRESH_RATIO = 0.5
@@ -106,6 +121,16 @@ PAIR_STOP_STREAK_LIMIT = 3
 PAIR_EPSILON = 0.000001
 PAIR_MULTI_READY_MARKER = "PAIR_MULTI"
 SINGLE_STRICT_MARKER = "SINGLE_STRICT"
+SINGLE_REVERSE_MARKER = "SINGLE_REVERSE"
+SINGLE_AGGRESSIVE_EDGE_REPLAY_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE"
+SINGLE_AGGRESSIVE_EDGE_REPLAY_COMBO = "SINGLE + FAK Aggressive Edge"
+SINGLE_AGGRESSIVE_EDGE_REPLAY_FILE = "single_fak_aggressive_edge.jsonl"
+AGGRESSIVE_EDGE_FILTER_MODES = frozenset(
+    {
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    }
+)
 SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
 SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
 REALTIME_MAKER_MARKER = "REALTIME_MAKER_PAPER"
@@ -251,6 +276,13 @@ class PaperTradingBot:
         self.pair_stop_loss_streak = 0
         self.last_pair_event: dict[str, Any] | None = None
         self.single_entry_mode = SINGLE_ENTRY_MODE_LEGACY
+        self.signal_side_mode = SIGNAL_SIDE_MODE_BASE
+        self.signal_filter_mode = SIGNAL_FILTER_MODE_NONE
+        self._aggressive_edge_loss_replay = AggressiveEdgeLossReplayRecorder(
+            self.settings.db_path.parent / "loss-replays" / SINGLE_AGGRESSIVE_EDGE_REPLAY_FILE,
+            variant_id=SINGLE_AGGRESSIVE_EDGE_REPLAY_VARIANT_ID,
+            combo=SINGLE_AGGRESSIVE_EDGE_REPLAY_COMBO,
+        )
         self.market_data_mode = MARKET_DATA_MODE_BASE
         self.price_source_mode = PRICE_SOURCE_MODE_MIXED
         self.anti_bot_guard_mode = ANTI_BOT_GUARD_MODE_NONE
@@ -287,6 +319,27 @@ class PaperTradingBot:
         self.live_paper_stop_win_trading = (
             LivePaperStopWinStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
         )
+
+    def configure_strategy_experiment_variant(self, variant: StrategyVariant) -> None:
+        """绑定实验组合元数据；版本化组合必须隔离过滤路径和复盘文件。"""
+
+        self.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
+        self.realtime_maker_enabled = variant.strategy_family == STRATEGY_FAMILY_REALTIME_MAKER
+        self.llm_super_agent_enabled = variant.strategy_family == STRATEGY_FAMILY_LLM_SUPER_AGENT
+        self.llm_super_agent_variant_id = variant.variant_id
+        self.single_entry_mode = variant.single_entry_mode
+        self.signal_side_mode = variant.signal_side_mode
+        self.signal_filter_mode = variant.signal_filter_mode
+        self.market_data_mode = variant.market_data_mode
+        self.price_source_mode = variant.price_source_mode
+        self.anti_bot_guard_mode = variant.anti_bot_guard_mode
+        if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES:
+            replay_file = f"{variant.variant_id.lower()}.jsonl"
+            self._aggressive_edge_loss_replay = AggressiveEdgeLossReplayRecorder(
+                self.settings.db_path.parent / "loss-replays" / replay_file,
+                variant_id=variant.variant_id,
+                combo=variant.combo,
+            )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -931,6 +984,7 @@ class PaperTradingBot:
                     settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
                 )
                 self._broadcast_official_resolution(slug, str(resolution["outcome"]), now, final_price, target_price)
+                self._finalize_aggressive_edge_loss_replay(slug, str(resolution["outcome"]), now, final_price, target_price)
                 if final_price is None:
                     with self._lock:
                         self._official_price_backfill_next_at[slug] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
@@ -982,6 +1036,7 @@ class PaperTradingBot:
                         target_price=target_price,
                     )
                     self._broadcast_official_resolution(round_id, str(outcome), now, final_price, target_price)
+                    self._finalize_aggressive_edge_loss_replay(round_id, str(outcome), now, final_price, target_price)
                     with self._lock:
                         self._official_recheck_next_at.pop(round_id, None)
                         if final_price is None:
@@ -1021,6 +1076,20 @@ class PaperTradingBot:
                 final_price = _maybe_float(resolution.get("final_price"))
                 target_price = _maybe_float(resolution.get("target_price"))
                 if outcome in {"Up", "Down"} and (final_price is not None or target_price is not None):
+                    local_final_price = _maybe_float(row.get("final_price"))
+                    if (
+                        final_price is not None
+                        and local_final_price is not None
+                        and abs(final_price - local_final_price) > 0.000001
+                    ):
+                        logger.debug(
+                            "官方最终价回填更新 round_id=%s local_final=%s official_final=%s local_target=%s official_target=%s",
+                            round_id,
+                            local_final_price,
+                            final_price,
+                            row.get("target_price"),
+                            target_price,
+                        )
                     self.store.reconcile_round_official_outcome(
                         round_id,
                         str(outcome),
@@ -1029,6 +1098,7 @@ class PaperTradingBot:
                         target_price=target_price,
                     )
                     self._broadcast_official_resolution(round_id, str(outcome), now, final_price, target_price)
+                    self._finalize_aggressive_edge_loss_replay(round_id, str(outcome), now, final_price, target_price)
                 with self._lock:
                     if final_price is not None:
                         self._official_price_backfill_next_at.pop(round_id, None)
@@ -1112,6 +1182,8 @@ class PaperTradingBot:
             self.price_source_mode,
             self.anti_bot_guard_mode,
         )
+        signal = self._apply_signal_side_mode(market, signal, quotes)
+        signal = self._apply_signal_filter_mode(market, signal, price)
         with self._lock:
             self.last_signal = {
                 "symbol": signal.symbol,
@@ -1119,9 +1191,19 @@ class PaperTradingBot:
                 "confidence": signal.confidence,
                 "entry_price": signal.entry_price,
                 "move_bps": signal.move_bps,
-            "reason": signal.reason,
+                "reason": signal.reason,
             }
-        self._maybe_place_trade(market, signal, quotes)
+        trade_ids = self._maybe_place_trade(market, signal, quotes)
+        replay_event = "entry_fill" if trade_ids else "strategy_tick"
+        self._record_aggressive_edge_loss_replay_sample(
+            market,
+            price,
+            quotes,
+            signal,
+            event=replay_event,
+            force=bool(trade_ids),
+            trade_ids=trade_ids,
+        )
         self._run_strategy_experiments(market, price, quotes)
         self._run_live_strategy(market, price, quotes)
 
@@ -1229,6 +1311,8 @@ class PaperTradingBot:
                 self.anti_bot_guard_mode,
             )
             signal = replace(signal, reason=_append_reason_text(signal.reason, note))
+            signal = self._apply_signal_side_mode(market, signal, quotes)
+            signal = self._apply_signal_filter_mode(market, signal, price)
             with self._lock:
                 self.last_signal = {
                     "symbol": signal.symbol,
@@ -1238,7 +1322,17 @@ class PaperTradingBot:
                     "move_bps": signal.move_bps,
                     "reason": signal.reason,
                 }
-            self._maybe_place_trade(market, signal, quotes)
+            trade_ids = self._maybe_place_trade(market, signal, quotes)
+            replay_event = "entry_fill" if trade_ids else "strategy_tick"
+            self._record_aggressive_edge_loss_replay_sample(
+                market,
+                price,
+                quotes,
+                signal,
+                event=replay_event,
+                force=bool(trade_ids),
+                trade_ids=trade_ids,
+            )
         finally:
             self.single_entry_mode = str(previous["single_entry_mode"])
             self.market_data_mode = str(previous["market_data_mode"])
@@ -1280,16 +1374,16 @@ class PaperTradingBot:
         market,
         signal,
         quotes: dict[str, dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> list[int]:
         if signal.side not in {"Up", "Down"}:
-            return
+            return []
         with self._lock:
             paper_paused = self.paper_trading_paused
         if paper_paused:
             self._append_last_signal_reason(PAPER_PAUSE_REASON)
-            return
+            return []
         if self.store.daily_realized_pnl() <= -abs(self.settings.max_daily_loss):
-            return
+            return []
         single_entry_mode = self.single_entry_mode
         round_open_rows = [
             row
@@ -1300,7 +1394,7 @@ class PaperTradingBot:
         opposite_rows = [row for row in round_open_rows if row.get("side") != signal.side]
         closing_count = len(opposite_rows) if single_entry_mode == SINGLE_ENTRY_MODE_STOP_AND_FLIP else 0
         if self.store.open_trade_count("BTC") - closing_count >= self.settings.max_open_trades:
-            return
+            return []
         if same_side_open:
             if single_entry_mode in {
                 SINGLE_ENTRY_MODE_STRICT,
@@ -1308,24 +1402,24 @@ class PaperTradingBot:
                 SINGLE_ENTRY_MODE_STOP_AND_FLIP,
             }:
                 self._append_last_signal_reason(f"{single_entry_mode} 当前市场已有同方向持仓，跳过重复开仓")
-            return
+            return []
         if single_entry_mode == SINGLE_ENTRY_MODE_STRICT and round_open_rows:
             existing_sides = _side_list_text(row.get("side") for row in round_open_rows)
             self._append_last_signal_reason(f"{SINGLE_STRICT_MARKER} 当前市场已有 {existing_sides} 持仓，禁止反向开仓")
-            return
+            return []
         if self.store.active_paper_order_exists(market.round_id, signal.side):
             self._append_last_signal_reason("已有同方向挂单等待成交")
-            return
+            return []
         if single_entry_mode == SINGLE_ENTRY_MODE_STRICT and self.store.active_paper_order_exists_for_round(market.round_id):
             self._append_last_signal_reason(f"{SINGLE_STRICT_MARKER} 当前市场已有挂单，禁止再次开仓")
-            return
+            return []
         if single_entry_mode == SINGLE_ENTRY_MODE_STOP_AND_FLIP and self.store.active_paper_order_exists_for_round(market.round_id):
             self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 当前市场有活跃挂单，暂不止损反手")
-            return
+            return []
         account = self.store.account()
         stake = min(self.settings.stake_dollars, float(account["cash_balance"]))
         if stake < 0.1:
-            return
+            return []
         if quotes is None:
             with self._lock:
                 _price, quotes, _source = self._paper_market_data_locked()
@@ -1345,21 +1439,21 @@ class PaperTradingBot:
                 self._append_last_signal_reason(
                     f"{SINGLE_STOP_AND_FLIP_MARKER} 新方向不可成交，保留旧仓 | {precheck.reason}"
                 )
-                return
+                return []
             exit_side = str(opposite_rows[0].get("side") or "")
             exit_quote = quotes.get(exit_side) if isinstance(quotes.get(exit_side), dict) else {}
             exit_quote = self._quote_with_bid(market, exit_side, exit_quote)
             exit_bid = _maybe_float(exit_quote.get("best_bid"))
             if exit_bid is None or exit_bid <= 0:
                 self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 缺少 {exit_side} 买一价，保留旧仓")
-                return
+                return []
             close_shares = sum(_maybe_float(row.get("shares")) or 0.0 for row in opposite_rows)
             now = time.time()
             close_reason = f"{SINGLE_STOP_AND_FLIP_MARKER} 平旧仓后反手 {exit_side}->{signal.side}"
             closed = self._close_side_shares(opposite_rows, exit_side, close_shares, exit_bid, now, close_reason)
             if not closed:
                 self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 旧仓平仓失败，取消反手开仓")
-                return
+                return []
             closed_pnl = sum(_maybe_float(row.get("pnl")) or 0.0 for row in closed)
             note = (
                 f"{SINGLE_STOP_AND_FLIP_MARKER} 平旧仓后反手: {exit_side}->{signal.side}, "
@@ -1372,9 +1466,206 @@ class PaperTradingBot:
         trade_ids = self.store.place_execution_result(intent, result)
         if not result.fills:
             self._append_last_signal_reason(result.reason)
-            return
+            return []
         if not trade_ids:
             self._append_last_signal_reason("执行结果未生成持仓")
+            return []
+        return trade_ids
+
+    def _record_aggressive_edge_loss_replay_sample(
+        self,
+        market: MarketRound,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        signal: Signal,
+        *,
+        event: str,
+        force: bool = False,
+        trade_ids: list[int] | None = None,
+    ) -> None:
+        if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES:
+            return
+        try:
+            self._aggressive_edge_loss_replay.record_sample(
+                market,
+                price,
+                quotes,
+                signal,
+                event=event,
+                force=force,
+                trade_ids=trade_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - 复盘记录不能影响交易主循环。
+            logger.debug("Aggressive Edge 输局复盘采样失败 round_id=%s error=%s", market.round_id, exc)
+
+    def _finalize_aggressive_edge_loss_replay(
+        self,
+        round_id: str,
+        outcome: str,
+        now: float,
+        final_price: float | None,
+        target_price: float | None,
+    ) -> None:
+        if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES:
+            return
+        try:
+            trades = self.store.trades_for_round(round_id)
+            packet = self._aggressive_edge_loss_replay.finalize_official_round(
+                round_id,
+                outcome,
+                now=now,
+                final_price=final_price,
+                target_price=target_price,
+                trades=trades,
+            )
+            if packet is not None:
+                logger.debug(
+                    "Aggressive Edge 输局复盘证据已记录 round_id=%s samples=%s path=%s",
+                    round_id,
+                    packet.get("sample_count"),
+                    self._aggressive_edge_loss_replay.path,
+                )
+        except Exception as exc:  # noqa: BLE001 - 复盘落盘失败不能影响官方结算。
+            logger.debug("Aggressive Edge 输局复盘落盘失败 round_id=%s error=%s", round_id, exc)
+
+    def _apply_signal_side_mode(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        quotes: dict[str, dict[str, Any]],
+    ) -> Signal:
+        """按实验组合改写信号方向；Reverse 只反向 Up/Down 有效信号。"""
+
+        if self.signal_side_mode != SIGNAL_SIDE_MODE_REVERSE or signal.side not in {"Up", "Down"}:
+            return signal
+
+        reverse_side = "Down" if signal.side == "Up" else "Up"
+        reverse_quote = quotes.get(reverse_side) if isinstance(quotes.get(reverse_side), dict) else {}
+        reverse_quote = self._quote_with_depth(market, reverse_side, reverse_quote)
+        reverse_ask = _maybe_float(reverse_quote.get("best_ask"))
+        reverse_bid = _maybe_float(reverse_quote.get("best_bid"))
+        reverse_ask_size = _maybe_float(reverse_quote.get("ask_size"))
+        reverse_confidence = round(max(0.01, min(0.99, 1.0 - float(signal.confidence or 0.0))), 4)
+        reverse_move_bps = -float(signal.move_bps or 0.0)
+        base_note = (
+            f"{SINGLE_REVERSE_MARKER} 原始信号 {signal.side}->反向下单 {reverse_side}, "
+            f"原始入场价 {signal.entry_price:.4f}, 原始置信度 {signal.confidence:.4f}"
+        )
+
+        # 反向策略必须用实际下注方向的盘口做执行侧风控，避免拿原方向价格去买反方向合约。
+        if reverse_ask is None or reverse_ask <= 0:
+            return replace(
+                signal,
+                side="NO_TRADE",
+                confidence=reverse_confidence,
+                entry_price=0.0,
+                move_bps=reverse_move_bps,
+                reason=_append_reason_text(signal.reason, f"{base_note}, 缺少 {reverse_side} 卖一价"),
+            )
+        if reverse_ask > self.settings.max_entry_price:
+            return replace(
+                signal,
+                side="NO_TRADE",
+                confidence=reverse_confidence,
+                entry_price=round(reverse_ask, 4),
+                move_bps=reverse_move_bps,
+                reason=_append_reason_text(
+                    signal.reason,
+                    f"{base_note}, 反向入场价格 {reverse_ask:.4f} 高于上限 {self.settings.max_entry_price:.4f}",
+                ),
+            )
+        if reverse_bid is not None and reverse_ask - reverse_bid > self.settings.max_spread:
+            return replace(
+                signal,
+                side="NO_TRADE",
+                confidence=reverse_confidence,
+                entry_price=round(reverse_ask, 4),
+                move_bps=reverse_move_bps,
+                reason=_append_reason_text(
+                    signal.reason,
+                    f"{base_note}, 反向盘口价差 {reverse_ask - reverse_bid:.4f} 过大",
+                ),
+            )
+        if reverse_ask_size is not None and reverse_ask_size < self.settings.min_ask_size:
+            return replace(
+                signal,
+                side="NO_TRADE",
+                confidence=reverse_confidence,
+                entry_price=round(reverse_ask, 4),
+                move_bps=reverse_move_bps,
+                reason=_append_reason_text(
+                    signal.reason,
+                    f"{base_note}, 反向卖盘深度 {reverse_ask_size:.4f} 不足",
+                ),
+            )
+
+        note = (
+            f"{base_note}, 反向入场价 {reverse_ask:.4f}, "
+            f"反向置信度 {reverse_confidence:.4f}"
+        )
+        return replace(
+            signal,
+            side=reverse_side,
+            confidence=reverse_confidence,
+            entry_price=round(reverse_ask, 4),
+            move_bps=reverse_move_bps,
+            reason=_append_reason_text(signal.reason, note),
+        )
+
+    def _apply_signal_filter_mode(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+    ) -> Signal:
+        """按实验组合过滤信号；默认 NONE 不改变旧策略行为。"""
+
+        if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES or signal.side not in {"Up", "Down"}:
+            return signal
+        block_reason = aggressive_edge_block_reason(market, signal, price, self.settings.max_quote_age_ms)
+        if block_reason:
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(signal.reason, block_reason),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1:
+            learned_block_reason = self._aggressive_edge_learned_block_reason(market, signal, price)
+            if learned_block_reason:
+                logger.debug("Aggressive Edge V1 学习过滤拦截 round_id=%s reason=%s", market.round_id, learned_block_reason)
+                return replace(
+                    signal,
+                    side="NO_TRADE",
+                    reason=_append_reason_text(signal.reason, learned_block_reason),
+                )
+        note = aggressive_edge_pass_note(signal)
+        return replace(signal, reason=_append_reason_text(signal.reason, note))
+
+    def _aggressive_edge_learned_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+    ) -> str | None:
+        # 只在 Aggressive Edge V1 执行二代学习过滤，基准组和 REAL 不调用该逻辑。
+        v2_reason = aggressive_edge_paper_v2_block_reason(signal)
+        if v2_reason:
+            return v2_reason
+
+        # 旧假突破规则继续作为补充证据，避免后续样本回到早段突拉形态时漏拦。
+        signal_at = _updated_at_seconds(price.get("chainlink_updated_ms"), time.time())
+        before60_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 60.0,
+            max_distance_seconds=20.0,
+            source_contains="chainlink",
+        )
+        return aggressive_edge_false_breakout_block_reason(
+            market,
+            signal,
+            signal_at=signal_at,
+            before60_tick=before60_tick,
+        )
 
     def _manage_resting_orders(self, market: MarketRound, quotes: dict[str, dict[str, Any]]) -> None:
         now = time.time()
@@ -2744,7 +3035,7 @@ class PaperTradingBot:
         payload = {
             "created_at": created_at,
             "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_at)),
-            "purpose": "SINGLE_FAK_REAL live one-shot audit",
+            "purpose": f"{result.get('variant_id') or LIVE_VARIANT_ID} live one-shot audit",
             "live_once": _sanitize_live_audit_payload(result),
         }
         tmp_path = path.with_suffix(".json.tmp")
@@ -3250,14 +3541,7 @@ class StrategyExperimentRunner:
             bot = PaperTradingBot(variant_settings, store)
             bot.polymarket = polymarket
             bot.price_fallback = price_fallback
-            bot.pair_strategy_enabled = variant.strategy_family == STRATEGY_FAMILY_PAIR
-            bot.realtime_maker_enabled = variant.strategy_family == STRATEGY_FAMILY_REALTIME_MAKER
-            bot.llm_super_agent_enabled = variant.strategy_family == STRATEGY_FAMILY_LLM_SUPER_AGENT
-            bot.llm_super_agent_variant_id = variant.variant_id
-            bot.single_entry_mode = variant.single_entry_mode
-            bot.market_data_mode = variant.market_data_mode
-            bot.price_source_mode = variant.price_source_mode
-            bot.anti_bot_guard_mode = variant.anti_bot_guard_mode
+            bot.configure_strategy_experiment_variant(variant)
             self._bots[variant.variant_id] = bot
             self._errors[variant.variant_id] = None
             self._official_broadcast_errors[variant.variant_id] = None
@@ -3664,6 +3948,8 @@ class StrategyExperimentRunner:
             "strategy_family": variant.strategy_family,
             "order_type": variant.order_type,
             "single_entry_mode": variant.single_entry_mode,
+            "signal_side_mode": variant.signal_side_mode,
+            "signal_filter_mode": variant.signal_filter_mode,
             "market_data_mode": variant.market_data_mode,
             "price_source_mode": variant.price_source_mode,
             "anti_bot_guard_mode": variant.anti_bot_guard_mode,
@@ -3678,6 +3964,9 @@ class StrategyExperimentRunner:
             "last_signal": dict(bot.last_signal or {}),
             "last_error": last_error,
             "official_broadcast_error": official_broadcast_error,
+            "loss_replay_path": str(bot._aggressive_edge_loss_replay.path)
+            if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES
+            else None,
             "active_orders": len(bot.store.active_paper_orders("BTC")),
             "window": {"start_at": start_at, "end_at": end_at},
             "review_score": _experiment_review_score(trade_summary, order_summary, last_error, official_broadcast_error),
@@ -3692,6 +3981,12 @@ class StrategyExperimentRunner:
             ),
             "single_stop_and_flip_summary": bot.store.trade_reason_summary(
                 SINGLE_STOP_AND_FLIP_MARKER,
+                "BTC",
+                start_at,
+                end_at,
+            ),
+            "single_aggressive_edge_summary": bot.store.trade_reason_summary(
+                SINGLE_AGGRESSIVE_EDGE_MARKER,
                 "BTC",
                 start_at,
                 end_at,
@@ -3731,6 +4026,13 @@ class StrategyExperimentRunner:
                     final_price=final_price,
                     target_price=target_price,
                     settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+                )
+                bot._finalize_aggressive_edge_loss_replay(
+                    normalized_round_id,
+                    outcome,
+                    now,
+                    final_price,
+                    target_price,
                 )
                 with self._lock:
                     self._official_broadcast_errors[variant.variant_id] = None
@@ -4005,6 +4307,8 @@ def _variant_tags(variant: StrategyVariant) -> dict[str, Any]:
         "strategy_family": variant.strategy_family,
         "experiment_order_type": variant.order_type,
         "single_entry_mode": variant.single_entry_mode,
+        "signal_side_mode": variant.signal_side_mode,
+        "signal_filter_mode": variant.signal_filter_mode,
         "market_data_mode": variant.market_data_mode,
         "price_source_mode": variant.price_source_mode,
         "anti_bot_guard_mode": variant.anti_bot_guard_mode,
