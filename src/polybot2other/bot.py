@@ -6,9 +6,15 @@ import math
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from .actor_analysis import PolymarketDataClient, build_actor_analysis
+from .aggressive_edge_v3 import (
+    aggressive_edge_v3_guard_note,
+    aggressive_edge_v3_guard_report,
+    aggressive_edge_v3_memory_summary,
+)
 from .clob_ws import ClobMarketWebSocketFeed, RtdsChainlinkWebSocketFeed
 from .config import Settings, reload_live_credential_env
 from .execution import (
@@ -35,7 +41,15 @@ from .experiments import (
     SIGNAL_SIDE_MODE_BASE,
     SIGNAL_SIDE_MODE_REVERSE,
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_NONE,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
@@ -75,6 +89,8 @@ from .signal_filters import (
     aggressive_edge_false_breakout_block_reason,
     aggressive_edge_paper_v2_block_reason,
     aggressive_edge_pass_note,
+    aggressive_edge_v2_risk_note,
+    aggressive_edge_v2_risk_report,
 )
 from .market import PublicPriceClient
 from .models import MarketRound, Signal, TradeIntent
@@ -129,8 +145,34 @@ AGGRESSIVE_EDGE_FILTER_MODES = frozenset(
     {
         SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
         SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
     }
 )
+# V5 只用于诊断采样。阈值来自 91 条 V4 已结算样本复盘，先验证再考虑交易化。
+AGGRESSIVE_EDGE_V5_UP_MIN_BUCKET = 2
+AGGRESSIVE_EDGE_V5_DOWN_ALLOWED_BUCKETS = frozenset({2, 3})
+AGGRESSIVE_EDGE_V5_DOWN_MAX_ENTRY_PRICE = 0.70
+AGGRESSIVE_EDGE_V5_DOWN_MIN_DEPTH_SKEW = 0.25
+AGGRESSIVE_EDGE_V5_DOWN_MIN_TOP_LEVEL_SKEW = 0.25
+AGGRESSIVE_EDGE_V5_DOWN_MAX_ABS_MOVE_BPS = 10.0
+# V6 只用于诊断采样。阈值来自 58 条 V5 已结算样本复盘，先采样验证再考虑交易化。
+AGGRESSIVE_EDGE_V6_MAX_RISK_SCORE = 0.25
+AGGRESSIVE_EDGE_V6_MAX_ABS_MOVE_BPS = 8.0
+# V7 只用于诊断采样。阈值来自 V6 35 条已结算放行样本复盘，目标是验证 Up 盘口支撑和 Down 赔率约束。
+AGGRESSIVE_EDGE_V7_UP_M2_MIN_DEPTH_SKEW = 0.55
+AGGRESSIVE_EDGE_V7_UP_M3_MIN_DEPTH_SKEW = 0.70
+AGGRESSIVE_EDGE_V7_DOWN_MAX_ENTRY_PRICE = 0.68
+# V8 只用于学习采样。它故意放宽到基础 Aggressive Edge 候选，用标签积累输赢结构，不能直接交易化。
+AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE = 0.90
+AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS = 20.0
+AGGRESSIVE_EDGE_V8_ALLOWED_BUCKETS = frozenset({0, 1, 2, 3, 4})
 SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
 SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
 REALTIME_MAKER_MARKER = "REALTIME_MAKER_PAPER"
@@ -1183,7 +1225,7 @@ class PaperTradingBot:
             self.anti_bot_guard_mode,
         )
         signal = self._apply_signal_side_mode(market, signal, quotes)
-        signal = self._apply_signal_filter_mode(market, signal, price)
+        signal = self._apply_signal_filter_mode(market, signal, price, quotes)
         with self._lock:
             self.last_signal = {
                 "symbol": signal.symbol,
@@ -1312,7 +1354,7 @@ class PaperTradingBot:
             )
             signal = replace(signal, reason=_append_reason_text(signal.reason, note))
             signal = self._apply_signal_side_mode(market, signal, quotes)
-            signal = self._apply_signal_filter_mode(market, signal, price)
+            signal = self._apply_signal_filter_mode(market, signal, price, quotes)
             with self._lock:
                 self.last_signal = {
                     "symbol": signal.symbol,
@@ -1509,6 +1551,14 @@ class PaperTradingBot:
         if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES:
             return
         try:
+            self.store.settle_aggressive_edge_v2_shadow_samples(
+                round_id,
+                outcome,
+                now,
+                final_price=final_price,
+                target_price=target_price,
+                settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+            )
             trades = self.store.trades_for_round(round_id)
             packet = self._aggressive_edge_loss_replay.finalize_official_round(
                 round_id,
@@ -1617,17 +1667,111 @@ class PaperTradingBot:
         market: MarketRound,
         signal: Signal,
         price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]] | None = None,
     ) -> Signal:
         """按实验组合过滤信号；默认 NONE 不改变旧策略行为。"""
 
-        if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES or signal.side not in {"Up", "Down"}:
+        if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES:
+            return signal
+        shadow_report: dict[str, Any] | None = None
+        shadow_modes = {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+        }
+        v2_shadow_signal = self._aggressive_edge_v2_shadow_candidate(signal) if self.signal_filter_mode in shadow_modes else None
+        if self.signal_filter_mode in shadow_modes and v2_shadow_signal is not None:
+            v2_note, shadow_report = self._aggressive_edge_v2_shadow_report(market, v2_shadow_signal, price, quotes or {})
+            if v2_note:
+                signal = replace(signal, reason=_append_reason_text(signal.reason, v2_note))
+            if shadow_report:
+                self._record_aggressive_edge_v2_shadow_sample(market, signal, v2_shadow_signal, price, shadow_report)
+        if signal.side not in {"Up", "Down"}:
+            if (
+                self.signal_filter_mode
+                in {
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                }
+                and v2_shadow_signal is not None
+            ):
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
+                    guard_label = "V8_LEARNING_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V8"
+                    block_reason = self._aggressive_edge_v8_learning_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC:
+                    guard_label = "V7_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V7"
+                    block_reason = self._aggressive_edge_v7_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC:
+                    guard_label = "V6_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V6"
+                    block_reason = self._aggressive_edge_v6_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC:
+                    guard_label = "V5_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V5"
+                    block_reason = self._aggressive_edge_v5_block_reason(market, v2_shadow_signal, shadow_report)
+                else:
+                    guard_label = "V4_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V4"
+                    block_reason = self._aggressive_edge_v4_block_reason(market, v2_shadow_signal, shadow_report)
+                if block_reason:
+                    diagnostic_note = (
+                        f"{SINGLE_AGGRESSIVE_EDGE_MARKER} {guard_label}: "
+                        f"基础信号已 NO_TRADE，影子候选只记录；{block_reason}"
+                    )
+                else:
+                    diagnostic_note = (
+                        f"{SINGLE_AGGRESSIVE_EDGE_MARKER} {guard_label}: "
+                        f"基础信号已 NO_TRADE，{guard_name} 守卫通过，基础不下注，只记录"
+                    )
+                return replace(signal, reason=_append_reason_text(signal.reason, diagnostic_note))
             return signal
         block_reason = aggressive_edge_block_reason(market, signal, price, self.settings.max_quote_age_ms)
         if block_reason:
+            reason = _append_reason_text(signal.reason, block_reason)
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V4_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V4 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V5 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V6 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V7 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V8 学习样本只记录不下注",
+                )
             return replace(
                 signal,
                 side="NO_TRADE",
-                reason=_append_reason_text(signal.reason, block_reason),
+                reason=reason,
             )
         if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1:
             learned_block_reason = self._aggressive_edge_learned_block_reason(market, signal, price)
@@ -1638,7 +1782,137 @@ class PaperTradingBot:
                     side="NO_TRADE",
                     reason=_append_reason_text(signal.reason, learned_block_reason),
                 )
+        v3_blocked = False
+        if self.signal_filter_mode in {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+        }:
+            v3_note, v3_report = self._aggressive_edge_v3_guard_report(market, signal, shadow_report)
+            if v3_note:
+                signal = replace(signal, reason=_append_reason_text(signal.reason, v3_note))
+            if v3_report and v3_report.get("block"):
+                v3_blocked = True
+                logger.debug(
+                    "Aggressive Edge V3 直觉守卫拦截 round_id=%s report=%s",
+                    market.round_id,
+                    json.dumps(v3_report, ensure_ascii=False, sort_keys=True)[:1600],
+                )
+                if self.signal_filter_mode not in {
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                }:
+                    return replace(signal, side="NO_TRADE")
         note = aggressive_edge_pass_note(signal)
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC:
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} DIAGNOSTIC_NO_TRADE: "
+                "旧 Aggressive Edge 交易版已暂停，当前候选只记录不下注"
+            )
+            return replace(signal, side="NO_TRADE", reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note))
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC:
+            v4_block_reason = self._aggressive_edge_v4_block_reason(market, signal, shadow_report)
+            if v4_block_reason:
+                logger.debug("Aggressive Edge V4 诊断拦截 round_id=%s reason=%s", market.round_id, v4_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V4_DIAGNOSTIC_NO_TRADE: {v4_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V4_DIAGNOSTIC_NO_TRADE: "
+                "V4 候选通过，只记录不下注"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V4 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC:
+            v5_block_reason = self._aggressive_edge_v5_block_reason(market, signal, shadow_report)
+            if v5_block_reason:
+                logger.debug("Aggressive Edge V5 诊断拦截 round_id=%s reason=%s", market.round_id, v5_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_DIAGNOSTIC_NO_TRADE: {v5_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_DIAGNOSTIC_NO_TRADE: "
+                "V5 候选通过，只记录不下注"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V5 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC:
+            v6_block_reason = self._aggressive_edge_v6_block_reason(market, signal, shadow_report)
+            if v6_block_reason:
+                logger.debug("Aggressive Edge V6 诊断拦截 round_id=%s reason=%s", market.round_id, v6_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_DIAGNOSTIC_NO_TRADE: {v6_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_DIAGNOSTIC_NO_TRADE: "
+                "V6 候选通过，只记录不下注"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V6 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC:
+            v7_block_reason = self._aggressive_edge_v7_block_reason(market, signal, shadow_report)
+            if v7_block_reason:
+                logger.debug("Aggressive Edge V7 诊断拦截 round_id=%s reason=%s", market.round_id, v7_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_DIAGNOSTIC_NO_TRADE: {v7_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_DIAGNOSTIC_NO_TRADE: "
+                "V7 候选通过，只记录不下注"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V7 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
+            v8_block_reason = self._aggressive_edge_v8_learning_block_reason(market, signal, shadow_report)
+            if v8_block_reason:
+                logger.debug("Aggressive Edge V8 学习采样拦截 round_id=%s reason=%s", market.round_id, v8_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING_DIAGNOSTIC_NO_TRADE: {v8_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            learning_tags = self._aggressive_edge_v8_learning_tags(market, signal, shadow_report)
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING_DIAGNOSTIC_NO_TRADE: "
+                f"V8 学习样本通过，只记录不下注；{learning_tags}"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V8 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
         return replace(signal, reason=_append_reason_text(signal.reason, note))
 
     def _aggressive_edge_learned_block_reason(
@@ -1666,6 +1940,612 @@ class PaperTradingBot:
             signal_at=signal_at,
             before60_tick=before60_tick,
         )
+
+    def _aggressive_edge_v2_shadow_candidate(self, signal: Signal) -> Signal | None:
+        """V2 影子采样候选：真实 Up/Down 信号直接采样，部分 NO_TRADE 按 bps 推断方向。"""
+
+        if signal.side in {"Up", "Down"}:
+            return signal
+        entry_price = _maybe_float(signal.entry_price)
+        move_bps = _maybe_float(signal.move_bps)
+        if entry_price is None or entry_price <= 0 or move_bps is None or abs(move_bps) < 0.000001:
+            return None
+        side = "Up" if move_bps >= 0 else "Down"
+        return replace(signal, side=side)
+
+    def _aggressive_edge_sample_minute_bucket(self, market: MarketRound, now: float | None = None) -> int:
+        """返回开局后的分钟桶，V4 用它区分抢第一波和等待确认的候选。"""
+
+        current_ts = time.time() if now is None else float(now)
+        seconds_from_start = max(0.0, current_ts - float(market.started_at or current_ts))
+        return max(0, min(4, int(seconds_from_start // 60.0)))
+
+    def _aggressive_edge_v2_shadow_report(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        signal_at = _updated_at_seconds(price.get("chainlink_updated_ms"), time.time())
+        before60_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 60.0,
+            max_distance_seconds=20.0,
+            source_contains="chainlink",
+        )
+        before30_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 30.0,
+            max_distance_seconds=15.0,
+            source_contains="chainlink",
+        )
+        quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
+        quote = self._quote_with_depth(market, signal.side, quote)
+        report = aggressive_edge_v2_risk_report(
+            market,
+            signal,
+            price=price,
+            quote=quote,
+            signal_at=signal_at,
+            before60_tick=before60_tick,
+            before30_tick=before30_tick,
+            max_age_ms=self.settings.max_quote_age_ms,
+        )
+        return aggressive_edge_v2_risk_note(report), report
+
+    def _aggressive_edge_v4_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V4 诊断守卫：用复盘出的反转结构判断候选是否只应记录，不应进入交易。"""
+
+        if signal.side not in {"Up", "Down"}:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V4_GUARD BLOCK: 无有效方向候选"
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        entry_price = _maybe_float(signal.entry_price)
+        if entry_price is None:
+            entry_price = _maybe_float(features.get("entry_price"))
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        edge = _maybe_float(features.get("edge"))
+        momentum_decay = _maybe_float(features.get("momentum_decay_bps"))
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+
+        reasons: list[str] = []
+        # Up 前两分钟必须有明显加速，否则容易买在第一波假突破。
+        up_strong_acceleration = (
+            signal.side == "Up"
+            and momentum_decay is not None
+            and momentum_decay <= -10.0
+            and edge is not None
+            and edge >= 0.20
+        )
+        if signal.side == "Up" and minute_bucket < 2 and not up_strong_acceleration:
+            reasons.append(f"V4_UP_WAIT_CONFIRM m{minute_bucket}: Up 前两分钟缺少强加速")
+        if minute_bucket == 0 and entry_price is not None and entry_price >= 0.70:
+            reasons.append(f"V4_FIRST_MINUTE_HIGH_ENTRY m0 entry={entry_price:.4f}")
+        if abs_move_bps >= 15.0:
+            reasons.append(f"V4_OVEREXTENDED_MOVE abs_move={abs_move_bps:.2f}bps")
+        if (
+            momentum_decay is not None
+            and edge is not None
+            and -10.0 <= momentum_decay < 5.0
+            and edge >= 0.20
+        ):
+            reasons.append(f"V4_FLAT_DECAY_HIGH_EDGE decay={momentum_decay:.2f} edge={edge:.4f}")
+        if (
+            depth_skew is not None
+            and top_level_skew is not None
+            and edge is not None
+            and depth_skew < 0.50
+            and top_level_skew < 0.50
+            and edge >= 0.20
+        ):
+            reasons.append(
+                f"V4_WEAK_BOOK_HIGH_EDGE depth={depth_skew:.4f} top={top_level_skew:.4f} edge={edge:.4f}"
+            )
+        if not reasons:
+            return None
+        metrics = (
+            f"m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+            f"abs_move={abs_move_bps:.2f} edge={_format_optional_float(edge, 4)} "
+            f"decay={_format_optional_float(momentum_decay, 2)} "
+            f"depth={_format_optional_float(depth_skew, 4)} top={_format_optional_float(top_level_skew, 4)}"
+        )
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V4_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v5_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V5 诊断守卫：复盘 V4 后收紧 Down 反转局，只做影子采样。"""
+
+        v4_block_reason = self._aggressive_edge_v4_block_reason(market, signal, report, now=now)
+        if v4_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_GUARD BLOCK: V4 守卫未通过；{v4_block_reason}"
+        if signal.side not in {"Up", "Down"}:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_GUARD BLOCK: 无有效方向候选"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        entry_price = _maybe_float(signal.entry_price)
+        if entry_price is None:
+            entry_price = _maybe_float(features.get("entry_price"))
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+
+        reasons: list[str] = []
+        # Up 的有效样本主要来自 m2 以后，开局抢跑继续留给 V4 历史对照。
+        if signal.side == "Up" and minute_bucket < AGGRESSIVE_EDGE_V5_UP_MIN_BUCKET:
+            reasons.append(f"V5_UP_WAIT_M2 m{minute_bucket}: Up 只验证 m2 以后候选")
+        if signal.side == "Down":
+            if minute_bucket not in AGGRESSIVE_EDGE_V5_DOWN_ALLOWED_BUCKETS:
+                reasons.append(f"V5_DOWN_BUCKET_BLOCK m{minute_bucket}: Down 只验证 m2/m3")
+            if entry_price is None:
+                reasons.append("V5_DOWN_ENTRY_MISSING: Down 缺少入场价")
+            elif entry_price >= AGGRESSIVE_EDGE_V5_DOWN_MAX_ENTRY_PRICE:
+                reasons.append(
+                    f"V5_DOWN_HIGH_ENTRY entry={entry_price:.4f}: 要求 entry<{AGGRESSIVE_EDGE_V5_DOWN_MAX_ENTRY_PRICE:.2f}"
+                )
+            if depth_skew is None:
+                reasons.append("V5_DOWN_DEPTH_MISSING: Down 缺少 depth_skew")
+            elif depth_skew < AGGRESSIVE_EDGE_V5_DOWN_MIN_DEPTH_SKEW:
+                reasons.append(
+                    f"V5_DOWN_WEAK_DEPTH depth={depth_skew:.4f}: 要求 depth>={AGGRESSIVE_EDGE_V5_DOWN_MIN_DEPTH_SKEW:.2f}"
+                )
+            if top_level_skew is None:
+                reasons.append("V5_DOWN_TOP_MISSING: Down 缺少 top_level_skew")
+            elif top_level_skew < AGGRESSIVE_EDGE_V5_DOWN_MIN_TOP_LEVEL_SKEW:
+                reasons.append(
+                    f"V5_DOWN_WEAK_TOP top={top_level_skew:.4f}: 要求 top>={AGGRESSIVE_EDGE_V5_DOWN_MIN_TOP_LEVEL_SKEW:.2f}"
+                )
+            if abs_move_bps >= AGGRESSIVE_EDGE_V5_DOWN_MAX_ABS_MOVE_BPS:
+                reasons.append(
+                    f"V5_DOWN_OVEREXTENDED abs_move={abs_move_bps:.2f}bps: 要求 abs_move<{AGGRESSIVE_EDGE_V5_DOWN_MAX_ABS_MOVE_BPS:.2f}bps"
+                )
+
+        if not reasons:
+            return None
+        metrics = (
+            f"m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+            f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(depth_skew, 4)} "
+            f"top={_format_optional_float(top_level_skew, 4)}"
+        )
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V5_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v6_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V6 诊断守卫：继承 V5 后，只验证低风险且非极端位移候选。"""
+
+        v5_block_reason = self._aggressive_edge_v5_block_reason(market, signal, report, now=now)
+        if v5_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_GUARD BLOCK: V5 守卫未通过；{v5_block_reason}"
+        if signal.side not in {"Up", "Down"}:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_GUARD BLOCK: 无有效方向候选"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+
+        reasons: list[str] = []
+        if risk_score is None:
+            reasons.append("V6_RISK_SCORE_MISSING: 缺少 risk_score")
+        elif risk_score >= AGGRESSIVE_EDGE_V6_MAX_RISK_SCORE:
+            reasons.append(
+                f"V6_RISK_SCORE_HIGH risk={risk_score:.4f}: 要求 risk<{AGGRESSIVE_EDGE_V6_MAX_RISK_SCORE:.2f}"
+            )
+        if abs_move_bps >= AGGRESSIVE_EDGE_V6_MAX_ABS_MOVE_BPS:
+            reasons.append(
+                f"V6_EXTREME_MOVE abs_move={abs_move_bps:.2f}bps: 要求 abs_move<{AGGRESSIVE_EDGE_V6_MAX_ABS_MOVE_BPS:.2f}bps"
+            )
+
+        if not reasons:
+            return None
+        metrics = (
+            f"m{minute_bucket} side={signal.side} risk={_format_optional_float(risk_score, 4)} "
+            f"abs_move={abs_move_bps:.2f}"
+        )
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V6_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v7_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V7 诊断守卫：继承 V6 后，验证 Up 盘口深度支撑和 Down 赔率约束。"""
+
+        v6_block_reason = self._aggressive_edge_v6_block_reason(market, signal, report, now=now)
+        if v6_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_GUARD BLOCK: V6 守卫未通过；{v6_block_reason}"
+        if signal.side not in {"Up", "Down"}:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_GUARD BLOCK: 无有效方向候选"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        entry_price = _maybe_float(signal.entry_price)
+        if entry_price is None:
+            entry_price = _maybe_float(features.get("entry_price"))
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+
+        reasons: list[str] = []
+        if signal.side == "Up":
+            # V6 输单集中在 Up 低风险但盘口支撑不足的局，V7 按时间桶验证不同深度门槛。
+            if depth_skew is None:
+                reasons.append("V7_UP_DEPTH_MISSING: Up 缺少 depth_skew")
+            elif minute_bucket == 2 and depth_skew < AGGRESSIVE_EDGE_V7_UP_M2_MIN_DEPTH_SKEW:
+                reasons.append(
+                    f"V7_UP_M2_WEAK_DEPTH depth={depth_skew:.4f}: 要求 depth>={AGGRESSIVE_EDGE_V7_UP_M2_MIN_DEPTH_SKEW:.2f}"
+                )
+            elif minute_bucket == 3 and depth_skew < AGGRESSIVE_EDGE_V7_UP_M3_MIN_DEPTH_SKEW:
+                reasons.append(
+                    f"V7_UP_M3_WEAK_DEPTH depth={depth_skew:.4f}: 要求 depth>={AGGRESSIVE_EDGE_V7_UP_M3_MIN_DEPTH_SKEW:.2f}"
+                )
+            elif minute_bucket not in {2, 3}:
+                reasons.append(f"V7_UP_BUCKET_BLOCK m{minute_bucket}: Up 只验证 m2/m3")
+        if signal.side == "Down":
+            # Down 方向 V6 有正收益，但高买价压低赔率，V7 单独验证更低入场上限。
+            if entry_price is None:
+                reasons.append("V7_DOWN_ENTRY_MISSING: Down 缺少入场价")
+            elif entry_price > AGGRESSIVE_EDGE_V7_DOWN_MAX_ENTRY_PRICE:
+                reasons.append(
+                    f"V7_DOWN_HIGH_ENTRY entry={entry_price:.4f}: 要求 entry<={AGGRESSIVE_EDGE_V7_DOWN_MAX_ENTRY_PRICE:.2f}"
+                )
+
+        if not reasons:
+            return None
+        metrics = (
+            f"m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+            f"risk={_format_optional_float(risk_score, 4)} abs_move={abs_move_bps:.2f} "
+            f"depth={_format_optional_float(depth_skew, 4)} top={_format_optional_float(top_level_skew, 4)}"
+        )
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V7_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v8_learning_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V8 学习采样守卫：只拦截极端或字段缺失样本，主要目标是提高复盘样本速度。"""
+
+        if signal.side not in {"Up", "Down"}:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING BLOCK: 无有效方向候选"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        entry_price = _maybe_float(signal.entry_price)
+        if entry_price is None:
+            entry_price = _maybe_float(features.get("entry_price"))
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+
+        reasons: list[str] = []
+        # V8 要扩大样本，只有缺少核心字段或极端风险时才拦截；普通弱盘口保留为学习标签。
+        if entry_price is None:
+            reasons.append("V8_ENTRY_MISSING: 缺少入场价")
+        if risk_score is None:
+            reasons.append("V8_RISK_SCORE_MISSING: 缺少 risk_score")
+        elif risk_score >= AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE:
+            reasons.append(
+                f"V8_RISK_SCORE_EXTREME risk={risk_score:.4f}: 要求 risk<{AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE:.2f}"
+            )
+        if abs_move_bps >= AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS:
+            reasons.append(
+                f"V8_EXTREME_MOVE abs_move={abs_move_bps:.2f}bps: 要求 abs_move<{AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS:.2f}bps"
+            )
+        if minute_bucket not in AGGRESSIVE_EDGE_V8_ALLOWED_BUCKETS:
+            reasons.append(f"V8_BUCKET_INVALID m{minute_bucket}: 非 5 分钟局有效采样桶")
+
+        if not reasons:
+            return None
+        metrics = self._aggressive_edge_v8_learning_tags(market, signal, report, now=now)
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v8_learning_tags(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str:
+        """生成 V8 复盘标签，帮助后续从输单里找反转共性。"""
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        entry_price = _maybe_float(signal.entry_price)
+        if entry_price is None:
+            entry_price = _maybe_float(features.get("entry_price"))
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+        risk_level = str(report.get("risk_level") or "") if isinstance(report, dict) else ""
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        momentum_decay = _maybe_float(features.get("momentum_decay_bps"))
+        edge = _maybe_float(features.get("edge"))
+
+        tags: list[str] = [f"m{minute_bucket}", f"side={signal.side}"]
+        if minute_bucket == 0:
+            tags.append("early_m0")
+        if entry_price is not None and entry_price >= 0.70:
+            tags.append("high_entry")
+        if entry_price is not None and entry_price < 0.50:
+            tags.append("low_entry")
+        if depth_skew is not None and depth_skew < 0.35:
+            tags.append("weak_depth")
+        if top_level_skew is not None and top_level_skew < 0.35:
+            tags.append("weak_top")
+        if momentum_decay is not None and momentum_decay > 0:
+            tags.append("momentum_decay")
+        if edge is not None and edge < 0.06:
+            tags.append("thin_edge")
+        if abs_move_bps >= 10.0:
+            tags.append("wide_move")
+        if risk_level:
+            tags.append(f"risk_level={risk_level}")
+        if risk_score is not None:
+            tags.append(f"risk={risk_score:.4f}")
+        tags.append(f"entry={_format_optional_float(entry_price, 4)}")
+        tags.append(f"abs_move={abs_move_bps:.2f}")
+        tags.append(f"depth={_format_optional_float(depth_skew, 4)}")
+        tags.append(f"top={_format_optional_float(top_level_skew, 4)}")
+        tags.append(f"decay={_format_optional_float(momentum_decay, 2)}")
+        return " ".join(tags)
+
+    def _record_aggressive_edge_v2_shadow_sample(
+        self,
+        market: MarketRound,
+        source_signal: Signal,
+        shadow_signal: Signal,
+        price: dict[str, Any],
+        report: dict[str, Any],
+    ) -> None:
+        """持久化 V2 影子候选，结算后可反推当时下注会赢还是会输。"""
+
+        if self.signal_filter_mode not in {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+        }:
+            return
+        if market.target_price <= 0 or shadow_signal.side not in {"Up", "Down"}:
+            return
+        now = time.time()
+        try:
+            base_block_reason = aggressive_edge_block_reason(market, shadow_signal, price, self.settings.max_quote_age_ms)
+            v1_block_reason = self._aggressive_edge_learned_block_reason(market, shadow_signal, price) if base_block_reason is None else None
+            minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+            base_would_trade = base_block_reason is None
+            v1_would_trade = base_would_trade and v1_block_reason is None
+            v4_block_reason = None
+            v5_block_reason = None
+            v6_block_reason = None
+            v7_block_reason = None
+            v8_block_reason = None
+            if base_would_trade:
+                v4_block_reason = self._aggressive_edge_v4_block_reason(market, shadow_signal, report, now=now)
+                v5_block_reason = self._aggressive_edge_v5_block_reason(market, shadow_signal, report, now=now)
+                v6_block_reason = self._aggressive_edge_v6_block_reason(market, shadow_signal, report, now=now)
+                v7_block_reason = self._aggressive_edge_v7_block_reason(market, shadow_signal, report, now=now)
+                v8_block_reason = self._aggressive_edge_v8_learning_block_reason(market, shadow_signal, report, now=now)
+            else:
+                v4_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v5_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v6_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v7_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v8_block_reason = f"基础过滤已拦截: {base_block_reason}"
+            v4_would_trade = base_would_trade and v4_block_reason is None
+            v5_would_trade = base_would_trade and v5_block_reason is None
+            v6_would_trade = base_would_trade and v6_block_reason is None
+            v7_would_trade = base_would_trade and v7_block_reason is None
+            v8_would_trade = base_would_trade and v8_block_reason is None
+            sample_key = f"m{minute_bucket}:{'pass' if base_would_trade else 'block'}"
+            self.store.record_aggressive_edge_v2_shadow_sample(
+                round_id=market.round_id,
+                symbol=market.symbol or "BTC",
+                sample_key=sample_key,
+                side=shadow_signal.side,
+                source_signal_side=source_signal.side,
+                base_would_trade=base_would_trade,
+                v1_would_trade=v1_would_trade,
+                v2_would_trade=base_would_trade,
+                v4_would_trade=v4_would_trade,
+                v5_would_trade=v5_would_trade,
+                v6_would_trade=v6_would_trade,
+                v7_would_trade=v7_would_trade,
+                v8_would_trade=v8_would_trade,
+                entry_price=_maybe_float(shadow_signal.entry_price),
+                confidence=_maybe_float(shadow_signal.confidence),
+                move_bps=_maybe_float(shadow_signal.move_bps),
+                report=report,
+                base_block_reason=base_block_reason,
+                v1_block_reason=v1_block_reason,
+                v4_block_reason=v4_block_reason,
+                v5_block_reason=v5_block_reason,
+                v6_block_reason=v6_block_reason,
+                v7_block_reason=v7_block_reason,
+                v8_block_reason=v8_block_reason,
+                signal_reason=source_signal.reason,
+                created_at=now,
+            )
+        except Exception as exc:  # noqa: BLE001 - 影子采样不能影响策略主循环。
+            logger.debug("Aggressive Edge V2 影子样本记录失败 round_id=%s error=%s", market.round_id, exc)
+
+    def _aggressive_edge_v3_guard_report(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        shadow_report: dict[str, Any] | None,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """读取历史输局指纹，判断当前候选是否属于负期望相似局。"""
+
+        report = aggressive_edge_v3_guard_report(
+            signal,
+            shadow_report,
+            source_db_paths=self._aggressive_edge_v3_source_db_paths(),
+            loss_replay_paths=self._aggressive_edge_v3_loss_replay_paths(),
+            symbol=market.symbol or "BTC",
+        )
+        return aggressive_edge_v3_guard_note(report), report
+
+    def _aggressive_edge_v3_source_db_paths(self) -> list[Path]:
+        """V3 的经验来源：历史 Aggressive Edge 系列实验库和自身后续积累。"""
+
+        parent = self.settings.db_path.parent
+        return [
+            parent / "single_fak_aggressive_edge.sqlite3",
+            parent / "single_fak_aggressive_edge_v1.sqlite3",
+            parent / "single_fak_aggressive_edge_v2.sqlite3",
+            parent / "single_fak_aggressive_edge_v3.sqlite3",
+            parent / "single_fak_aggressive_edge_diagnostic.sqlite3",
+            *(
+                [parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3"]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v8_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC
+                else []
+            ),
+        ]
+
+    def _aggressive_edge_v3_loss_replay_paths(self) -> list[Path]:
+        """V3 的整盘输局证据来源，JSONL 只读加载并带文件签名缓存。"""
+
+        replay_dir = self.settings.db_path.parent / "loss-replays"
+        return [
+            replay_dir / "single_fak_aggressive_edge.jsonl",
+            replay_dir / "single_fak_aggressive_edge_v1.jsonl",
+            replay_dir / "single_fak_aggressive_edge_v2.jsonl",
+            replay_dir / "single_fak_aggressive_edge_v3.jsonl",
+            replay_dir / "single_fak_aggressive_edge_diagnostic.jsonl",
+            *(
+                [replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl"]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC
+                else []
+            ),
+        ]
 
     def _manage_resting_orders(self, market: MarketRound, quotes: dict[str, dict[str, Any]]) -> None:
         now = time.time()
@@ -3991,6 +4871,33 @@ class StrategyExperimentRunner:
                 start_at,
                 end_at,
             ),
+            "aggressive_edge_v2_shadow_summary": bot.store.aggressive_edge_v2_shadow_summary("BTC")
+            if variant.signal_filter_mode in {
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+            }
+            else None,
+            "aggressive_edge_v3_memory_summary": aggressive_edge_v3_memory_summary(
+                source_db_paths=bot._aggressive_edge_v3_source_db_paths(),
+                loss_replay_paths=bot._aggressive_edge_v3_loss_replay_paths(),
+                symbol="BTC",
+            )
+            if variant.signal_filter_mode in {
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+            }
+            else None,
         }
 
     def apply_official_resolution(
@@ -4090,6 +4997,29 @@ class StrategyExperimentRunner:
                 if not round_id:
                     continue
                 rounds.setdefault(round_id, _maybe_float(row.get("ends_at")) or 0.0)
+            try:
+                # 诊断组合不会产生真实持仓，只能靠影子样本候选触发官方结果补偿。
+                shadow_rows = bot.store.pending_aggressive_edge_shadow_official_rounds(
+                    now,
+                    OFFICIAL_RECHECK_WINDOW_SECONDS,
+                    OFFICIAL_RECHECK_LIMIT,
+                    "BTC",
+                )
+            except Exception as exc:  # noqa: BLE001 - 单个实验库损坏不能影响其它组合。
+                with self._lock:
+                    self._errors[variant.variant_id] = f"{type(exc).__name__}: {exc}"
+                continue
+            for row in shadow_rows:
+                round_id = str(row.get("round_id") or "").strip()
+                if not round_id:
+                    continue
+                rounds.setdefault(round_id, _maybe_float(row.get("ends_at")) or 0.0)
+                logger.debug(
+                    "实验影子样本等待官方结算 variant=%s round_id=%s unsettled_shadow_count=%s",
+                    variant.variant_id,
+                    round_id,
+                    row.get("unsettled_shadow_count"),
+                )
         return [
             round_id
             for round_id, _ends_at in sorted(
@@ -5188,6 +6118,13 @@ def _maybe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_optional_float(value: Any, digits: int) -> str:
+    parsed = _maybe_float(value)
+    if parsed is None:
+        return "-"
+    return f"{parsed:.{int(digits)}f}"
 
 
 def _maybe_int(value: Any) -> int | None:

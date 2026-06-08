@@ -11,7 +11,7 @@ from typing import Any, Callable
 from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 14
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
@@ -230,6 +230,55 @@ class TradeStore:
 
             CREATE INDEX IF NOT EXISTS idx_llm_decisions_round_created
                 ON llm_decisions(round_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS aggressive_edge_v2_shadow_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                sample_key TEXT NOT NULL,
+                side TEXT NOT NULL,
+                source_signal_side TEXT NOT NULL,
+                base_would_trade INTEGER NOT NULL,
+                v1_would_trade INTEGER NOT NULL,
+                v2_would_trade INTEGER NOT NULL,
+                v4_would_trade INTEGER NOT NULL DEFAULT 0,
+                v5_would_trade INTEGER NOT NULL DEFAULT 0,
+                v6_would_trade INTEGER NOT NULL DEFAULT 0,
+                v7_would_trade INTEGER NOT NULL DEFAULT 0,
+                v8_would_trade INTEGER NOT NULL DEFAULT 0,
+                entry_price REAL,
+                confidence REAL,
+                move_bps REAL,
+                risk_score REAL,
+                risk_level TEXT,
+                risk_reasons_json TEXT NOT NULL,
+                features_json TEXT NOT NULL,
+                components_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                base_block_reason TEXT,
+                v1_block_reason TEXT,
+                v4_block_reason TEXT,
+                v5_block_reason TEXT,
+                v6_block_reason TEXT,
+                v7_block_reason TEXT,
+                v8_block_reason TEXT,
+                signal_reason TEXT NOT NULL,
+                outcome TEXT,
+                final_price REAL,
+                target_price REAL,
+                settled_at REAL,
+                settlement_source TEXT,
+                would_win INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(round_id, sample_key, side)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_aggressive_edge_v2_shadow_round
+                ON aggressive_edge_v2_shadow_samples(round_id, sample_key, side);
+
+            CREATE INDEX IF NOT EXISTS idx_aggressive_edge_v2_shadow_settled
+                ON aggressive_edge_v2_shadow_samples(symbol, settled_at DESC, id DESC);
             """
         )
         self.conn.execute(
@@ -254,7 +303,634 @@ class TradeStore:
         self._ensure_column("paper_orders", "raw_response", "TEXT")
         self._ensure_column("paper_orders", "confidence", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("paper_orders", "move_bps", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v4_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v4_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v5_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v5_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v6_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v6_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v7_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v7_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v8_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v8_block_reason", "TEXT")
         self.conn.commit()
+
+    @_locked
+    def record_aggressive_edge_v2_shadow_sample(
+        self,
+        *,
+        round_id: str,
+        symbol: str,
+        sample_key: str,
+        side: str,
+        source_signal_side: str,
+        base_would_trade: bool,
+        v1_would_trade: bool,
+        v2_would_trade: bool,
+        entry_price: float | None,
+        confidence: float | None,
+        move_bps: float | None,
+        report: dict[str, Any],
+        base_block_reason: str | None,
+        v1_block_reason: str | None,
+        signal_reason: str,
+        v4_would_trade: bool | None = None,
+        v4_block_reason: str | None = None,
+        v5_would_trade: bool | None = None,
+        v5_block_reason: str | None = None,
+        v6_would_trade: bool | None = None,
+        v6_block_reason: str | None = None,
+        v7_would_trade: bool | None = None,
+        v7_block_reason: str | None = None,
+        v8_would_trade: bool | None = None,
+        v8_block_reason: str | None = None,
+        created_at: float | None = None,
+    ) -> int:
+        """记录 Aggressive Edge V2 影子样本；同一市场同一时间桶只保留最新特征。"""
+
+        now = time.time() if created_at is None else float(created_at)
+        features = report.get("features") if isinstance(report.get("features"), dict) else {}
+        components = report.get("components") if isinstance(report.get("components"), dict) else {}
+        risk_reasons = report.get("risk_reasons") if isinstance(report.get("risk_reasons"), list) else []
+        risk_score = _maybe_float(report.get("risk_score"))
+        cur = self.conn.execute(
+            """
+            INSERT INTO aggressive_edge_v2_shadow_samples(
+                round_id, symbol, sample_key, side, source_signal_side,
+                base_would_trade, v1_would_trade, v2_would_trade, v4_would_trade, v5_would_trade, v6_would_trade, v7_would_trade, v8_would_trade,
+                entry_price, confidence, move_bps, risk_score, risk_level,
+                risk_reasons_json, features_json, components_json, report_json,
+                base_block_reason, v1_block_reason, v4_block_reason, v5_block_reason, v6_block_reason, v7_block_reason, v8_block_reason, signal_reason,
+                created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(round_id, sample_key, side) DO UPDATE SET
+                source_signal_side = excluded.source_signal_side,
+                base_would_trade = excluded.base_would_trade,
+                v1_would_trade = excluded.v1_would_trade,
+                v2_would_trade = excluded.v2_would_trade,
+                v4_would_trade = excluded.v4_would_trade,
+                v5_would_trade = excluded.v5_would_trade,
+                v6_would_trade = excluded.v6_would_trade,
+                v7_would_trade = excluded.v7_would_trade,
+                v8_would_trade = excluded.v8_would_trade,
+                entry_price = excluded.entry_price,
+                confidence = excluded.confidence,
+                move_bps = excluded.move_bps,
+                risk_score = excluded.risk_score,
+                risk_level = excluded.risk_level,
+                risk_reasons_json = excluded.risk_reasons_json,
+                features_json = excluded.features_json,
+                components_json = excluded.components_json,
+                report_json = excluded.report_json,
+                base_block_reason = excluded.base_block_reason,
+                v1_block_reason = excluded.v1_block_reason,
+                v4_block_reason = excluded.v4_block_reason,
+                v5_block_reason = excluded.v5_block_reason,
+                v6_block_reason = excluded.v6_block_reason,
+                v7_block_reason = excluded.v7_block_reason,
+                v8_block_reason = excluded.v8_block_reason,
+                signal_reason = excluded.signal_reason,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(round_id),
+                str(symbol or "BTC"),
+                str(sample_key),
+                str(side),
+                str(source_signal_side),
+                1 if base_would_trade else 0,
+                1 if v1_would_trade else 0,
+                1 if v2_would_trade else 0,
+                1 if (v2_would_trade if v4_would_trade is None else v4_would_trade) else 0,
+                1 if (False if v5_would_trade is None else v5_would_trade) else 0,
+                1 if (False if v6_would_trade is None else v6_would_trade) else 0,
+                1 if (False if v7_would_trade is None else v7_would_trade) else 0,
+                1 if (False if v8_would_trade is None else v8_would_trade) else 0,
+                entry_price,
+                confidence,
+                move_bps,
+                risk_score,
+                str(report.get("risk_level") or ""),
+                json.dumps(risk_reasons, ensure_ascii=False, sort_keys=True),
+                json.dumps(features, ensure_ascii=False, sort_keys=True),
+                json.dumps(components, ensure_ascii=False, sort_keys=True),
+                json.dumps(report, ensure_ascii=False, sort_keys=True),
+                base_block_reason,
+                v1_block_reason,
+                v4_block_reason,
+                v5_block_reason,
+                v6_block_reason,
+                v7_block_reason,
+                v8_block_reason,
+                str(signal_reason or "")[:1200],
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    @_locked
+    def settle_aggressive_edge_v2_shadow_samples(
+        self,
+        round_id: str,
+        outcome: str,
+        now: float | None = None,
+        *,
+        final_price: float | None = None,
+        target_price: float | None = None,
+        settlement_source: str = SETTLEMENT_SOURCE_POLYMARKET,
+    ) -> int:
+        """把官方终局结果回填到 V2 影子样本，供后续统计候选命中率。"""
+
+        settled_at = time.time() if now is None else float(now)
+        normalized_outcome = _normalize_side(outcome)
+        if normalized_outcome not in {"Up", "Down"}:
+            return 0
+        cur = self.conn.execute(
+            """
+            UPDATE aggressive_edge_v2_shadow_samples
+            SET outcome = ?,
+                final_price = ?,
+                target_price = COALESCE(?, target_price),
+                settled_at = ?,
+                settlement_source = ?,
+                would_win = CASE WHEN side = ? THEN 1 ELSE 0 END,
+                updated_at = ?
+            WHERE round_id = ?
+            """,
+            (
+                normalized_outcome,
+                final_price,
+                _positive_price_or_none(target_price),
+                settled_at,
+                str(settlement_source or ""),
+                normalized_outcome,
+                settled_at,
+                str(round_id),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
+    @_locked
+    def aggressive_edge_v2_shadow_summary(self, symbol: str = "BTC") -> dict[str, Any]:
+        """汇总 V2 影子样本；用于面板判断是否已经积累足够学习数据。"""
+
+        rows = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_count,
+                SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS settled_count,
+                SUM(CASE WHEN base_would_trade = 1 THEN 1 ELSE 0 END) AS base_would_trade_count,
+                SUM(CASE WHEN base_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS base_would_trade_settled_count,
+                SUM(CASE WHEN base_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS base_would_win_count,
+                SUM(CASE WHEN base_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS base_would_loss_count,
+                SUM(CASE WHEN v1_would_trade = 1 THEN 1 ELSE 0 END) AS v1_would_trade_count,
+                SUM(CASE WHEN v2_would_trade = 1 THEN 1 ELSE 0 END) AS v2_would_trade_count,
+                SUM(CASE WHEN v4_would_trade = 1 THEN 1 ELSE 0 END) AS v4_would_trade_count,
+                SUM(CASE WHEN v4_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v4_would_trade_settled_count,
+                SUM(CASE WHEN v4_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v4_would_win_count,
+                SUM(CASE WHEN v4_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v4_would_loss_count,
+                SUM(CASE WHEN v5_would_trade = 1 THEN 1 ELSE 0 END) AS v5_would_trade_count,
+                SUM(CASE WHEN v5_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v5_would_trade_settled_count,
+                SUM(CASE WHEN v5_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v5_would_win_count,
+                SUM(CASE WHEN v5_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v5_would_loss_count,
+                SUM(CASE WHEN v6_would_trade = 1 THEN 1 ELSE 0 END) AS v6_would_trade_count,
+                SUM(CASE WHEN v6_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v6_would_trade_settled_count,
+                SUM(CASE WHEN v6_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v6_would_win_count,
+                SUM(CASE WHEN v6_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v6_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v6_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v6_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v6_simulated_pnl,
+                SUM(CASE WHEN v6_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v6_simulated_stake_count,
+                SUM(CASE WHEN v7_would_trade = 1 THEN 1 ELSE 0 END) AS v7_would_trade_count,
+                SUM(CASE WHEN v7_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v7_would_trade_settled_count,
+                SUM(CASE WHEN v7_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v7_would_win_count,
+                SUM(CASE WHEN v7_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v7_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v7_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v7_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v7_simulated_pnl,
+                SUM(CASE WHEN v7_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v7_simulated_stake_count,
+                SUM(CASE WHEN v8_would_trade = 1 THEN 1 ELSE 0 END) AS v8_would_trade_count,
+                SUM(CASE WHEN v8_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v8_would_trade_settled_count,
+                SUM(CASE WHEN v8_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v8_would_win_count,
+                SUM(CASE WHEN v8_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v8_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v8_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v8_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v8_simulated_pnl,
+                SUM(CASE WHEN v8_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v8_simulated_stake_count,
+                SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) AS high_risk_count,
+                SUM(CASE WHEN risk_level = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_risk_count,
+                SUM(CASE WHEN risk_level = 'LOW' THEN 1 ELSE 0 END) AS low_risk_count,
+                SUM(CASE WHEN risk_level = 'HIGH' AND would_win = 0 THEN 1 ELSE 0 END) AS high_risk_loss_count,
+                SUM(CASE WHEN risk_level = 'HIGH' AND would_win = 1 THEN 1 ELSE 0 END) AS high_risk_win_count,
+                AVG(risk_score) AS avg_risk_score,
+                MAX(risk_score) AS max_risk_score
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchone()
+        v6_direction_rows = self.conn.execute(
+            """
+            SELECT side,
+                   COUNT(*) AS settled_count,
+                   SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                   SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v6_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY side
+            ORDER BY side
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v6_bucket_rows = self.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                    WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                    WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                    WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                    WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                    ELSE 'unknown'
+                END AS bucket,
+                COUNT(*) AS settled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v6_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v7_direction_rows = self.conn.execute(
+            """
+            SELECT side,
+                   COUNT(*) AS settled_count,
+                   SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                   SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v7_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY side
+            ORDER BY side
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v7_bucket_rows = self.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                    WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                    WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                    WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                    WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                    ELSE 'unknown'
+                END AS bucket,
+                COUNT(*) AS settled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v7_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v8_direction_rows = self.conn.execute(
+            """
+            SELECT side,
+                   COUNT(*) AS settled_count,
+                   SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                   SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v8_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY side
+            ORDER BY side
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v8_bucket_rows = self.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                    WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                    WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                    WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                    WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                    ELSE 'unknown'
+                END AS bucket,
+                COUNT(*) AS settled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v8_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, risk_score, risk_level,
+                   base_would_trade, v1_would_trade, v2_would_trade,
+                   v4_would_trade, v4_block_reason, v5_would_trade, v5_block_reason,
+                   v6_would_trade, v6_block_reason, v7_would_trade, v7_block_reason,
+                   v8_would_trade, v8_block_reason,
+                   outcome, would_win, created_at, updated_at
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 5
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_v6_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v6_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v6_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_v7_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v7_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v7_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_v8_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v8_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v8_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        summary = dict(rows) if rows is not None else {}
+        version_columns = {
+            "V4": "v4_would_trade",
+            "V5": "v5_would_trade",
+            "V6": "v6_would_trade",
+            "V7": "v7_would_trade",
+            "V8": "v8_would_trade",
+        }
+
+        def integer(key: str) -> int:
+            return int(summary.get(key) or 0)
+
+        def win_rate(win_count: int, loss_count: int) -> float | None:
+            total = win_count + loss_count
+            return round(win_count / total * 100.0, 4) if total else None
+
+        def stat_row(row: sqlite3.Row, label_key: str) -> dict[str, Any]:
+            win_count = int(row["win_count"] or 0)
+            loss_count = int(row["loss_count"] or 0)
+            return {
+                label_key: row[label_key],
+                "settled_count": int(row["settled_count"] or 0),
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate_pct": win_rate(win_count, loss_count),
+            }
+
+        def version_summary(version: str, column: str) -> dict[str, Any]:
+            """按统一结构汇总诊断版本，前端切换版本时不用理解各版本字段名。"""
+
+            aggregate = self.conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS would_trade_count,
+                    SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS settled_count,
+                    SUM(CASE WHEN settled_at IS NULL THEN 1 ELSE 0 END) AS unsettled_count,
+                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                    SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count,
+                    SUM(
+                        CASE
+                            WHEN would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                            WHEN would_win = 0 AND entry_price > 0 THEN -1.0
+                            ELSE 0.0
+                        END
+                    ) AS simulated_pnl,
+                    SUM(CASE WHEN would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS simulated_stake_count
+                FROM aggressive_edge_v2_shadow_samples
+                WHERE symbol = ?
+                  AND {column} = 1
+                """,
+                (str(symbol or "BTC"),),
+            ).fetchone()
+            direction_rows = self.conn.execute(
+                f"""
+                SELECT side,
+                       COUNT(*) AS settled_count,
+                       SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                       SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+                FROM aggressive_edge_v2_shadow_samples
+                WHERE symbol = ?
+                  AND {column} = 1
+                  AND settled_at IS NOT NULL
+                GROUP BY side
+                ORDER BY side
+                """,
+                (str(symbol or "BTC"),),
+            ).fetchall()
+            bucket_rows = self.conn.execute(
+                f"""
+                SELECT
+                    CASE
+                        WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                        WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                        WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                        WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                        WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                        ELSE 'unknown'
+                    END AS bucket,
+                    COUNT(*) AS settled_count,
+                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                    SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+                FROM aggressive_edge_v2_shadow_samples
+                WHERE symbol = ?
+                  AND {column} = 1
+                  AND settled_at IS NOT NULL
+                GROUP BY bucket
+                ORDER BY bucket
+                """,
+                (str(symbol or "BTC"),),
+            ).fetchall()
+            recent = self.conn.execute(
+                f"""
+                SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                       outcome, would_win, created_at, updated_at, settled_at
+                FROM aggressive_edge_v2_shadow_samples
+                WHERE symbol = ?
+                  AND {column} = 1
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 8
+                """,
+                (str(symbol or "BTC"),),
+            ).fetchall()
+            data = dict(aggregate) if aggregate is not None else {}
+            win_count = int(data.get("win_count") or 0)
+            loss_count = int(data.get("loss_count") or 0)
+            stake_count = int(data.get("simulated_stake_count") or 0)
+            return {
+                "version": version,
+                "column": column,
+                "would_trade_count": int(data.get("would_trade_count") or 0),
+                "settled_count": int(data.get("settled_count") or 0),
+                "unsettled_count": int(data.get("unsettled_count") or 0),
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate_pct": win_rate(win_count, loss_count),
+                "simulated_roi_pct": round(float(data.get("simulated_pnl") or 0.0) / stake_count * 100.0, 4)
+                if stake_count
+                else None,
+                "direction_stats": [stat_row(row, "side") for row in direction_rows],
+                "bucket_stats": [stat_row(row, "bucket") for row in bucket_rows],
+                "recent_samples": [dict(row) for row in recent],
+            }
+
+        diagnostic_version_summaries = [
+            version_summary(version, column) for version, column in version_columns.items()
+        ]
+
+        settled_count = integer("settled_count")
+        base_win = integer("base_would_win_count")
+        base_loss = integer("base_would_loss_count")
+        v6_stake_count = integer("v6_simulated_stake_count")
+        v7_stake_count = integer("v7_simulated_stake_count")
+        v8_stake_count = integer("v8_simulated_stake_count")
+        high_loss = integer("high_risk_loss_count")
+        high_win = integer("high_risk_win_count")
+        high_settled = high_loss + high_win
+        return {
+            "total_count": integer("total_count"),
+            "settled_count": settled_count,
+            "base_would_trade_count": integer("base_would_trade_count"),
+            "base_would_trade_settled_count": integer("base_would_trade_settled_count"),
+            "base_would_win_count": base_win,
+            "base_would_loss_count": base_loss,
+            "base_would_win_rate_pct": win_rate(base_win, base_loss),
+            "v1_would_trade_count": integer("v1_would_trade_count"),
+            "v2_would_trade_count": integer("v2_would_trade_count"),
+            "v4_would_trade_count": integer("v4_would_trade_count"),
+            "v4_would_trade_settled_count": integer("v4_would_trade_settled_count"),
+            "v4_would_win_count": integer("v4_would_win_count"),
+            "v4_would_loss_count": integer("v4_would_loss_count"),
+            "v4_would_win_rate_pct": round(
+                integer("v4_would_win_count")
+                / (integer("v4_would_win_count") + integer("v4_would_loss_count"))
+                * 100.0,
+                4,
+            )
+            if integer("v4_would_win_count") + integer("v4_would_loss_count")
+            else None,
+            "v5_would_trade_count": integer("v5_would_trade_count"),
+            "v5_would_trade_settled_count": integer("v5_would_trade_settled_count"),
+            "v5_would_win_count": integer("v5_would_win_count"),
+            "v5_would_loss_count": integer("v5_would_loss_count"),
+            "v5_would_win_rate_pct": round(
+                integer("v5_would_win_count")
+                / (integer("v5_would_win_count") + integer("v5_would_loss_count"))
+                * 100.0,
+                4,
+            )
+            if integer("v5_would_win_count") + integer("v5_would_loss_count")
+            else None,
+            "v6_would_trade_count": integer("v6_would_trade_count"),
+            "v6_would_trade_settled_count": integer("v6_would_trade_settled_count"),
+            "v6_would_win_count": integer("v6_would_win_count"),
+            "v6_would_loss_count": integer("v6_would_loss_count"),
+            "v6_would_win_rate_pct": round(
+                integer("v6_would_win_count")
+                / (integer("v6_would_win_count") + integer("v6_would_loss_count"))
+                * 100.0,
+                4,
+            )
+            if integer("v6_would_win_count") + integer("v6_would_loss_count")
+            else None,
+            "v6_simulated_roi_pct": round(float(summary.get("v6_simulated_pnl") or 0.0) / v6_stake_count * 100.0, 4)
+            if v6_stake_count
+            else None,
+            "v7_would_trade_count": integer("v7_would_trade_count"),
+            "v7_would_trade_settled_count": integer("v7_would_trade_settled_count"),
+            "v7_would_win_count": integer("v7_would_win_count"),
+            "v7_would_loss_count": integer("v7_would_loss_count"),
+            "v7_would_win_rate_pct": win_rate(integer("v7_would_win_count"), integer("v7_would_loss_count")),
+            "v7_simulated_roi_pct": round(float(summary.get("v7_simulated_pnl") or 0.0) / v7_stake_count * 100.0, 4)
+            if v7_stake_count
+            else None,
+            "v8_would_trade_count": integer("v8_would_trade_count"),
+            "v8_would_trade_settled_count": integer("v8_would_trade_settled_count"),
+            "v8_would_win_count": integer("v8_would_win_count"),
+            "v8_would_loss_count": integer("v8_would_loss_count"),
+            "v8_would_win_rate_pct": win_rate(integer("v8_would_win_count"), integer("v8_would_loss_count")),
+            "v8_simulated_roi_pct": round(float(summary.get("v8_simulated_pnl") or 0.0) / v8_stake_count * 100.0, 4)
+            if v8_stake_count
+            else None,
+            "high_risk_count": integer("high_risk_count"),
+            "medium_risk_count": integer("medium_risk_count"),
+            "low_risk_count": integer("low_risk_count"),
+            "high_risk_loss_count": high_loss,
+            "high_risk_win_count": high_win,
+            "high_risk_loss_rate_pct": round(high_loss / high_settled * 100.0, 4) if high_settled else None,
+            "avg_risk_score": round(float(summary.get("avg_risk_score")), 6) if summary.get("avg_risk_score") is not None else None,
+            "max_risk_score": round(float(summary.get("max_risk_score")), 6) if summary.get("max_risk_score") is not None else None,
+            "v6_direction_stats": [stat_row(row, "side") for row in v6_direction_rows],
+            "v6_bucket_stats": [stat_row(row, "bucket") for row in v6_bucket_rows],
+            "v7_direction_stats": [stat_row(row, "side") for row in v7_direction_rows],
+            "v7_bucket_stats": [stat_row(row, "bucket") for row in v7_bucket_rows],
+            "v8_direction_stats": [stat_row(row, "side") for row in v8_direction_rows],
+            "v8_bucket_stats": [stat_row(row, "bucket") for row in v8_bucket_rows],
+            "recent_samples": [dict(row) for row in recent_rows],
+            "recent_v6_samples": [dict(row) for row in recent_v6_rows],
+            "recent_v7_samples": [dict(row) for row in recent_v7_rows],
+            "recent_v8_samples": [dict(row) for row in recent_v8_rows],
+            "diagnostic_version_summaries": diagnostic_version_summaries,
+        }
 
     @_locked
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -1970,6 +2646,41 @@ class TradeStore:
             LIMIT ?
             """,
             (symbol, cutoff, SETTLEMENT_SOURCE_POLYMARKET, safe_limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @_locked
+    def pending_aggressive_edge_shadow_official_rounds(
+        self,
+        now: float,
+        lookback_seconds: float,
+        limit: int = 10,
+        symbol: str = "BTC",
+    ) -> list[dict[str, Any]]:
+        """查询已结束但影子样本仍未拿到官方结果的市场，用于诊断组合补偿结算。"""
+
+        cutoff = now - max(0.0, float(lookback_seconds))
+        safe_limit = max(1, min(100, int(limit)))
+        rows = self.conn.execute(
+            """
+            SELECT
+                r.round_id,
+                r.symbol,
+                r.ends_at,
+                r.outcome,
+                r.settlement_source,
+                COUNT(s.id) AS unsettled_shadow_count
+            FROM market_rounds r
+            JOIN aggressive_edge_v2_shadow_samples s ON s.round_id = r.round_id
+            WHERE r.symbol = ?
+              AND r.ends_at <= ?
+              AND r.ends_at >= ?
+              AND (s.outcome IS NULL OR s.outcome NOT IN ('Up', 'Down') OR s.settled_at IS NULL)
+            GROUP BY r.round_id
+            ORDER BY r.ends_at DESC, r.round_id DESC
+            LIMIT ?
+            """,
+            (str(symbol or "BTC"), now, cutoff, safe_limit),
         ).fetchall()
         return [dict(row) for row in rows]
 

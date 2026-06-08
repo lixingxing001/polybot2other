@@ -4,6 +4,16 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 const ids = {
   navItems: Array.from(document.querySelectorAll("[data-nav-page]")),
   botPage: document.getElementById("bot-page"),
+  samplePage: document.getElementById("sample-page"),
+  sampleProgressMeta: document.getElementById("sample-progress-meta"),
+  sampleProgressSummary: document.getElementById("sample-progress-summary"),
+  sampleProgressBars: document.getElementById("sample-progress-bars"),
+  sampleProgressCards: document.getElementById("sample-progress-cards"),
+  sampleVersion: document.getElementById("sample-version"),
+  sampleDirectionStats: document.getElementById("sample-direction-stats"),
+  sampleBucketStats: document.getElementById("sample-bucket-stats"),
+  sampleRecentMeta: document.getElementById("sample-recent-meta"),
+  sampleRecentV7: document.getElementById("sample-recent-v7"),
   runtime: document.getElementById("runtime-pill"),
   paperPauseToggle: document.getElementById("paper-pause-toggle"),
   liveEnabled: document.getElementById("live-enabled"),
@@ -120,7 +130,18 @@ const FIELD_STORAGE_KEYS = {
   order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
 };
-const APP_PAGE_KEYS = new Set(["bot"]);
+const APP_PAGE_KEYS = new Set(["bot", "samples"]);
+const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version";
+const SAMPLE_VERSION_KEYS = ["V8", "V7", "V6", "V5", "V4"];
+const SAMPLE_VERSION_VARIANT_IDS = {
+  V4: "SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC",
+  V5: "SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC",
+  V6: "SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC",
+  V7: "SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC",
+  V8: "SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC",
+};
+const SAMPLE_REVIEW_TARGET = 80;
+const SAMPLE_STABILITY_TARGET = 100;
 const DEPRECATED_STRATEGY_VARIANT_IDS = new Set([
   "PAIR_FAK",
   "PAIR_FAK_MULTI_CONFIRM",
@@ -136,6 +157,10 @@ const DEPRECATED_STRATEGY_VARIANT_IDS = new Set([
   "SINGLE_FAK_STRICT",
   "SINGLE_FAK_MULTI_LEAD",
   "SINGLE_FAK_MULTI_CONFIRM",
+  "SINGLE_FAK_AGGRESSIVE_EDGE",
+  "SINGLE_FAK_AGGRESSIVE_EDGE_V1",
+  "SINGLE_FAK_AGGRESSIVE_EDGE_V2",
+  "SINGLE_FAK_AGGRESSIVE_EDGE_V3",
 ]);
 const ORDER_STATUS_LABELS = {
   PENDING: "待官方确认",
@@ -212,6 +237,7 @@ const orderFillCache = new Map();
 let expandedExperimentId = null;
 let loadingExperimentId = null;
 const experimentDetailCache = new Map();
+let selectedSampleVersion = loadSampleVersion();
 let recentPageLoading = false;
 let pageVisible = document.visibilityState !== "hidden";
 let renderQueued = false;
@@ -222,6 +248,7 @@ let lastOpenRenderKey = "";
 let lastRecentRenderKey = "";
 let lastOrderRenderKey = "";
 let lastExperimentRenderKey = "";
+let lastSampleProgressRenderKey = "";
 let lastOpenRenderedScope = "";
 let lastOpenRenderedCount = 0;
 let pendingOpenRender = false;
@@ -808,7 +835,7 @@ function setActiveAppPage(page, options = {}) {
     if (selected) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  for (const [key, element] of [["bot", ids.botPage]]) {
+  for (const [key, element] of [["bot", ids.botPage], ["samples", ids.samplePage]]) {
     if (!element) continue;
     const selected = key === nextPage;
     element.classList.toggle("is-active", selected);
@@ -824,6 +851,9 @@ function setActiveAppPage(page, options = {}) {
   }
   if (nextPage === "bot" && latestStatus) {
     window.setTimeout(() => renderAll(latestStatus, { force: true, forceChart: true }), 210);
+  }
+  if (nextPage === "samples" && latestStatus) {
+    window.setTimeout(() => renderSampleProgress(latestStatus.runtime || {}, { force: true }), 120);
   }
 }
 
@@ -1805,6 +1835,273 @@ function renderStrategyExperiments(runtime = {}) {
 
 function experimentSummaryItem(label, value) {
   return `<span><b>${safe(label)}</b>${safe(value)}</span>`;
+}
+
+function sampleVariantId(version = selectedSampleVersion) {
+  const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
+    ? String(version || "").toUpperCase()
+    : "V8";
+  return SAMPLE_VERSION_VARIANT_IDS[normalized] || SAMPLE_VERSION_VARIANT_IDS.V8;
+}
+
+function sampleProgressVariant(runtime = {}, version = selectedSampleVersion) {
+  const source = runtime || {};
+  const variants = Array.isArray(source.strategy_experiments?.variants) ? source.strategy_experiments.variants : [];
+  const variantId = sampleVariantId(version);
+  return variants.find((row) => row?.variant_id === variantId) || null;
+}
+
+function loadSampleVersion() {
+  try {
+    const stored = window.localStorage.getItem(SAMPLE_VERSION_STORAGE_KEY);
+    if (SAMPLE_VERSION_KEYS.includes(stored)) return stored;
+  } catch (error) {
+    return "V8";
+  }
+  return "V8";
+}
+
+function setSampleVersion(version) {
+  const next = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
+    ? String(version || "").toUpperCase()
+    : "V8";
+  selectedSampleVersion = next;
+  if (ids.sampleVersion && ids.sampleVersion.value !== next) ids.sampleVersion.value = next;
+  try {
+    window.localStorage.setItem(SAMPLE_VERSION_STORAGE_KEY, next);
+  } catch (error) {
+    // localStorage 不可用时只保留当前页面状态。
+  }
+  renderSampleProgress(latestStatus?.runtime || {}, { force: true });
+}
+
+function sampleVersionSummary(summary = {}, version = selectedSampleVersion) {
+  const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
+    ? String(version || "").toUpperCase()
+    : "V8";
+  const rows = Array.isArray(summary.diagnostic_version_summaries)
+    ? summary.diagnostic_version_summaries
+    : [];
+  const found = rows.find((row) => String(row?.version || "").toUpperCase() === normalized);
+  if (found) return found;
+  const prefix = normalized.toLowerCase();
+  const total = toNumber(summary[`${prefix}_would_trade_count`]) || 0;
+  const settled = toNumber(summary[`${prefix}_would_trade_settled_count`]) || 0;
+  return {
+    version: normalized,
+    would_trade_count: total,
+    settled_count: settled,
+    unsettled_count: Math.max(0, total - settled),
+    win_count: toNumber(summary[`${prefix}_would_win_count`]) || 0,
+    loss_count: toNumber(summary[`${prefix}_would_loss_count`]) || 0,
+    win_rate_pct: summary[`${prefix}_would_win_rate_pct`],
+    simulated_roi_pct: summary[`${prefix}_simulated_roi_pct`],
+    direction_stats: summary[`${prefix}_direction_stats`] || [],
+    bucket_stats: summary[`${prefix}_bucket_stats`] || [],
+    recent_samples: summary[`recent_${prefix}_samples`] || [],
+  };
+}
+
+function sampleProgressRenderKey(runtime = {}) {
+  const source = runtime || {};
+  const variant = sampleProgressVariant(source, selectedSampleVersion);
+  const summary = variant?.aggressive_edge_v2_shadow_summary || {};
+  const selected = sampleVersionSummary(summary);
+  return JSON.stringify({
+    run_count: source.strategy_experiments?.run_count || 0,
+    variant_id: variant?.variant_id || "",
+    selected_version: selectedSampleVersion,
+    total: summary.total_count || 0,
+    settled: summary.settled_count || 0,
+    base_settled: summary.base_would_trade_settled_count || 0,
+    base_win_rate: summary.base_would_win_rate_pct,
+    version_summary: selected,
+    available: summary.diagnostic_version_summaries || [],
+  });
+}
+
+function renderSampleProgress(runtime = {}, options = {}) {
+  if (!ids.sampleProgressCards) return;
+  const source = runtime || {};
+  const renderKey = sampleProgressRenderKey(source);
+  if (!options.force && renderKey === lastSampleProgressRenderKey) return;
+  lastSampleProgressRenderKey = renderKey;
+
+  const variant = sampleProgressVariant(source, selectedSampleVersion);
+  if (!variant) {
+    ids.sampleProgressMeta.textContent = `${safe(selectedSampleVersion)} 诊断组合未加载`;
+    ids.sampleProgressSummary.innerHTML = "";
+    ids.sampleProgressBars.innerHTML = "";
+    ids.sampleProgressCards.innerHTML = `<div class="sample-empty">未找到 ${safe(sampleVariantId(selectedSampleVersion))}</div>`;
+    ids.sampleDirectionStats.innerHTML = sampleEmptyRow(5, "暂无方向样本");
+    ids.sampleBucketStats.innerHTML = sampleEmptyRow(5, "暂无时间桶样本");
+    ids.sampleRecentMeta.textContent = "0 条";
+    ids.sampleRecentV7.innerHTML = sampleEmptyRow(9, "暂无候选");
+    return;
+  }
+
+  const experiments = source.strategy_experiments || {};
+  const summary = variant.aggressive_edge_v2_shadow_summary || {};
+  if (ids.sampleVersion && ids.sampleVersion.value !== selectedSampleVersion) {
+    ids.sampleVersion.value = selectedSampleVersion;
+  }
+  const selected = sampleVersionSummary(summary);
+  const versionLabel = selected.version || selectedSampleVersion;
+  const allTotal = toNumber(summary.total_count) || 0;
+  const allSettled = toNumber(summary.settled_count) || 0;
+  const baseSettled = toNumber(summary.base_would_trade_settled_count) || 0;
+  const versionTotal = toNumber(selected.would_trade_count) || 0;
+  const versionSettled = toNumber(selected.settled_count) || 0;
+  const versionUnsettled = Math.max(0, toNumber(selected.unsettled_count) ?? (versionTotal - versionSettled));
+  const versionWin = toNumber(selected.win_count) || 0;
+  const versionLoss = toNumber(selected.loss_count) || 0;
+  const reviewMissing = Math.max(0, SAMPLE_REVIEW_TARGET - versionSettled);
+  const stabilityMissing = Math.max(0, SAMPLE_STABILITY_TARGET - versionSettled);
+
+  ids.sampleProgressMeta.textContent = `${safe(versionLabel)} Diagnostic · ${safe(variant.combo || "Aggressive Edge")} · tick ${experiments.run_count || 0}`;
+  ids.sampleProgressSummary.innerHTML = [
+    sampleSummaryItem("状态", versionSettled >= SAMPLE_REVIEW_TARGET ? "可完整复盘" : "继续采样"),
+    sampleSummaryItem("已结算", `${fmtNumberCell(versionSettled, 0)} / ${SAMPLE_REVIEW_TARGET}`),
+    sampleSummaryItem("稳定线", `${fmtNumberCell(versionSettled, 0)} / ${SAMPLE_STABILITY_TARGET}`),
+  ].join("");
+  ids.sampleProgressBars.innerHTML = [
+    sampleProgressBar("80 单复盘线", versionSettled, SAMPLE_REVIEW_TARGET),
+    sampleProgressBar("100 单稳定性线", versionSettled, SAMPLE_STABILITY_TARGET),
+  ].join("");
+  ids.sampleProgressCards.innerHTML = [
+    sampleMetricCard("全部影子样本", fmtNumberCell(allTotal, 0), "观察样本"),
+    sampleMetricCard("已结算影子样本", fmtNumberCell(allSettled, 0), "可回填结果"),
+    sampleMetricCard("原始会下注样本", `${fmtNumberCell(baseSettled, 0)} 已结算`, "Aggressive Edge"),
+    sampleMetricCard("原始会下注胜率", samplePctText(summary.base_would_win_rate_pct), "基准口径"),
+    sampleMetricCard(`${versionLabel} 会放行样本`, fmtNumberCell(versionTotal, 0), "诊断候选"),
+    sampleMetricCard(`${versionLabel} 已结算样本`, fmtNumberCell(versionSettled, 0), "复盘有效"),
+    sampleMetricCard(`${versionLabel} 未结算样本`, fmtNumberCell(versionUnsettled, 0), "等待终局"),
+    sampleMetricCard(`${versionLabel} 胜`, fmtNumberCell(versionWin, 0), "已结算"),
+    sampleMetricCard(`${versionLabel} 负`, fmtNumberCell(versionLoss, 0), "已结算"),
+    sampleMetricCard(`${versionLabel} 胜率`, samplePctText(selected.win_rate_pct), "模拟命中"),
+    sampleMetricCard(`${versionLabel} 模拟 ROI`, sampleSignedPctText(selected.simulated_roi_pct), "按 1 单位本金"),
+    sampleMetricCard("距离复盘线", reviewMissing ? `还差 ${fmtNumberCell(reviewMissing, 0)} 单` : "已达到", "80 单"),
+    sampleMetricCard("距离稳定性线", stabilityMissing ? `还差 ${fmtNumberCell(stabilityMissing, 0)} 单` : "已达到", "100 单"),
+  ].join("");
+
+  ids.sampleDirectionStats.innerHTML = sampleDirectionRows(selected.direction_stats || []);
+  ids.sampleBucketStats.innerHTML = sampleBucketRows(selected.bucket_stats || []);
+  const recent = Array.isArray(selected.recent_samples) ? selected.recent_samples : [];
+  ids.sampleRecentMeta.textContent = `${recent.length} 条`;
+  ids.sampleRecentV7.innerHTML = recent.length
+    ? recent.map(sampleRecentRow).join("")
+    : sampleEmptyRow(9, `暂无 ${safe(versionLabel)} 候选`);
+}
+
+function sampleSummaryItem(label, value) {
+  return `<span><b>${safe(label)}</b>${safe(value)}</span>`;
+}
+
+function sampleMetricCard(label, valueHtml, note) {
+  return `
+    <div class="sample-metric">
+      <span>${safe(label)}</span>
+      <strong>${valueHtml}</strong>
+      <small>${safe(note)}</small>
+    </div>
+  `;
+}
+
+function sampleProgressBar(label, value, target) {
+  const current = Math.max(0, toNumber(value) || 0);
+  const max = Math.max(1, toNumber(target) || 1);
+  const pct = Math.max(0, Math.min(100, current / max * 100));
+  return `
+    <div class="sample-progress-bar">
+      <div class="sample-progress-bar-head">
+        <span>${safe(label)}</span>
+        <strong>${fmtNumberCell(current, 0)} / ${fmtNumberCell(max, 0)}</strong>
+      </div>
+      <div class="sample-progress-track" aria-hidden="true"><span style="width:${pct.toFixed(2)}%"></span></div>
+    </div>
+  `;
+}
+
+function samplePctText(value) {
+  const parsed = toNumber(value);
+  return parsed == null ? "样本不足" : `${fmtNumberCell(parsed, 2)}%`;
+}
+
+function sampleSignedPctText(value) {
+  const parsed = toNumber(value);
+  if (parsed == null) return "样本不足";
+  const klass = cls(parsed);
+  const prefix = parsed > 0 ? "+" : "";
+  return `<span class="${klass}">${prefix}${fmtNumberCell(parsed, 2)}%</span>`;
+}
+
+function sampleEmptyRow(colspan, text) {
+  return `<tr><td colspan="${Math.max(1, colspan)}" class="empty">${safe(text)}</td></tr>`;
+}
+
+function sampleStatMap(rows, key) {
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    map.set(String(row?.[key] || ""), row);
+  }
+  return map;
+}
+
+function sampleDirectionRows(rows) {
+  const map = sampleStatMap(rows, "side");
+  return ["Down", "Up"].map((side) => {
+    const row = map.get(side) || {};
+    const settled = toNumber(row.settled_count) || 0;
+    const win = toNumber(row.win_count) || 0;
+    const loss = toNumber(row.loss_count) || 0;
+    return `
+      <tr>
+        <td><span class="${sideClass(side)}">${safe(side)}</span></td>
+        <td>${fmtNumberCell(settled, 0)}</td>
+        <td>${fmtNumberCell(win, 0)}</td>
+        <td>${fmtNumberCell(loss, 0)}</td>
+        <td>${samplePctText(row.win_rate_pct)}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function sampleBucketRows(rows) {
+  const map = sampleStatMap(rows, "bucket");
+  return ["m0", "m1", "m2", "m3", "m4"].map((bucket) => {
+    const row = map.get(bucket) || {};
+    const settled = toNumber(row.settled_count) || 0;
+    const win = toNumber(row.win_count) || 0;
+    const loss = toNumber(row.loss_count) || 0;
+    return `
+      <tr>
+        <td class="mono-cell">${safe(bucket)}</td>
+        <td>${fmtNumberCell(settled, 0)}</td>
+        <td>${fmtNumberCell(win, 0)}</td>
+        <td>${fmtNumberCell(loss, 0)}</td>
+        <td>${samplePctText(row.win_rate_pct)}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function sampleRecentRow(row) {
+  const bucket = String(row?.sample_key || "").split(":")[0] || "-";
+  const state = row?.would_win == null ? "未结算" : Number(row.would_win) === 1 ? "赢" : "输";
+  const stateClass = row?.would_win == null ? "" : Number(row.would_win) === 1 ? "positive" : "negative";
+  return `
+    <tr>
+      <td>${fmtDateTimeCell(row?.created_at)}</td>
+      <td class="mono-cell">${safe(row?.round_id || "-")}</td>
+      <td class="mono-cell">${safe(bucket)}</td>
+      <td><span class="${sideClass(row?.side)}">${safe(row?.side || "-")}</span></td>
+      <td>${fmtNumberCell(row?.entry_price, 4)}</td>
+      <td>${fmtSignedBpsCell(row?.move_bps)}</td>
+      <td>${fmtNumberCell(row?.risk_score, 4)}</td>
+      <td><span class="${stateClass}">${safe(state)}</span></td>
+      <td><span class="${sideClass(row?.outcome)}">${safe(row?.outcome || "-")}</span></td>
+    </tr>
+  `;
 }
 
 function experimentRenderKey(experiments, variants, decision = {}, profit = {}) {
@@ -4061,6 +4358,7 @@ function renderAllNow(data = latestStatus, options = {}) {
   renderMetrics(selectedAccountMetrics(data));
   renderMarket(data);
   renderStrategyExperiments(data.runtime);
+  renderSampleProgress(data.runtime);
   if (strategyExperimentViewActive() && !strategyTablesLoading) {
     loadStrategyExperimentTables(false).catch(showError);
   }
@@ -4593,6 +4891,7 @@ function queueChartHoverDraw() {
 for (const navItem of ids.navItems || []) {
   navItem.addEventListener("click", () => setActiveAppPage(navItem.dataset.navPage));
 }
+ids.sampleVersion?.addEventListener("change", () => setSampleVersion(ids.sampleVersion.value));
 bindLiveSettingsDirtyTracking();
 bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));

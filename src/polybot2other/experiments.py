@@ -18,6 +18,14 @@ SIGNAL_SIDE_MODE_REVERSE = "REVERSE"
 SIGNAL_FILTER_MODE_NONE = "NONE"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE = "AGGRESSIVE_EDGE"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1 = "AGGRESSIVE_EDGE_V1"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2 = "AGGRESSIVE_EDGE_V2"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3 = "AGGRESSIVE_EDGE_V3"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC = "AGGRESSIVE_EDGE_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC = "AGGRESSIVE_EDGE_V4_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC = "AGGRESSIVE_EDGE_V5_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC = "AGGRESSIVE_EDGE_V6_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC = "AGGRESSIVE_EDGE_V7_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC = "AGGRESSIVE_EDGE_V8_DIAGNOSTIC"
 MARKET_DATA_MODE_BASE = "BASE"
 MARKET_DATA_MODE_MULTI_CONFIRM = "MULTI_CONFIRM"
 MARKET_DATA_MODE_MULTI_LEAD = "MULTI_LEAD"
@@ -68,6 +76,22 @@ class StrategyVariant:
             filter_suffix = " Aggressive Edge"
         elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1:
             filter_suffix = " Aggressive Edge V1"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2:
+            filter_suffix = " Aggressive Edge V2"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3:
+            filter_suffix = " Aggressive Edge V3"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V4 Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V5 Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V6 Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V7 Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V8 Learning Diagnostic"
         else:
             filter_suffix = ""
         return f"{self.strategy_family} + {self.order_type}{entry_suffix}{data_suffix}{signal_suffix}{filter_suffix}"
@@ -101,6 +125,78 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
         "待验证",
         "Paper-only Aggressive Edge V1，迁移输单反思后的学习过滤，和基准组隔离对照",
         signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V1,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V2",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only Aggressive Edge V2，影子计算盘口微观特征和动量衰竭得分",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V2,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V3",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "采样",
+        "待验证",
+        "Paper-only Aggressive Edge V3，读取历史输局指纹并在下注前做负期望守卫",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V3,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "诊断",
+        "只采样",
+        "Paper-only Aggressive Edge 诊断组合，只记录候选和输局指纹，不主动下注",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V4 诊断组合，按复盘出的反转结构记录 V4 候选，不主动下注",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V4_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V5 诊断组合，收紧 Down 反转风险和早晚时间桶，只记录不主动下注",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V6 诊断组合，继承 V5 后只放行低风险和非极端位移候选",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V7 诊断组合，继承 V6 后验证盘口深度支撑和 Down 入场价上限",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "学习采样",
+        "只采样",
+        "Paper-only Aggressive Edge V8 学习采样组合，放宽至基础候选并记录盘口和风险标签，不主动下注",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
     ),
     StrategyVariant(
         "SINGLE_FAK_CHAINLINK_ONLY",
@@ -166,8 +262,18 @@ DEPRECATED_STRATEGY_VARIANT_IDS: frozenset[str] = frozenset(
         "SINGLE_FAK_STRICT",
         "SINGLE_FAK_MULTI_LEAD",
         "SINGLE_FAK_MULTI_CONFIRM",
+        "SINGLE_FAK_AGGRESSIVE_EDGE",
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V1",
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V2",
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V3",
     }
 )
+
+
+def active_strategy_variants() -> tuple[StrategyVariant, ...]:
+    """默认运行组合；已证伪的 Aggressive Edge 交易版只保留历史数据，不再主动跑。"""
+
+    return tuple(variant for variant in STRATEGY_VARIANTS if variant.variant_id not in DEPRECATED_STRATEGY_VARIANT_IDS)
 
 
 def selected_strategy_variants(raw_variant_ids: str | None) -> tuple[StrategyVariant, ...]:
@@ -175,10 +281,10 @@ def selected_strategy_variants(raw_variant_ids: str | None) -> tuple[StrategyVar
 
     raw = str(raw_variant_ids or "").strip()
     if not raw:
-        return STRATEGY_VARIANTS
+        return active_strategy_variants()
     wanted = {item.strip().upper().replace("-", "_") for item in raw.split(",") if item.strip()}
     if not wanted:
-        return STRATEGY_VARIANTS
+        return active_strategy_variants()
     # 已淘汰组合：为兼容旧配置，这里静默忽略历史 variant_id。
     wanted = wanted.difference(DEPRECATED_STRATEGY_VARIANT_IDS)
     if not wanted:

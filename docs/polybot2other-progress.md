@@ -1,5 +1,89 @@
 # polybot2other-progress
 
+## 2026-06-05 v2026-06-05-05
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC` 组合，页面名称为 `SINGLE + FAK Aggressive Edge Diagnostic`。
+2. Diagnostic 组合复用 V2 shadow 和 V3 intuition，记录候选、相似历史样本、输局 episode 和风险指纹，但最终强制 `NO_TRADE`，不再主动下注。
+3. 将 `SINGLE_FAK_AGGRESSIVE_EDGE`、`SINGLE_FAK_AGGRESSIVE_EDGE_V1`、`SINGLE_FAK_AGGRESSIVE_EDGE_V2`、`SINGLE_FAK_AGGRESSIVE_EDGE_V3` 加入淘汰列表；默认实验运行集合不再启动这些失败交易版。
+4. 历史 SQLite 和 loss replay 文件继续保留，Diagnostic 会继续读取它们作为经验来源。
+5. 新增低价 Up 冲刺风险指纹：`low_entry_up_sprint_reversal` 和 `low_entry_false_safety`，用于标记此前 V3 大量亏损的低价假安全分支。
+6. 新增高价薄 edge 严重风险指纹：`critical_high_entry_thin_edge`。
+7. 前端淘汰列表同步隐藏旧 Aggressive Edge 交易版，避免旧配置把失败组合继续放进主实验列表。
+
+### 已确认决策
+
+1. Aggressive Edge 后续先做诊断，不给交易权。
+2. 旧交易版只作为历史样本来源，不继续扩大 Paper 亏损曲线。
+3. 后续如要恢复交易权，必须先证明 Diagnostic 能在留出样本里提前识别输局。
+
+## 2026-06-04 v2026-06-04-19
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_AGGRESSIVE_EDGE_V3` 策略实验组合，对应页面名称为 `SINGLE + FAK Aggressive Edge V3`。
+2. 新增 `aggressive_edge_v3.py`，实现 V3 下注前直觉守卫：读取历史 Aggressive Edge 系列 SQLite 和 loss replay 输局证据，生成当前候选指纹。
+3. V3 的历史来源包含 `single_fak_aggressive_edge.sqlite3`、`single_fak_aggressive_edge_v1.sqlite3`、`single_fak_aggressive_edge_v2.sqlite3` 和自身后续库；整盘输局证据读取 `loss-replays` 目录下对应 JSONL。
+4. V3 不使用单条历史输局硬编码拦截，必须满足相似样本数不少于 6、历史输局不少于 2、相似样本胜率低于当前买入价所需胜率，并且命中高价脆弱、sweet Up 反转区、Down 急跌反弹区等指纹后才会拦截。
+5. V3 继续复用 V2 shadow 结构化快照，候选样本会随官方结算回填胜负，后续可继续自我校准。
+6. `/api/strategy-experiments` 的 V3 组合新增 `aggressive_edge_v3_memory_summary`，展示可用历史样本、输局 episode 数、高价样本胜率和记忆是否可用。
+
+### 已确认决策
+
+1. V3 是独立组合，V1/V2/Base 不被修改，便于对照。
+2. V3 的目标是“提前识别像历史输局的候选”，不是追求立刻提高下注频率。
+3. V3 当前只做入场前守卫，后续如需处理入场后失速，需要再新增退出或止盈止损模块。
+
+## 2026-06-04 v2026-06-04-16
+
+### 已完成
+
+1. 新增 `aggressive_edge_v2_shadow_samples` SQLite 表，用于记录 `SINGLE_FAK_AGGRESSIVE_EDGE_V2` 的影子候选样本。
+2. V2 现在会持久化每个有效候选的方向、基础 Aggressive Edge 是否会下注、V1 是否会放行、V2 是否会下注、结构化风险报告、基础拦截原因和 V1 拦截原因。
+3. V2 会对部分 `NO_TRADE` 候选按 `move_bps` 推断 Up/Down 方向并采样，因此不再只依赖真实下注来积累学习数据。
+4. 影子样本按每个市场的分钟桶去重更新，控制数据量，避免每秒无限落库。
+5. 官方结算广播时自动回填影子样本的 `outcome`、`final_price`、`target_price`、`settled_at` 和 `would_win`，后续可统计“如果当时下注会赢还是会输”。
+6. `/api/strategy-experiments` 的 V2 组合新增 `aggressive_edge_v2_shadow_summary`，返回影子样本总数、已结算数、基础/V1/V2 候选数量、高风险样本胜负统计和最近样本。
+
+### 已确认决策
+
+1. V2 继续不放宽真实下注条件，真实交易样本和影子候选样本分开积累。
+2. 先用 V2 影子样本跑出分布差异，再决定是否升级 V3 做动态拦截或退出。
+
+## 2026-06-04 v2026-06-04-14
+
+### 已完成
+
+1. 修复 `SINGLE_FAK_AGGRESSIVE_EDGE_V2` 在真实策略循环中引用未定义 `quotes` 的问题。
+2. 将 V2 影子评分从纯文本拼接升级为结构化报告，包含 `risk_score`、`risk_level`、`features`、`components` 和外部价格分歧明细。
+3. V2 现在使用前 10 档盘口深度计算 `depth_skew`，保留一档盘口 `top_level_skew`，并单独计算价差风险、动量衰退风险、外部源分歧风险和高价脆弱度。
+4. V2 在基础 Aggressive Edge 过滤前先计算影子评分，因此被基础过滤拦截的候选也会留下风险特征，减少后续复盘的样本选择偏差。
+5. 补充 V2 结构化评分测试、真实策略实验循环测试、组合注册测试，以及基础过滤拦截候选仍记录 V2 影子评分的回归测试。
+
+### 已确认决策
+
+1. V2 继续只做影子评分，不直接拦截交易。
+2. 后续是否升级为 V3 动态拦截，需要等 V2 的胜单和输单样本跑出足够分布差异后再决定。
+
+## 2026-06-04 v2026-06-04-12
+
+### 已完成
+
+1. 新增 `SINGLE_FAK_AGGRESSIVE_EDGE_V2` 策略实验组合。
+2. 引入盘口微观特征，在 `signal_filters.py` 中实现了 `aggressive_edge_v2_risk_score`，提取包含买卖盘厚度比例 (skew)、价差 (spread)、动量衰退 (momentum) 以及外部价格分歧 (divergence) 的实时特征。
+3. 开启 V2 影子模式：仅在 `reason` 字段中附加微观评分，不硬性拦截交易，以便于通过 `loss_replay` 收集真实反转的特征分布。
+
+### 已确认决策
+
+1. V1 保留作为历史对照组，防止污染基线。
+2. V2 阶段核心目标是特征采集和评分，拒绝使用基于具体历史价位的静态补丁。
+
+### 待办和后期优化
+
+1. 收集足够的 V2 影子模式数据后，分析胜单和输单在各微观特征上的分布差异。
+2. 进一步引入动态追踪止损 (Trailing Stop)，结合 V2 评分在反转初期切断亏损。
+
 ## 2026-06-02 v4.38
 
 ### 已完成

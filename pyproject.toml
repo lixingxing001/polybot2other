@@ -19,6 +19,7 @@ polybot2other-live-evidence = "polybot2other.live_evidence:main"
 polybot2other-live-doctor = "polybot2other.live_doctor:main"
 polybot2other-live-setup = "polybot2other.live_env_setup:main"
 polybot2other-strategy-memory = "polybot2other.strategy_memory:main"
+polybot2other-sample-monitor = "polybot2other.sample_monitor:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

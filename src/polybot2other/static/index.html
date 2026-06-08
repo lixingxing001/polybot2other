@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20260529-v2-97">
+    <link rel="stylesheet" href="/static/styles.css?v=20260608-samples-v4">
   </head>
   <body>
     <main class="app-shell">
@@ -19,6 +19,7 @@
         </div>
         <nav class="app-nav" aria-label="页面导航">
           <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">Bot</button>
+          <button id="nav-samples" class="app-nav-item" type="button" data-nav-page="samples">样本</button>
         </nav>
         <div class="top-actions">
           <button id="paper-pause-toggle" class="paper-pause-button" type="button" aria-pressed="false">暂停Paper</button>
@@ -335,9 +336,97 @@
         </div>
       </section>
       </section>
+      <section id="sample-page" class="app-page is-hidden" data-page="samples" aria-labelledby="nav-samples" aria-hidden="true">
+        <section class="panel sample-progress-panel">
+          <div class="panel-head sample-progress-head">
+            <div>
+              <h2>样本进度</h2>
+              <span id="sample-progress-meta">等待数据</span>
+            </div>
+            <div class="sample-progress-controls">
+              <label class="sample-version-select">
+                组合
+                <select id="sample-version" aria-label="样本组合版本">
+                  <option value="V8">V8 Learning Diagnostic</option>
+                  <option value="V7">V7 Diagnostic</option>
+                  <option value="V6">V6 Diagnostic</option>
+                  <option value="V5">V5 Diagnostic</option>
+                  <option value="V4">V4 Diagnostic</option>
+                </select>
+              </label>
+              <div id="sample-progress-summary" class="sample-progress-summary"></div>
+            </div>
+          </div>
+          <div id="sample-progress-bars" class="sample-progress-bars"></div>
+          <div id="sample-progress-cards" class="sample-progress-cards"></div>
+        </section>
+
+        <section class="sample-progress-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+              <h2>分方向</h2>
+                <span>当前版本已结算放行样本</span>
+              </div>
+            </div>
+            <div class="table-wrap sample-table-wrap">
+              <table class="trade-table sample-table">
+                <thead>
+                  <tr><th>方向</th><th>已结算</th><th>胜</th><th>负</th><th>胜率</th></tr>
+                </thead>
+                <tbody id="sample-direction-stats"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+              <h2>分时间桶</h2>
+                <span>当前版本已结算放行样本</span>
+              </div>
+            </div>
+            <div class="table-wrap sample-table-wrap">
+              <table class="trade-table sample-table">
+                <thead>
+                  <tr><th>桶</th><th>已结算</th><th>胜</th><th>负</th><th>胜率</th></tr>
+                </thead>
+                <tbody id="sample-bucket-stats"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>最近当前版本放行候选</h2>
+              <span id="sample-recent-meta">0 条</span>
+            </div>
+          </div>
+          <div class="table-wrap sample-recent-wrap">
+            <table class="trade-table sample-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>市场</th>
+                  <th>桶</th>
+                  <th>方向</th>
+                  <th>入场</th>
+                  <th>距离</th>
+                  <th>风险</th>
+                  <th>状态</th>
+                  <th>结果</th>
+                </tr>
+              </thead>
+              <tbody id="sample-recent-v7"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260530-v2-105"></script>
+    <script src="/static/app.js?v=20260608-samples-v8"></script>
   </body>
 </html>
