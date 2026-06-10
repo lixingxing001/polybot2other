@@ -1,17 +1,40 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="EdgePulse">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="EdgePulse Hacker 1">
   <defs>
-    <linearGradient id="mark-bg" x1="10" y1="6" x2="54" y2="58" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#1f2b33"/>
-      <stop offset="1" stop-color="#11161a"/>
+    <linearGradient id="hp1-bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0b0f0c"/>
+      <stop offset="1" stop-color="#030504"/>
     </linearGradient>
-    <linearGradient id="pulse" x1="12" y1="18" x2="52" y2="46" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#63b3ff"/>
-      <stop offset="1" stop-color="#23c483"/>
+    <linearGradient id="hp1-pulse" x1="14" y1="40" x2="50" y2="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8aff9a"/>
+      <stop offset="1" stop-color="#00ff66"/>
     </linearGradient>
+    <filter id="hp1-glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="hp1-scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="2" fill="rgba(255,255,255,0.03)"/>
+      <rect y="2" width="4" height="2" fill="rgba(0,0,0,0)"/>
+    </pattern>
   </defs>
-  <rect x="5" y="5" width="54" height="54" rx="13" fill="url(#mark-bg)"/>
-  <rect x="5.5" y="5.5" width="53" height="53" rx="12.5" fill="none" stroke="#323a42"/>
-  <path d="M15 38h8l5-15 9 24 5-14h8" fill="none" stroke="url(#pulse)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M15 24h19" fill="none" stroke="#eef2f4" stroke-width="5" stroke-linecap="round"/>
-  <path d="M15 32h12" fill="none" stroke="#9aa7b1" stroke-width="5" stroke-linecap="round"/>
+
+  <rect x="5" y="5" width="54" height="54" rx="13" fill="url(#hp1-bg)"/>
+  <rect x="5.5" y="5.5" width="53" height="53" rx="12.5" fill="none" stroke="#1f3324"/>
+  <rect x="5" y="5" width="54" height="54" rx="13" fill="url(#hp1-scan)" opacity="0.35"/>
+
+  <path d="M15 22h18" fill="none" stroke="#d8ffe1" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M15 30h11" fill="none" stroke="#6cd987" stroke-width="4.5" stroke-linecap="round"/>
+
+  <path d="M15 40h8l5-15 9 23 5-13h7"
+        fill="none"
+        stroke="url(#hp1-pulse)"
+        stroke-width="5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        filter="url(#hp1-glow)"/>
+
+  <circle cx="49" cy="21" r="2" fill="#00ff66" opacity="0.9"/>
 </svg>
