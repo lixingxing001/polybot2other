@@ -30,6 +30,8 @@ from .execution import (
 )
 from .experiments import (
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_NONE,
     SINGLE_ENTRY_MODE_LEGACY,
     STRATEGY_FAMILY_SINGLE,
@@ -37,7 +39,7 @@ from .experiments import (
 )
 from .models import MarketRound, PaperFill, PaperFillLevel, Signal, TradeIntent
 from .polymarket import PolymarketClient
-from .signal_filters import aggressive_edge_block_reason, aggressive_edge_pass_note
+from .signal_filters import aggressive_edge_block_reason, aggressive_edge_pass_note, aggressive_edge_v2_risk_report
 from .storage import (
     SETTLEMENT_SOURCE_POLYMARKET,
     TradeStore,
@@ -67,6 +69,12 @@ LIVE_STOP_WIN_MARKER = "LIVE_STOP_WIN"
 LIVE_AGGRESSIVE_EDGE_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL"
 LIVE_AGGRESSIVE_EDGE_COMBO = "SINGLE + FAK Aggressive Edge REAL"
 LIVE_AGGRESSIVE_EDGE_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL"
+LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL"
+LIVE_AGGRESSIVE_EDGE_V10_COMBO = "SINGLE + FAK Aggressive Edge V10 REAL"
+LIVE_AGGRESSIVE_EDGE_V10_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL"
+LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL"
+LIVE_AGGRESSIVE_EDGE_V11_COMBO = "SINGLE + FAK Aggressive Edge V11 REAL"
+LIVE_AGGRESSIVE_EDGE_V11_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL"
 LIVE_PAPER_VARIANT_ID = "SINGLE_FAK_REAL_PAPER"
 LIVE_PAPER_COMBO = "SINGLE + FAK REAL PAPER"
 LIVE_PAPER_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER"
@@ -104,6 +112,17 @@ LIVE_FALLBACK_SOURCE_ORDER = (
     LIVE_FALLBACK_SOURCE_BINANCE,
 )
 LIVE_BASIS_FALLBACK_SOURCES = (LIVE_FALLBACK_SOURCE_OKX, LIVE_FALLBACK_SOURCE_BINANCE)
+LIVE_AGGRESSIVE_EDGE_V8_ALLOWED_BUCKETS = frozenset({0, 1, 2, 3, 4})
+LIVE_AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE = 0.90
+LIVE_AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS = 20.0
+LIVE_AGGRESSIVE_EDGE_V9_BLOCKED_BUCKETS = frozenset({1})
+LIVE_AGGRESSIVE_EDGE_V10_UP_MIN_ABS_MOVE_BPS = 5.7
+LIVE_AGGRESSIVE_EDGE_V10_UP_MIN_TOP_LEVEL_SKEW = 0.20
+LIVE_AGGRESSIVE_EDGE_V11_ALLOWED_BUCKETS = frozenset({2, 3})
+LIVE_AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS = 5.5
+LIVE_AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW = 0.35
+LIVE_AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE = 0.25
+LIVE_AGGRESSIVE_EDGE_V11_UP_MIN_TOP_LEVEL_SKEW = 0.20
 LIVE_STRATEGY_OPTIONS = (
     {
         "variant_id": LIVE_VARIANT_ID,
@@ -128,6 +147,22 @@ LIVE_STRATEGY_OPTIONS = (
         "role": "实盘隔离账户，沿用 SINGLE_FAK Aggressive Edge 过滤逻辑",
         "stop_win_enabled": False,
         "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+    },
+    {
+        "variant_id": LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID,
+        "combo": LIVE_AGGRESSIVE_EDGE_V10_COMBO,
+        "entry_marker": LIVE_AGGRESSIVE_EDGE_V10_ENTRY_MARKER,
+        "role": "实盘隔离账户，沿用 Aggressive Edge V10 诊断过滤；未过样本准入前只做预检准备",
+        "stop_win_enabled": False,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+    },
+    {
+        "variant_id": LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID,
+        "combo": LIVE_AGGRESSIVE_EDGE_V11_COMBO,
+        "entry_marker": LIVE_AGGRESSIVE_EDGE_V11_ENTRY_MARKER,
+        "role": "实盘隔离账户，沿用 Aggressive Edge V11 深盘口强动量过滤；过样本准入后进入实盘预检",
+        "stop_win_enabled": False,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
     },
 )
 
@@ -1724,7 +1759,7 @@ class LiveStrategyRunner:
             reason = str(price_selection.get("message") or "LIVE fallback price source blocked")
             return Signal("BTC", "NO_TRADE", 0.0, 0.0, 0.0, reason), signal_price, price_selection
         signal = self.strategy.signal(input_from_snapshot(market, {"price": signal_price, "quotes": quotes}))
-        signal = self._apply_signal_filter_mode(market, signal, signal_price)
+        signal = self._apply_signal_filter_mode(market, signal, signal_price, quotes)
         note = str(price_selection.get("note") or "").strip()
         if note:
             signal = replace(signal, reason=_append_reason(signal.reason, note))
@@ -1735,15 +1770,249 @@ class LiveStrategyRunner:
         market: MarketRound,
         signal: Signal,
         price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
     ) -> Signal:
-        """按实盘组合过滤信号；Aggressive Edge REAL 复用 Paper 同一份过滤器。"""
+        """按实盘组合过滤信号；Aggressive Edge REAL、V10 REAL、V11 REAL 各自复用对应 Paper 口径。"""
 
-        if self.variant.signal_filter_mode != SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE or signal.side not in {"Up", "Down"}:
+        if self.variant.signal_filter_mode not in {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+        } or signal.side not in {"Up", "Down"}:
             return signal
         block_reason = aggressive_edge_block_reason(market, signal, price, self.settings.max_quote_age_ms)
         if block_reason:
             return replace(signal, side="NO_TRADE", reason=_append_reason(signal.reason, block_reason))
+        if self.variant.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+            v10_block_reason = self._aggressive_edge_v10_live_block_reason(market, signal, price, quotes)
+            if v10_block_reason:
+                logger.debug("Aggressive Edge V10 REAL 过滤拦截 round_id=%s reason=%s", market.round_id, v10_block_reason)
+                return replace(signal, side="NO_TRADE", reason=_append_reason(signal.reason, v10_block_reason))
+        if self.variant.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+            v11_block_reason, v11_pass_note = self._aggressive_edge_v11_live_guard_result(market, signal, price, quotes)
+            if v11_block_reason:
+                logger.debug("Aggressive Edge V11 REAL 过滤拦截 round_id=%s reason=%s", market.round_id, v11_block_reason)
+                return replace(signal, side="NO_TRADE", reason=_append_reason(signal.reason, v11_block_reason))
+            pass_note = aggressive_edge_pass_note(signal)
+            if v11_pass_note:
+                pass_note = _append_reason(pass_note, v11_pass_note)
+            return replace(signal, reason=_append_reason(signal.reason, pass_note))
         return replace(signal, reason=_append_reason(signal.reason, aggressive_edge_pass_note(signal)))
+
+    def _aggressive_edge_v10_live_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """V10 REAL 入场守卫；和 V10 Diagnostic 使用同一批可解释特征。"""
+
+        now = time.time()
+        minute_bucket = _aggressive_edge_minute_bucket(market, now)
+        quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
+        quote = self._quote_with_depth(market, signal.side, quote)
+        signal_at = _updated_at_seconds(price.get("chainlink_updated_ms"), now)
+        before60_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 60.0,
+            max_distance_seconds=20.0,
+            source_contains="chainlink",
+        )
+        before30_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 30.0,
+            max_distance_seconds=15.0,
+            source_contains="chainlink",
+        )
+        report = aggressive_edge_v2_risk_report(
+            market,
+            signal,
+            price=price,
+            quote=quote,
+            signal_at=signal_at,
+            before60_tick=before60_tick,
+            before30_tick=before30_tick,
+            max_age_ms=self.settings.max_quote_age_ms,
+        )
+        if report is None:
+            return "SINGLE_AGGRESSIVE_EDGE V10_REAL_GUARD BLOCK: 缺少盘口风险报告，禁止实盘入场"
+        features = report.get("features") if isinstance(report.get("features"), dict) else {}
+        move_bps = _float_or_none(signal.move_bps)
+        if move_bps is None:
+            move_bps = _float_or_none(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        risk_score = _float_or_none(report.get("risk_score"))
+        top_level_skew = _float_or_none(features.get("top_level_skew"))
+        reasons: list[str] = []
+        if risk_score is None:
+            reasons.append("V10_RISK_SCORE_MISSING")
+        elif risk_score >= LIVE_AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE:
+            reasons.append(f"V10_RISK_SCORE_EXTREME risk={risk_score:.4f}")
+        if abs_move_bps >= LIVE_AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS:
+            reasons.append(f"V10_EXTREME_MOVE abs_move={abs_move_bps:.2f}bps")
+        if minute_bucket in LIVE_AGGRESSIVE_EDGE_V9_BLOCKED_BUCKETS:
+            reasons.append(f"V10_M1_BUCKET_BLOCK m{minute_bucket}")
+        if signal.side == "Up":
+            if abs_move_bps < LIVE_AGGRESSIVE_EDGE_V10_UP_MIN_ABS_MOVE_BPS:
+                reasons.append(f"V10_UP_WEAK_MOVE abs_move={abs_move_bps:.2f}bps")
+            if top_level_skew is None:
+                reasons.append("V10_UP_TOP_SKEW_MISSING")
+            elif top_level_skew < LIVE_AGGRESSIVE_EDGE_V10_UP_MIN_TOP_LEVEL_SKEW:
+                reasons.append(f"V10_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+        if not reasons:
+            return None
+        return (
+            "SINGLE_AGGRESSIVE_EDGE V10_REAL_GUARD BLOCK: "
+            + "; ".join(reasons)
+            + f" | m{minute_bucket} side={signal.side} entry={_format_optional_float(signal.entry_price, 4)} "
+            + f"abs_move={abs_move_bps:.2f} top={_format_optional_float(top_level_skew, 4)} risk={_format_optional_float(risk_score, 4)}"
+        )
+
+    def _aggressive_edge_v8_live_block_reason(
+        self,
+        signal: Signal,
+        report: dict[str, Any],
+        *,
+        minute_bucket: int,
+        abs_move_bps: float,
+        risk_score: float | None,
+        entry_price: float | None,
+    ) -> str | None:
+        """V8 前置守卫；V11 REAL 必须先通过样本准入使用的基础安全线。"""
+
+        reasons: list[str] = []
+        # 这里对齐 diagnostic V11 的 V8 前置逻辑，防止实盘比样本准入更宽松。
+        if signal.side not in {"Up", "Down"}:
+            reasons.append("V8_NO_SIDE")
+        if entry_price is None:
+            reasons.append("V8_ENTRY_MISSING")
+        if risk_score is None:
+            reasons.append("V8_RISK_SCORE_MISSING")
+        elif risk_score >= LIVE_AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE:
+            reasons.append(f"V8_RISK_SCORE_EXTREME risk={risk_score:.4f}")
+        if abs_move_bps >= LIVE_AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS:
+            reasons.append(f"V8_EXTREME_MOVE abs_move={abs_move_bps:.2f}bps")
+        if minute_bucket not in LIVE_AGGRESSIVE_EDGE_V8_ALLOWED_BUCKETS:
+            reasons.append(f"V8_BUCKET_INVALID m{minute_bucket}")
+        if not reasons:
+            return None
+        features = report.get("features") if isinstance(report.get("features"), dict) else {}
+        return (
+            "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: V8 前置守卫未通过；"
+            + "; ".join(reasons)
+            + f" | m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+            + f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(_float_or_none(features.get('depth_skew')), 4)} "
+            + f"top={_format_optional_float(_float_or_none(features.get('top_level_skew')), 4)} "
+            + f"risk={_format_optional_float(risk_score, 4)}"
+        )
+
+    def _aggressive_edge_v11_live_guard_result(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        """V11 REAL 入场守卫；和 V11 Diagnostic 使用同一批盘口深度、动量和风险特征。"""
+
+        now = time.time()
+        minute_bucket = _aggressive_edge_minute_bucket(market, now)
+        quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
+        quote = self._quote_with_depth(market, signal.side, quote)
+        signal_at = _updated_at_seconds(price.get("chainlink_updated_ms"), now)
+        before60_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 60.0,
+            max_distance_seconds=20.0,
+            source_contains="chainlink",
+        )
+        before30_tick = self.store.closest_price_tick(
+            market.symbol or "BTC",
+            signal_at - 30.0,
+            max_distance_seconds=15.0,
+            source_contains="chainlink",
+        )
+        report = aggressive_edge_v2_risk_report(
+            market,
+            signal,
+            price=price,
+            quote=quote,
+            signal_at=signal_at,
+            before60_tick=before60_tick,
+            before30_tick=before30_tick,
+            max_age_ms=self.settings.max_quote_age_ms,
+        )
+        if report is None:
+            return "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: 缺少盘口风险报告，禁止实盘入场", None
+        features = report.get("features") if isinstance(report.get("features"), dict) else {}
+        entry_price = _float_or_none(signal.entry_price)
+        if entry_price is None:
+            entry_price = _float_or_none(features.get("entry_price"))
+        move_bps = _float_or_none(signal.move_bps)
+        if move_bps is None:
+            move_bps = _float_or_none(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        depth_skew = _float_or_none(features.get("depth_skew"))
+        top_level_skew = _float_or_none(features.get("top_level_skew"))
+        risk_score = _float_or_none(report.get("risk_score"))
+        v8_block_reason = self._aggressive_edge_v8_live_block_reason(
+            signal,
+            report,
+            minute_bucket=minute_bucket,
+            abs_move_bps=abs_move_bps,
+            risk_score=risk_score,
+            entry_price=entry_price,
+        )
+        if v8_block_reason:
+            return v8_block_reason, None
+        reasons: list[str] = []
+        if minute_bucket not in LIVE_AGGRESSIVE_EDGE_V11_ALLOWED_BUCKETS:
+            reasons.append(f"V11_BUCKET_BLOCK m{minute_bucket}")
+        if abs_move_bps < LIVE_AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS:
+            reasons.append(f"V11_WEAK_MOVE abs_move={abs_move_bps:.2f}bps")
+        if depth_skew is None:
+            reasons.append("V11_DEPTH_SKEW_MISSING")
+        elif depth_skew < LIVE_AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW:
+            reasons.append(f"V11_WEAK_DEPTH depth={depth_skew:.4f}")
+        if risk_score is None:
+            reasons.append("V11_RISK_SCORE_MISSING")
+        elif risk_score > LIVE_AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE:
+            reasons.append(f"V11_RISK_TOO_HIGH risk={risk_score:.4f}")
+        if signal.side == "Up":
+            # 实盘首批输单暴露出 Up 深度达标但顶层买盘很薄的问题，这里保留样本验证后的小幅收紧。
+            if top_level_skew is None:
+                reasons.append("V11_UP_TOP_SKEW_MISSING")
+            elif top_level_skew < LIVE_AGGRESSIVE_EDGE_V11_UP_MIN_TOP_LEVEL_SKEW:
+                reasons.append(f"V11_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+        if not reasons:
+            pass_note = (
+                "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD PASS: "
+                f"m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+                f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(depth_skew, 4)} "
+                f"top={_format_optional_float(top_level_skew, 4)} risk={_format_optional_float(risk_score, 4)}"
+            )
+            logger.debug("Aggressive Edge V11 REAL 放行 round_id=%s %s", market.round_id, pass_note)
+            return None, pass_note
+        return (
+            "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: "
+            + "; ".join(reasons)
+            + f" | m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
+            + f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(depth_skew, 4)} "
+            + f"top={_format_optional_float(top_level_skew, 4)} risk={_format_optional_float(risk_score, 4)}"
+        ), None
+
+    def _aggressive_edge_v11_live_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """兼容旧测试入口，返回 V11 REAL 拦截原因。"""
+
+        block_reason, _pass_note = self._aggressive_edge_v11_live_guard_result(market, signal, price, quotes)
+        return block_reason
 
     def preflight(
         self,
@@ -1770,6 +2039,39 @@ class LiveStrategyRunner:
         }
         checks.append(_preflight_check("runtime", True, "live runner 已加载"))
         checks.append(_preflight_check("enabled", self.config.enabled, "实盘开关已开启", "实盘开关当前关闭"))
+        if self.variant.signal_filter_mode in {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+        }:
+            sample_version = (
+                "V11"
+                if self.variant.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC
+                else "V10"
+            )
+            sample_readiness = _live_aggressive_edge_readiness(self.settings, sample_version)
+            payload["sample_readiness"] = sample_readiness
+            sample_ready = bool(sample_readiness.get("eligible_for_live_review"))
+            sample_reasons = sample_readiness.get("reasons") if isinstance(sample_readiness.get("reasons"), list) else []
+            sample_message = (
+                f"{sample_version} 样本准入通过: {sample_readiness.get('settled_count', 0)}/80"
+                if sample_ready
+                else (
+                    "；".join(str(item) for item in sample_reasons[:3])
+                    or str(sample_readiness.get("label") or f"{sample_version} 样本准入未通过")
+                )
+            )
+            checks.append(
+                _preflight_check(
+                    "sample_readiness",
+                    sample_ready,
+                    sample_message,
+                    sample_message,
+                    version=sample_version,
+                    settled_count=int(sample_readiness.get("settled_count") or 0),
+                    win_rate_pct=sample_readiness.get("win_rate_pct"),
+                    simulated_roi_pct=sample_readiness.get("simulated_roi_pct"),
+                )
+            )
         checks.append(
             _preflight_check(
                 "process_lock",
@@ -2317,6 +2619,17 @@ class LiveStrategyRunner:
         open_orders_reason = self._official_open_orders_block_reason(force=True)
         if open_orders_reason:
             self._append_last_signal_reason(open_orders_reason)
+            return
+        quote, sweep, rest_book_reason = self._confirm_live_fak_quote(
+            market=market,
+            side=signal.side,
+            local_quote=quote,
+            local_sweep=sweep,
+            limit_price=limit_price,
+            stake=stake,
+        )
+        if rest_book_reason:
+            self._append_last_signal_reason(rest_book_reason)
             return
         response = self.client.place_market_buy(
             token_id=market.up_token if signal.side == "Up" else market.down_token,
@@ -3537,6 +3850,20 @@ class LiveStrategyRunner:
             return f"{self.variant_id} 已有同方向实盘订单，等待状态确认"
         if self.store.active_live_entry_order_exists_for_round(market.round_id):
             return f"{self.variant_id} 当前市场已有待确认实盘买入订单，等待官方确认后再开新仓"
+        if self.variant.signal_filter_mode in {
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+        }:
+            sample_version = (
+                "V11"
+                if self.variant.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC
+                else "V10"
+            )
+            readiness = _live_aggressive_edge_readiness(self.settings, sample_version)
+            if not readiness.get("eligible_for_live_review"):
+                reasons = readiness.get("reasons") if isinstance(readiness.get("reasons"), list) else []
+                detail = "；".join(str(item) for item in reasons[:3]) if reasons else str(readiness.get("label") or "样本准入未通过")
+                return f"{self.variant_id} {sample_version} 样本准入未通过，停止真实下单: {detail}"
         if self.store.open_trade_count("BTC") >= self.config.max_open_trades:
             return f"实盘最大同时持仓 {self.config.max_open_trades} 笔已满"
         if float(self.store.account()["cash_balance"]) < LIVE_MIN_USDC:
@@ -3692,6 +4019,110 @@ class LiveStrategyRunner:
             return self.polymarket.get_quote(token_id, side).to_dict()
         except Exception:  # noqa: BLE001 - 缺盘口时由下单前置检查阻断。
             return quote
+
+    def _confirm_live_fak_quote(
+        self,
+        *,
+        market: MarketRound,
+        side: str,
+        local_quote: dict[str, Any],
+        local_sweep: Any,
+        limit_price: float,
+        stake: float,
+    ) -> tuple[dict[str, Any], Any, str | None]:
+        """真实 FAK 下单前用官方 REST book 复核深度，降低 WS 盘口瞬时失配导致的拒单。"""
+
+        if not self._should_confirm_live_fak_quote(local_quote):
+            return local_quote, local_sweep, None
+        started = time.perf_counter()
+        try:
+            rest_quotes = self.polymarket.get_quotes(market)
+            rest_quote = _quote_payload(rest_quotes.get(side))
+        except Exception as exc:  # noqa: BLE001 - 实盘下单前复核失败时要保守跳过。
+            latency_ms = _elapsed_ms(started)
+            self._record_fak_quote_check(
+                {
+                    "status": "REST_ERROR",
+                    "side": side,
+                    "latency_ms": latency_ms,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "local": _quote_depth_payload(local_quote, local_sweep),
+                }
+            )
+            logger.warning(
+                "实盘 FAK 官方盘口二次确认失败 market=%s side=%s latency_ms=%.3f error=%s",
+                market.round_id,
+                side,
+                latency_ms,
+                exc,
+            )
+            return local_quote, local_sweep, "实盘官方盘口二次确认失败，跳过真实下单"
+
+        latency_ms = _elapsed_ms(started)
+        if not rest_quote:
+            self._record_fak_quote_check(
+                {
+                    "status": "REST_EMPTY",
+                    "side": side,
+                    "latency_ms": latency_ms,
+                    "local": _quote_depth_payload(local_quote, local_sweep),
+                }
+            )
+            logger.warning(
+                "实盘 FAK 官方盘口二次确认缺少目标侧盘口 market=%s side=%s latency_ms=%.3f",
+                market.round_id,
+                side,
+                latency_ms,
+            )
+            return local_quote, local_sweep, "实盘官方盘口二次确认缺少目标侧盘口，跳过真实下单"
+
+        rest_sweep = sweep_taker_buy_by_budget(
+            rest_quote,
+            limit_price=limit_price,
+            budget=stake,
+            taker_fee_rate=self.settings.paper_taker_fee_rate,
+        )
+        depth_ok = rest_sweep.shares >= self.settings.min_ask_size
+        self._record_fak_quote_check(
+            {
+                "status": "PASS" if depth_ok else "REST_DEPTH_BLOCK",
+                "side": side,
+                "latency_ms": latency_ms,
+                "limit_price": limit_price,
+                "stake": stake,
+                "min_ask_size": self.settings.min_ask_size,
+                "local": _quote_depth_payload(local_quote, local_sweep),
+                "rest": _quote_depth_payload(rest_quote, rest_sweep),
+            }
+        )
+        if not depth_ok:
+            logger.info(
+                "实盘 FAK 官方盘口深度不足 market=%s side=%s local_shares=%.6f rest_shares=%.6f "
+                "limit_price=%.4f latency_ms=%.3f",
+                market.round_id,
+                side,
+                _float(getattr(local_sweep, "shares", 0.0), 0.0),
+                rest_sweep.shares,
+                limit_price,
+                latency_ms,
+            )
+            return rest_quote, rest_sweep, "实盘 REST FAK 可成交份额不足，跳过真实下单"
+        return rest_quote, rest_sweep, None
+
+    def _should_confirm_live_fak_quote(self, quote: dict[str, Any]) -> bool:
+        if bool(getattr(self, "_force_rest_fak_confirmation", False)):
+            return True
+        if not isinstance(self.client, PolymarketLiveClient):
+            return False
+        source = str(quote.get("source") or "")
+        if source.startswith("clob-ws") or source in {"browser-ws", "rest"}:
+            return True
+        return bool(quote.get("clob_received_ms") or quote.get("clob_event_updated_ms"))
+
+    def _record_fak_quote_check(self, payload: dict[str, Any]) -> None:
+        signal = dict(self.last_signal or {})
+        signal["fak_quote_check"] = payload
+        self.last_signal = signal
 
     def _quote_with_bid(self, market: MarketRound, side: str, quote: dict[str, Any]) -> dict[str, Any]:
         if _float_or_none(quote.get("best_bid")) is not None:
@@ -4690,8 +5121,60 @@ def _live_strategy_options_payload(settings: Settings | None = None) -> list[dic
         }
         if settings is not None:
             row["db_path"] = str(_live_strategy_db_path(settings, item["variant_id"]))
+            if row["signal_filter_mode"] == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+                row["sample_readiness"] = _live_aggressive_edge_v10_readiness(settings)
+            if row["signal_filter_mode"] == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+                row["sample_readiness"] = _live_aggressive_edge_v11_readiness(settings)
         payload.append(row)
     return payload
+
+
+def _live_aggressive_edge_readiness(settings: Settings, version: str) -> dict[str, Any]:
+    """读取指定诊断版本样本准入结果；REAL 只能消费统一诊断池的已结算证据。"""
+
+    normalized_version = str(version or "V10").upper()
+    db_path = settings.strategy_experiments_db_dir / "single_fak_aggressive_edge_diagnostic.sqlite3"
+    if not db_path.exists():
+        return {
+            "status": "WAITING_FOR_SAMPLE",
+            "label": "继续采样",
+            "eligible_for_live_review": False,
+            "reasons": [f"缺少 {normalized_version} 诊断样本库 {db_path}"],
+        }
+    store = TradeStore(db_path, 100.0)
+    try:
+        summary = store.aggressive_edge_v2_shadow_summary("BTC")
+    finally:
+        store.conn.close()
+    versions = {
+        str(row.get("version") or "").upper(): row
+        for row in summary.get("diagnostic_version_summaries") or []
+        if isinstance(row, dict)
+    }
+    version_row = versions.get(normalized_version) or {}
+    readiness = version_row.get("live_readiness") if isinstance(version_row.get("live_readiness"), dict) else {}
+    result = dict(readiness)
+    result.setdefault("status", "WAITING_FOR_SAMPLE")
+    result.setdefault("label", "继续采样")
+    result.setdefault("eligible_for_live_review", False)
+    result.setdefault("reasons", [f"{normalized_version} 样本准入数据缺失"])
+    result["version"] = normalized_version
+    result["settled_count"] = int(version_row.get("settled_count") or 0)
+    result["win_rate_pct"] = version_row.get("win_rate_pct")
+    result["simulated_roi_pct"] = version_row.get("simulated_roi_pct")
+    return result
+
+
+def _live_aggressive_edge_v10_readiness(settings: Settings) -> dict[str, Any]:
+    """读取 V10 诊断样本准入结果。"""
+
+    return _live_aggressive_edge_readiness(settings, "V10")
+
+
+def _live_aggressive_edge_v11_readiness(settings: Settings) -> dict[str, Any]:
+    """读取 V11 诊断样本准入结果。"""
+
+    return _live_aggressive_edge_readiness(settings, "V11")
 
 
 def _live_strategy_variant(variant_id: Any) -> StrategyVariant:
@@ -5633,6 +6116,32 @@ def _append_reason(existing: str, addition: str) -> str:
     return existing_text or addition_text
 
 
+def _quote_payload(value: Any) -> dict[str, Any]:
+    if hasattr(value, "to_dict"):
+        payload = value.to_dict()
+        return dict(payload) if isinstance(payload, dict) else {}
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _quote_depth_payload(quote: dict[str, Any], sweep: Any) -> dict[str, Any]:
+    return {
+        "source": str(quote.get("source") or ""),
+        "updated_at_ms": _int_or_none(quote.get("updated_at_ms")),
+        "clob_received_ms": _int_or_none(quote.get("clob_received_ms")),
+        "clob_event_updated_ms": _int_or_none(quote.get("clob_event_updated_ms")),
+        "best_ask": _float_or_none(quote.get("best_ask")),
+        "ask_size": _float_or_none(quote.get("ask_size")),
+        "sweep_shares": _float(getattr(sweep, "shares", 0.0), 0.0),
+        "sweep_avg_price": _float_or_none(getattr(sweep, "avg_price", None)),
+    }
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000.0, 3)
+
+
 def _env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
@@ -5693,6 +6202,16 @@ def _updated_at_seconds(value: Any, fallback: float) -> float:
     if parsed is None or parsed <= 0:
         return fallback
     return parsed / 1000.0 if parsed > 10_000_000_000 else float(parsed)
+
+
+def _aggressive_edge_minute_bucket(market: MarketRound, now: float) -> int:
+    seconds_from_start = max(0.0, float(now) - float(market.started_at or now))
+    return max(0, min(4, int(seconds_from_start // 60.0)))
+
+
+def _format_optional_float(value: Any, digits: int) -> str:
+    parsed = _float_or_none(value)
+    return "-" if parsed is None else f"{parsed:.{digits}f}"
 
 
 def _float(value: Any, default: float) -> float:

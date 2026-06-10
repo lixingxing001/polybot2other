@@ -26,6 +26,10 @@ SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V5_DIAGNOSTIC = "AGGRESSIVE_EDGE_V5_DIAGNOSTI
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC = "AGGRESSIVE_EDGE_V6_DIAGNOSTIC"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC = "AGGRESSIVE_EDGE_V7_DIAGNOSTIC"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC = "AGGRESSIVE_EDGE_V8_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC = "AGGRESSIVE_EDGE_V9_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC = "AGGRESSIVE_EDGE_V10_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC = "AGGRESSIVE_EDGE_V11_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC = "AGGRESSIVE_EDGE_V12_DIAGNOSTIC"
 MARKET_DATA_MODE_BASE = "BASE"
 MARKET_DATA_MODE_MULTI_CONFIRM = "MULTI_CONFIRM"
 MARKET_DATA_MODE_MULTI_LEAD = "MULTI_LEAD"
@@ -92,6 +96,14 @@ class StrategyVariant:
             filter_suffix = " Aggressive Edge V7 Diagnostic"
         elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
             filter_suffix = " Aggressive Edge V8 Learning Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V9 M1 Guard Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V10 Up Reversal Guard Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V11 Depth Momentum Diagnostic"
+        elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC:
+            filter_suffix = " Aggressive Edge V12 Reversal Guard Diagnostic"
         else:
             filter_suffix = ""
         return f"{self.strategy_family} + {self.order_type}{entry_suffix}{data_suffix}{signal_suffix}{filter_suffix}"
@@ -197,6 +209,42 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
         "只采样",
         "Paper-only Aggressive Edge V8 学习采样组合，放宽至基础候选并记录盘口和风险标签，不主动下注",
         signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "实盘候选诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V9 诊断组合，继承 V8 后屏蔽 V8 复盘亏损最集中的 m1 时间桶",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "实盘候选诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V10 诊断组合，继承 V9 后拦截 Up 动能不足和顶层盘口支撑弱的反转风险",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "实盘候选诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V11 诊断组合，用历史全样本筛出的 m2/m3 深盘口强动量规则验证实盘候选",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+    ),
+    StrategyVariant(
+        "SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC",
+        STRATEGY_FAMILY_SINGLE,
+        ORDER_TYPE_FAK,
+        "实盘候选诊断",
+        "只采样",
+        "Paper-only Aggressive Edge V12 诊断组合，继承 V11 REAL Guard 后拦截过度位移和 Down 顶层盘口不足的反转风险",
+        signal_filter_mode=SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
     ),
     StrategyVariant(
         "SINGLE_FAK_CHAINLINK_ONLY",

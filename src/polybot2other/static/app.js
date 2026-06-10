@@ -13,6 +13,9 @@ const ids = {
   sampleDirectionStats: document.getElementById("sample-direction-stats"),
   sampleBucketStats: document.getElementById("sample-bucket-stats"),
   sampleRecentMeta: document.getElementById("sample-recent-meta"),
+  sampleRecentPrevPage: document.getElementById("sample-recent-prev-page"),
+  sampleRecentPageInfo: document.getElementById("sample-recent-page-info"),
+  sampleRecentNextPage: document.getElementById("sample-recent-next-page"),
   sampleRecentV7: document.getElementById("sample-recent-v7"),
   runtime: document.getElementById("runtime-pill"),
   paperPauseToggle: document.getElementById("paper-pause-toggle"),
@@ -131,17 +134,37 @@ const FIELD_STORAGE_KEYS = {
   recent: "polybot2other:recent-trade-fields",
 };
 const APP_PAGE_KEYS = new Set(["bot", "samples"]);
-const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version";
-const SAMPLE_VERSION_KEYS = ["V8", "V7", "V6", "V5", "V4"];
+const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version:v12";
+const SAMPLE_DEFAULT_VERSION = "V12";
+const SAMPLE_VERSION_KEYS = ["V12", "V11", "V10", "V9", "V8", "V7", "V6", "V5", "V4"];
+const SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC";
 const SAMPLE_VERSION_VARIANT_IDS = {
+  // 样本页统一读取同一个诊断数据池，避免不同版本各自建库导致样本口径不一致。
+  V4: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V5: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V6: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V7: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V8: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V9: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V10: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V11: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+  V12: SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID,
+};
+const SAMPLE_VERSION_FALLBACK_VARIANT_IDS = {
+  // 统一样本池缺失时才使用旧的独立诊断组合兜底，正常页面统计不走这些来源。
   V4: "SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC",
   V5: "SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC",
   V6: "SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC",
   V7: "SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC",
   V8: "SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC",
+  V9: "SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC",
+  V10: "SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC",
+  V11: "SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC",
+  V12: "SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC",
 };
 const SAMPLE_REVIEW_TARGET = 80;
 const SAMPLE_STABILITY_TARGET = 100;
+const SAMPLE_RECENT_PAGE_SIZE = 8;
 const DEPRECATED_STRATEGY_VARIANT_IDS = new Set([
   "PAIR_FAK",
   "PAIR_FAK_MULTI_CONFIRM",
@@ -180,6 +203,8 @@ const TRADE_STATUS_LABELS = {
 const LIVE_REAL_DEFAULT_STRATEGY_ID = "SINGLE_FAK_REAL";
 const LIVE_REAL_STOP_WIN_STRATEGY_ID = "SINGLE_FAK_REAL_STOP_WIN";
 const LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL";
 
 let activeMarket = null;
 let activeAppPage = "bot";
@@ -238,6 +263,19 @@ let expandedExperimentId = null;
 let loadingExperimentId = null;
 const experimentDetailCache = new Map();
 let selectedSampleVersion = loadSampleVersion();
+let sampleRecentPage = 1;
+let sampleRecentRows = [];
+let sampleRecentMeta = {
+  version: selectedSampleVersion,
+  limit: SAMPLE_RECENT_PAGE_SIZE,
+  offset: 0,
+  loaded: 0,
+  total: 0,
+  has_more: false,
+  total_pages: 0,
+};
+let sampleRecentLoading = false;
+let sampleRecentRequestId = 0;
 let recentPageLoading = false;
 let pageVisible = document.visibilityState !== "hidden";
 let renderQueued = false;
@@ -577,14 +615,24 @@ function liveStrategyOptions(settings = {}, live = {}) {
     { variant_id: LIVE_REAL_DEFAULT_STRATEGY_ID, combo: "SINGLE + FAK REAL" },
     { variant_id: LIVE_REAL_STOP_WIN_STRATEGY_ID, combo: "SINGLE + FAK REAL STOP WIN" },
     { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V10 REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V11 REAL" },
   ];
   const rows = raw.length ? raw : fallback;
   const seen = new Set();
   return rows.map((row) => {
     const value = normalizeLiveRealStrategyId(row?.variant_id);
+    const readiness = row?.sample_readiness || {};
+    const settled = toNumber(readiness?.settled_count);
+    const readinessLabel = readiness?.label
+      ? `${readiness.label}${settled == null ? "" : ` ${fmtNumberCell(settled, 0)}/80`}`
+      : "";
+    const label = (value === LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID || value === LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID) && readinessLabel
+      ? `${String(row?.combo || value)} · ${readinessLabel}`
+      : String(row?.combo || value);
     return {
       value,
-      label: String(row?.combo || value),
+      label,
     };
   }).filter((row) => {
     if (seen.has(row.value)) return false;
@@ -854,6 +902,7 @@ function setActiveAppPage(page, options = {}) {
   }
   if (nextPage === "samples" && latestStatus) {
     window.setTimeout(() => renderSampleProgress(latestStatus.runtime || {}, { force: true }), 120);
+    window.setTimeout(() => loadSampleCandidates({ renderLoading: true }).catch(showError), 160);
   }
 }
 
@@ -1840,15 +1889,21 @@ function experimentSummaryItem(label, value) {
 function sampleVariantId(version = selectedSampleVersion) {
   const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
     ? String(version || "").toUpperCase()
-    : "V8";
-  return SAMPLE_VERSION_VARIANT_IDS[normalized] || SAMPLE_VERSION_VARIANT_IDS.V8;
+    : SAMPLE_DEFAULT_VERSION;
+  return SAMPLE_VERSION_VARIANT_IDS[normalized] || SAMPLE_VERSION_VARIANT_IDS[SAMPLE_DEFAULT_VERSION];
 }
 
 function sampleProgressVariant(runtime = {}, version = selectedSampleVersion) {
   const source = runtime || {};
   const variants = Array.isArray(source.strategy_experiments?.variants) ? source.strategy_experiments.variants : [];
-  const variantId = sampleVariantId(version);
-  return variants.find((row) => row?.variant_id === variantId) || null;
+  // 样本页必须固定读取统一样本池，再按版本字段过滤，避免 V12 等独立诊断组合样本太少导致口径漂移。
+  const unifiedVariant = variants.find((row) => row?.variant_id === SAMPLE_DIAGNOSTIC_SOURCE_VARIANT_ID);
+  if (unifiedVariant) return unifiedVariant;
+  const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
+    ? String(version || "").toUpperCase()
+    : SAMPLE_DEFAULT_VERSION;
+  const fallbackVariantId = SAMPLE_VERSION_FALLBACK_VARIANT_IDS[normalized];
+  return variants.find((row) => row?.variant_id === fallbackVariantId) || null;
 }
 
 function loadSampleVersion() {
@@ -1856,15 +1911,105 @@ function loadSampleVersion() {
     const stored = window.localStorage.getItem(SAMPLE_VERSION_STORAGE_KEY);
     if (SAMPLE_VERSION_KEYS.includes(stored)) return stored;
   } catch (error) {
-    return "V8";
+    return SAMPLE_DEFAULT_VERSION;
   }
-  return "V8";
+  return SAMPLE_DEFAULT_VERSION;
+}
+
+function samplePageActive() {
+  return document.body?.dataset?.page === "samples";
+}
+
+function resetSampleRecentState(version = selectedSampleVersion) {
+  const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
+    ? String(version || "").toUpperCase()
+    : SAMPLE_DEFAULT_VERSION;
+  sampleRecentPage = 1;
+  sampleRecentRows = [];
+  sampleRecentMeta = {
+    version: normalized,
+    limit: SAMPLE_RECENT_PAGE_SIZE,
+    offset: 0,
+    loaded: 0,
+    total: 0,
+    has_more: false,
+    total_pages: 0,
+  };
+  sampleRecentRequestId += 1;
+  lastSampleProgressRenderKey = "";
+}
+
+function sampleRecentTotalPages(meta = sampleRecentMeta) {
+  const total = Math.max(0, Number(meta?.total) || 0);
+  const limit = Math.max(1, Number(meta?.limit) || SAMPLE_RECENT_PAGE_SIZE);
+  return total > 0 ? Math.ceil(total / limit) : 0;
+}
+
+async function loadSampleCandidates(options = {}) {
+  if (sampleRecentLoading) return;
+  const localOnly = Boolean(options.localOnly);
+  const requestVersion = SAMPLE_VERSION_KEYS.includes(String(selectedSampleVersion || "").toUpperCase())
+    ? String(selectedSampleVersion || "").toUpperCase()
+    : SAMPLE_DEFAULT_VERSION;
+  const requestPage = Math.max(1, Number(sampleRecentPage) || 1);
+  const requestOffset = (requestPage - 1) * SAMPLE_RECENT_PAGE_SIZE;
+  const requestId = sampleRecentRequestId + 1;
+  sampleRecentRequestId = requestId;
+  sampleRecentLoading = true;
+  if (options.renderLoading !== false) {
+    if (localOnly) {
+      renderSampleRecentPanelFromStatus({ autoLoad: false });
+    } else {
+      lastSampleProgressRenderKey = "";
+      renderSampleProgress(latestStatus?.runtime || {}, { force: true });
+    }
+  }
+  try {
+    const params = new URLSearchParams({
+      version: requestVersion,
+      limit: String(SAMPLE_RECENT_PAGE_SIZE),
+      offset: String(requestOffset),
+    });
+    const res = await fetch(`/api/aggressive-edge-sample-candidates?${params.toString()}`);
+    if (!res.ok) throw new Error(`sample candidates HTTP ${res.status}`);
+    const payload = await res.json();
+    if (requestId !== sampleRecentRequestId || requestVersion !== selectedSampleVersion) return;
+    const meta = payload.meta || {};
+    const total = Math.max(0, Number(meta.total) || 0);
+    const totalPages = total > 0 ? Math.ceil(total / SAMPLE_RECENT_PAGE_SIZE) : 0;
+    if (totalPages > 0 && requestPage > totalPages) {
+      sampleRecentLoading = false;
+      sampleRecentPage = totalPages;
+      await loadSampleCandidates({ renderLoading: false, localOnly });
+      return;
+    }
+    sampleRecentRows = Array.isArray(payload.candidates) ? payload.candidates : [];
+    sampleRecentMeta = {
+      version: String(meta.version || requestVersion).toUpperCase(),
+      limit: Number(meta.limit || SAMPLE_RECENT_PAGE_SIZE),
+      offset: Number(meta.offset || requestOffset),
+      loaded: Number(meta.loaded || sampleRecentRows.length),
+      total,
+      has_more: Boolean(meta.has_more),
+      total_pages: Number(meta.total_pages || totalPages),
+    };
+  } finally {
+    if (requestId === sampleRecentRequestId) {
+      sampleRecentLoading = false;
+      if (localOnly) {
+        renderSampleRecentPanelFromStatus({ autoLoad: false });
+      } else {
+        lastSampleProgressRenderKey = "";
+        renderSampleProgress(latestStatus?.runtime || {}, { force: true });
+      }
+    }
+  }
 }
 
 function setSampleVersion(version) {
   const next = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
     ? String(version || "").toUpperCase()
-    : "V8";
+    : SAMPLE_DEFAULT_VERSION;
   selectedSampleVersion = next;
   if (ids.sampleVersion && ids.sampleVersion.value !== next) ids.sampleVersion.value = next;
   try {
@@ -1872,13 +2017,15 @@ function setSampleVersion(version) {
   } catch (error) {
     // localStorage 不可用时只保留当前页面状态。
   }
+  resetSampleRecentState(next);
   renderSampleProgress(latestStatus?.runtime || {}, { force: true });
+  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
 }
 
 function sampleVersionSummary(summary = {}, version = selectedSampleVersion) {
   const normalized = SAMPLE_VERSION_KEYS.includes(String(version || "").toUpperCase())
     ? String(version || "").toUpperCase()
-    : "V8";
+    : SAMPLE_DEFAULT_VERSION;
   const rows = Array.isArray(summary.diagnostic_version_summaries)
     ? summary.diagnostic_version_summaries
     : [];
@@ -1908,7 +2055,6 @@ function sampleProgressRenderKey(runtime = {}) {
   const summary = variant?.aggressive_edge_v2_shadow_summary || {};
   const selected = sampleVersionSummary(summary);
   return JSON.stringify({
-    run_count: source.strategy_experiments?.run_count || 0,
     variant_id: variant?.variant_id || "",
     selected_version: selectedSampleVersion,
     total: summary.total_count || 0,
@@ -1918,6 +2064,63 @@ function sampleProgressRenderKey(runtime = {}) {
     version_summary: selected,
     available: summary.diagnostic_version_summaries || [],
   });
+}
+
+function sampleRecentContext(runtime = {}) {
+  const variant = sampleProgressVariant(runtime || {}, selectedSampleVersion);
+  const summary = variant?.aggressive_edge_v2_shadow_summary || {};
+  const selected = sampleVersionSummary(summary);
+  const versionLabel = selected.version || selectedSampleVersion;
+  const versionTotal = toNumber(selected.would_trade_count) || 0;
+  return { selected, versionLabel, versionTotal };
+}
+
+function renderSampleRecentPanelFromStatus(options = {}) {
+  const context = sampleRecentContext(latestStatus?.runtime || {});
+  renderSampleRecentPanel(context.selected, context.versionLabel, context.versionTotal, options);
+}
+
+function renderSampleRecentPanel(selected = {}, versionLabel = selectedSampleVersion, versionTotal = 0, options = {}) {
+  if (!ids.sampleRecentV7) return;
+  const expectedOffset = (Math.max(1, sampleRecentPage) - 1) * SAMPLE_RECENT_PAGE_SIZE;
+  const currentCandidatePageReady = (
+    String(sampleRecentMeta.version || "").toUpperCase() === String(versionLabel || selectedSampleVersion).toUpperCase()
+    && Number(sampleRecentMeta.offset || 0) === expectedOffset
+  );
+  const fallbackRecent = sampleRecentPage === 1 && Array.isArray(selected.recent_samples) ? selected.recent_samples : [];
+  const recent = currentCandidatePageReady ? sampleRecentRows : fallbackRecent;
+  const totalCandidates = currentCandidatePageReady ? Number(sampleRecentMeta.total || 0) : versionTotal;
+  const totalPages = currentCandidatePageReady
+    ? sampleRecentTotalPages(sampleRecentMeta)
+    : (totalCandidates > 0 ? Math.ceil(totalCandidates / SAMPLE_RECENT_PAGE_SIZE) : 0);
+  const displayPage = totalCandidates > 0 ? Math.min(Math.max(1, sampleRecentPage), Math.max(1, totalPages)) : 0;
+  ids.sampleRecentMeta.textContent = sampleRecentLoading
+    ? `${safe(versionLabel)} · 加载中`
+    : `${safe(versionLabel)} · 第 ${displayPage} / ${totalPages} 页`;
+  if (ids.sampleRecentPageInfo) {
+    const loadedStart = totalCandidates > 0 ? expectedOffset + 1 : 0;
+    const visibleCount = sampleRecentLoading && !currentCandidatePageReady ? SAMPLE_RECENT_PAGE_SIZE : recent.length;
+    const loadedEnd = totalCandidates > 0 ? Math.min(expectedOffset + visibleCount, totalCandidates) : 0;
+    ids.sampleRecentPageInfo.textContent = totalCandidates > 0
+      ? `第 ${displayPage} / ${totalPages} 页 · ${loadedStart}-${loadedEnd} / ${totalCandidates} 条`
+      : "第 0 / 0 页 · 共 0 条";
+  }
+  if (ids.sampleRecentPrevPage) {
+    ids.sampleRecentPrevPage.disabled = sampleRecentLoading || totalPages === 0 || sampleRecentPage <= 1;
+  }
+  if (ids.sampleRecentNextPage) {
+    ids.sampleRecentNextPage.disabled = sampleRecentLoading || totalPages === 0 || sampleRecentPage >= totalPages;
+  }
+
+  // 分页加载期间保留当前表格行，只更新页码和按钮状态，避免整个候选卡片闪动。
+  if (!sampleRecentLoading) {
+    ids.sampleRecentV7.innerHTML = recent.length
+      ? recent.map(sampleRecentRow).join("")
+      : sampleEmptyRow(9, `暂无 ${safe(versionLabel)} 候选`);
+  }
+  if (options.autoLoad !== false && samplePageActive() && !currentCandidatePageReady && !sampleRecentLoading) {
+    loadSampleCandidates({ renderLoading: false, localOnly: true }).catch(showError);
+  }
 }
 
 function renderSampleProgress(runtime = {}, options = {}) {
@@ -1936,6 +2139,9 @@ function renderSampleProgress(runtime = {}, options = {}) {
     ids.sampleDirectionStats.innerHTML = sampleEmptyRow(5, "暂无方向样本");
     ids.sampleBucketStats.innerHTML = sampleEmptyRow(5, "暂无时间桶样本");
     ids.sampleRecentMeta.textContent = "0 条";
+    if (ids.sampleRecentPageInfo) ids.sampleRecentPageInfo.textContent = "第 0 / 0 页 · 共 0 条";
+    if (ids.sampleRecentPrevPage) ids.sampleRecentPrevPage.disabled = true;
+    if (ids.sampleRecentNextPage) ids.sampleRecentNextPage.disabled = true;
     ids.sampleRecentV7.innerHTML = sampleEmptyRow(9, "暂无候选");
     return;
   }
@@ -1957,10 +2163,15 @@ function renderSampleProgress(runtime = {}, options = {}) {
   const versionLoss = toNumber(selected.loss_count) || 0;
   const reviewMissing = Math.max(0, SAMPLE_REVIEW_TARGET - versionSettled);
   const stabilityMissing = Math.max(0, SAMPLE_STABILITY_TARGET - versionSettled);
+  const liveReadiness = selected.live_readiness || {};
+  const liveReadinessReasons = Array.isArray(liveReadiness.reasons) ? liveReadiness.reasons : [];
+  const liveReadinessLabel = liveReadiness.label || "继续采样";
+  const liveReadinessReason = liveReadinessReasons.length ? liveReadinessReasons[0] : "实盘预检通过后再准备 REAL";
 
-  ids.sampleProgressMeta.textContent = `${safe(versionLabel)} Diagnostic · ${safe(variant.combo || "Aggressive Edge")} · tick ${experiments.run_count || 0}`;
+  ids.sampleProgressMeta.textContent = `${safe(versionLabel)} 统一样本池 · ${safe(variant.combo || "Aggressive Edge")} · tick ${experiments.run_count || 0}`;
   ids.sampleProgressSummary.innerHTML = [
     sampleSummaryItem("状态", versionSettled >= SAMPLE_REVIEW_TARGET ? "可完整复盘" : "继续采样"),
+    sampleSummaryItem("实盘", liveReadinessLabel),
     sampleSummaryItem("已结算", `${fmtNumberCell(versionSettled, 0)} / ${SAMPLE_REVIEW_TARGET}`),
     sampleSummaryItem("稳定线", `${fmtNumberCell(versionSettled, 0)} / ${SAMPLE_STABILITY_TARGET}`),
   ].join("");
@@ -1980,17 +2191,14 @@ function renderSampleProgress(runtime = {}, options = {}) {
     sampleMetricCard(`${versionLabel} 负`, fmtNumberCell(versionLoss, 0), "已结算"),
     sampleMetricCard(`${versionLabel} 胜率`, samplePctText(selected.win_rate_pct), "模拟命中"),
     sampleMetricCard(`${versionLabel} 模拟 ROI`, sampleSignedPctText(selected.simulated_roi_pct), "按 1 单位本金"),
+    sampleMetricCard("实盘准入", safe(liveReadinessLabel), liveReadinessReason),
     sampleMetricCard("距离复盘线", reviewMissing ? `还差 ${fmtNumberCell(reviewMissing, 0)} 单` : "已达到", "80 单"),
     sampleMetricCard("距离稳定性线", stabilityMissing ? `还差 ${fmtNumberCell(stabilityMissing, 0)} 单` : "已达到", "100 单"),
   ].join("");
 
   ids.sampleDirectionStats.innerHTML = sampleDirectionRows(selected.direction_stats || []);
   ids.sampleBucketStats.innerHTML = sampleBucketRows(selected.bucket_stats || []);
-  const recent = Array.isArray(selected.recent_samples) ? selected.recent_samples : [];
-  ids.sampleRecentMeta.textContent = `${recent.length} 条`;
-  ids.sampleRecentV7.innerHTML = recent.length
-    ? recent.map(sampleRecentRow).join("")
-    : sampleEmptyRow(9, `暂无 ${safe(versionLabel)} 候选`);
+  renderSampleRecentPanel(selected, versionLabel, versionTotal);
 }
 
 function sampleSummaryItem(label, value) {
@@ -4329,6 +4537,17 @@ async function changeRecentPage(step) {
   }
 }
 
+async function changeSampleRecentPage(step) {
+  if (sampleRecentLoading) return;
+  const totalPages = sampleRecentTotalPages(sampleRecentMeta);
+  const current = Math.min(Math.max(1, Number(sampleRecentPage) || 1), Math.max(1, totalPages));
+  const target = current + step;
+  if (target < 1) return;
+  if (totalPages > 0 && target > totalPages) return;
+  sampleRecentPage = target;
+  await loadSampleCandidates({ renderLoading: true, localOnly: true });
+}
+
 function renderAll(data = latestStatus, options = {}) {
   if (data) pendingRenderData = data;
   pendingRenderOptions = {
@@ -4892,6 +5111,8 @@ for (const navItem of ids.navItems || []) {
   navItem.addEventListener("click", () => setActiveAppPage(navItem.dataset.navPage));
 }
 ids.sampleVersion?.addEventListener("change", () => setSampleVersion(ids.sampleVersion.value));
+ids.sampleRecentPrevPage?.addEventListener("click", () => changeSampleRecentPage(-1).catch(showError));
+ids.sampleRecentNextPage?.addEventListener("click", () => changeSampleRecentPage(1).catch(showError));
 bindLiveSettingsDirtyTracking();
 bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
@@ -4984,6 +5205,7 @@ document.addEventListener("pointerup", scheduleProtectedLiveCopyFlush);
 initFieldOptions();
 	setRecentLoading(true);
 	loadStatus().then(() => {
+	  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
 	  connectStatusStream();
 	  connectPriceSocket();
 	  connectOkxSocket();

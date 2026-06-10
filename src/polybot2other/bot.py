@@ -5,6 +5,7 @@ import logging
 import math
 import threading
 import time
+from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -15,7 +16,13 @@ from .aggressive_edge_v3 import (
     aggressive_edge_v3_guard_report,
     aggressive_edge_v3_memory_summary,
 )
-from .clob_ws import ClobMarketWebSocketFeed, RtdsChainlinkWebSocketFeed
+from .clob_ws import (
+    SPOT_WS_SOURCE_BINANCE,
+    SPOT_WS_SOURCE_OKX,
+    ClobMarketWebSocketFeed,
+    RtdsChainlinkWebSocketFeed,
+    SpotPriceWebSocketFeed,
+)
 from .config import Settings, reload_live_credential_env
 from .execution import (
     ORDER_TYPE_GTC,
@@ -50,6 +57,10 @@ from .experiments import (
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
     SIGNAL_FILTER_MODE_NONE,
     SINGLE_ENTRY_MODE_LEGACY,
     SINGLE_ENTRY_MODE_REVERSAL,
@@ -109,6 +120,10 @@ logger = logging.getLogger(__name__)
 LIVE_SNAPSHOT_MIN_INTERVAL_SECONDS = 0.5
 BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS = 1.0
 BACKEND_MARKET_DATA_REFRESH_RATIO = 0.5
+LIVE_DIAGNOSTIC_HISTORY_LIMIT = 600
+LIVE_TICK_PROFILE_HISTORY_LIMIT = 240
+LIVE_SLOW_TICK_LOG_INTERVAL_SECONDS = 15.0
+LIVE_SLOW_TICK_WARN_MS = 3_000.0
 OFFICIAL_RECHECK_INTERVAL_SECONDS = 10.0
 OFFICIAL_RECHECK_WINDOW_SECONDS = 24 * 60 * 60
 OFFICIAL_RECHECK_LIMIT = 5
@@ -153,6 +168,10 @@ AGGRESSIVE_EDGE_FILTER_MODES = frozenset(
         SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
         SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
         SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+        SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
     }
 )
 # V5 只用于诊断采样。阈值来自 91 条 V4 已结算样本复盘，先验证再考虑交易化。
@@ -173,6 +192,20 @@ AGGRESSIVE_EDGE_V7_DOWN_MAX_ENTRY_PRICE = 0.68
 AGGRESSIVE_EDGE_V8_MAX_RISK_SCORE = 0.90
 AGGRESSIVE_EDGE_V8_MAX_ABS_MOVE_BPS = 20.0
 AGGRESSIVE_EDGE_V8_ALLOWED_BUCKETS = frozenset({0, 1, 2, 3, 4})
+# V9 是 V8 早期失败复盘后的实盘候选诊断版。m1 当前 12 单 5胜7负，先整桶排除再重新采样。
+AGGRESSIVE_EDGE_V9_BLOCKED_BUCKETS = frozenset({1})
+# V10 继承 V9。当前 V9 的亏损集中在 Up 反转，先拦截动能不足和顶层盘口支撑偏弱的 Up 候选。
+AGGRESSIVE_EDGE_V10_UP_MIN_ABS_MOVE_BPS = 5.7
+AGGRESSIVE_EDGE_V10_UP_MIN_TOP_LEVEL_SKEW = 0.20
+# V11 来自 773 条原始会下注样本的三段验证，保留 m2/m3 的强波动、深盘口、低风险候选。
+AGGRESSIVE_EDGE_V11_ALLOWED_BUCKETS = frozenset({2, 3})
+AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS = 5.5
+AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW = 0.35
+AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE = 0.25
+# V12 是 V11 REAL Guard 的影子验证版：保留 V11 的强样本，只验证过度位移和 Down 顶层盘口不足风险。
+AGGRESSIVE_EDGE_V12_MAX_ABS_MOVE_BPS = 8.0
+AGGRESSIVE_EDGE_V12_UP_MIN_TOP_LEVEL_SKEW = 0.20
+AGGRESSIVE_EDGE_V12_DOWN_MIN_TOP_LEVEL_SKEW = 0.30
 SINGLE_REVERSAL_MARKER = "SINGLE_REVERSAL"
 SINGLE_STOP_AND_FLIP_MARKER = "SINGLE_STOP_AND_FLIP"
 REALTIME_MAKER_MARKER = "REALTIME_MAKER_PAPER"
@@ -245,13 +278,14 @@ class PriceBasisTracker:
             for source in MULTI_SOURCE_KEYS:
                 source_price = _multi_source_price_for_basis(enriched, source)
                 updated_ms = _multi_source_updated_ms_for_basis(enriched, source)
+                sample_updated_ms = _multi_source_sample_updated_ms_for_basis(enriched, source)
                 samples = self._basis.setdefault(source, [])
                 if not source_price or not updated_ms:
                     continue
                 age_ms = max(0, now_ms - updated_ms)
                 if age_ms > self.settings_max_age_ms:
                     continue
-                sample_key = (chainlink_updated_ms, updated_ms)
+                sample_key = (chainlink_updated_ms, sample_updated_ms or updated_ms)
                 if self._last_sample_keys.get(source) == sample_key:
                     continue
                 basis_bps = (source_price - chainlink) / chainlink * 10_000.0
@@ -297,6 +331,8 @@ class PaperTradingBot:
         self._market_data_thread: threading.Thread | None = None
         self._clob_ws_thread: threading.Thread | None = None
         self._rtds_ws_thread: threading.Thread | None = None
+        self._okx_spot_ws_thread: threading.Thread | None = None
+        self._binance_spot_ws_thread: threading.Thread | None = None
         self._price_refresh_thread: threading.Thread | None = None
         self.last_error: str | None = None
         self.last_tick_at: float | None = None
@@ -312,6 +348,9 @@ class PaperTradingBot:
         self._last_backend_market_data_refresh_at = 0.0
         self._last_backend_quote_refresh_at = 0.0
         self._last_backend_price_refresh_at = 0.0
+        self._live_gate_diagnostics = deque(maxlen=LIVE_DIAGNOSTIC_HISTORY_LIMIT)
+        self._tick_profile_history = deque(maxlen=LIVE_TICK_PROFILE_HISTORY_LIMIT)
+        self._last_slow_tick_log_at = 0.0
         self._official_recheck_next_at: dict[str, float] = {}
         self._official_price_backfill_next_at: dict[str, float] = {}
         self.pair_strategy_enabled = False
@@ -338,6 +377,14 @@ class PaperTradingBot:
         self.price_basis_tracker = PriceBasisTracker()
         self.clob_ws_feed = ClobMarketWebSocketFeed(timeout_seconds=settings.request_timeout_seconds)
         self.rtds_chainlink_feed = RtdsChainlinkWebSocketFeed(timeout_seconds=settings.request_timeout_seconds)
+        self.okx_spot_ws_feed = SpotPriceWebSocketFeed(
+            SPOT_WS_SOURCE_OKX,
+            timeout_seconds=settings.request_timeout_seconds,
+        )
+        self.binance_spot_ws_feed = SpotPriceWebSocketFeed(
+            SPOT_WS_SOURCE_BINANCE,
+            timeout_seconds=settings.request_timeout_seconds,
+        )
         self._actor_analysis_cache: dict[str, Any] | None = None
         self._actor_analysis_cache_key: str | None = None
         self._actor_analysis_cache_until = 0.0
@@ -348,6 +395,10 @@ class PaperTradingBot:
             "backend_rest_fallback_at": None,
             "backend_rtds_ws": "waiting",
             "backend_rtds_ws_at": None,
+            "backend_okx_ws": "waiting",
+            "backend_okx_ws_at": None,
+            "backend_binance_ws": "waiting",
+            "backend_binance_ws_at": None,
         }
         self.strategy_experiments = (
             StrategyExperimentRunner(settings, self.polymarket, self.price_fallback)
@@ -405,6 +456,18 @@ class PaperTradingBot:
             daemon=True,
         )
         self._rtds_ws_thread.start()
+        self._okx_spot_ws_thread = threading.Thread(
+            target=self._run_okx_spot_ws,
+            name="polybot2other-okx-spot-ws",
+            daemon=True,
+        )
+        self._okx_spot_ws_thread.start()
+        self._binance_spot_ws_thread = threading.Thread(
+            target=self._run_binance_spot_ws,
+            name="polybot2other-binance-spot-ws",
+            daemon=True,
+        )
+        self._binance_spot_ws_thread.start()
         self._thread = threading.Thread(target=self._run, name="polybot2other-real-btc-paper-bot", daemon=True)
         self._thread.start()
 
@@ -418,6 +481,10 @@ class PaperTradingBot:
             self._clob_ws_thread.join(timeout=3)
         if self._rtds_ws_thread:
             self._rtds_ws_thread.join(timeout=3)
+        if self._okx_spot_ws_thread:
+            self._okx_spot_ws_thread.join(timeout=3)
+        if self._binance_spot_ws_thread:
+            self._binance_spot_ws_thread.join(timeout=3)
         if self._price_refresh_thread:
             self._price_refresh_thread.join(timeout=3)
 
@@ -511,6 +578,20 @@ class PaperTradingBot:
             self._set_backend_rtds_ws_status,
         )
 
+    def _run_okx_spot_ws(self) -> None:
+        self.okx_spot_ws_feed.run(
+            self._stop,
+            self._ingest_backend_spot_price,
+            self._set_backend_spot_ws_status,
+        )
+
+    def _run_binance_spot_ws(self) -> None:
+        self.binance_spot_ws_feed.run(
+            self._stop,
+            self._ingest_backend_spot_price,
+            self._set_backend_spot_ws_status,
+        )
+
     def _clob_ws_market(self) -> MarketRound | None:
         with self._lock:
             return self.current_market
@@ -537,25 +618,47 @@ class PaperTradingBot:
 
     def tick(self) -> None:
         now = time.time()
+        tick_started = time.perf_counter()
+        profile: dict[str, Any] = {"started_at": now, "status": "ok"}
         try:
+            step_started = time.perf_counter()
             market = self._refresh_market()
+            profile["refresh_market_ms"] = _elapsed_ms(step_started)
             if market is None:
+                profile["status"] = "market_unavailable"
                 self._set_error("current_btc_5m_market_unavailable", now)
                 return
             if self._backend_market_data_refresh_needed(now) and not self._market_data_loop_alive():
+                step_started = time.perf_counter()
                 self._backend_market_data_snapshot(market)
+                profile["backend_market_data_snapshot_ms"] = _elapsed_ms(step_started)
+            step_started = time.perf_counter()
             self._settle_due(now)
+            profile["settle_due_ms"] = _elapsed_ms(step_started)
+            step_started = time.perf_counter()
             self._reconcile_official_settlements(now)
+            profile["official_reconcile_ms"] = _elapsed_ms(step_started)
+            step_started = time.perf_counter()
             self._backfill_official_final_prices(now)
+            profile["official_backfill_ms"] = _elapsed_ms(step_started)
+            step_started = time.perf_counter()
             self._run_strategy_from_state()
+            profile["strategy_and_live_ms"] = _elapsed_ms(step_started)
+            step_started = time.perf_counter()
             self.store.record_equity()
             if self.live_trading is not None:
                 self.live_trading.store.record_equity()
+            profile["equity_record_ms"] = _elapsed_ms(step_started)
             with self._lock:
                 self.last_error = None
                 self.last_tick_at = time.time()
         except Exception as exc:  # noqa: BLE001 - dashboard must keep running and expose the error.
+            profile["status"] = "error"
+            profile["error"] = f"{type(exc).__name__}: {exc}"
             self._set_error(f"{type(exc).__name__}: {exc}", now)
+        finally:
+            profile["total_ms"] = _elapsed_ms(tick_started)
+            self._record_tick_profile(profile)
 
     def ingest_live_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = time.time()
@@ -800,6 +903,81 @@ class PaperTradingBot:
             self.ws_status["backend_rtds_ws_topic"] = str((status or {}).get("topic") or "crypto_prices_chainlink")
             self.ws_status.pop("backend_rtds_ws_error", None)
 
+    def _ingest_backend_spot_price(
+        self,
+        price: dict[str, Any],
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        """接收后端 OKX/Binance WS 现货价格；只更新后端行情作用域。"""
+
+        okx = _maybe_float(price.get("okx"))
+        binance = _maybe_float(price.get("binance_market"))
+        if (okx is None or okx <= 0) and (binance is None or binance <= 0):
+            return
+        now = time.time()
+        now_ms = int(now * 1000)
+        source = (
+            SPOT_WS_SOURCE_OKX
+            if okx is not None and okx > 0
+            else SPOT_WS_SOURCE_BINANCE
+            if binance is not None and binance > 0
+            else ""
+        )
+        merged_update = dict(price)
+        if source == SPOT_WS_SOURCE_OKX and not _maybe_int(merged_update.get("okx_updated_ms")):
+            merged_update["okx_updated_ms"] = now_ms
+        if source == SPOT_WS_SOURCE_BINANCE and not _maybe_int(merged_update.get("binance_market_updated_ms")):
+            merged_update["binance_market_updated_ms"] = now_ms
+        with self._lock:
+            market = self.current_market
+            merged = dict(self.execution_price or self.paper_price or self.latest_price or {})
+        merged.update(merged_update)
+        merged["source"] = (
+            "backend-rtds-chainlink+spot-ws"
+            if _maybe_float(merged.get("chainlink"))
+            else f"backend-{source}-spot-ws"
+        )
+        enriched = self._backend_price_payload(market, merged, now_ms)
+        spot_status = dict(status or {})
+        spot_status.setdefault("source", source)
+        spot_status.setdefault("state", "message")
+        exchange_updated_ms = _spot_exchange_updated_ms(enriched, source)
+        if exchange_updated_ms:
+            spot_status["exchange_age_ms"] = max(0, now_ms - exchange_updated_ms)
+        with self._lock:
+            self.latest_price = dict(enriched)
+            self.paper_price = dict(enriched)
+            self.execution_price = dict(enriched)
+            self._last_backend_market_data_refresh_at = max(self._last_backend_market_data_refresh_at, now)
+            self.ws_status["price"] = (
+                "backend-rtds-chainlink+spot-ws"
+                if _maybe_float(enriched.get("chainlink"))
+                else f"backend-{source}-spot-ws"
+            )
+            self._apply_backend_spot_ws_status_locked(spot_status, now)
+
+    def _set_backend_spot_ws_status(self, status: dict[str, Any]) -> None:
+        with self._lock:
+            self._apply_backend_spot_ws_status_locked(status, time.time())
+
+    def _apply_backend_spot_ws_status_locked(self, status: dict[str, Any], fallback_at: float) -> None:
+        source = str(status.get("source") or "")
+        if source not in {SPOT_WS_SOURCE_OKX, SPOT_WS_SOURCE_BINANCE}:
+            return
+        state = str(status.get("state") or "unknown")
+        prefix = "backend_okx_ws" if source == SPOT_WS_SOURCE_OKX else "backend_binance_ws"
+        self.ws_status[prefix] = state
+        self.ws_status[f"{prefix}_at"] = _maybe_float(status.get("at")) or fallback_at
+        if status.get("exchange_age_ms") is not None:
+            self.ws_status[f"{prefix}_exchange_age_ms"] = _round_float(
+                _maybe_float(status.get("exchange_age_ms")),
+                3,
+            )
+        if status.get("error"):
+            self.ws_status[f"{prefix}_error"] = str(status.get("error"))
+        elif state in {"connected", "message", "connecting"}:
+            self.ws_status.pop(f"{prefix}_error", None)
+
     def _set_backend_clob_ws_status(self, status: dict[str, Any]) -> None:
         state = str(status.get("state") or "unknown")
         with self._lock:
@@ -834,10 +1012,12 @@ class PaperTradingBot:
             paper.update(_merge_quote_depth(cleaned, paper))
             execution = _copy_quotes(self.execution_quotes)
             execution.update(_merge_quote_depth(cleaned, execution))
+            quote_feed_stale = self._quotes_stale_for_strategy(execution, now)
             self.latest_quotes = latest
             self.paper_quotes = paper
             self.execution_quotes = execution
-            self._last_backend_quote_refresh_at = now
+            if not quote_feed_stale:
+                self._last_backend_quote_refresh_at = now
             self._last_backend_market_data_refresh_at = max(self._last_backend_market_data_refresh_at, now)
             self.ws_status["market"] = "clob-ws"
             self.ws_status["backend_clob_ws"] = str((status or {}).get("state") or "message")
@@ -954,15 +1134,20 @@ class PaperTradingBot:
     def _quote_feed_stale_for_strategy(self, now: float) -> bool:
         with self._lock:
             _price, quotes, _source = self._execution_market_data_locked()
-        if not quotes.get("Up") or not quotes.get("Down"):
-            return True
-        updated_ms = max(
-            _maybe_int(quotes.get("Up", {}).get("updated_at_ms")) or 0,
-            _maybe_int(quotes.get("Down", {}).get("updated_at_ms")) or 0,
-        )
-        if not updated_ms:
-            return True
-        return now - updated_ms / 1000.0 > self._strategy_feed_refresh_age_seconds()
+        return self._quotes_stale_for_strategy(quotes, now)
+
+    def _quotes_stale_for_strategy(self, quotes: dict[str, dict[str, Any]], now: float) -> bool:
+        max_age_seconds = self._strategy_feed_refresh_age_seconds()
+        for side in ("Up", "Down"):
+            quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+            if not quote:
+                return True
+            updated_ms = _maybe_int(quote.get("updated_at_ms")) or 0
+            if not updated_ms:
+                return True
+            if now - updated_ms / 1000.0 > max_age_seconds:
+                return True
+        return False
 
     def _price_feed_stale_for_strategy(self, now: float) -> bool:
         with self._lock:
@@ -1277,10 +1462,22 @@ class PaperTradingBot:
                 runner.last_error = f"live paper market data error {type(exc).__name__}: {exc}"
             return
         if self.live_trading is not None:
+            live_started = time.perf_counter()
+            live_error = None
             try:
                 self.live_trading.run_from_state(market, live_price, live_quotes)
             except Exception as exc:  # noqa: BLE001 - 实盘错误必须暴露但不能阻塞 Paper 采样。
-                self.live_trading.last_error = f"{type(exc).__name__}: {exc}"
+                live_error = f"{type(exc).__name__}: {exc}"
+                self.live_trading.last_error = live_error
+            finally:
+                self._record_live_gate_diagnostic(
+                    market,
+                    self.live_trading,
+                    live_price,
+                    live_quotes,
+                    duration_ms=_elapsed_ms(live_started),
+                    error=live_error,
+                )
         for runner in live_paper_runners:
             try:
                 with self._lock:
@@ -1296,6 +1493,160 @@ class PaperTradingBot:
                 )
             except Exception as exc:  # noqa: BLE001 - 影子 Paper 不允许影响主循环和真实实盘。
                 runner.last_error = f"{type(exc).__name__}: {exc}"
+
+    def _record_tick_profile(self, profile: dict[str, Any]) -> None:
+        """记录主 tick 耗时；只写内存诊断，不参与交易决策。"""
+
+        total_ms = _maybe_float(profile.get("total_ms")) or 0.0
+        profile = dict(profile)
+        profile["recorded_at"] = time.time()
+        with self._lock:
+            self._tick_profile_history.append(profile)
+            last_logged_at = self._last_slow_tick_log_at
+            should_log = total_ms >= LIVE_SLOW_TICK_WARN_MS and profile["recorded_at"] - last_logged_at >= LIVE_SLOW_TICK_LOG_INTERVAL_SECONDS
+            if should_log:
+                self._last_slow_tick_log_at = profile["recorded_at"]
+        if should_log:
+            logger.warning(
+                "实盘诊断: 主 tick 耗时偏高 total_ms=%.1f status=%s refresh_market_ms=%s "
+                "backend_snapshot_ms=%s settle_ms=%s official_reconcile_ms=%s official_backfill_ms=%s "
+                "strategy_and_live_ms=%s equity_ms=%s",
+                total_ms,
+                profile.get("status"),
+                _format_optional_float(_maybe_float(profile.get("refresh_market_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("backend_market_data_snapshot_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("settle_due_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("official_reconcile_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("official_backfill_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("strategy_and_live_ms")), 1),
+                _format_optional_float(_maybe_float(profile.get("equity_record_ms")), 1),
+            )
+
+    def _record_live_gate_diagnostic(
+        self,
+        market: MarketRound,
+        live_runner: LiveStrategyRunner,
+        price: dict[str, Any],
+        quotes: dict[str, dict[str, Any]],
+        *,
+        duration_ms: float,
+        error: str | None = None,
+    ) -> None:
+        """记录 V11 REAL 最近阻断原因；只写内存诊断，不影响 live runner 下单路径。"""
+
+        now = time.time()
+        now_ms = int(now * 1000)
+        signal = dict(live_runner.last_signal or {})
+        price_selection = signal.get("price_selection") if isinstance(signal.get("price_selection"), dict) else {}
+        reason = str(signal.get("reason") or error or "")
+        category = _live_gate_category(signal, price_selection, error=error)
+        diagnostic = {
+            "at": now,
+            "market": market.round_id,
+            "seconds_left": round(max(0.0, market.ends_at - now), 3),
+            "variant_id": live_runner.variant_id,
+            "side": signal.get("side"),
+            "entry_price": _round_float(_maybe_float(signal.get("entry_price")), 6),
+            "move_bps": _round_float(_maybe_float(signal.get("move_bps")), 6),
+            "category": category,
+            "reason": reason[:500],
+            "duration_ms": round(float(duration_ms), 3),
+            "run_count": live_runner.run_count,
+            "error": error,
+            "price_ages_ms": _price_age_payload(price, now_ms),
+            "quote_ages_ms": _quote_age_payload(quotes, now_ms),
+            "price_selection": _compact_price_selection(price_selection),
+        }
+        with self._lock:
+            self._live_gate_diagnostics.append(diagnostic)
+
+    def live_health(self) -> dict[str, Any]:
+        """轻量实盘健康快照；避免 /api/status 全量聚合给实盘进程加压。"""
+
+        now = time.time()
+        now_ms = int(now * 1000)
+        with self._lock:
+            live_runner = self.live_trading
+            current_market = self.current_market
+            execution_price = dict(self.execution_price)
+            execution_quotes = _copy_quotes(self.execution_quotes)
+            ws_status = dict(self.ws_status)
+            last_tick_at = self.last_tick_at
+            live_gate_rows = list(self._live_gate_diagnostics)
+            tick_rows = list(self._tick_profile_history)
+        if live_runner is None:
+            return {
+                "ok": False,
+                "checked_at": now,
+                "message": "live runner 未加载",
+                "live_trading": {"enabled": False},
+            }
+        last_signal = dict(live_runner.last_signal or {})
+        price_selection = (
+            last_signal.get("price_selection") if isinstance(last_signal.get("price_selection"), dict) else {}
+        )
+        return {
+            "ok": True,
+            "checked_at": now,
+            "live_trading": {
+                "enabled": bool(live_runner.config.enabled),
+                "variant_id": live_runner.variant_id,
+                "combo": live_runner.combo,
+                "run_count": live_runner.run_count,
+                "last_run_at": live_runner.last_run_at,
+                "last_run_age_s": _age_seconds(now, live_runner.last_run_at),
+                "overlap_skip_count": live_runner.overlap_skip_count,
+                "last_error": live_runner.last_error,
+                "last_signal": {
+                    "side": last_signal.get("side"),
+                    "entry_price": last_signal.get("entry_price"),
+                    "move_bps": last_signal.get("move_bps"),
+                    "reason": str(last_signal.get("reason") or "")[:500],
+                    "fak_quote_check": (
+                        dict(last_signal.get("fak_quote_check"))
+                        if isinstance(last_signal.get("fak_quote_check"), dict)
+                        else None
+                    ),
+                },
+                "last_gate_category": _live_gate_category(last_signal, price_selection, error=None),
+            },
+            "market": market_to_payload(current_market),
+            "runtime": {
+                "last_tick_at": last_tick_at,
+                "last_tick_age_s": _age_seconds(now, last_tick_at),
+                "backend_market_data_loop_age_s": _age_seconds(now, ws_status.get("backend_market_data_loop_at")),
+                "backend_rest_fallback_age_s": _age_seconds(now, ws_status.get("backend_rest_fallback_at")),
+                "backend_clob_ws_age_s": _age_seconds(now, ws_status.get("backend_clob_ws_at")),
+                "backend_rtds_ws_age_s": _age_seconds(now, ws_status.get("backend_rtds_ws_at")),
+                "backend_okx_ws_age_s": _age_seconds(now, ws_status.get("backend_okx_ws_at")),
+                "backend_binance_ws_age_s": _age_seconds(now, ws_status.get("backend_binance_ws_at")),
+                "ws_status": ws_status,
+            },
+            "market_data": {
+                "price_ages_ms": _price_age_payload(execution_price, now_ms),
+                "price_exchange_ages_ms": _price_exchange_age_payload(execution_price, now_ms),
+                "quote_ages_ms": _quote_age_payload(execution_quotes, now_ms),
+                "price": _compact_live_price(execution_price),
+                "quotes": _compact_live_quotes(execution_quotes),
+                "max_quote_age_ms": self.settings.max_quote_age_ms,
+            },
+            "gate_diagnostics": {
+                "last": live_gate_rows[-1] if live_gate_rows else None,
+                "last_12": live_gate_rows[-12:],
+                "windows": {
+                    "60s": _live_gate_window_summary(live_gate_rows, now, 60.0),
+                    "300s": _live_gate_window_summary(live_gate_rows, now, 300.0),
+                },
+            },
+            "tick_profile": {
+                "last": tick_rows[-1] if tick_rows else None,
+                "last_12": tick_rows[-12:],
+                "windows": {
+                    "60s": _tick_profile_window_summary(tick_rows, now, 60.0),
+                    "300s": _tick_profile_window_summary(tick_rows, now, 300.0),
+                },
+            },
+        }
 
     def _run_llm_super_agent_strategy_from_state(
         self,
@@ -1683,6 +2034,10 @@ class PaperTradingBot:
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
         }
         v2_shadow_signal = self._aggressive_edge_v2_shadow_candidate(signal) if self.signal_filter_mode in shadow_modes else None
         if self.signal_filter_mode in shadow_modes and v2_shadow_signal is not None:
@@ -1700,10 +2055,30 @@ class PaperTradingBot:
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
                 }
                 and v2_shadow_signal is not None
             ):
-                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC:
+                    guard_label = "V12_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V12"
+                    block_reason = self._aggressive_edge_v12_reversal_guard_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+                    guard_label = "V11_DEPTH_MOMENTUM_GUARD_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V11"
+                    block_reason = self._aggressive_edge_v11_depth_momentum_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+                    guard_label = "V10_UP_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V10"
+                    block_reason = self._aggressive_edge_v10_up_reversal_guard_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC:
+                    guard_label = "V9_M1_GUARD_DIAGNOSTIC_NO_TRADE"
+                    guard_name = "V9"
+                    block_reason = self._aggressive_edge_v9_m1_guard_block_reason(market, v2_shadow_signal, shadow_report)
+                elif self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC:
                     guard_label = "V8_LEARNING_DIAGNOSTIC_NO_TRADE"
                     guard_name = "V8"
                     block_reason = self._aggressive_edge_v8_learning_block_reason(market, v2_shadow_signal, shadow_report)
@@ -1768,6 +2143,26 @@ class PaperTradingBot:
                     reason,
                     f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V8_LEARNING_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V8 学习样本只记录不下注",
                 )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V9_M1_GUARD_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V9 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V10_UP_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V10 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V11_DEPTH_MOMENTUM_GUARD_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V11 候选只记录不下注",
+                )
+            if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC:
+                reason = _append_reason_text(
+                    reason,
+                    f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V12_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: 基础过滤已拦截，V12 候选只记录不下注",
+                )
             return replace(
                 signal,
                 side="NO_TRADE",
@@ -1791,6 +2186,10 @@ class PaperTradingBot:
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
         }:
             v3_note, v3_report = self._aggressive_edge_v3_guard_report(market, signal, shadow_report)
             if v3_note:
@@ -1808,6 +2207,10 @@ class PaperTradingBot:
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
                     SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+                    SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
                 }:
                     return replace(signal, side="NO_TRADE")
         note = aggressive_edge_pass_note(signal)
@@ -1907,6 +2310,86 @@ class PaperTradingBot:
             if v3_blocked:
                 diagnostic_note = (
                     f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V8 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC:
+            v9_block_reason = self._aggressive_edge_v9_m1_guard_block_reason(market, signal, shadow_report)
+            if v9_block_reason:
+                logger.debug("Aggressive Edge V9 诊断拦截 round_id=%s reason=%s", market.round_id, v9_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V9_M1_GUARD_DIAGNOSTIC_NO_TRADE: {v9_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            learning_tags = self._aggressive_edge_v8_learning_tags(market, signal, shadow_report)
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V9_M1_GUARD_DIAGNOSTIC_NO_TRADE: "
+                f"V9 候选通过，只记录不下注；{learning_tags}"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V9 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC:
+            v10_block_reason = self._aggressive_edge_v10_up_reversal_guard_block_reason(market, signal, shadow_report)
+            if v10_block_reason:
+                logger.debug("Aggressive Edge V10 诊断拦截 round_id=%s reason=%s", market.round_id, v10_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V10_UP_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: {v10_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            learning_tags = self._aggressive_edge_v8_learning_tags(market, signal, shadow_report)
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V10_UP_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: "
+                f"V10 候选通过，只记录不下注；{learning_tags}"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V10 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC:
+            v11_block_reason = self._aggressive_edge_v11_depth_momentum_block_reason(market, signal, shadow_report)
+            if v11_block_reason:
+                logger.debug("Aggressive Edge V11 诊断拦截 round_id=%s reason=%s", market.round_id, v11_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V11_DEPTH_MOMENTUM_GUARD_DIAGNOSTIC_NO_TRADE: {v11_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            learning_tags = self._aggressive_edge_v8_learning_tags(market, signal, shadow_report)
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V11_DEPTH_MOMENTUM_GUARD_DIAGNOSTIC_NO_TRADE: "
+                f"V11 候选通过，只记录不下注；{learning_tags}"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V11 与 V3 的分歧"
+                )
+            return replace(
+                signal,
+                side="NO_TRADE",
+                reason=_append_reason_text(_append_reason_text(signal.reason, note), diagnostic_note),
+            )
+        if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC:
+            v12_block_reason = self._aggressive_edge_v12_reversal_guard_block_reason(market, signal, shadow_report)
+            if v12_block_reason:
+                logger.debug("Aggressive Edge V12 诊断拦截 round_id=%s reason=%s", market.round_id, v12_block_reason)
+                diagnostic_note = f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V12_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: {v12_block_reason}"
+                return replace(signal, side="NO_TRADE", reason=_append_reason_text(signal.reason, diagnostic_note))
+            learning_tags = self._aggressive_edge_v8_learning_tags(market, signal, shadow_report)
+            diagnostic_note = (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V12_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE: "
+                f"V12 候选通过，只记录不下注；{learning_tags}"
+            )
+            if v3_blocked:
+                diagnostic_note = (
+                    f"{diagnostic_note}；V3 直觉守卫已拦截，后续复盘需对比 V12 与 V3 的分歧"
                 )
             return replace(
                 signal,
@@ -2336,6 +2819,167 @@ class PaperTradingBot:
         tags.append(f"decay={_format_optional_float(momentum_decay, 2)}")
         return " ".join(tags)
 
+    def _aggressive_edge_v9_m1_guard_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V9 诊断守卫：继承 V8 后屏蔽 m1，验证 V8 最大亏损桶是否应永久剔除。"""
+
+        v8_block_reason = self._aggressive_edge_v8_learning_block_reason(market, signal, report, now=now)
+        if v8_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V9_M1_GUARD BLOCK: V8 守卫未通过；{v8_block_reason}"
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        if minute_bucket in AGGRESSIVE_EDGE_V9_BLOCKED_BUCKETS:
+            metrics = self._aggressive_edge_v8_learning_tags(market, signal, report, now=now)
+            return (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V9_M1_GUARD BLOCK: "
+                f"V9_M1_BUCKET_BLOCK m{minute_bucket}: V8 复盘 m1 胜率和 ROI 明显劣化 | {metrics}"
+            )
+        return None
+
+    def _aggressive_edge_v10_up_reversal_guard_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V10 诊断守卫：继承 V9 后拦截 Up 动能不足和顶层盘口支撑弱的反转候选。"""
+
+        v9_block_reason = self._aggressive_edge_v9_m1_guard_block_reason(market, signal, report, now=now)
+        if v9_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V10_UP_REVERSAL_GUARD BLOCK: V9 守卫未通过；{v9_block_reason}"
+        if signal.side != "Up":
+            return None
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        reasons: list[str] = []
+        if abs_move_bps < AGGRESSIVE_EDGE_V10_UP_MIN_ABS_MOVE_BPS:
+            reasons.append(
+                f"V10_UP_WEAK_MOVE abs_move={abs_move_bps:.2f}bps: 要求 abs_move>={AGGRESSIVE_EDGE_V10_UP_MIN_ABS_MOVE_BPS:.2f}bps"
+            )
+        if top_level_skew is None:
+            reasons.append("V10_UP_TOP_SKEW_MISSING: 缺少顶层盘口支撑")
+        elif top_level_skew < AGGRESSIVE_EDGE_V10_UP_MIN_TOP_LEVEL_SKEW:
+            reasons.append(
+                f"V10_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}: 要求 top>={AGGRESSIVE_EDGE_V10_UP_MIN_TOP_LEVEL_SKEW:.2f}"
+            )
+        if not reasons:
+            return None
+        metrics = self._aggressive_edge_v8_learning_tags(market, signal, report, now=now)
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V10_UP_REVERSAL_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v11_depth_momentum_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V11 诊断守卫：用全样本验证过的 m2/m3 深盘口强波动低风险规则筛实盘候选。"""
+
+        v8_block_reason = self._aggressive_edge_v8_learning_block_reason(market, signal, report, now=now)
+        if v8_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V11_DEPTH_MOMENTUM_GUARD BLOCK: V8 守卫未通过；{v8_block_reason}"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+
+        reasons: list[str] = []
+        if minute_bucket not in AGGRESSIVE_EDGE_V11_ALLOWED_BUCKETS:
+            reasons.append(f"V11_BUCKET_BLOCK m{minute_bucket}: 只放行 m2/m3")
+        if abs_move_bps < AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS:
+            reasons.append(
+                f"V11_WEAK_MOVE abs_move={abs_move_bps:.2f}bps: 要求 abs_move>={AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS:.2f}bps"
+            )
+        if depth_skew is None:
+            reasons.append("V11_DEPTH_SKEW_MISSING: 缺少盘口深度偏斜")
+        elif depth_skew < AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW:
+            reasons.append(
+                f"V11_WEAK_DEPTH depth={depth_skew:.4f}: 要求 depth>={AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW:.2f}"
+            )
+        if risk_score is None:
+            reasons.append("V11_RISK_SCORE_MISSING: 缺少 risk_score")
+        elif risk_score > AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE:
+            reasons.append(
+                f"V11_RISK_TOO_HIGH risk={risk_score:.4f}: 要求 risk<={AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE:.2f}"
+            )
+        if not reasons:
+            return None
+        metrics = self._aggressive_edge_v8_learning_tags(market, signal, report, now=now)
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V11_DEPTH_MOMENTUM_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
+    def _aggressive_edge_v12_reversal_guard_block_reason(
+        self,
+        market: MarketRound,
+        signal: Signal,
+        report: dict[str, Any] | None,
+        *,
+        now: float | None = None,
+    ) -> str | None:
+        """V12 诊断守卫：继承 V11 后，验证高位移和 Down 顶层盘口不足是否属于可复用反转风险。"""
+
+        v11_block_reason = self._aggressive_edge_v11_depth_momentum_block_reason(market, signal, report, now=now)
+        if v11_block_reason:
+            return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V12_REVERSAL_GUARD BLOCK: V11 守卫未通过；{v11_block_reason}"
+
+        features = report.get("features") if isinstance(report, dict) and isinstance(report.get("features"), dict) else {}
+        move_bps = _maybe_float(signal.move_bps)
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        risk_score = _maybe_float(report.get("risk_score")) if isinstance(report, dict) else None
+        minute_bucket = self._aggressive_edge_sample_minute_bucket(market, now)
+
+        reasons: list[str] = []
+        # V11 复盘显示 abs_move>=8bps 胜率明显回落，先作为 V12 影子候选验证，不直接替换实盘。
+        if abs_move_bps >= AGGRESSIVE_EDGE_V12_MAX_ABS_MOVE_BPS:
+            reasons.append(
+                f"V12_OVEREXTENDED_MOVE abs_move={abs_move_bps:.2f}bps: 要求 abs_move<{AGGRESSIVE_EDGE_V12_MAX_ABS_MOVE_BPS:.2f}bps"
+            )
+        if signal.side == "Up":
+            if top_level_skew is None:
+                reasons.append("V12_UP_TOP_SKEW_MISSING: Up 缺少顶层盘口支撑")
+            elif top_level_skew < AGGRESSIVE_EDGE_V12_UP_MIN_TOP_LEVEL_SKEW:
+                reasons.append(
+                    f"V12_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}: 要求 top>={AGGRESSIVE_EDGE_V12_UP_MIN_TOP_LEVEL_SKEW:.2f}"
+                )
+        if signal.side == "Down":
+            if top_level_skew is None:
+                reasons.append("V12_DOWN_TOP_SKEW_MISSING: Down 缺少顶层盘口支撑")
+            elif top_level_skew < AGGRESSIVE_EDGE_V12_DOWN_MIN_TOP_LEVEL_SKEW:
+                reasons.append(
+                    f"V12_DOWN_WEAK_TOP_SKEW top={top_level_skew:.4f}: 要求 top>={AGGRESSIVE_EDGE_V12_DOWN_MIN_TOP_LEVEL_SKEW:.2f}"
+                )
+
+        if not reasons:
+            return None
+        metrics = (
+            f"m{minute_bucket} side={signal.side} abs_move={abs_move_bps:.2f} "
+            f"depth={_format_optional_float(depth_skew, 4)} top={_format_optional_float(top_level_skew, 4)} "
+            f"risk={_format_optional_float(risk_score, 4)}"
+        )
+        return f"{SINGLE_AGGRESSIVE_EDGE_MARKER} V12_REVERSAL_GUARD BLOCK: {'; '.join(reasons)} | {metrics}"
+
     def _record_aggressive_edge_v2_shadow_sample(
         self,
         market: MarketRound,
@@ -2355,6 +2999,10 @@ class PaperTradingBot:
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
             SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+            SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
         }:
             return
         if market.target_price <= 0 or shadow_signal.side not in {"Up", "Down"}:
@@ -2371,23 +3019,39 @@ class PaperTradingBot:
             v6_block_reason = None
             v7_block_reason = None
             v8_block_reason = None
+            v9_block_reason = None
+            v10_block_reason = None
+            v11_block_reason = None
+            v12_block_reason = None
             if base_would_trade:
                 v4_block_reason = self._aggressive_edge_v4_block_reason(market, shadow_signal, report, now=now)
                 v5_block_reason = self._aggressive_edge_v5_block_reason(market, shadow_signal, report, now=now)
                 v6_block_reason = self._aggressive_edge_v6_block_reason(market, shadow_signal, report, now=now)
                 v7_block_reason = self._aggressive_edge_v7_block_reason(market, shadow_signal, report, now=now)
                 v8_block_reason = self._aggressive_edge_v8_learning_block_reason(market, shadow_signal, report, now=now)
+                v9_block_reason = self._aggressive_edge_v9_m1_guard_block_reason(market, shadow_signal, report, now=now)
+                v10_block_reason = self._aggressive_edge_v10_up_reversal_guard_block_reason(market, shadow_signal, report, now=now)
+                v11_block_reason = self._aggressive_edge_v11_depth_momentum_block_reason(market, shadow_signal, report, now=now)
+                v12_block_reason = self._aggressive_edge_v12_reversal_guard_block_reason(market, shadow_signal, report, now=now)
             else:
                 v4_block_reason = f"基础过滤已拦截: {base_block_reason}"
                 v5_block_reason = f"基础过滤已拦截: {base_block_reason}"
                 v6_block_reason = f"基础过滤已拦截: {base_block_reason}"
                 v7_block_reason = f"基础过滤已拦截: {base_block_reason}"
                 v8_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v9_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v10_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v11_block_reason = f"基础过滤已拦截: {base_block_reason}"
+                v12_block_reason = f"基础过滤已拦截: {base_block_reason}"
             v4_would_trade = base_would_trade and v4_block_reason is None
             v5_would_trade = base_would_trade and v5_block_reason is None
             v6_would_trade = base_would_trade and v6_block_reason is None
             v7_would_trade = base_would_trade and v7_block_reason is None
             v8_would_trade = base_would_trade and v8_block_reason is None
+            v9_would_trade = base_would_trade and v9_block_reason is None
+            v10_would_trade = base_would_trade and v10_block_reason is None
+            v11_would_trade = base_would_trade and v11_block_reason is None
+            v12_would_trade = base_would_trade and v12_block_reason is None
             sample_key = f"m{minute_bucket}:{'pass' if base_would_trade else 'block'}"
             self.store.record_aggressive_edge_v2_shadow_sample(
                 round_id=market.round_id,
@@ -2403,6 +3067,10 @@ class PaperTradingBot:
                 v6_would_trade=v6_would_trade,
                 v7_would_trade=v7_would_trade,
                 v8_would_trade=v8_would_trade,
+                v9_would_trade=v9_would_trade,
+                v10_would_trade=v10_would_trade,
+                v11_would_trade=v11_would_trade,
+                v12_would_trade=v12_would_trade,
                 entry_price=_maybe_float(shadow_signal.entry_price),
                 confidence=_maybe_float(shadow_signal.confidence),
                 move_bps=_maybe_float(shadow_signal.move_bps),
@@ -2414,6 +3082,10 @@ class PaperTradingBot:
                 v6_block_reason=v6_block_reason,
                 v7_block_reason=v7_block_reason,
                 v8_block_reason=v8_block_reason,
+                v9_block_reason=v9_block_reason,
+                v10_block_reason=v10_block_reason,
+                v11_block_reason=v11_block_reason,
+                v12_block_reason=v12_block_reason,
                 signal_reason=source_signal.reason,
                 created_at=now,
             )
@@ -2490,6 +3162,60 @@ class PaperTradingBot:
                 if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC
                 else []
             ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v8_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v9_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v8_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v9_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v10_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v8_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v9_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v10_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v11_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    parent / "single_fak_aggressive_edge_v4_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v5_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v6_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v7_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v8_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v9_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v10_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v11_diagnostic.sqlite3",
+                    parent / "single_fak_aggressive_edge_v12_diagnostic.sqlite3",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC
+                else []
+            ),
         ]
 
     def _aggressive_edge_v3_loss_replay_paths(self) -> list[Path]:
@@ -2543,6 +3269,60 @@ class PaperTradingBot:
                     replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
                 ]
                 if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v9_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v9_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v10_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v9_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v10_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v11_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC
+                else []
+            ),
+            *(
+                [
+                    replay_dir / "single_fak_aggressive_edge_v4_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v5_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v6_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v7_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v8_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v9_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v10_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v11_diagnostic.jsonl",
+                    replay_dir / "single_fak_aggressive_edge_v12_diagnostic.jsonl",
+                ]
+                if self.signal_filter_mode == SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC
                 else []
             ),
         ]
@@ -3691,6 +4471,26 @@ class PaperTradingBot:
             return {"enabled": False, "variant": None, "recent_trades": [], "recent_orders": []}
         return self.strategy_experiments.detail(variant_id, trade_limit, order_limit)
 
+    def aggressive_edge_sample_candidates(self, version: str = "V12", limit: int = 8, offset: int = 0) -> dict[str, Any]:
+        """样本页当前版本候选分页；只读取统一诊断样本池，不影响任何交易策略。"""
+
+        if self.strategy_experiments is None:
+            return {
+                "enabled": False,
+                "version": str(version or "V12").upper(),
+                "candidates": [],
+                "meta": {
+                    "version": str(version or "V12").upper(),
+                    "limit": max(1, int(limit)),
+                    "offset": max(0, int(offset)),
+                    "loaded": 0,
+                    "total": 0,
+                    "has_more": False,
+                    "total_pages": 0,
+                },
+            }
+        return self.strategy_experiments.aggressive_edge_sample_candidates(version, limit, offset)
+
     def live_settings(self) -> dict[str, Any]:
         if self.live_trading is None:
             return _disabled_live_settings()
@@ -4567,6 +5367,26 @@ class StrategyExperimentRunner:
             "recent_orders_page": bot.orders_page(order_limit, 0),
         }
 
+    def aggressive_edge_sample_candidates(self, version: str = "V12", limit: int = 8, offset: int = 0) -> dict[str, Any]:
+        """读取样本页候选分页；V4 到 V12 统一从 Diagnostic 数据池做横向对比。"""
+
+        source_variant_id = "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"
+        variant, bot = self._variant_bot(source_variant_id)
+        payload = bot.store.aggressive_edge_v2_shadow_candidates(
+            "BTC",
+            version,
+            limit=limit,
+            offset=offset,
+        )
+        payload.update(
+            {
+                "enabled": True,
+                "variant_id": variant.variant_id,
+                "combo": variant.combo,
+            }
+        )
+        return payload
+
     def llm_decision_review(self, limit: int = 80) -> dict[str, Any]:
         limit = max(1, min(300, int(limit)))
         reviews: list[dict[str, Any]] = []
@@ -4881,6 +5701,10 @@ class StrategyExperimentRunner:
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
             }
             else None,
             "aggressive_edge_v3_memory_summary": aggressive_edge_v3_memory_summary(
@@ -4896,6 +5720,10 @@ class StrategyExperimentRunner:
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V6_DIAGNOSTIC,
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V7_DIAGNOSTIC,
                 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V8_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
             }
             else None,
         }
@@ -5223,6 +6051,16 @@ def _multi_source_updated_ms_for_basis(price: dict[str, Any], source: str) -> in
     if source == "binance":
         return _maybe_int(price.get("binance_market_updated_ms")) or _maybe_int(price.get("binance_updated_ms"))
     return _maybe_int(price.get(f"{source}_updated_ms"))
+
+
+def _multi_source_sample_updated_ms_for_basis(price: dict[str, Any], source: str) -> int | None:
+    if source == "binance":
+        return (
+            _maybe_int(price.get("binance_market_exchange_updated_ms"))
+            or _maybe_int(price.get("binance_market_updated_ms"))
+            or _maybe_int(price.get("binance_updated_ms"))
+        )
+    return _maybe_int(price.get(f"{source}_exchange_updated_ms")) or _maybe_int(price.get(f"{source}_updated_ms"))
 
 
 def _side_list_text(sides: Any) -> str:
@@ -5604,7 +6442,7 @@ def _clean_quotes(quotes: dict[str, Any]) -> dict[str, dict[str, Any]]:
         row = quotes.get(side)
         if not isinstance(row, dict):
             continue
-        cleaned[side] = {
+        item = {
             "token_id": str(row.get("token_id") or ""),
             "outcome": side,
             "best_bid": _maybe_float(row.get("best_bid")),
@@ -5616,6 +6454,13 @@ def _clean_quotes(quotes: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "updated_at_ms": _maybe_int(row.get("updated_at_ms")) or int(time.time() * 1000),
             "source": str(row.get("source") or "browser-ws"),
         }
+        clob_received_ms = _maybe_int(row.get("clob_received_ms"))
+        clob_event_updated_ms = _maybe_int(row.get("clob_event_updated_ms"))
+        if clob_received_ms:
+            item["clob_received_ms"] = clob_received_ms
+        if clob_event_updated_ms:
+            item["clob_event_updated_ms"] = clob_event_updated_ms
+        cleaned[side] = item
     return cleaned
 
 
@@ -6136,12 +6981,203 @@ def _maybe_int(value: Any) -> int | None:
         return None
 
 
+def _elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000.0, 3)
+
+
+def _age_seconds(now: float, timestamp: Any) -> float | None:
+    value = _maybe_float(timestamp)
+    if value is None or value <= 0:
+        return None
+    return round(max(0.0, now - value), 3)
+
+
+def _age_ms_from_updated(now_ms: int, value: Any) -> int | None:
+    updated = _maybe_int(value)
+    if updated is None or updated <= 0:
+        return None
+    return max(0, now_ms - updated)
+
+
+def _price_age_payload(price: dict[str, Any], now_ms: int) -> dict[str, int | None]:
+    return {
+        "chainlink": _age_ms_from_updated(now_ms, price.get("chainlink_updated_ms")),
+        "okx": _age_ms_from_updated(now_ms, price.get("okx_updated_ms")),
+        "binance": _age_ms_from_updated(
+            now_ms,
+            price.get("binance_market_updated_ms") or price.get("binance_updated_ms"),
+        ),
+    }
+
+
+def _price_exchange_age_payload(price: dict[str, Any], now_ms: int) -> dict[str, int | None]:
+    return {
+        "okx": _age_ms_from_updated(now_ms, price.get("okx_exchange_updated_ms")),
+        "binance": _age_ms_from_updated(now_ms, price.get("binance_market_exchange_updated_ms")),
+    }
+
+
+def _quote_age_payload(quotes: dict[str, dict[str, Any]], now_ms: int) -> dict[str, int | None]:
+    return {
+        side: _age_ms_from_updated(now_ms, (quotes.get(side) or {}).get("updated_at_ms"))
+        for side in ("Up", "Down")
+    }
+
+
+def _compact_live_price(price: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source": price.get("source"),
+        "chainlink": _round_float(_maybe_float(price.get("chainlink")), 8),
+        "okx": _round_float(_maybe_float(price.get("okx")), 8),
+        "binance": _round_float(
+            _maybe_float(price.get("binance_market")) or _maybe_float(price.get("binance")),
+            8,
+        ),
+        "target_price": _round_float(_maybe_float(price.get("target_price")), 8),
+    }
+
+
+def _compact_live_quotes(quotes: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    compact: dict[str, dict[str, Any]] = {}
+    for side in ("Up", "Down"):
+        quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
+        compact[side] = {
+            "source": quote.get("source"),
+            "best_bid": _round_float(_maybe_float(quote.get("best_bid")), 4),
+            "best_ask": _round_float(_maybe_float(quote.get("best_ask")), 4),
+            "bid_size": _round_float(_maybe_float(quote.get("bid_size")), 6),
+            "ask_size": _round_float(_maybe_float(quote.get("ask_size")), 6),
+            "updated_at_ms": _maybe_int(quote.get("updated_at_ms")),
+            "clob_received_ms": _maybe_int(quote.get("clob_received_ms")),
+            "clob_event_updated_ms": _maybe_int(quote.get("clob_event_updated_ms")),
+        }
+    return compact
+
+
+def _compact_price_selection(price_selection: dict[str, Any]) -> dict[str, Any]:
+    basis_rows = price_selection.get("basis") if isinstance(price_selection.get("basis"), list) else []
+    compact_basis = []
+    for row in basis_rows:
+        if not isinstance(row, dict):
+            continue
+        compact_basis.append(
+            {
+                "source": row.get("source"),
+                "ready": bool(row.get("ready")),
+                "reason": row.get("reason"),
+                "age_ms": row.get("age_ms"),
+                "price": row.get("price"),
+                "adjusted_price": row.get("adjusted_price"),
+                "samples": row.get("samples"),
+            }
+        )
+    return {
+        "blocked": bool(price_selection.get("blocked")),
+        "message": str(price_selection.get("message") or "")[:300],
+        "selected_source": price_selection.get("selected_source"),
+        "selected_age_ms": price_selection.get("selected_age_ms"),
+        "basis": compact_basis,
+    }
+
+
+def _live_gate_category(
+    signal: dict[str, Any],
+    price_selection: dict[str, Any],
+    *,
+    error: str | None,
+) -> str:
+    if error:
+        return "live_error"
+    reason = str(signal.get("reason") or "")
+    if "缺少官方目标价" in reason or "priceToBeat" in reason:
+        return "target_missing"
+    if price_selection.get("blocked") or any(
+        marker in reason
+        for marker in (
+            "价格过期",
+            "缺少实时价",
+            "Chainlink 不可用",
+            "价格流过期",
+            "fallback 选择无可用价格源",
+        )
+    ):
+        return "price_source_stale_or_missing"
+    if "盘口报价过期" in reason or "盘口接近过期" in reason:
+        return "quote_stale"
+    if "入场价格高于上限" in reason:
+        return "entry_above_max"
+    if "V11_REAL_GUARD BLOCK" in reason:
+        return "v11_guard_block"
+    if "V8 前置守卫" in reason:
+        return "v8_guard_block"
+    if signal.get("side") in {"Up", "Down"}:
+        return "signal_ready"
+    return "other_no_trade"
+
+
+def _live_gate_window_summary(rows: list[dict[str, Any]], now: float, seconds: float) -> dict[str, Any]:
+    window = [row for row in rows if now - float(row.get("at") or 0.0) <= seconds]
+    categories = Counter(str(row.get("category") or "unknown") for row in window)
+    price_age_rows = [row.get("price_ages_ms") for row in window if isinstance(row.get("price_ages_ms"), dict)]
+    quote_age_rows = [row.get("quote_ages_ms") for row in window if isinstance(row.get("quote_ages_ms"), dict)]
+    return {
+        "seconds": seconds,
+        "count": len(window),
+        "categories": dict(categories),
+        "okx_age_ms": _numeric_summary(row.get("okx") for row in price_age_rows),
+        "binance_age_ms": _numeric_summary(row.get("binance") for row in price_age_rows),
+        "chainlink_age_ms": _numeric_summary(row.get("chainlink") for row in price_age_rows),
+        "quote_age_ms": _numeric_summary(
+            max(age for age in (row.get("Up"), row.get("Down")) if age is not None)
+            for row in quote_age_rows
+            if row.get("Up") is not None or row.get("Down") is not None
+        ),
+        "duration_ms": _numeric_summary(row.get("duration_ms") for row in window),
+    }
+
+
+def _tick_profile_window_summary(rows: list[dict[str, Any]], now: float, seconds: float) -> dict[str, Any]:
+    window = [row for row in rows if now - float(row.get("recorded_at") or 0.0) <= seconds]
+    statuses = Counter(str(row.get("status") or "unknown") for row in window)
+    return {
+        "seconds": seconds,
+        "count": len(window),
+        "statuses": dict(statuses),
+        "total_ms": _numeric_summary(row.get("total_ms") for row in window),
+        "refresh_market_ms": _numeric_summary(row.get("refresh_market_ms") for row in window),
+        "backend_market_data_snapshot_ms": _numeric_summary(
+            row.get("backend_market_data_snapshot_ms") for row in window
+        ),
+        "strategy_and_live_ms": _numeric_summary(row.get("strategy_and_live_ms") for row in window),
+    }
+
+
+def _numeric_summary(values: Any) -> dict[str, Any]:
+    numbers = sorted(float(value) for value in values if _maybe_float(value) is not None)
+    if not numbers:
+        return {"count": 0, "min": None, "p50": None, "max": None}
+    return {
+        "count": len(numbers),
+        "min": round(numbers[0], 3),
+        "p50": round(numbers[len(numbers) // 2], 3),
+        "max": round(numbers[-1], 3),
+    }
+
+
 def _fallback_source_updated_ms(price: dict[str, Any], source: str) -> int | None:
     if source == "binance":
         return _maybe_int(price.get("binance_market_updated_ms")) or _maybe_int(price.get("binance_updated_ms"))
     if source == "okx":
         return _maybe_int(price.get("okx_updated_ms"))
     return _maybe_int(price.get(f"{source}_updated_ms"))
+
+
+def _spot_exchange_updated_ms(price: dict[str, Any], source: str) -> int | None:
+    if source == SPOT_WS_SOURCE_BINANCE:
+        return _maybe_int(price.get("binance_market_exchange_updated_ms"))
+    if source == SPOT_WS_SOURCE_OKX:
+        return _maybe_int(price.get("okx_exchange_updated_ms"))
+    return None
 
 
 def _updated_at_seconds(value: Any, fallback: float) -> float:

@@ -168,6 +168,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/strategy-experiments-tables":
             self._send_json(self.server.bot.strategy_experiments_tables(), include_body=False)
             return
+        if path == "/api/aggressive-edge-sample-candidates":
+            self._send_json(self.server.bot.aggressive_edge_sample_candidates(), include_body=False)
+            return
         if path == "/strategy-experiments-retrospective.html":
             self._send_html(
                 _strategy_experiments_retrospective_report_html(
@@ -314,6 +317,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if path == "/api/aggressive-edge-sample-candidates":
+            try:
+                version = _query_str_optional(query, "version") or "V12"
+                limit = _query_int(query, "limit", 8, 1, 100)
+                offset = _query_int(query, "offset", 0, 0, 100_000)
+                self._send_json(self.server.bot.aggressive_edge_sample_candidates(version, limit, offset))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if path == "/strategy-experiments-retrospective.html":
             try:
                 start_at = _query_float_optional(query, "start_at", 0, 4_102_444_800)
@@ -325,6 +337,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/live-settings":
             self._send_json(self.server.bot.live_settings())
+            return
+        if path == "/api/live-health":
+            self._send_json(self.server.bot.live_health())
             return
         if path == "/api/live-preflight":
             try:

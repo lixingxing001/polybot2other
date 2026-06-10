@@ -43,6 +43,9 @@
               <select id="live-strategy-id" aria-label="实盘策略">
                 <option value="SINGLE_FAK_REAL">SINGLE + FAK REAL</option>
                 <option value="SINGLE_FAK_REAL_STOP_WIN">SINGLE + FAK REAL STOP WIN</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_REAL">SINGLE + FAK Aggressive Edge REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL">SINGLE + FAK Aggressive Edge V10 REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL">SINGLE + FAK Aggressive Edge V11 REAL</option>
               </select>
             </label>
             <span id="live-status">实盘关闭</span>
@@ -347,6 +350,10 @@
               <label class="sample-version-select">
                 组合
                 <select id="sample-version" aria-label="样本组合版本">
+                  <option value="V12">V12 Reversal Guard Diagnostic</option>
+                  <option value="V11">V11 Depth Momentum Diagnostic</option>
+                  <option value="V10">V10 Up Reversal Guard Diagnostic</option>
+                  <option value="V9">V9 M1 Guard Diagnostic</option>
                   <option value="V8">V8 Learning Diagnostic</option>
                   <option value="V7">V7 Diagnostic</option>
                   <option value="V6">V6 Diagnostic</option>
@@ -422,11 +429,16 @@
               <tbody id="sample-recent-v7"></tbody>
             </table>
           </div>
+          <div class="table-footer">
+            <button id="sample-recent-prev-page" type="button" class="page-button" aria-label="样本候选上一页">上一页</button>
+            <span id="sample-recent-page-info">第 0 / 0 页 · 共 0 条</span>
+            <button id="sample-recent-next-page" type="button" class="page-button" aria-label="样本候选下一页">下一页</button>
+          </div>
         </section>
       </section>
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260608-samples-v8"></script>
+    <script src="/static/app.js?v=20260609-sample-local-pagination"></script>
   </body>
 </html>

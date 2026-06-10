@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import sqlite3
 import threading
 import time
@@ -11,15 +13,27 @@ from typing import Any, Callable
 from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 
 
-SCHEMA_VERSION = 14
+logger = logging.getLogger(__name__)
+
+
+SCHEMA_VERSION = 17
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
 PAPER_MIN_OPEN_TRADE_STAKE = 0.01
 CHAINLINK_FALLBACK_SETTLEMENT_MAX_AGE_SECONDS = 5.0
+AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED = 80
+AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT = 70.0
+AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT = 5.0
+AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED = 10
+AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT = 60.0
+AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED = 15
+AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT = 60.0
 SETTLEMENT_SOURCE_POLYMARKET = "polymarket_official"
 SETTLEMENT_SOURCE_CHAINLINK = "chainlink_fallback"
 SETTLEMENT_SOURCE_EARLY_EXIT = "early_exit"
+# 官方复核只能处理真实 BTC 5m 市场 slug；测试/诊断合成 slug 没有官方 resolution，会拖慢实盘循环。
+OFFICIAL_BTC_5M_ROUND_ID_GLOB = "btc-updown-5m-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
 PAPER_ORDER_STATUS_FILTERS: dict[str, tuple[str, ...]] = {
     "all": (),
     "active": ACTIVE_ORDER_STATUSES,
@@ -246,6 +260,10 @@ class TradeStore:
                 v6_would_trade INTEGER NOT NULL DEFAULT 0,
                 v7_would_trade INTEGER NOT NULL DEFAULT 0,
                 v8_would_trade INTEGER NOT NULL DEFAULT 0,
+                v9_would_trade INTEGER NOT NULL DEFAULT 0,
+                v10_would_trade INTEGER NOT NULL DEFAULT 0,
+                v11_would_trade INTEGER NOT NULL DEFAULT 0,
+                v12_would_trade INTEGER NOT NULL DEFAULT 0,
                 entry_price REAL,
                 confidence REAL,
                 move_bps REAL,
@@ -262,6 +280,10 @@ class TradeStore:
                 v6_block_reason TEXT,
                 v7_block_reason TEXT,
                 v8_block_reason TEXT,
+                v9_block_reason TEXT,
+                v10_block_reason TEXT,
+                v11_block_reason TEXT,
+                v12_block_reason TEXT,
                 signal_reason TEXT NOT NULL,
                 outcome TEXT,
                 final_price REAL,
@@ -313,7 +335,324 @@ class TradeStore:
         self._ensure_column("aggressive_edge_v2_shadow_samples", "v7_block_reason", "TEXT")
         self._ensure_column("aggressive_edge_v2_shadow_samples", "v8_would_trade", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("aggressive_edge_v2_shadow_samples", "v8_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v9_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v9_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v10_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v10_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v11_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v11_block_reason", "TEXT")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v12_would_trade", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("aggressive_edge_v2_shadow_samples", "v12_block_reason", "TEXT")
+        self._backfill_aggressive_edge_v9_shadow_samples()
+        self._backfill_aggressive_edge_v10_shadow_samples()
+        self._backfill_aggressive_edge_v11_shadow_samples()
+        self._backfill_aggressive_edge_v12_shadow_samples()
         self.conn.commit()
+
+    def _backfill_aggressive_edge_v9_shadow_samples(self) -> None:
+        """用已验证的 V8 历史样本回填 V9 口径，避免新版本从零开始空等。"""
+
+        if not self._has_column("aggressive_edge_v2_shadow_samples", "v8_would_trade"):
+            return
+        if not self._has_column("aggressive_edge_v2_shadow_samples", "v9_would_trade"):
+            return
+
+        pass_cur = self.conn.execute(
+            """
+            UPDATE aggressive_edge_v2_shadow_samples
+            SET
+                v9_would_trade = 1,
+                v9_block_reason = NULL,
+                updated_at = updated_at
+            WHERE v8_would_trade = 1
+              AND sample_key NOT LIKE 'm1:%'
+              AND (v9_would_trade != 1 OR v9_block_reason IS NOT NULL)
+            """
+        )
+        block_cur = self.conn.execute(
+            """
+            UPDATE aggressive_edge_v2_shadow_samples
+            SET
+                v9_would_trade = 0,
+                v9_block_reason = 'V9_M1_BUCKET_BLOCK 历史回填: V8 通过样本中的 m1 时间桶被 V9 拦截',
+                updated_at = updated_at
+            WHERE v8_would_trade = 1
+              AND sample_key LIKE 'm1:%'
+              AND (
+                    v9_would_trade != 0
+                    OR v9_block_reason IS NULL
+                    OR v9_block_reason NOT LIKE 'V9_M1_BUCKET_BLOCK%'
+              )
+            """
+        )
+        pass_count = int(pass_cur.rowcount if pass_cur.rowcount is not None else 0)
+        block_count = int(block_cur.rowcount if block_cur.rowcount is not None else 0)
+        if pass_count or block_count:
+            logger.debug(
+                "Aggressive Edge V9 历史影子样本回填 db=%s pass=%s block=%s",
+                self.db_path,
+                pass_count,
+                block_count,
+            )
+
+    def _backfill_aggressive_edge_v10_shadow_samples(self) -> None:
+        """用 V9 历史样本回填 V10 口径，验证 Up 反转守卫的候选质量。"""
+
+        required = {"v9_would_trade", "v10_would_trade", "features_json"}
+        if not all(self._has_column("aggressive_edge_v2_shadow_samples", column) for column in required):
+            return
+
+        rows = self.conn.execute(
+            """
+            SELECT id, side, move_bps, features_json
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE v9_would_trade = 1
+            """
+        ).fetchall()
+        pass_count = 0
+        block_count = 0
+        for row in rows:
+            block_reason = self._aggressive_edge_v10_backfill_block_reason(row)
+            if block_reason:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v10_would_trade = 0,
+                        v10_block_reason = ?,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (
+                            v10_would_trade != 0
+                            OR v10_block_reason IS NULL
+                            OR v10_block_reason NOT LIKE 'V10_%'
+                      )
+                    """,
+                    (block_reason, row["id"]),
+                )
+                block_count += int(cur.rowcount if cur.rowcount is not None else 0)
+            else:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v10_would_trade = 1,
+                        v10_block_reason = NULL,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (v10_would_trade != 1 OR v10_block_reason IS NOT NULL)
+                    """,
+                    (row["id"],),
+                )
+                pass_count += int(cur.rowcount if cur.rowcount is not None else 0)
+        if pass_count or block_count:
+            logger.debug(
+                "Aggressive Edge V10 历史影子样本回填 db=%s pass=%s block=%s",
+                self.db_path,
+                pass_count,
+                block_count,
+            )
+
+    def _aggressive_edge_v10_backfill_block_reason(self, row: sqlite3.Row) -> str | None:
+        """历史回填专用 V10 判断；阈值和 bot 中的 V10 诊断守卫保持一致。"""
+
+        if str(row["side"] or "") != "Up":
+            return None
+        try:
+            features = json.loads(row["features_json"] or "{}")
+        except Exception:
+            features = {}
+        move_bps = _maybe_float(row["move_bps"])
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        reasons: list[str] = []
+        if abs_move_bps < 5.7:
+            reasons.append(f"V10_UP_WEAK_MOVE abs_move={abs_move_bps:.2f}bps")
+        if top_level_skew is None:
+            reasons.append("V10_UP_TOP_SKEW_MISSING")
+        elif top_level_skew < 0.20:
+            reasons.append(f"V10_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+        return f"{'; '.join(reasons)} 历史回填: Up 反转守卫拦截" if reasons else None
+
+    def _backfill_aggressive_edge_v11_shadow_samples(self) -> None:
+        """用基础 Aggressive Edge 历史样本回填 V11 口径，验证 m2/m3 深盘口强波动规则。"""
+
+        required = {"base_would_trade", "v11_would_trade", "features_json"}
+        if not all(self._has_column("aggressive_edge_v2_shadow_samples", column) for column in required):
+            return
+
+        rows = self.conn.execute(
+            """
+            SELECT id, sample_key, move_bps, risk_score, features_json
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE base_would_trade = 1
+            """
+        ).fetchall()
+        pass_count = 0
+        block_count = 0
+        for row in rows:
+            block_reason = self._aggressive_edge_v11_backfill_block_reason(row)
+            if block_reason:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v11_would_trade = 0,
+                        v11_block_reason = ?,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (
+                            v11_would_trade != 0
+                            OR v11_block_reason IS NULL
+                            OR v11_block_reason NOT LIKE 'V11_%'
+                      )
+                    """,
+                    (block_reason, row["id"]),
+                )
+                block_count += int(cur.rowcount if cur.rowcount is not None else 0)
+            else:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v11_would_trade = 1,
+                        v11_block_reason = NULL,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (v11_would_trade != 1 OR v11_block_reason IS NOT NULL)
+                    """,
+                    (row["id"],),
+                )
+                pass_count += int(cur.rowcount if cur.rowcount is not None else 0)
+        if pass_count or block_count:
+            logger.debug(
+                "Aggressive Edge V11 历史影子样本回填 db=%s pass=%s block=%s",
+                self.db_path,
+                pass_count,
+                block_count,
+            )
+
+    def _aggressive_edge_v11_backfill_block_reason(self, row: sqlite3.Row) -> str | None:
+        """历史回填专用 V11 判断；阈值和 bot 中的 V11 诊断守卫保持一致。"""
+
+        try:
+            features = json.loads(row["features_json"] or "{}")
+        except Exception:
+            features = {}
+        sample_key = str(row["sample_key"] or "")
+        minute_bucket: int | None = None
+        for bucket in range(5):
+            if sample_key.startswith(f"m{bucket}:"):
+                minute_bucket = bucket
+                break
+        move_bps = _maybe_float(row["move_bps"])
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        depth_skew = _maybe_float(features.get("depth_skew"))
+        risk_score = _maybe_float(row["risk_score"])
+        reasons: list[str] = []
+        if minute_bucket not in {2, 3}:
+            reasons.append(f"V11_BUCKET_BLOCK m{minute_bucket if minute_bucket is not None else '?'}")
+        if abs_move_bps < 5.5:
+            reasons.append(f"V11_WEAK_MOVE abs_move={abs_move_bps:.2f}bps")
+        if depth_skew is None:
+            reasons.append("V11_DEPTH_SKEW_MISSING")
+        elif depth_skew < 0.35:
+            reasons.append(f"V11_WEAK_DEPTH depth={depth_skew:.4f}")
+        if risk_score is None:
+            reasons.append("V11_RISK_SCORE_MISSING")
+        elif risk_score > 0.25:
+            reasons.append(f"V11_RISK_TOO_HIGH risk={risk_score:.4f}")
+        return f"{'; '.join(reasons)} 历史回填: m2/m3 深盘口强波动守卫拦截" if reasons else None
+
+    def _backfill_aggressive_edge_v12_shadow_samples(self) -> None:
+        """用 V11 历史样本回填 V12 口径，验证过度位移和 Down 顶层盘口不足风险。"""
+
+        required = {"v11_would_trade", "v12_would_trade", "features_json"}
+        if not all(self._has_column("aggressive_edge_v2_shadow_samples", column) for column in required):
+            return
+
+        rows = self.conn.execute(
+            """
+            SELECT id, side, move_bps, features_json
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE v11_would_trade = 1
+            """
+        ).fetchall()
+        pass_count = 0
+        block_count = 0
+        for row in rows:
+            block_reason = self._aggressive_edge_v12_backfill_block_reason(row)
+            if block_reason:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v12_would_trade = 0,
+                        v12_block_reason = ?,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (
+                            v12_would_trade != 0
+                            OR v12_block_reason IS NULL
+                            OR v12_block_reason NOT LIKE 'V12_%'
+                      )
+                    """,
+                    (block_reason, row["id"]),
+                )
+                block_count += int(cur.rowcount if cur.rowcount is not None else 0)
+            else:
+                cur = self.conn.execute(
+                    """
+                    UPDATE aggressive_edge_v2_shadow_samples
+                    SET
+                        v12_would_trade = 1,
+                        v12_block_reason = NULL,
+                        updated_at = updated_at
+                    WHERE id = ?
+                      AND (v12_would_trade != 1 OR v12_block_reason IS NOT NULL)
+                    """,
+                    (row["id"],),
+                )
+                pass_count += int(cur.rowcount if cur.rowcount is not None else 0)
+        if pass_count or block_count:
+            logger.debug(
+                "Aggressive Edge V12 历史影子样本回填 db=%s pass=%s block=%s",
+                self.db_path,
+                pass_count,
+                block_count,
+            )
+
+    def _aggressive_edge_v12_backfill_block_reason(self, row: sqlite3.Row) -> str | None:
+        """历史回填专用 V12 判断；阈值和 bot 中的 V12 诊断守卫保持一致。"""
+
+        try:
+            features = json.loads(row["features_json"] or "{}")
+        except Exception:
+            features = {}
+        move_bps = _maybe_float(row["move_bps"])
+        if move_bps is None:
+            move_bps = _maybe_float(features.get("move_bps"))
+        abs_move_bps = abs(move_bps or 0.0)
+        top_level_skew = _maybe_float(features.get("top_level_skew"))
+        side = str(row["side"] or "")
+        reasons: list[str] = []
+        if abs_move_bps >= 8.0:
+            reasons.append(f"V12_OVEREXTENDED_MOVE abs_move={abs_move_bps:.2f}bps")
+        if side == "Up":
+            if top_level_skew is None:
+                reasons.append("V12_UP_TOP_SKEW_MISSING")
+            elif top_level_skew < 0.20:
+                reasons.append(f"V12_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+        if side == "Down":
+            if top_level_skew is None:
+                reasons.append("V12_DOWN_TOP_SKEW_MISSING")
+            elif top_level_skew < 0.30:
+                reasons.append(f"V12_DOWN_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+        return f"{'; '.join(reasons)} 历史回填: V12 反转守卫拦截" if reasons else None
 
     @_locked
     def record_aggressive_edge_v2_shadow_sample(
@@ -344,6 +683,14 @@ class TradeStore:
         v7_block_reason: str | None = None,
         v8_would_trade: bool | None = None,
         v8_block_reason: str | None = None,
+        v9_would_trade: bool | None = None,
+        v9_block_reason: str | None = None,
+        v10_would_trade: bool | None = None,
+        v10_block_reason: str | None = None,
+        v11_would_trade: bool | None = None,
+        v11_block_reason: str | None = None,
+        v12_would_trade: bool | None = None,
+        v12_block_reason: str | None = None,
         created_at: float | None = None,
     ) -> int:
         """记录 Aggressive Edge V2 影子样本；同一市场同一时间桶只保留最新特征。"""
@@ -357,13 +704,13 @@ class TradeStore:
             """
             INSERT INTO aggressive_edge_v2_shadow_samples(
                 round_id, symbol, sample_key, side, source_signal_side,
-                base_would_trade, v1_would_trade, v2_would_trade, v4_would_trade, v5_would_trade, v6_would_trade, v7_would_trade, v8_would_trade,
+                base_would_trade, v1_would_trade, v2_would_trade, v4_would_trade, v5_would_trade, v6_would_trade, v7_would_trade, v8_would_trade, v9_would_trade, v10_would_trade, v11_would_trade, v12_would_trade,
                 entry_price, confidence, move_bps, risk_score, risk_level,
                 risk_reasons_json, features_json, components_json, report_json,
-                base_block_reason, v1_block_reason, v4_block_reason, v5_block_reason, v6_block_reason, v7_block_reason, v8_block_reason, signal_reason,
+                base_block_reason, v1_block_reason, v4_block_reason, v5_block_reason, v6_block_reason, v7_block_reason, v8_block_reason, v9_block_reason, v10_block_reason, v11_block_reason, v12_block_reason, signal_reason,
                 created_at, updated_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(round_id, sample_key, side) DO UPDATE SET
                 source_signal_side = excluded.source_signal_side,
                 base_would_trade = excluded.base_would_trade,
@@ -374,6 +721,10 @@ class TradeStore:
                 v6_would_trade = excluded.v6_would_trade,
                 v7_would_trade = excluded.v7_would_trade,
                 v8_would_trade = excluded.v8_would_trade,
+                v9_would_trade = excluded.v9_would_trade,
+                v10_would_trade = excluded.v10_would_trade,
+                v11_would_trade = excluded.v11_would_trade,
+                v12_would_trade = excluded.v12_would_trade,
                 entry_price = excluded.entry_price,
                 confidence = excluded.confidence,
                 move_bps = excluded.move_bps,
@@ -390,6 +741,10 @@ class TradeStore:
                 v6_block_reason = excluded.v6_block_reason,
                 v7_block_reason = excluded.v7_block_reason,
                 v8_block_reason = excluded.v8_block_reason,
+                v9_block_reason = excluded.v9_block_reason,
+                v10_block_reason = excluded.v10_block_reason,
+                v11_block_reason = excluded.v11_block_reason,
+                v12_block_reason = excluded.v12_block_reason,
                 signal_reason = excluded.signal_reason,
                 updated_at = excluded.updated_at
             """,
@@ -407,6 +762,10 @@ class TradeStore:
                 1 if (False if v6_would_trade is None else v6_would_trade) else 0,
                 1 if (False if v7_would_trade is None else v7_would_trade) else 0,
                 1 if (False if v8_would_trade is None else v8_would_trade) else 0,
+                1 if (False if v9_would_trade is None else v9_would_trade) else 0,
+                1 if (False if v10_would_trade is None else v10_would_trade) else 0,
+                1 if (False if v11_would_trade is None else v11_would_trade) else 0,
+                1 if (False if v12_would_trade is None else v12_would_trade) else 0,
                 entry_price,
                 confidence,
                 move_bps,
@@ -423,6 +782,10 @@ class TradeStore:
                 v6_block_reason,
                 v7_block_reason,
                 v8_block_reason,
+                v9_block_reason,
+                v10_block_reason,
+                v11_block_reason,
+                v12_block_reason,
                 str(signal_reason or "")[:1200],
                 now,
                 now,
@@ -533,6 +896,54 @@ class TradeStore:
                     END
                 ) AS v8_simulated_pnl,
                 SUM(CASE WHEN v8_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v8_simulated_stake_count,
+                SUM(CASE WHEN v9_would_trade = 1 THEN 1 ELSE 0 END) AS v9_would_trade_count,
+                SUM(CASE WHEN v9_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v9_would_trade_settled_count,
+                SUM(CASE WHEN v9_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v9_would_win_count,
+                SUM(CASE WHEN v9_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v9_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v9_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v9_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v9_simulated_pnl,
+                SUM(CASE WHEN v9_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v9_simulated_stake_count,
+                SUM(CASE WHEN v10_would_trade = 1 THEN 1 ELSE 0 END) AS v10_would_trade_count,
+                SUM(CASE WHEN v10_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v10_would_trade_settled_count,
+                SUM(CASE WHEN v10_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v10_would_win_count,
+                SUM(CASE WHEN v10_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v10_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v10_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v10_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v10_simulated_pnl,
+                SUM(CASE WHEN v10_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v10_simulated_stake_count,
+                SUM(CASE WHEN v11_would_trade = 1 THEN 1 ELSE 0 END) AS v11_would_trade_count,
+                SUM(CASE WHEN v11_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v11_would_trade_settled_count,
+                SUM(CASE WHEN v11_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v11_would_win_count,
+                SUM(CASE WHEN v11_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v11_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v11_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v11_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v11_simulated_pnl,
+                SUM(CASE WHEN v11_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v11_simulated_stake_count,
+                SUM(CASE WHEN v12_would_trade = 1 THEN 1 ELSE 0 END) AS v12_would_trade_count,
+                SUM(CASE WHEN v12_would_trade = 1 AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS v12_would_trade_settled_count,
+                SUM(CASE WHEN v12_would_trade = 1 AND would_win = 1 THEN 1 ELSE 0 END) AS v12_would_win_count,
+                SUM(CASE WHEN v12_would_trade = 1 AND would_win = 0 THEN 1 ELSE 0 END) AS v12_would_loss_count,
+                SUM(
+                    CASE
+                        WHEN v12_would_trade = 1 AND would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN v12_would_trade = 1 AND would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS v12_simulated_pnl,
+                SUM(CASE WHEN v12_would_trade = 1 AND would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS v12_simulated_stake_count,
                 SUM(CASE WHEN risk_level = 'HIGH' THEN 1 ELSE 0 END) AS high_risk_count,
                 SUM(CASE WHEN risk_level = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_risk_count,
                 SUM(CASE WHEN risk_level = 'LOW' THEN 1 ELSE 0 END) AS low_risk_count,
@@ -659,13 +1070,53 @@ class TradeStore:
             """,
             (str(symbol or "BTC"),),
         ).fetchall()
+        v9_direction_rows = self.conn.execute(
+            """
+            SELECT side,
+                   COUNT(*) AS settled_count,
+                   SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                   SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v9_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY side
+            ORDER BY side
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        v9_bucket_rows = self.conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                    WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                    WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                    WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                    WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                    ELSE 'unknown'
+                END AS bucket,
+                COUNT(*) AS settled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v9_would_trade = 1
+              AND settled_at IS NOT NULL
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
         recent_rows = self.conn.execute(
             """
             SELECT id, round_id, sample_key, side, risk_score, risk_level,
                    base_would_trade, v1_would_trade, v2_would_trade,
                    v4_would_trade, v4_block_reason, v5_would_trade, v5_block_reason,
                    v6_would_trade, v6_block_reason, v7_would_trade, v7_block_reason,
-                   v8_would_trade, v8_block_reason,
+                   v8_would_trade, v8_block_reason, v9_would_trade, v9_block_reason,
+                   v10_would_trade, v10_block_reason, v11_would_trade, v11_block_reason,
+                   v12_would_trade, v12_block_reason,
                    outcome, would_win, created_at, updated_at
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
@@ -710,6 +1161,42 @@ class TradeStore:
             """,
             (str(symbol or "BTC"),),
         ).fetchall()
+        recent_v9_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v9_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v9_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_v10_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v10_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v10_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
+        recent_v12_rows = self.conn.execute(
+            """
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at, v12_block_reason
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND v12_would_trade = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 8
+            """,
+            (str(symbol or "BTC"),),
+        ).fetchall()
         summary = dict(rows) if rows is not None else {}
         version_columns = {
             "V4": "v4_would_trade",
@@ -717,6 +1204,10 @@ class TradeStore:
             "V6": "v6_would_trade",
             "V7": "v7_would_trade",
             "V8": "v8_would_trade",
+            "V9": "v9_would_trade",
+            "V10": "v10_would_trade",
+            "V11": "v11_would_trade",
+            "V12": "v12_would_trade",
         }
 
         def integer(key: str) -> int:
@@ -735,6 +1226,83 @@ class TradeStore:
                 "win_count": win_count,
                 "loss_count": loss_count,
                 "win_rate_pct": win_rate(win_count, loss_count),
+            }
+
+        def live_readiness(version_data: dict[str, Any]) -> dict[str, Any]:
+            """诊断版本的实盘准入预检；只给准入状态，不会自动启用 REAL。"""
+
+            settled = int(version_data.get("settled_count") or 0)
+            win_rate_pct = _maybe_float(version_data.get("win_rate_pct"))
+            roi_pct = _maybe_float(version_data.get("simulated_roi_pct"))
+            reasons: list[str] = []
+            bad_directions: list[dict[str, Any]] = []
+            bad_buckets: list[dict[str, Any]] = []
+            if settled < AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED:
+                reasons.append(
+                    f"已结算样本 {settled}/{AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED}，继续采样"
+                )
+            if win_rate_pct is None:
+                reasons.append("胜率样本不足")
+            elif win_rate_pct < AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT:
+                reasons.append(
+                    f"胜率 {win_rate_pct:.2f}% 低于 {AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT:.2f}%"
+                )
+            if roi_pct is None:
+                reasons.append("模拟 ROI 样本不足")
+            elif roi_pct < AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT:
+                reasons.append(
+                    f"模拟 ROI {roi_pct:.2f}% 低于 {AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT:.2f}%"
+                )
+            for row in version_data.get("direction_stats") or []:
+                row_settled = int(row.get("settled_count") or 0)
+                row_win_rate = _maybe_float(row.get("win_rate_pct"))
+                if (
+                    row_settled >= AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED
+                    and row_win_rate is not None
+                    and row_win_rate < AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT
+                ):
+                    bad_directions.append(dict(row))
+            for row in version_data.get("bucket_stats") or []:
+                row_settled = int(row.get("settled_count") or 0)
+                row_win_rate = _maybe_float(row.get("win_rate_pct"))
+                if (
+                    row_settled >= AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED
+                    and row_win_rate is not None
+                    and row_win_rate < AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT
+                ):
+                    bad_buckets.append(dict(row))
+            if bad_directions:
+                names = ", ".join(str(row.get("side") or "-") for row in bad_directions)
+                reasons.append(f"方向分组未达标: {names}")
+            if bad_buckets:
+                names = ", ".join(str(row.get("bucket") or "-") for row in bad_buckets)
+                reasons.append(f"时间桶未达标: {names}")
+            eligible = not reasons
+            if eligible:
+                status = "READY_FOR_REAL_REVIEW"
+                label = "可准备 REAL 预检"
+            elif settled < AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED:
+                status = "WAITING_FOR_SAMPLE"
+                label = "继续采样"
+            else:
+                status = "FAILED_LIVE_GATES"
+                label = "未达实盘门槛"
+            return {
+                "status": status,
+                "label": label,
+                "eligible_for_live_review": eligible,
+                "reasons": reasons,
+                "bad_direction_stats": bad_directions,
+                "bad_bucket_stats": bad_buckets,
+                "thresholds": {
+                    "min_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED,
+                    "min_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT,
+                    "min_roi_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT,
+                    "min_direction_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED,
+                    "min_direction_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT,
+                    "min_bucket_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED,
+                    "min_bucket_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT,
+                },
             }
 
         def version_summary(version: str, column: str) -> dict[str, Any]:
@@ -816,7 +1384,9 @@ class TradeStore:
             win_count = int(data.get("win_count") or 0)
             loss_count = int(data.get("loss_count") or 0)
             stake_count = int(data.get("simulated_stake_count") or 0)
-            return {
+            direction_stats = [stat_row(row, "side") for row in direction_rows]
+            bucket_stats = [stat_row(row, "bucket") for row in bucket_rows]
+            result = {
                 "version": version,
                 "column": column,
                 "would_trade_count": int(data.get("would_trade_count") or 0),
@@ -828,10 +1398,12 @@ class TradeStore:
                 "simulated_roi_pct": round(float(data.get("simulated_pnl") or 0.0) / stake_count * 100.0, 4)
                 if stake_count
                 else None,
-                "direction_stats": [stat_row(row, "side") for row in direction_rows],
-                "bucket_stats": [stat_row(row, "bucket") for row in bucket_rows],
+                "direction_stats": direction_stats,
+                "bucket_stats": bucket_stats,
                 "recent_samples": [dict(row) for row in recent],
             }
+            result["live_readiness"] = live_readiness(result)
+            return result
 
         diagnostic_version_summaries = [
             version_summary(version, column) for version, column in version_columns.items()
@@ -843,6 +1415,10 @@ class TradeStore:
         v6_stake_count = integer("v6_simulated_stake_count")
         v7_stake_count = integer("v7_simulated_stake_count")
         v8_stake_count = integer("v8_simulated_stake_count")
+        v9_stake_count = integer("v9_simulated_stake_count")
+        v10_stake_count = integer("v10_simulated_stake_count")
+        v11_stake_count = integer("v11_simulated_stake_count")
+        v12_stake_count = integer("v12_simulated_stake_count")
         high_loss = integer("high_risk_loss_count")
         high_win = integer("high_risk_win_count")
         high_settled = high_loss + high_win
@@ -911,6 +1487,38 @@ class TradeStore:
             "v8_simulated_roi_pct": round(float(summary.get("v8_simulated_pnl") or 0.0) / v8_stake_count * 100.0, 4)
             if v8_stake_count
             else None,
+            "v9_would_trade_count": integer("v9_would_trade_count"),
+            "v9_would_trade_settled_count": integer("v9_would_trade_settled_count"),
+            "v9_would_win_count": integer("v9_would_win_count"),
+            "v9_would_loss_count": integer("v9_would_loss_count"),
+            "v9_would_win_rate_pct": win_rate(integer("v9_would_win_count"), integer("v9_would_loss_count")),
+            "v9_simulated_roi_pct": round(float(summary.get("v9_simulated_pnl") or 0.0) / v9_stake_count * 100.0, 4)
+            if v9_stake_count
+            else None,
+            "v10_would_trade_count": integer("v10_would_trade_count"),
+            "v10_would_trade_settled_count": integer("v10_would_trade_settled_count"),
+            "v10_would_win_count": integer("v10_would_win_count"),
+            "v10_would_loss_count": integer("v10_would_loss_count"),
+            "v10_would_win_rate_pct": win_rate(integer("v10_would_win_count"), integer("v10_would_loss_count")),
+            "v10_simulated_roi_pct": round(float(summary.get("v10_simulated_pnl") or 0.0) / v10_stake_count * 100.0, 4)
+            if v10_stake_count
+            else None,
+            "v11_would_trade_count": integer("v11_would_trade_count"),
+            "v11_would_trade_settled_count": integer("v11_would_trade_settled_count"),
+            "v11_would_win_count": integer("v11_would_win_count"),
+            "v11_would_loss_count": integer("v11_would_loss_count"),
+            "v11_would_win_rate_pct": win_rate(integer("v11_would_win_count"), integer("v11_would_loss_count")),
+            "v11_simulated_roi_pct": round(float(summary.get("v11_simulated_pnl") or 0.0) / v11_stake_count * 100.0, 4)
+            if v11_stake_count
+            else None,
+            "v12_would_trade_count": integer("v12_would_trade_count"),
+            "v12_would_trade_settled_count": integer("v12_would_trade_settled_count"),
+            "v12_would_win_count": integer("v12_would_win_count"),
+            "v12_would_loss_count": integer("v12_would_loss_count"),
+            "v12_would_win_rate_pct": win_rate(integer("v12_would_win_count"), integer("v12_would_loss_count")),
+            "v12_simulated_roi_pct": round(float(summary.get("v12_simulated_pnl") or 0.0) / v12_stake_count * 100.0, 4)
+            if v12_stake_count
+            else None,
             "high_risk_count": integer("high_risk_count"),
             "medium_risk_count": integer("medium_risk_count"),
             "low_risk_count": integer("low_risk_count"),
@@ -925,11 +1533,87 @@ class TradeStore:
             "v7_bucket_stats": [stat_row(row, "bucket") for row in v7_bucket_rows],
             "v8_direction_stats": [stat_row(row, "side") for row in v8_direction_rows],
             "v8_bucket_stats": [stat_row(row, "bucket") for row in v8_bucket_rows],
+            "v9_direction_stats": [stat_row(row, "side") for row in v9_direction_rows],
+            "v9_bucket_stats": [stat_row(row, "bucket") for row in v9_bucket_rows],
             "recent_samples": [dict(row) for row in recent_rows],
             "recent_v6_samples": [dict(row) for row in recent_v6_rows],
             "recent_v7_samples": [dict(row) for row in recent_v7_rows],
             "recent_v8_samples": [dict(row) for row in recent_v8_rows],
+            "recent_v9_samples": [dict(row) for row in recent_v9_rows],
+            "recent_v10_samples": [dict(row) for row in recent_v10_rows],
+            "recent_v12_samples": [dict(row) for row in recent_v12_rows],
             "diagnostic_version_summaries": diagnostic_version_summaries,
+        }
+
+    @_locked
+    def aggressive_edge_v2_shadow_candidates(
+        self,
+        symbol: str = "BTC",
+        version: str = "V12",
+        *,
+        limit: int = 8,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """按诊断版本分页读取放行候选；样本页只展示当前页，避免一次性返回大量历史行。"""
+
+        version_columns = {
+            "V4": "v4_would_trade",
+            "V5": "v5_would_trade",
+            "V6": "v6_would_trade",
+            "V7": "v7_would_trade",
+            "V8": "v8_would_trade",
+            "V9": "v9_would_trade",
+            "V10": "v10_would_trade",
+            "V11": "v11_would_trade",
+            "V12": "v12_would_trade",
+        }
+        normalized_version = str(version or "V12").strip().upper()
+        column = version_columns.get(normalized_version)
+        if column is None:
+            allowed = ", ".join(version_columns)
+            raise ValueError(f"unknown aggressive edge sample version: {normalized_version}; allowed: {allowed}")
+
+        safe_symbol = str(symbol or "BTC")
+        safe_limit = max(1, min(100, int(limit)))
+        safe_offset = max(0, int(offset))
+        total_row = self.conn.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND {column} = 1
+            """,
+            (safe_symbol,),
+        ).fetchone()
+        total = int((total_row or {})["total"] or 0)
+        rows = self.conn.execute(
+            f"""
+            SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
+                   outcome, would_win, created_at, updated_at, settled_at
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND {column} = 1
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            OFFSET ?
+            """,
+            (safe_symbol, safe_limit, safe_offset),
+        ).fetchall()
+        loaded = len(rows)
+        return {
+            "version": normalized_version,
+            "column": column,
+            "symbol": safe_symbol,
+            "candidates": [dict(row) for row in rows],
+            "meta": {
+                "version": normalized_version,
+                "limit": safe_limit,
+                "offset": safe_offset,
+                "loaded": loaded,
+                "total": total,
+                "has_more": safe_offset + loaded < total,
+                "total_pages": math.ceil(total / safe_limit) if total else 0,
+            },
         }
 
     @_locked
@@ -938,6 +1622,10 @@ class TradeStore:
         if any(row["name"] == column for row in rows):
             return
         self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
 
     @_locked
     def _init_account(self) -> None:
@@ -2605,13 +3293,14 @@ class TradeStore:
             SELECT *
             FROM market_rounds
             WHERE symbol = ?
+              AND round_id GLOB ?
               AND settled_at IS NOT NULL
               AND ends_at >= ?
               AND (settlement_source IS NULL OR settlement_source = ?)
             ORDER BY ends_at DESC, round_id DESC
             LIMIT ?
             """,
-            (symbol, cutoff, SETTLEMENT_SOURCE_CHAINLINK, safe_limit),
+            (symbol, OFFICIAL_BTC_5M_ROUND_ID_GLOB, cutoff, SETTLEMENT_SOURCE_CHAINLINK, safe_limit),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -2630,6 +3319,7 @@ class TradeStore:
             SELECT *
             FROM market_rounds
             WHERE symbol = ?
+              AND round_id GLOB ?
               AND settled_at IS NOT NULL
               AND ends_at >= ?
               AND settlement_source = ?
@@ -2645,7 +3335,7 @@ class TradeStore:
             ORDER BY ends_at DESC, round_id DESC
             LIMIT ?
             """,
-            (symbol, cutoff, SETTLEMENT_SOURCE_POLYMARKET, safe_limit),
+            (symbol, OFFICIAL_BTC_5M_ROUND_ID_GLOB, cutoff, SETTLEMENT_SOURCE_POLYMARKET, safe_limit),
         ).fetchall()
         return [dict(row) for row in rows]
 

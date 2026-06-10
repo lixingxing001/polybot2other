@@ -17,13 +17,18 @@ from .models import MarketRound
 
 CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+OKX_SPOT_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
+BINANCE_SPOT_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
 CLOB_WS_PING_SECONDS = 10.0
 RTDS_WS_PING_SECONDS = 5.0
+SPOT_WS_PING_SECONDS = 10.0
 CLOB_WS_READ_TIMEOUT_SECONDS = 1.0
 CLOB_WS_RECONNECT_INITIAL_SECONDS = 0.5
 CLOB_WS_RECONNECT_MAX_SECONDS = 5.0
 MAX_CLOB_WS_LEVELS = 50
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SPOT_WS_SOURCE_OKX = "okx"
+SPOT_WS_SOURCE_BINANCE = "binance"
 
 
 class WebSocketProtocolError(RuntimeError):
@@ -240,9 +245,10 @@ class ClobMarketOrderBook:
             side=side,
             bids=bids,
             asks=asks,
-            updated_at_ms=_event_timestamp_ms(message, now),
+            updated_at_ms=_received_timestamp_ms(now),
             source="clob-ws-book",
         )
+        _apply_clob_quote_timestamps(self.quotes[side], message, now)
         return True
 
     def _apply_price_change(
@@ -266,7 +272,7 @@ class ClobMarketOrderBook:
             quote["best_bid"] = best_bid
         if best_ask is not None:
             quote["best_ask"] = best_ask
-        quote["updated_at_ms"] = _event_timestamp_ms(message, now)
+        _apply_clob_quote_timestamps(quote, message, now)
         quote["source"] = "clob-ws-price-change"
         self.quotes[side] = quote
         return True
@@ -279,7 +285,7 @@ class ClobMarketOrderBook:
             quote["best_bid"] = best_bid
         if best_ask is not None:
             quote["best_ask"] = best_ask
-        quote["updated_at_ms"] = _event_timestamp_ms(message, now)
+        _apply_clob_quote_timestamps(quote, message, now)
         quote["source"] = "clob-ws-best"
         self.quotes[side] = quote
         return True
@@ -460,6 +466,147 @@ class RtdsChainlinkWebSocketFeed:
             ws.close()
 
 
+class SpotPriceWebSocketFeed:
+    def __init__(self, source: str, url: str | None = None, timeout_seconds: float = 5.0) -> None:
+        self.source = source
+        self.url = url or _spot_ws_url(source)
+        self.timeout_seconds = timeout_seconds
+
+    def run(
+        self,
+        stop_event: Any,
+        price_callback: Callable[[dict[str, Any], dict[str, Any]], None],
+        status_callback: Callable[[dict[str, Any]], None],
+    ) -> None:
+        backoff = CLOB_WS_RECONNECT_INITIAL_SECONDS
+        while not stop_event.is_set():
+            try:
+                self._run_once(stop_event, price_callback, status_callback)
+                backoff = CLOB_WS_RECONNECT_INITIAL_SECONDS
+            except Exception as exc:  # noqa: BLE001 - 行情线程必须自动重连，不能影响实盘主循环。
+                status_callback(
+                    {
+                        "state": "error",
+                        "source": self.source,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "at": time.time(),
+                    }
+                )
+                stop_event.wait(backoff)
+                backoff = min(CLOB_WS_RECONNECT_MAX_SECONDS, backoff * 1.8)
+
+    def _run_once(
+        self,
+        stop_event: Any,
+        price_callback: Callable[[dict[str, Any], dict[str, Any]], None],
+        status_callback: Callable[[dict[str, Any]], None],
+    ) -> None:
+        status_callback({"state": "connecting", "source": self.source, "at": time.time()})
+        ws = _StdlibWebSocket.connect(self.url, self.timeout_seconds)
+        try:
+            if self.source == SPOT_WS_SOURCE_OKX:
+                ws.send_text(
+                    json.dumps(
+                        {"op": "subscribe", "args": [{"channel": "tickers", "instId": "BTC-USDT"}]},
+                        separators=(",", ":"),
+                    )
+                )
+            last_ping = time.time()
+            status_callback({"state": "connected", "source": self.source, "at": last_ping})
+            while not stop_event.is_set():
+                now = time.time()
+                if self.source == SPOT_WS_SOURCE_OKX and now - last_ping >= SPOT_WS_PING_SECONDS:
+                    ws.send_text("ping")
+                    last_ping = now
+                text = ws.read_text(CLOB_WS_READ_TIMEOUT_SECONDS)
+                if text is None:
+                    continue
+                if text in {"PING", "PONG", "pong", ""}:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                tick = spot_price_from_payload(self.source, payload, time.time())
+                if tick:
+                    price_callback(
+                        tick,
+                        {
+                            "state": "message",
+                            "source": self.source,
+                            "at": time.time(),
+                        },
+                    )
+        finally:
+            ws.close()
+
+
+def spot_price_from_payload(source: str, payload: Any, now: float | None = None) -> dict[str, Any] | None:
+    now = time.time() if now is None else now
+    if source == SPOT_WS_SOURCE_OKX:
+        return okx_spot_price_from_payload(payload, now)
+    if source == SPOT_WS_SOURCE_BINANCE:
+        return binance_spot_price_from_payload(payload, now)
+    return None
+
+
+def okx_spot_price_from_payload(payload: Any, now: float | None = None) -> dict[str, Any] | None:
+    now = time.time() if now is None else now
+    received_ms = int(now * 1000)
+    messages = payload if isinstance(payload, list) else [payload]
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        rows = message.get("data")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            arg = message.get("arg") if isinstance(message.get("arg"), dict) else {}
+            inst_id = str(row.get("instId") or arg.get("instId") or "").upper()
+            if inst_id and inst_id != "BTC-USDT":
+                continue
+            price = _maybe_float(row.get("last"))
+            if price is None or price <= 0:
+                continue
+            exchange_updated_ms = _normalize_timestamp_ms(row.get("ts"), now)
+            return {
+                "okx": price,
+                # 策略 freshness 使用本机收到时间，避免交易所事件时间抖动误判过期。
+                "okx_updated_ms": received_ms,
+                "okx_received_ms": received_ms,
+                "okx_exchange_updated_ms": exchange_updated_ms,
+                "okx_source": "okx-spot-ws",
+            }
+    return None
+
+
+def binance_spot_price_from_payload(payload: Any, now: float | None = None) -> dict[str, Any] | None:
+    now = time.time() if now is None else now
+    received_ms = int(now * 1000)
+    messages = payload if isinstance(payload, list) else [payload]
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        symbol = str(message.get("s") or "").upper()
+        if symbol and symbol != "BTCUSDT":
+            continue
+        price = _maybe_float(message.get("c") or message.get("lastPrice"))
+        if price is None or price <= 0:
+            continue
+        exchange_updated_ms = _normalize_timestamp_ms(message.get("E"), now)
+        return {
+            "binance_market": price,
+            # 策略 freshness 使用本机收到时间，事件时间保留给诊断。
+            "binance_market_updated_ms": received_ms,
+            "binance_market_received_ms": received_ms,
+            "binance_market_exchange_updated_ms": exchange_updated_ms,
+            "binance_market_source": "binance-spot-ws",
+        }
+    return None
+
+
 def rtds_chainlink_price_from_payload(payload: Any, now: float | None = None) -> dict[str, Any] | None:
     now = time.time() if now is None else now
     messages = payload if isinstance(payload, list) else [payload]
@@ -510,6 +657,14 @@ def _normalize_timestamp_ms(value: Any, now: float) -> int:
     if raw < 10_000_000_000:
         return int(raw * 1000)
     return int(raw)
+
+
+def _spot_ws_url(source: str) -> str:
+    if source == SPOT_WS_SOURCE_OKX:
+        return OKX_SPOT_WS_URL
+    if source == SPOT_WS_SOURCE_BINANCE:
+        return BINANCE_SPOT_WS_URL
+    raise ValueError(f"unsupported spot websocket source: {source}")
 
 
 def _market_has_tokens(market: MarketRound | None) -> bool:
@@ -611,6 +766,18 @@ def _event_timestamp_ms(message: dict[str, Any], now: float) -> int:
     if value and value > 0:
         return value
     return int(now * 1000)
+
+
+def _received_timestamp_ms(now: float) -> int:
+    return int(now * 1000)
+
+
+def _apply_clob_quote_timestamps(quote: dict[str, Any], message: dict[str, Any], now: float) -> None:
+    received_ms = _received_timestamp_ms(now)
+    # 策略 freshness 使用本机收到时间，CLOB 事件时间单独保留给诊断。
+    quote["updated_at_ms"] = received_ms
+    quote["clob_received_ms"] = received_ms
+    quote["clob_event_updated_ms"] = _event_timestamp_ms(message, now)
 
 
 def _maybe_float(value: Any) -> float | None:
