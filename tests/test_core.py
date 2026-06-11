@@ -72,6 +72,8 @@ from polybot2other.live import (
     LIVE_ACTIVE_LOCK_PRESERVE_MESSAGE,
     LIVE_AGGRESSIVE_EDGE_COMBO,
     LIVE_AGGRESSIVE_EDGE_V10_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V11_1_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_V11_COMBO,
     LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID,
@@ -9561,6 +9563,39 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIn("sample_readiness", option_by_id[LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID])
             self.assertFalse(option_by_id[LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID]["sample_readiness"]["eligible_for_live_review"])
 
+    def test_single_fak_aggressive_edge_v11_1_real_selects_independent_live_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.live_trading.client = FakeLiveClient()
+
+            payload = bot.update_live_settings({"live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID})
+
+            v11_1_db_path = Path(tmp) / "single_fak_aggressive_edge_v11_1_real.sqlite3"
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_AGGRESSIVE_EDGE_V11_1_COMBO)
+            self.assertEqual(bot.live_trading.variant.signal_filter_mode, SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC)
+            self.assertEqual(bot.live_trading.store.db_path, v11_1_db_path)
+            self.assertTrue(v11_1_db_path.exists())
+            self.assertEqual(payload["live_trading"]["db_path"], str(v11_1_db_path))
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            self.assertEqual(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID]["signal_filter_mode"],
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+            )
+            self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID]["db_path"], str(v11_1_db_path))
+            self.assertIn("sample_readiness", option_by_id[LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID])
+
     def test_single_fak_aggressive_edge_real_blocks_same_mid_entry_band_as_paper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
@@ -10136,6 +10171,80 @@ class TradingCoreTest(unittest.TestCase):
             orders = bot.orders_page(account_scope="live", variant_id=LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID)["recent_orders"]
             self.assertEqual(orders[0]["variant_id"], LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID)
             self.assertEqual(orders[0]["signal_filter_mode"], SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC)
+
+    def test_single_fak_aggressive_edge_v11_1_real_blocks_intermediate_up_top_skew(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v11-1-intermediate-top",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.075,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.08,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.08,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.67, "size": 300}, {"price": 0.66, "size": 700}],
+                    "asks": [{"price": 0.68, "size": 700}, {"price": 0.69, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.31, "size": 700}, {"price": 0.30, "size": 300}],
+                    "asks": [{"price": 0.32, "size": 300}, {"price": 0.33, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V11.1_REAL_GUARD BLOCK", bot.live_trading.last_signal["reason"])
+            self.assertIn("V11_UP_WEAK_TOP_SKEW top=0.3000 min=0.35", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
 
     def test_single_fak_real_blocks_strategy_switch_with_open_live_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

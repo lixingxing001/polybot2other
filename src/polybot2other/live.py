@@ -75,6 +75,9 @@ LIVE_AGGRESSIVE_EDGE_V10_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL"
 LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL"
 LIVE_AGGRESSIVE_EDGE_V11_COMBO = "SINGLE + FAK Aggressive Edge V11 REAL"
 LIVE_AGGRESSIVE_EDGE_V11_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL"
+LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_1_REAL"
+LIVE_AGGRESSIVE_EDGE_V11_1_COMBO = "SINGLE + FAK Aggressive Edge V11.1 REAL"
+LIVE_AGGRESSIVE_EDGE_V11_1_ENTRY_MARKER = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_1_REAL"
 LIVE_PAPER_VARIANT_ID = "SINGLE_FAK_REAL_PAPER"
 LIVE_PAPER_COMBO = "SINGLE + FAK REAL PAPER"
 LIVE_PAPER_ENTRY_MARKER = "SINGLE_FAK_REAL_PAPER"
@@ -123,6 +126,7 @@ LIVE_AGGRESSIVE_EDGE_V11_MIN_ABS_MOVE_BPS = 5.5
 LIVE_AGGRESSIVE_EDGE_V11_MIN_DEPTH_SKEW = 0.35
 LIVE_AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE = 0.25
 LIVE_AGGRESSIVE_EDGE_V11_UP_MIN_TOP_LEVEL_SKEW = 0.20
+LIVE_AGGRESSIVE_EDGE_V11_1_UP_MIN_TOP_LEVEL_SKEW = 0.35
 LIVE_STRATEGY_OPTIONS = (
     {
         "variant_id": LIVE_VARIANT_ID,
@@ -161,6 +165,14 @@ LIVE_STRATEGY_OPTIONS = (
         "combo": LIVE_AGGRESSIVE_EDGE_V11_COMBO,
         "entry_marker": LIVE_AGGRESSIVE_EDGE_V11_ENTRY_MARKER,
         "role": "实盘隔离账户，沿用 Aggressive Edge V11 深盘口强动量过滤；过样本准入后进入实盘预检",
+        "stop_win_enabled": False,
+        "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+    },
+    {
+        "variant_id": LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID,
+        "combo": LIVE_AGGRESSIVE_EDGE_V11_1_COMBO,
+        "entry_marker": LIVE_AGGRESSIVE_EDGE_V11_1_ENTRY_MARKER,
+        "role": "实盘隔离账户，基于 V11 小幅收紧 Up 顶层盘口偏斜；用于和 V11 做独立实盘对照",
         "stop_win_enabled": False,
         "signal_filter_mode": SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
     },
@@ -1874,12 +1886,13 @@ class LiveStrategyRunner:
         signal: Signal,
         report: dict[str, Any],
         *,
+        guard_label: str = "V11",
         minute_bucket: int,
         abs_move_bps: float,
         risk_score: float | None,
         entry_price: float | None,
     ) -> str | None:
-        """V8 前置守卫；V11 REAL 必须先通过样本准入使用的基础安全线。"""
+        """V8 前置守卫；V11 系列 REAL 必须先通过样本准入使用的基础安全线。"""
 
         reasons: list[str] = []
         # 这里对齐 diagnostic V11 的 V8 前置逻辑，防止实盘比样本准入更宽松。
@@ -1899,13 +1912,20 @@ class LiveStrategyRunner:
             return None
         features = report.get("features") if isinstance(report.get("features"), dict) else {}
         return (
-            "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: V8 前置守卫未通过；"
+            f"SINGLE_AGGRESSIVE_EDGE {guard_label}_REAL_GUARD BLOCK: V8 前置守卫未通过；"
             + "; ".join(reasons)
             + f" | m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
             + f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(_float_or_none(features.get('depth_skew')), 4)} "
             + f"top={_format_optional_float(_float_or_none(features.get('top_level_skew')), 4)} "
             + f"risk={_format_optional_float(risk_score, 4)}"
         )
+
+    def _aggressive_edge_v11_live_guard_profile(self) -> tuple[str, float]:
+        """返回 V11 系列实盘守卫标签和 Up 顶层盘口阈值，避免 V11 历史口径被覆盖。"""
+
+        if self.variant_id == LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID:
+            return "V11.1", LIVE_AGGRESSIVE_EDGE_V11_1_UP_MIN_TOP_LEVEL_SKEW
+        return "V11", LIVE_AGGRESSIVE_EDGE_V11_UP_MIN_TOP_LEVEL_SKEW
 
     def _aggressive_edge_v11_live_guard_result(
         self,
@@ -1914,9 +1934,10 @@ class LiveStrategyRunner:
         price: dict[str, Any],
         quotes: dict[str, dict[str, Any]],
     ) -> tuple[str | None, str | None]:
-        """V11 REAL 入场守卫；和 V11 Diagnostic 使用同一批盘口深度、动量和风险特征。"""
+        """V11 系列 REAL 入场守卫；和 V11 Diagnostic 使用同一批盘口深度、动量和风险特征。"""
 
         now = time.time()
+        guard_label, up_min_top_level_skew = self._aggressive_edge_v11_live_guard_profile()
         minute_bucket = _aggressive_edge_minute_bucket(market, now)
         quote = quotes.get(signal.side) if isinstance(quotes.get(signal.side), dict) else {}
         quote = self._quote_with_depth(market, signal.side, quote)
@@ -1944,7 +1965,7 @@ class LiveStrategyRunner:
             max_age_ms=self.settings.max_quote_age_ms,
         )
         if report is None:
-            return "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: 缺少盘口风险报告，禁止实盘入场", None
+            return f"SINGLE_AGGRESSIVE_EDGE {guard_label}_REAL_GUARD BLOCK: 缺少盘口风险报告，禁止实盘入场", None
         features = report.get("features") if isinstance(report.get("features"), dict) else {}
         entry_price = _float_or_none(signal.entry_price)
         if entry_price is None:
@@ -1959,6 +1980,7 @@ class LiveStrategyRunner:
         v8_block_reason = self._aggressive_edge_v8_live_block_reason(
             signal,
             report,
+            guard_label=guard_label,
             minute_bucket=minute_bucket,
             abs_move_bps=abs_move_bps,
             risk_score=risk_score,
@@ -1980,26 +2002,28 @@ class LiveStrategyRunner:
         elif risk_score > LIVE_AGGRESSIVE_EDGE_V11_MAX_RISK_SCORE:
             reasons.append(f"V11_RISK_TOO_HIGH risk={risk_score:.4f}")
         if signal.side == "Up":
-            # 实盘首批输单暴露出 Up 深度达标但顶层买盘很薄的问题，这里保留样本验证后的小幅收紧。
+            # 实盘首批输单暴露出 Up 深度达标但顶层买盘偏薄的问题；V11.1 只在这里加严，方便和 V11 对照复盘。
             if top_level_skew is None:
                 reasons.append("V11_UP_TOP_SKEW_MISSING")
-            elif top_level_skew < LIVE_AGGRESSIVE_EDGE_V11_UP_MIN_TOP_LEVEL_SKEW:
-                reasons.append(f"V11_UP_WEAK_TOP_SKEW top={top_level_skew:.4f}")
+            elif top_level_skew < up_min_top_level_skew:
+                reasons.append(f"V11_UP_WEAK_TOP_SKEW top={top_level_skew:.4f} min={up_min_top_level_skew:.2f}")
         if not reasons:
             pass_note = (
-                "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD PASS: "
+                f"SINGLE_AGGRESSIVE_EDGE {guard_label}_REAL_GUARD PASS: "
                 f"m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
                 f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(depth_skew, 4)} "
-                f"top={_format_optional_float(top_level_skew, 4)} risk={_format_optional_float(risk_score, 4)}"
+                f"top={_format_optional_float(top_level_skew, 4)} "
+                f"up_top_min={up_min_top_level_skew:.2f} risk={_format_optional_float(risk_score, 4)}"
             )
-            logger.debug("Aggressive Edge V11 REAL 放行 round_id=%s %s", market.round_id, pass_note)
+            logger.debug("Aggressive Edge %s REAL 放行 round_id=%s %s", guard_label, market.round_id, pass_note)
             return None, pass_note
         return (
-            "SINGLE_AGGRESSIVE_EDGE V11_REAL_GUARD BLOCK: "
+            f"SINGLE_AGGRESSIVE_EDGE {guard_label}_REAL_GUARD BLOCK: "
             + "; ".join(reasons)
             + f" | m{minute_bucket} side={signal.side} entry={_format_optional_float(entry_price, 4)} "
             + f"abs_move={abs_move_bps:.2f} depth={_format_optional_float(depth_skew, 4)} "
-            + f"top={_format_optional_float(top_level_skew, 4)} risk={_format_optional_float(risk_score, 4)}"
+            + f"top={_format_optional_float(top_level_skew, 4)} "
+            + f"up_top_min={up_min_top_level_skew:.2f} risk={_format_optional_float(risk_score, 4)}"
         ), None
 
     def _aggressive_edge_v11_live_block_reason(
