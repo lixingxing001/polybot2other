@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20260608-samples-v4">
+    <link rel="stylesheet" href="/static/styles.css?v=20260611-polymarket-status">
   </head>
   <body>
     <main class="app-shell">
@@ -20,6 +20,7 @@
         <nav class="app-nav" aria-label="页面导航">
           <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">Bot</button>
           <button id="nav-samples" class="app-nav-item" type="button" data-nav-page="samples">样本</button>
+          <button id="nav-status" class="app-nav-item" type="button" data-nav-page="status">状态</button>
         </nav>
         <div class="top-actions">
           <button id="paper-pause-toggle" class="paper-pause-button" type="button" aria-pressed="false">暂停Paper</button>
@@ -28,6 +29,7 @@
             <span></span>
             实盘
           </label>
+          <span id="polymarket-status-pill" class="polymarket-status-pill is-loading">Polymarket 读取中</span>
           <span id="runtime-pill" class="pill">连接中</span>
           <button id="tick-button" type="button" title="立即同步">同步</button>
         </div>
@@ -436,9 +438,52 @@
           </div>
         </section>
       </section>
+      <section id="status-page" class="app-page is-hidden" data-page="status" aria-labelledby="nav-status" aria-hidden="true">
+        <section class="panel polymarket-status-panel">
+          <div class="panel-head status-page-head">
+            <div>
+              <h2>Polymarket 服务状态</h2>
+              <span id="polymarket-status-meta">等待官方状态</span>
+            </div>
+            <div class="panel-head-actions">
+              <a id="polymarket-status-official" class="report-link" href="https://status.polymarket.com" target="_blank" rel="noopener">官方状态页</a>
+              <button id="polymarket-status-refresh" type="button">刷新状态</button>
+            </div>
+          </div>
+          <div id="polymarket-status-summary" class="polymarket-status-summary">
+            <div class="status-empty">等待 Polymarket 状态数据</div>
+          </div>
+        </section>
+
+        <section class="status-layout">
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>活跃事件</h2>
+                <span id="polymarket-incident-meta">0 条</span>
+              </div>
+            </div>
+            <div id="polymarket-incident-list" class="polymarket-incident-list">
+              <div class="status-empty">暂无事件数据</div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>拉取诊断</h2>
+                <span>后端代理接口</span>
+              </div>
+            </div>
+            <div id="polymarket-status-diagnostics" class="polymarket-status-diagnostics">
+              <div class="status-empty">等待接口响应</div>
+            </div>
+          </div>
+        </section>
+      </section>
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260609-sample-local-pagination"></script>
+    <script src="/static/app.js?v=20260611-polymarket-status"></script>
   </body>
 </html>

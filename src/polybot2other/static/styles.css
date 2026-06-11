@@ -333,6 +333,64 @@ button.danger-button:hover:not(:disabled) {
   color: var(--amber);
 }
 
+.polymarket-status-pill {
+  min-width: 156px;
+  min-height: 32px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #20262b;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.polymarket-status-pill::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.9;
+}
+
+.polymarket-status-pill.ok {
+  border-color: rgba(35, 196, 131, 0.42);
+  background: rgba(35, 196, 131, 0.1);
+  color: var(--green);
+}
+
+.polymarket-status-pill.warn,
+.polymarket-status-pill.stale {
+  border-color: rgba(244, 191, 80, 0.48);
+  background: rgba(244, 191, 80, 0.1);
+  color: var(--amber);
+}
+
+.polymarket-status-pill.error {
+  border-color: rgba(255, 95, 109, 0.56);
+  background: rgba(255, 95, 109, 0.1);
+  color: var(--red);
+}
+
+.polymarket-status-pill.is-loading::before {
+  animation: status-pulse 900ms ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  50% {
+    opacity: 0.34;
+    transform: scale(0.72);
+  }
+}
+
 .scope-switch {
   min-height: 30px;
   display: inline-flex;
@@ -1274,6 +1332,198 @@ button.danger-button:hover:not(:disabled) {
   overflow: auto;
 }
 
+.polymarket-status-panel {
+  margin-bottom: 12px;
+}
+
+.status-page-head .panel-head-actions {
+  align-items: center;
+}
+
+.polymarket-status-summary {
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.status-summary-card {
+  min-height: 96px;
+  padding: 13px;
+  display: grid;
+  align-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #12171b;
+}
+
+.status-summary-card span,
+.status-summary-card small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-summary-card strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-summary-card.ok {
+  border-color: rgba(35, 196, 131, 0.35);
+}
+
+.status-summary-card.ok strong {
+  color: var(--green);
+}
+
+.status-summary-card.warn,
+.status-summary-card.stale {
+  border-color: rgba(244, 191, 80, 0.42);
+}
+
+.status-summary-card.warn strong,
+.status-summary-card.stale strong {
+  color: var(--amber);
+}
+
+.status-summary-card.error {
+  border-color: rgba(255, 95, 109, 0.45);
+}
+
+.status-summary-card.error strong {
+  color: var(--red);
+}
+
+.status-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.65fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.polymarket-incident-list,
+.polymarket-status-diagnostics {
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.status-empty {
+  min-height: 92px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.incident-card {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #12171b;
+}
+
+.incident-card.warn {
+  border-color: rgba(244, 191, 80, 0.42);
+}
+
+.incident-card.error {
+  border-color: rgba(255, 95, 109, 0.48);
+}
+
+.incident-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.incident-card-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.incident-card-head strong {
+  min-width: 0;
+  font-size: 15px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.incident-card-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.incident-impact {
+  min-height: 26px;
+  padding: 4px 9px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(244, 191, 80, 0.42);
+  border-radius: 999px;
+  color: var(--amber);
+  background: rgba(244, 191, 80, 0.09);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.incident-card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.incident-card-grid span,
+.diagnostic-row {
+  min-width: 0;
+  padding: 9px 10px;
+  display: grid;
+  gap: 4px;
+  border: 1px solid rgba(50, 58, 66, 0.82);
+  border-radius: 6px;
+  background: #0f1317;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.incident-card-grid strong,
+.diagnostic-row strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  font-weight: 800;
+}
+
+.incident-card a {
+  width: fit-content;
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.incident-card a:hover {
+  text-decoration: underline;
+}
+
+.diagnostic-row {
+  grid-template-columns: 108px minmax(0, 1fr);
+  align-items: center;
+}
+
 .sample-table-wrap thead th,
 .sample-recent-wrap thead th {
   position: sticky;
@@ -2115,6 +2365,14 @@ tbody tr:hover {
     grid-template-columns: 1fr 1fr;
   }
 
+  .polymarket-status-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .status-layout {
+    grid-template-columns: 1fr;
+  }
+
   .sample-progress-cards {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -2157,9 +2415,15 @@ tbody tr:hover {
   .main-grid,
   .table-grid,
   .sample-progress-grid,
+  .polymarket-status-summary,
+  .incident-card-grid,
   .market-fields,
   .live-gate-summary,
   .live-gate-checks {
+    grid-template-columns: 1fr;
+  }
+
+  .diagnostic-row {
     grid-template-columns: 1fr;
   }
 
@@ -2288,7 +2552,8 @@ tbody tr:hover {
 
 @media (prefers-reduced-motion: reduce) {
   .skeleton::after,
-  .recent-content-enter {
+  .recent-content-enter,
+  .polymarket-status-pill.is-loading::before {
     animation: none;
   }
 

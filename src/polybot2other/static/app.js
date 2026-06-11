@@ -5,6 +5,15 @@ const ids = {
   navItems: Array.from(document.querySelectorAll("[data-nav-page]")),
   botPage: document.getElementById("bot-page"),
   samplePage: document.getElementById("sample-page"),
+  statusPage: document.getElementById("status-page"),
+  polymarketStatusPill: document.getElementById("polymarket-status-pill"),
+  polymarketStatusMeta: document.getElementById("polymarket-status-meta"),
+  polymarketStatusOfficial: document.getElementById("polymarket-status-official"),
+  polymarketStatusRefresh: document.getElementById("polymarket-status-refresh"),
+  polymarketStatusSummary: document.getElementById("polymarket-status-summary"),
+  polymarketIncidentMeta: document.getElementById("polymarket-incident-meta"),
+  polymarketIncidentList: document.getElementById("polymarket-incident-list"),
+  polymarketStatusDiagnostics: document.getElementById("polymarket-status-diagnostics"),
   sampleProgressMeta: document.getElementById("sample-progress-meta"),
   sampleProgressSummary: document.getElementById("sample-progress-summary"),
   sampleProgressBars: document.getElementById("sample-progress-bars"),
@@ -111,6 +120,7 @@ const OKX_PING_MS = 20_000;
 const SNAPSHOT_POST_MS = 1_000;
 const STATUS_POLL_MS = 2_000;
 const STATUS_STREAM_STALE_MS = 4_000;
+const POLYMARKET_STATUS_REFRESH_MS = 30_000;
 const RECENT_PAGE_SIZE = 100;
 const ORDER_PAGE_SIZE = 20;
 const TABLE_PAGE_SIZE = 10;
@@ -133,7 +143,7 @@ const FIELD_STORAGE_KEYS = {
   order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
 };
-const APP_PAGE_KEYS = new Set(["bot", "samples"]);
+const APP_PAGE_KEYS = new Set(["bot", "samples", "status"]);
 const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version:v12";
 const SAMPLE_DEFAULT_VERSION = "V12";
 const SAMPLE_VERSION_KEYS = ["V12", "V11", "V10", "V9", "V8", "V7", "V6", "V5", "V4"];
@@ -225,6 +235,9 @@ let latestStatus = null;
 let statusStream = null;
 let statusStreamConnected = false;
 let lastStatusStreamAt = 0;
+let polymarketStatus = null;
+let polymarketStatusInFlight = false;
+let polymarketStatusLastFetchMs = 0;
 let livePreflight = null;
 let liveDoctor = null;
 let liveOnce = null;
@@ -883,7 +896,7 @@ function setActiveAppPage(page, options = {}) {
     if (selected) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  for (const [key, element] of [["bot", ids.botPage], ["samples", ids.samplePage]]) {
+  for (const [key, element] of [["bot", ids.botPage], ["samples", ids.samplePage], ["status", ids.statusPage]]) {
     if (!element) continue;
     const selected = key === nextPage;
     element.classList.toggle("is-active", selected);
@@ -904,6 +917,265 @@ function setActiveAppPage(page, options = {}) {
     window.setTimeout(() => renderSampleProgress(latestStatus.runtime || {}, { force: true }), 120);
     window.setTimeout(() => loadSampleCandidates({ renderLoading: true }).catch(showError), 160);
   }
+  if (nextPage === "status") {
+    renderPolymarketStatus();
+    window.setTimeout(() => loadPolymarketStatus(true).catch(handlePolymarketStatusError), 120);
+  }
+}
+
+function statusPageActive() {
+  return activeAppPage === "status";
+}
+
+function renderPolymarketStatus() {
+  renderPolymarketStatusPill();
+  if (!ids.polymarketStatusSummary && !ids.polymarketIncidentList && !ids.polymarketStatusDiagnostics) return;
+  const data = polymarketStatus;
+  if (!data) {
+    if (ids.polymarketStatusMeta) ids.polymarketStatusMeta.textContent = "等待官方状态";
+    if (ids.polymarketStatusSummary) ids.polymarketStatusSummary.innerHTML = `<div class="status-empty">等待 Polymarket 状态数据</div>`;
+    if (ids.polymarketIncidentMeta) ids.polymarketIncidentMeta.textContent = "0 条";
+    if (ids.polymarketIncidentList) ids.polymarketIncidentList.innerHTML = `<div class="status-empty">暂无事件数据</div>`;
+    if (ids.polymarketStatusDiagnostics) ids.polymarketStatusDiagnostics.innerHTML = `<div class="status-empty">等待接口响应</div>`;
+    return;
+  }
+
+  const status = String(data.summary_status || data.page?.status || "UNKNOWN").toUpperCase();
+  const severity = polymarketStatusSeverity(data);
+  const incidents = Array.isArray(data.activeIncidents) ? data.activeIncidents : [];
+  const statusLabel = polymarketSummaryLabel(status, data);
+  const checkedAt = formatStatusTimestamp(data.checked_at);
+  const fetchedAt = formatStatusTimestamp(data.fetched_at);
+  const cacheAge = formatStatusAge(data.cache_age_seconds);
+  const latency = toNumber(data.latency_ms);
+  if (ids.polymarketStatusMeta) {
+    const cacheText = data.stale ? "状态过期" : data.cached ? "使用缓存" : "刚刚刷新";
+    ids.polymarketStatusMeta.textContent = `${cacheText} · 检查 ${checkedAt}`;
+  }
+  if (ids.polymarketStatusOfficial) {
+    ids.polymarketStatusOfficial.href = safeHttpUrl(data.page?.url) || "https://status.polymarket.com";
+  }
+  if (ids.polymarketStatusSummary) {
+    ids.polymarketStatusSummary.innerHTML = `
+      <div class="status-summary-card ${severity}">
+        <span>总体状态</span>
+        <strong>${safe(statusLabel)}</strong>
+        <small>${safe(status)}</small>
+      </div>
+      <div class="status-summary-card ${incidents.length ? "warn" : "ok"}">
+        <span>活跃事件</span>
+        <strong>${number.format(incidents.length)}</strong>
+        <small>${incidents.length ? "需要关注" : "暂无事件"}</small>
+      </div>
+      <div class="status-summary-card">
+        <span>官方更新时间</span>
+        <strong>${safe(fetchedAt)}</strong>
+        <small>${safe(cacheAge)}</small>
+      </div>
+      <div class="status-summary-card">
+        <span>后端延迟</span>
+        <strong>${latency == null ? "-" : `${safe(number.format(latency))} ms`}</strong>
+        <small>${data.cached ? "缓存命中" : "官方请求"}</small>
+      </div>
+    `;
+  }
+  renderPolymarketIncidents(incidents, data);
+  renderPolymarketDiagnostics(data);
+}
+
+function renderPolymarketStatusPill() {
+  if (!ids.polymarketStatusPill) return;
+  const data = polymarketStatus;
+  const severity = polymarketStatusSeverity(data);
+  ids.polymarketStatusPill.className = `polymarket-status-pill ${severity}`;
+  if (!data) {
+    ids.polymarketStatusPill.textContent = "Polymarket 读取中";
+    ids.polymarketStatusPill.title = "等待状态接口响应";
+    return;
+  }
+  const status = String(data.summary_status || data.page?.status || "UNKNOWN").toUpperCase();
+  ids.polymarketStatusPill.textContent = `Polymarket ${polymarketSummaryLabel(status, data)}`;
+  ids.polymarketStatusPill.title = `${status} · 检查 ${formatStatusTimestamp(data.checked_at)}`;
+}
+
+function renderPolymarketIncidents(incidents, data) {
+  if (ids.polymarketIncidentMeta) ids.polymarketIncidentMeta.textContent = `${number.format(incidents.length)} 条`;
+  if (!ids.polymarketIncidentList) return;
+  if (!incidents.length) {
+    const message = data.ok ? "当前无活跃事件" : "状态接口异常，暂无可用事件列表";
+    ids.polymarketIncidentList.innerHTML = `<div class="status-empty">${safe(message)}</div>`;
+    return;
+  }
+  ids.polymarketIncidentList.innerHTML = incidents.map((incident) => {
+    const impact = String(incident.impact || "UNKNOWN").toUpperCase();
+    const status = String(incident.status || "UNKNOWN").toUpperCase();
+    const href = safeHttpUrl(incident.url);
+    const link = href ? `<a href="${safe(href)}" target="_blank" rel="noopener">查看官方事件</a>` : "";
+    return `
+      <article class="incident-card ${polymarketIncidentSeverity(incident)}">
+        <div class="incident-card-head">
+          <div>
+            <strong>${safe(incident.name || "未命名事件")}</strong>
+            <span>${safe(polymarketIncidentStatusLabel(status))}</span>
+          </div>
+          <span class="incident-impact">${safe(polymarketImpactLabel(impact))}</span>
+        </div>
+        <div class="incident-card-grid">
+          <span>开始<strong>${safe(formatIncidentTimestamp(incident.started))}</strong></span>
+          <span>更新<strong>${safe(formatIncidentTimestamp(incident.updatedAt))}</strong></span>
+          <span>状态<strong>${safe(status)}</strong></span>
+          <span>影响<strong>${safe(impact)}</strong></span>
+        </div>
+        ${link}
+      </article>
+    `;
+  }).join("");
+}
+
+function renderPolymarketDiagnostics(data) {
+  if (!ids.polymarketStatusDiagnostics) return;
+  const rows = [
+    ["代理接口", "/api/polymarket-status"],
+    ["官方接口", data.source_url || "https://status.polymarket.com/v3/summary.json"],
+    ["拉取结果", data.ok ? "成功" : `失败：${data.error || "未知错误"}`],
+    ["缓存状态", data.stale ? "过期缓存" : data.cached ? "缓存命中" : "新鲜数据"],
+    ["检查时间", formatStatusTimestamp(data.checked_at)],
+    ["官方拉取", formatStatusTimestamp(data.fetched_at)],
+  ];
+  ids.polymarketStatusDiagnostics.innerHTML = rows.map(([label, value]) => `
+    <div class="diagnostic-row">
+      <span>${safe(label)}</span>
+      <strong>${safe(value)}</strong>
+    </div>
+  `).join("");
+}
+
+async function loadPolymarketStatus(force = false) {
+  if (polymarketStatusInFlight) return;
+  const now = Date.now();
+  if (!force && polymarketStatusLastFetchMs && now - polymarketStatusLastFetchMs < POLYMARKET_STATUS_REFRESH_MS) return;
+  polymarketStatusInFlight = true;
+  try {
+    const params = force ? "?refresh=true" : "";
+    const res = await fetch(`/api/polymarket-status${params}`);
+    const data = await res.json().catch(() => ({ ok: false, error: `polymarket status HTTP ${res.status}` }));
+    if (!res.ok) throw new Error(data.error || `polymarket status HTTP ${res.status}`);
+    polymarketStatus = data;
+    polymarketStatusLastFetchMs = Date.now();
+  } catch (error) {
+    if (polymarketStatus) {
+      polymarketStatus = {
+        ...polymarketStatus,
+        ok: false,
+        stale: true,
+        error: error.message,
+        checked_at: Date.now() / 1000,
+      };
+    } else {
+      polymarketStatus = {
+        ok: false,
+        stale: false,
+        cached: false,
+        error: error.message,
+        checked_at: Date.now() / 1000,
+        fetched_at: null,
+        page: { name: "Polymarket", url: "https://status.polymarket.com", status: "UNKNOWN" },
+        summary_status: "UNKNOWN",
+        activeIncidents: [],
+        incident_count: 0,
+      };
+    }
+    throw error;
+  } finally {
+    polymarketStatusInFlight = false;
+    renderPolymarketStatus();
+  }
+}
+
+function handlePolymarketStatusError(error) {
+  console.warn("[polymarket-status] refresh failed", error);
+  renderPolymarketStatus();
+}
+
+function polymarketStatusSeverity(data) {
+  if (!data) return "is-loading";
+  if (!data.ok && !data.stale) return "error";
+  if (data.stale) return "stale";
+  const status = String(data.summary_status || data.page?.status || "").toUpperCase();
+  const incidents = Array.isArray(data.activeIncidents) ? data.activeIncidents : [];
+  if (incidents.some((incident) => polymarketIncidentSeverity(incident) === "error")) return "error";
+  if (status === "UP" || status === "OPERATIONAL") return incidents.length ? "warn" : "ok";
+  if (status === "HASISSUES" || incidents.length) return "warn";
+  if (status === "UNDERMAINTENANCE" || status === "MAINTENANCE") return "stale";
+  return "error";
+}
+
+function polymarketIncidentSeverity(incident) {
+  const impact = String(incident?.impact || "").toUpperCase();
+  if (impact.includes("CRITICAL") || impact.includes("MAJOR") || impact.includes("OUTAGE")) return "error";
+  if (impact.includes("DEGRADED") || impact.includes("MINOR") || impact.includes("PERFORMANCE")) return "warn";
+  return "stale";
+}
+
+function polymarketSummaryLabel(status, data) {
+  if (data?.stale) return "状态过期";
+  if (data && !data.ok) return "读取失败";
+  const labels = {
+    UP: "正常",
+    OPERATIONAL: "正常",
+    HASISSUES: "有异常",
+    UNDERMAINTENANCE: "维护中",
+    MAINTENANCE: "维护中",
+    UNKNOWN: "未知",
+  };
+  return labels[String(status || "UNKNOWN").toUpperCase()] || "未知";
+}
+
+function polymarketImpactLabel(impact) {
+  const labels = {
+    NONE: "无影响",
+    MINOR: "轻微影响",
+    MAJOR: "严重影响",
+    CRITICAL: "关键影响",
+    DEGRADEDPERFORMANCE: "性能下降",
+    PARTIALOUTAGE: "部分中断",
+    MAJOROUTAGE: "严重中断",
+  };
+  return labels[String(impact || "UNKNOWN").toUpperCase()] || "未知影响";
+}
+
+function polymarketIncidentStatusLabel(status) {
+  const labels = {
+    INVESTIGATING: "调查中",
+    IDENTIFIED: "已定位",
+    MONITORING: "监控中",
+    RESOLVED: "已恢复",
+    UNKNOWN: "未知状态",
+  };
+  return labels[String(status || "UNKNOWN").toUpperCase()] || "未知状态";
+}
+
+function formatStatusTimestamp(seconds) {
+  const parsed = toNumber(seconds);
+  if (parsed == null) return "-";
+  return new Date(parsed * 1000).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatIncidentTimestamp(value) {
+  const text = String(value || "").trim();
+  if (!text) return "-";
+  const parsedMs = Date.parse(text);
+  if (!Number.isFinite(parsedMs)) return text;
+  return new Date(parsedMs).toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatStatusAge(seconds) {
+  const parsed = toNumber(seconds);
+  if (parsed == null) return "-";
+  if (parsed < 1) return "刚刚";
+  if (parsed < 60) return `${Math.round(parsed)} 秒前`;
+  if (parsed < 3600) return `${Math.floor(parsed / 60)} 分钟前`;
+  return `${Math.floor(parsed / 3600)} 小时前`;
 }
 
 function createRealtimeSignalState() {
@@ -5072,6 +5344,7 @@ function handleVisibilityChange() {
   loadEquityCurve(false).catch(showError);
   foregroundRefreshTimer = setTimeout(() => {
     loadStatus().catch(showError);
+    loadPolymarketStatus(statusPageActive()).catch(handlePolymarketStatusError);
   }, 150);
 }
 
@@ -5113,6 +5386,9 @@ for (const navItem of ids.navItems || []) {
 ids.sampleVersion?.addEventListener("change", () => setSampleVersion(ids.sampleVersion.value));
 ids.sampleRecentPrevPage?.addEventListener("click", () => changeSampleRecentPage(-1).catch(showError));
 ids.sampleRecentNextPage?.addEventListener("click", () => changeSampleRecentPage(1).catch(showError));
+ids.polymarketStatusRefresh?.addEventListener("click", () => {
+  withButtonLoading(ids.polymarketStatusRefresh, () => loadPolymarketStatus(true)).catch(handlePolymarketStatusError);
+});
 bindLiveSettingsDirtyTracking();
 bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
@@ -5203,19 +5479,24 @@ document.addEventListener("pointerup", scheduleProtectedTableFlush);
 document.addEventListener("pointerup", scheduleProtectedLiveCopyFlush);
 
 initFieldOptions();
-	setRecentLoading(true);
-	loadStatus().then(() => {
-	  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
-	  connectStatusStream();
-	  connectPriceSocket();
-	  connectOkxSocket();
-	  connectBinanceMarketSocket();
-	}).catch(showError);
-	setInterval(() => {
-	  if (!pageVisible) return;
-	  if (statusStreamConnected && Date.now() - lastStatusStreamAt < STATUS_STREAM_STALE_MS) return;
-	  loadStatus().catch(showError);
-	}, STATUS_POLL_MS);
+setRecentLoading(true);
+loadPolymarketStatus(false).catch(handlePolymarketStatusError);
+loadStatus().then(() => {
+  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
+  connectStatusStream();
+  connectPriceSocket();
+  connectOkxSocket();
+  connectBinanceMarketSocket();
+}).catch(showError);
+setInterval(() => {
+  if (!pageVisible) return;
+  if (statusStreamConnected && Date.now() - lastStatusStreamAt < STATUS_STREAM_STALE_MS) return;
+  loadStatus().catch(showError);
+}, STATUS_POLL_MS);
+setInterval(() => {
+  if (!pageVisible) return;
+  loadPolymarketStatus(false).catch(handlePolymarketStatusError);
+}, POLYMARKET_STATUS_REFRESH_MS);
 setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));

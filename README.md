@@ -147,6 +147,7 @@ GET /api/live-preflight?include_snapshot=false
 GET /api/live-open-orders
 GET /api/live-evidence?external_order_id=live-order-id&force=true&include_snapshot=false
 GET /api/live-doctor?refresh=true&include_snapshot=false
+GET /api/polymarket-status?refresh=true
 POST /api/live-once
 GET /api/strategy-experiments
 GET /api/strategy-experiments?variant_id=SINGLE_FAK&trade_limit=50&order_limit=50
@@ -180,6 +181,8 @@ POST /api/live-sell {"trade_id":1}
 `/api/live-doctor` is read-only and compresses live settings plus preflight into a first-order checklist: one-shot readiness, SDK compatibility, fatal blockers, transient blockers, credential setup status, next actions, recommended one-shot command, and post-order evidence checklist.
 
 `/api/live-doctor` also returns `first_order.stake_requirement` with the configured stake, current market minimum order size, shortfall, and a recommended settings patch when the stake is below the official minimum. The bot will not submit a real order while `stake_dollars < min_order_size`.
+
+`/api/polymarket-status` is a read-only backend proxy for Polymarket's official status summary. It caches successful responses briefly, returns stale cached data with an error field when the official status page cannot be reached, and is intended for dashboard visibility only. It does not replace live preflight, wallet, market, orderbook, or official open-order checks.
 
 `/api/live-reload-credentials` reloads only live credential env keys from `.env.live` / `.env.local` / `.env` or `POLYBOT2OTHER_ENV_FILE` in the running dashboard process, then clears cached SDK authentication state. Use it after editing private key, signature type, funder, or CLOB API credential values while the service is already running. It does not submit, cancel, or sell orders. Non-credential settings such as database path and default risk config still require a normal restart or the existing settings UI/API.
 

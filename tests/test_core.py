@@ -7,6 +7,7 @@ import threading
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -5441,6 +5442,94 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(bot.entered.wait(1.0))
         finally:
             bot.release.set()
+            server.server_close()
+
+    def test_dashboard_polymarket_status_caches_and_normalizes_payload(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, payload: dict[str, Any]) -> None:
+                self.data = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001 - context manager protocol
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                return self.data
+
+        server = DashboardServer(("127.0.0.1", 0), Handler, object())  # type: ignore[arg-type]
+        try:
+            payload = {
+                "page": {"name": "Polymarket", "url": "https://status.polymarket.com", "status": "HASISSUES"},
+                "activeIncidents": [
+                    {
+                        "id": "incident-1",
+                        "name": "Crypto charts and price feeds",
+                        "started": "2026-06-11T04:30:00.000Z",
+                        "status": "INVESTIGATING",
+                        "impact": "DEGRADEDPERFORMANCE",
+                        "url": "https://status.polymarket.com/incident-1",
+                        "updatedAt": "2026-06-11T05:10:36.742Z",
+                    }
+                ],
+            }
+            with patch("polybot2other.web.urllib.request.urlopen", return_value=FakeResponse(payload)) as urlopen:
+                first = server.polymarket_status()
+                second = server.polymarket_status()
+
+            self.assertTrue(first["ok"])
+            self.assertFalse(first["cached"])
+            self.assertEqual(first["summary_status"], "HASISSUES")
+            self.assertEqual(first["incident_count"], 1)
+            self.assertEqual(first["activeIncidents"][0]["impact"], "DEGRADEDPERFORMANCE")
+            self.assertTrue(second["cached"])
+            self.assertEqual(urlopen.call_count, 1)
+        finally:
+            server.server_close()
+
+    def test_dashboard_polymarket_status_returns_stale_cache_on_refresh_error(self) -> None:
+        class FakeResponse:
+            status = 200
+
+            def __init__(self) -> None:
+                self.data = json.dumps(
+                    {
+                        "page": {"name": "Polymarket", "url": "https://status.polymarket.com", "status": "UP"},
+                        "activeIncidents": [],
+                    }
+                ).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001 - context manager protocol
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                return self.data
+
+        server = DashboardServer(("127.0.0.1", 0), Handler, object())  # type: ignore[arg-type]
+        try:
+            with patch("polybot2other.web.urllib.request.urlopen", return_value=FakeResponse()):
+                first = server.polymarket_status()
+            self.assertEqual(first["summary_status"], "UP")
+            server._polymarket_status_cache_at = 0.0
+
+            with patch(
+                "polybot2other.web.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("offline"),
+            ):
+                fallback = server.polymarket_status()
+
+            self.assertFalse(fallback["ok"])
+            self.assertTrue(fallback["cached"])
+            self.assertTrue(fallback["stale"])
+            self.assertEqual(fallback["summary_status"], "UP")
+            self.assertIn("offline", fallback["error"])
+        finally:
             server.server_close()
 
     def test_live_snapshot_ignores_expired_market_without_sync_refresh(self) -> None:

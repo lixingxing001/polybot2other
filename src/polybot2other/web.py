@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +26,15 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATUS_STREAM_INTERVAL_SECONDS = 1.0
 STATUS_SNAPSHOT_CACHE_SECONDS = 0.5
 LIVE_SNAPSHOT_CACHE_SECONDS = 0.5
+POLYMARKET_STATUS_URL = "https://status.polymarket.com/v3/summary.json"
+POLYMARKET_STATUS_PAGE_URL = "https://status.polymarket.com"
+POLYMARKET_STATUS_CACHE_SECONDS = 30.0
+POLYMARKET_STATUS_TIMEOUT_SECONDS = 3.0
+POLYMARKET_STATUS_MAX_BYTES = 128 * 1024
+POLYMARKET_STATUS_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "polybot2other-dashboard/0.1",
+}
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -40,6 +50,9 @@ class DashboardServer(ThreadingHTTPServer):
         self._live_snapshot_cache_key = ""
         self._live_snapshot_lock = threading.Lock()
         self._live_snapshot_refresh_lock = threading.Lock()
+        self._polymarket_status_cache: dict[str, Any] | None = None
+        self._polymarket_status_cache_at = 0.0
+        self._polymarket_status_lock = threading.Lock()
 
     def status_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -116,6 +129,34 @@ class DashboardServer(ThreadingHTTPServer):
         threading.Thread(target=_worker, name="polybot2other-live-snapshot-refresh", daemon=True).start()
         return True
 
+    def polymarket_status(self, force: bool = False) -> dict[str, Any]:
+        now = time.time()
+        with self._polymarket_status_lock:
+            if (
+                not force
+                and self._polymarket_status_cache is not None
+                and now - self._polymarket_status_cache_at <= POLYMARKET_STATUS_CACHE_SECONDS
+            ):
+                return _polymarket_status_response(self._polymarket_status_cache, cached=True, stale=False)
+            try:
+                payload = _fetch_polymarket_status_payload()
+            except Exception as exc:  # noqa: BLE001 - 外部状态页失败时需要保留诊断信息
+                message = str(exc) or exc.__class__.__name__
+                sys.stderr.write(f"[polymarket-status] 官方状态刷新失败 error={message}\n")
+                if self._polymarket_status_cache is not None:
+                    fallback = _polymarket_status_response(self._polymarket_status_cache, cached=True, stale=True)
+                    fallback["ok"] = False
+                    fallback["error"] = message
+                    return fallback
+                return _polymarket_status_error_payload(message, checked_at=time.time())
+            self._polymarket_status_cache = payload
+            self._polymarket_status_cache_at = time.time()
+            sys.stderr.write(
+                "[polymarket-status] 官方状态刷新完成 "
+                f"status={payload.get('summary_status')} incidents={payload.get('incident_count')}\n"
+            )
+            return _polymarket_status_response(payload, cached=False, stale=False)
+
 
 class Handler(BaseHTTPRequestHandler):
     server: DashboardServer
@@ -130,6 +171,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.status_snapshot(), include_body=False)
+            return
+        if path == "/api/polymarket-status":
+            self._send_json(self.server.polymarket_status(force=False), include_body=False)
             return
         if path == "/api/actor-analysis":
             self._send_json(self.server.bot.actor_analysis(force=False), include_body=False)
@@ -194,6 +238,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.status_snapshot())
+            return
+        if path == "/api/polymarket-status":
+            try:
+                refresh = _query_bool_optional(query, "refresh", False)
+                self._send_json(self.server.polymarket_status(force=refresh))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
         if path == "/api/status-stream":
             self._send_status_stream()
@@ -1007,6 +1058,109 @@ def _body_choice(payload: dict[str, Any], key: str, choices: set[str], default: 
         allowed = ", ".join(sorted(choices))
         raise ValueError(f"{key} must be one of {allowed}")
     return value
+
+
+def _fetch_polymarket_status_payload() -> dict[str, Any]:
+    request = urllib.request.Request(POLYMARKET_STATUS_URL, headers=POLYMARKET_STATUS_HEADERS)
+    started_at = time.time()
+    try:
+        with urllib.request.urlopen(request, timeout=POLYMARKET_STATUS_TIMEOUT_SECONDS) as response:
+            status_code = getattr(response, "status", None)
+            if status_code is None and hasattr(response, "getcode"):
+                status_code = response.getcode()
+            status_code = int(status_code or 200)
+            if status_code >= 400:
+                raise RuntimeError(f"HTTP {status_code}")
+            data = response.read(POLYMARKET_STATUS_MAX_BYTES + 1)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(f"request failed: {reason}") from exc
+    if len(data) > POLYMARKET_STATUS_MAX_BYTES:
+        raise RuntimeError("response too large")
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("invalid json") from exc
+    if not isinstance(raw, dict):
+        raise RuntimeError("status payload must be an object")
+    payload = _normalize_polymarket_status_payload(raw, fetched_at=time.time())
+    payload["latency_ms"] = round((time.time() - started_at) * 1000, 2)
+    return payload
+
+
+def _normalize_polymarket_status_payload(raw: dict[str, Any], fetched_at: float) -> dict[str, Any]:
+    page_raw = raw.get("page") if isinstance(raw.get("page"), dict) else {}
+    incidents_raw = raw.get("activeIncidents") if isinstance(raw.get("activeIncidents"), list) else []
+    incidents: list[dict[str, str]] = []
+    for item in incidents_raw:
+        if not isinstance(item, dict):
+            continue
+        incidents.append(
+            {
+                "id": _status_text(item.get("id")),
+                "impact": _status_text(item.get("impact")),
+                "name": _status_text(item.get("name")),
+                "started": _status_text(item.get("started")),
+                "status": _status_text(item.get("status")),
+                "updatedAt": _status_text(item.get("updatedAt")),
+                "url": _status_text(item.get("url")),
+            }
+        )
+    status = _status_text(page_raw.get("status")).upper() or "UNKNOWN"
+    page = {
+        "name": _status_text(page_raw.get("name")) or "Polymarket",
+        "url": _status_text(page_raw.get("url")) or POLYMARKET_STATUS_PAGE_URL,
+        "status": status,
+    }
+    return {
+        "ok": True,
+        "source_url": POLYMARKET_STATUS_URL,
+        "fetched_at": fetched_at,
+        "page": page,
+        "activeIncidents": incidents,
+        "incident_count": len(incidents),
+        "summary_status": status,
+    }
+
+
+def _polymarket_status_response(payload: dict[str, Any], cached: bool, stale: bool) -> dict[str, Any]:
+    checked_at = time.time()
+    fetched_at = payload.get("fetched_at")
+    try:
+        cache_age = max(0.0, checked_at - float(fetched_at)) if fetched_at is not None else None
+    except (TypeError, ValueError):
+        cache_age = None
+    # 前端只展示这份稳定契约，官方字段抖动时也能定位是缓存、过期还是拉取失败。
+    return {
+        **payload,
+        "page": dict(payload.get("page") or {}),
+        "activeIncidents": [dict(row) for row in payload.get("activeIncidents") or [] if isinstance(row, dict)],
+        "checked_at": checked_at,
+        "cached": cached,
+        "stale": stale,
+        "cache_age_seconds": cache_age,
+    }
+
+
+def _polymarket_status_error_payload(message: str, checked_at: float) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "source_url": POLYMARKET_STATUS_URL,
+        "fetched_at": None,
+        "checked_at": checked_at,
+        "cached": False,
+        "stale": False,
+        "cache_age_seconds": None,
+        "error": message,
+        "page": {"name": "Polymarket", "url": POLYMARKET_STATUS_PAGE_URL, "status": "UNKNOWN"},
+        "activeIncidents": [],
+        "incident_count": 0,
+        "summary_status": "UNKNOWN",
+    }
+
+
+def _status_text(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def build_app(settings: Settings | None = None) -> tuple[DashboardServer, PaperTradingBot]:
