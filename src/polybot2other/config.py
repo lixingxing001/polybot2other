@@ -27,6 +27,10 @@ LIVE_CREDENTIAL_ENV_KEYS = {
     "POLYBOT2OTHER_LIVE_API_PASSPHRASE",
 }
 _LOADED_ENV_FILES: list[dict[str, Any]] = []
+DEFAULT_DB_PATH = Path("data/polybot2other-real-btc.sqlite3")
+DEFAULT_BTC_RUNTIME_SETTINGS_PATH = Path("data/btc-runtime.json")
+DEFAULT_MARKET_SCOUT_SETTINGS_PATH = Path("data/market-scout/settings.json")
+DEFAULT_MARKET_SCOUT_PAPER_DB_PATH = Path("data/market-scout/paper.sqlite3")
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,7 @@ class Settings:
     """运行配置；实盘密钥只允许从环境变量读取，禁止写入代码仓库。"""
 
     initial_balance: float = 100.0
-    db_path: Path = Path("data/polybot2other-real-btc.sqlite3")
+    db_path: Path = DEFAULT_DB_PATH
     tick_seconds: float = 2.0
     round_seconds: int = 300
     stake_dollars: float = 5.0
@@ -59,6 +63,8 @@ class Settings:
     strategy_experiments_enabled: bool = False
     strategy_experiments_db_dir: Path = Path("data/strategy-experiments")
     strategy_experiments_variants: str = ""
+    # BTC 运行态配置文件；用于持久化 BTC 数据采集总开关，避免页面刷新后自动恢复采集。
+    btc_runtime_settings_path: Path = DEFAULT_BTC_RUNTIME_SETTINGS_PATH
     live_trading_db_path: Path = Path("data/live/single_fak_real.sqlite3")
     live_trading_settings_path: Path = Path("data/live/live-settings.json")
     live_trading_chain_id: int = 137
@@ -75,6 +81,58 @@ class Settings:
     llm_super_agent_model: str = "openai/gpt-5.4-mini"
     llm_super_agent_timeout_seconds: float = 1.2
     llm_super_agent_min_interval_seconds: float = 12.0
+    # 非 BTC 市场扫描器总开关；只读扫描和 LLM 分析，不会触发真实下单。
+    market_scout_enabled: bool = True
+    # 非 BTC 市场扫描间隔，单位秒；调低会增加 Gamma API 和 LLM 请求频率。
+    market_scout_interval_seconds: float = 30.0
+    # 每轮从 Gamma API 拉取的活跃市场数量上限；数量越大覆盖越广，网络耗时越高。
+    market_scout_scan_limit: int = 120
+    # 每轮送入 LLM 的候选市场数量上限；用于控制 token 成本。
+    market_scout_analyze_top_n: int = 10
+    # 候选市场最低流动性，单位 USD；低于该值只写过滤日志。
+    market_scout_min_liquidity: float = 5_000.0
+    # 候选市场最低 24h 成交量，单位 USD；低于该值只写过滤日志。
+    market_scout_min_volume_24h: float = 1_000.0
+    # 同一轮 LLM 分析结果的有效时间，单位秒；有效期内不重复请求同一组候选。
+    market_scout_llm_ttl_seconds: float = 120.0
+    # 非 BTC 市场 LLM 分析超时，单位秒；只影响只读分析，不影响 BTC 策略 tick。
+    market_scout_llm_timeout_seconds: float = 8.0
+    # 非 BTC 市场 Evidence Scout 默认开关；开启后会在 LLM 前检索英文新闻证据。
+    market_scout_evidence_enabled: bool = True
+    # 每轮最多做 Web 证据搜索的候选数量；控制外部搜索请求量。
+    market_scout_evidence_max_markets: int = 6
+    # 每个市场最多保留的英文新闻证据条数。
+    market_scout_evidence_results_per_market: int = 4
+    # Evidence Scout 单个搜索请求超时，单位秒。
+    market_scout_evidence_timeout_seconds: float = 6.0
+    # Evidence Scout 缓存有效期，单位秒；避免候选不变时反复请求搜索入口。
+    market_scout_evidence_ttl_seconds: float = 900.0
+    # 市场页运行配置文件；保存扫描、LLM、Paper 自动下注和风控参数。
+    market_scout_settings_path: Path = DEFAULT_MARKET_SCOUT_SETTINGS_PATH
+    # 市场页独立 Paper 账本；和 BTC Paper 账户隔离，避免订单和资金互相污染。
+    market_scout_paper_db_path: Path = DEFAULT_MARKET_SCOUT_PAPER_DB_PATH
+    # 市场页 Paper 初始资金，单位 USD；页面可调整，调整后按差额修正可用资金。
+    market_scout_default_paper_initial_balance: float = 100.0
+    # 市场页单笔 Paper 预算，单位 USD；自动下注只使用这个隔离预算。
+    market_scout_default_paper_stake_dollars: float = 2.0
+    # 市场页最多同时持有的 Paper 市场数量。
+    market_scout_default_paper_max_open_positions: int = 3
+    # LLM 没有给 RECOMMEND 时是否允许小额 Paper 探针；仅用于样本采集，不连接实盘。
+    market_scout_default_paper_probe_enabled: bool = True
+    # Paper 探针最多同时持有的市场数量；默认 3，用小额仓位覆盖不同事件族，避免单个长周期市场锁死采样。
+    market_scout_default_paper_probe_max_open_positions: int = 3
+    # Paper 探针最低本地候选置信度；该置信度由候选分、价差和盘口可执行性折算。
+    market_scout_default_paper_probe_min_confidence: float = 0.55
+    # Paper 探针最低本地候选分；低分候选即使 LLM 反复 NO_TRADE 也不会采样。
+    market_scout_default_paper_probe_min_selection_score: float = 14.0
+    # 市场页 24 小时已实现亏损上限，单位 USD；触发后 Paper 自动下注暂停。
+    market_scout_default_paper_max_daily_loss: float = 10.0
+    # LLM 推荐进入 Paper 自动下注前的最低置信度。
+    market_scout_default_paper_min_confidence: float = 0.72
+    # LLM 推荐进入 Paper 自动下注前允许的最高买入价。
+    market_scout_default_paper_max_entry_price: float = 0.65
+    # LLM 推荐进入 Paper 自动下注前允许的最大盘口价差。
+    market_scout_default_paper_max_spread: float = 0.04
     gamma_url: str = "https://gamma-api.polymarket.com"
     clob_url: str = "https://clob.polymarket.com"
     data_api_url: str = "https://data-api.polymarket.com"
@@ -223,7 +281,7 @@ def load_settings() -> Settings:
     _load_env_files()
     return Settings(
         initial_balance=_float_env("POLYBOT2OTHER_INITIAL_BALANCE", 100.0, 1.0),
-        db_path=Path(os.environ.get("POLYBOT2OTHER_DB_PATH", "data/polybot2other-real-btc.sqlite3")),
+        db_path=Path(os.environ.get("POLYBOT2OTHER_DB_PATH", str(DEFAULT_DB_PATH))),
         tick_seconds=_float_env("POLYBOT2OTHER_TICK_SECONDS", 2.0, 0.5),
         round_seconds=_int_env("POLYBOT2OTHER_ROUND_SECONDS", 300, 60),
         stake_dollars=_float_env("POLYBOT2OTHER_STAKE_DOLLARS", 5.0, 0.1),
@@ -248,6 +306,9 @@ def load_settings() -> Settings:
             os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_DB_DIR", "data/strategy-experiments")
         ),
         strategy_experiments_variants=os.environ.get("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS", ""),
+        btc_runtime_settings_path=Path(
+            os.environ.get("POLYBOT2OTHER_BTC_RUNTIME_SETTINGS_PATH", str(DEFAULT_BTC_RUNTIME_SETTINGS_PATH))
+        ),
         live_trading_db_path=Path(
             os.environ.get("POLYBOT2OTHER_LIVE_TRADING_DB_PATH", "data/live/single_fak_real.sqlite3")
         ),
@@ -268,6 +329,91 @@ def load_settings() -> Settings:
         llm_super_agent_model=os.environ.get("POLYBOT2OTHER_LLM_MODEL", "openai/gpt-5.4-mini"),
         llm_super_agent_timeout_seconds=_float_env("POLYBOT2OTHER_LLM_TIMEOUT_SECONDS", 1.2, 0.2),
         llm_super_agent_min_interval_seconds=_float_env("POLYBOT2OTHER_LLM_MIN_INTERVAL_SECONDS", 12.0, 1.0),
+        market_scout_enabled=_bool_env("POLYBOT2OTHER_MARKET_SCOUT_ENABLED", True),
+        market_scout_interval_seconds=_float_env("POLYBOT2OTHER_MARKET_SCOUT_INTERVAL_SECONDS", 30.0, 5.0),
+        market_scout_scan_limit=_int_env("POLYBOT2OTHER_MARKET_SCOUT_SCAN_LIMIT", 120, 20),
+        market_scout_analyze_top_n=_int_env("POLYBOT2OTHER_MARKET_SCOUT_ANALYZE_TOP_N", 10, 1),
+        market_scout_min_liquidity=_float_env("POLYBOT2OTHER_MARKET_SCOUT_MIN_LIQUIDITY", 5_000.0, 0.0),
+        market_scout_min_volume_24h=_float_env("POLYBOT2OTHER_MARKET_SCOUT_MIN_VOLUME_24H", 1_000.0, 0.0),
+        market_scout_llm_ttl_seconds=_float_env("POLYBOT2OTHER_MARKET_SCOUT_LLM_TTL_SECONDS", 120.0, 10.0),
+        market_scout_llm_timeout_seconds=_float_env("POLYBOT2OTHER_MARKET_SCOUT_LLM_TIMEOUT_SECONDS", 8.0, 1.0),
+        market_scout_evidence_enabled=_bool_env("POLYBOT2OTHER_MARKET_SCOUT_EVIDENCE_ENABLED", True),
+        market_scout_evidence_max_markets=_int_env("POLYBOT2OTHER_MARKET_SCOUT_EVIDENCE_MAX_MARKETS", 6, 0),
+        market_scout_evidence_results_per_market=_int_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_EVIDENCE_RESULTS_PER_MARKET",
+            4,
+            1,
+        ),
+        market_scout_evidence_timeout_seconds=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_EVIDENCE_TIMEOUT_SECONDS",
+            6.0,
+            1.0,
+        ),
+        market_scout_evidence_ttl_seconds=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_EVIDENCE_TTL_SECONDS",
+            900.0,
+            30.0,
+        ),
+        market_scout_settings_path=Path(
+            os.environ.get("POLYBOT2OTHER_MARKET_SCOUT_SETTINGS_PATH", str(DEFAULT_MARKET_SCOUT_SETTINGS_PATH))
+        ),
+        market_scout_paper_db_path=Path(
+            os.environ.get("POLYBOT2OTHER_MARKET_SCOUT_PAPER_DB_PATH", str(DEFAULT_MARKET_SCOUT_PAPER_DB_PATH))
+        ),
+        market_scout_default_paper_initial_balance=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_INITIAL_BALANCE",
+            100.0,
+            1.0,
+        ),
+        market_scout_default_paper_stake_dollars=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_STAKE_DOLLARS",
+            2.0,
+            0.1,
+        ),
+        market_scout_default_paper_max_open_positions=_int_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_OPEN_POSITIONS",
+            3,
+            1,
+        ),
+        market_scout_default_paper_probe_enabled=_bool_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_PROBE_ENABLED",
+            True,
+        ),
+        market_scout_default_paper_probe_max_open_positions=_int_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_PROBE_MAX_OPEN_POSITIONS",
+            3,
+            1,
+        ),
+        market_scout_default_paper_probe_min_confidence=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_PROBE_MIN_CONFIDENCE",
+            0.55,
+            0.0,
+        ),
+        market_scout_default_paper_probe_min_selection_score=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_PROBE_MIN_SELECTION_SCORE",
+            14.0,
+            0.0,
+        ),
+        market_scout_default_paper_max_daily_loss=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_DAILY_LOSS",
+            10.0,
+            0.0,
+        ),
+        market_scout_default_paper_min_confidence=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_MIN_CONFIDENCE",
+            0.72,
+            0.0,
+        ),
+        market_scout_default_paper_max_entry_price=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_ENTRY_PRICE",
+            0.65,
+            0.01,
+        ),
+        market_scout_default_paper_max_spread=_float_env(
+            "POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_SPREAD",
+            0.04,
+            0.0,
+        ),
         gamma_url=os.environ.get("POLYBOT2OTHER_GAMMA_URL", "https://gamma-api.polymarket.com"),
         clob_url=os.environ.get("POLYBOT2OTHER_CLOB_URL", "https://clob.polymarket.com"),
         data_api_url=os.environ.get("POLYBOT2OTHER_DATA_API_URL", "https://data-api.polymarket.com"),

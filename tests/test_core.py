@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from polybot2other.clob_ws import (
     binance_spot_price_from_payload,
     okx_spot_price_from_payload,
     rtds_chainlink_price_from_payload,
+    rtds_spot_price_from_payload,
 )
 from polybot2other.config import Settings, env_file_status, load_settings, reload_live_credential_env
 from polybot2other.bot import (
@@ -76,7 +78,13 @@ from polybot2other.live import (
     LIVE_AGGRESSIVE_EDGE_V11_1_COMBO,
     LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_V11_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID,
+    LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID,
+    LIVE_AGGRESSIVE_EDGE_V12_COMBO,
+    LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_V10_VARIANT_ID,
     LIVE_AGGRESSIVE_EDGE_VARIANT_ID,
     LIVE_COMBO,
@@ -437,6 +445,85 @@ class TradingCoreTest(unittest.TestCase):
                     target_price=100.0,
                     settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
                 )
+        finally:
+            ready_store.conn.close()
+
+    def _seed_v11_mixed_readiness_with_down_edge(self, settings: Settings) -> None:
+        """构造 V11 总体不达标但 Down 单侧达标的样本，用来防止 Down-only 准入口径回退。"""
+
+        ready_store = TradeStore(
+            settings.strategy_experiments_db_dir / "single_fak_aggressive_edge_diagnostic.sqlite3",
+            100.0,
+        )
+        seed_now = time.time()
+        seq = 0
+
+        def seed_side(side: str, *, count: int, wins: int) -> None:
+            nonlocal seq
+            for index in range(count):
+                bucket = 2 if index % 2 == 0 else 3
+                round_id = f"btc-updown-5m-live-v11-mixed-{side.lower()}-{index}"
+                outcome = side if index < wins else ("Down" if side == "Up" else "Up")
+                ready_store.record_aggressive_edge_v2_shadow_sample(
+                    round_id=round_id,
+                    symbol="BTC",
+                    sample_key=f"m{bucket}:pass",
+                    side=side,
+                    source_signal_side=side,
+                    base_would_trade=True,
+                    v1_would_trade=True,
+                    v2_would_trade=True,
+                    v4_would_trade=True,
+                    v5_would_trade=True,
+                    v6_would_trade=True,
+                    v7_would_trade=True,
+                    v8_would_trade=True,
+                    v9_would_trade=True,
+                    v10_would_trade=True,
+                    v11_would_trade=True,
+                    v12_would_trade=True,
+                    entry_price=0.65,
+                    confidence=0.82,
+                    move_bps=6.5 if side == "Up" else -6.5,
+                    report={
+                        "risk_score": 0.1,
+                        "risk_level": "LOW",
+                        "risk_reasons": [],
+                        "features": {
+                            "entry_price": 0.65,
+                            "move_bps": 6.5 if side == "Up" else -6.5,
+                            "depth_skew": 0.55,
+                            "top_level_skew": 0.60,
+                        },
+                        "components": {},
+                    },
+                    base_block_reason=None,
+                    v1_block_reason=None,
+                    v4_block_reason=None,
+                    v5_block_reason=None,
+                    v6_block_reason=None,
+                    v7_block_reason=None,
+                    v8_block_reason=None,
+                    v9_block_reason=None,
+                    v10_block_reason=None,
+                    v11_block_reason=None,
+                    v12_block_reason=None,
+                    signal_reason="V11 Down-only 准入口径测试样本",
+                    created_at=seed_now + seq,
+                )
+                ready_store.settle_aggressive_edge_v2_shadow_samples(
+                    round_id,
+                    outcome,
+                    seed_now + seq + 1,
+                    final_price=101.0 if outcome == "Up" else 99.0,
+                    target_price=100.0,
+                    settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+                )
+                seq += 1
+
+        try:
+            seed_side("Down", count=80, wins=60)
+            seed_side("Up", count=120, wins=60)
         finally:
             ready_store.conn.close()
 
@@ -3154,6 +3241,103 @@ class TradingCoreTest(unittest.TestCase):
                 store.aggressive_edge_v2_shadow_candidates("BTC", "BAD", limit=8, offset=0)
             store.conn.close()
 
+    def test_aggressive_edge_shadow_summary_excludes_rtds_abnormal_fallback_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TradeStore(Path(tmp) / "test.sqlite3", 100.0)
+            abnormal_at = 1781151000.0
+            clean_at = 1781172600.0
+            report = {
+                "risk_score": 0.1,
+                "risk_level": "LOW",
+                "risk_reasons": [],
+                "features": {
+                    "entry_price": 0.25,
+                    "move_bps": 6.2,
+                    "depth_skew": 0.55,
+                    "top_level_skew": 0.60,
+                },
+                "components": {},
+            }
+
+            fixtures = [
+                (
+                    "btc-updown-5m-rtds-abnormal-fallback",
+                    abnormal_at,
+                    "真实 BTC 5m Up: fallback 62635.98 vs target 62600.81",
+                    "Down",
+                ),
+                (
+                    "btc-updown-5m-rtds-window-chainlink",
+                    abnormal_at + 60,
+                    "真实 BTC 5m Up: chainlink 62635.98 vs target 62600.81",
+                    "Up",
+                ),
+                (
+                    "btc-updown-5m-rtds-clean-fallback",
+                    clean_at,
+                    "真实 BTC 5m Up: fallback 62888.74 vs target 62849.23",
+                    "Up",
+                ),
+            ]
+            for round_id, created_at, reason, outcome in fixtures:
+                store.record_aggressive_edge_v2_shadow_sample(
+                    round_id=round_id,
+                    symbol="BTC",
+                    sample_key="m2:pass",
+                    side="Up",
+                    source_signal_side="Up",
+                    base_would_trade=True,
+                    v1_would_trade=True,
+                    v2_would_trade=True,
+                    v4_would_trade=True,
+                    v5_would_trade=True,
+                    v6_would_trade=True,
+                    v7_would_trade=True,
+                    v8_would_trade=True,
+                    v9_would_trade=True,
+                    v10_would_trade=True,
+                    v11_would_trade=True,
+                    v12_would_trade=True,
+                    entry_price=0.25,
+                    confidence=0.82,
+                    move_bps=6.2,
+                    report=report,
+                    base_block_reason=None,
+                    v1_block_reason=None,
+                    signal_reason=reason,
+                    created_at=created_at,
+                )
+                store.settle_aggressive_edge_v2_shadow_samples(
+                    round_id,
+                    outcome,
+                    created_at + 60,
+                    final_price=101.0 if outcome == "Up" else 99.0,
+                    target_price=100.0,
+                    settlement_source=SETTLEMENT_SOURCE_POLYMARKET,
+                )
+
+            summary = store.aggressive_edge_v2_shadow_summary("BTC")
+            versions = {row["version"]: row for row in summary["diagnostic_version_summaries"]}
+            candidates = store.aggressive_edge_v2_shadow_candidates("BTC", "V12", limit=10)
+
+            self.assertEqual(summary["raw_total_count"], 3)
+            self.assertEqual(summary["total_count"], 2)
+            self.assertEqual(summary["rtds_abnormal_excluded_count"], 1)
+            self.assertEqual(summary["rtds_abnormal_settled_excluded_count"], 1)
+            self.assertEqual(versions["V12"]["raw_would_trade_count"], 3)
+            self.assertEqual(versions["V12"]["would_trade_count"], 2)
+            self.assertEqual(versions["V12"]["win_count"], 2)
+            self.assertEqual(versions["V12"]["loss_count"], 0)
+            self.assertEqual(versions["V12"]["rtds_abnormal_loss_excluded_count"], 1)
+            self.assertEqual(candidates["meta"]["raw_total"], 3)
+            self.assertEqual(candidates["meta"]["total"], 2)
+            self.assertEqual(candidates["meta"]["rtds_abnormal_excluded_count"], 1)
+            self.assertNotIn(
+                "btc-updown-5m-rtds-abnormal-fallback",
+                {row["round_id"] for row in candidates["candidates"]},
+            )
+            store.conn.close()
+
     def test_aggressive_edge_live_readiness_marks_clean_v9_sample_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TradeStore(Path(tmp) / "test.sqlite3", 100.0)
@@ -4204,6 +4388,945 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variant_bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 1)
             self.assertIn("PAPER_PAUSED", variant_bot.snapshot()["runtime"]["last_signal"]["reason"])
 
+    def test_btc_runtime_pause_blocks_live_snapshot_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            market = MarketRound(
+                round_id="btc-updown-5m-btc-runtime-pause",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+                bot.latest_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+
+            payload = bot.set_btc_runtime_paused(True)
+
+            self.assertTrue(payload["btc_runtime"]["paused"])
+            self.assertNotIn("snapshot", payload)
+            self.assertEqual(bot.btc_runtime()["message"], "BTC 数据采集已暂停")
+            stored = json.loads(settings.btc_runtime_settings_path.read_text(encoding="utf-8"))
+            self.assertTrue(stored["paused"])
+
+            result = bot.ingest_live_snapshot(
+                {
+                    "market": {"slug": market.round_id},
+                    "price": {"chainlink": 99.0, "chainlink_updated_ms": int(time.time() * 1000)},
+                    "quotes": {"Down": {"best_ask": 0.4}},
+                    "market_ws_status": "test",
+                    "price_ws_status": "test",
+                }
+            )
+
+            self.assertEqual(result["ignored_snapshot"], "btc_runtime_paused")
+            self.assertTrue(result["paused"])
+            self.assertEqual(bot.latest_price["chainlink"], 101.0)
+            self.assertEqual(bot.latest_quotes, {})
+
+            restored = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            self.assertTrue(restored.btc_runtime()["paused"])
+
+    def test_btc_runtime_pause_does_not_wait_for_worker_join(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+
+            # 暂停按钮是用户面向流量控制的操作，不能等待后台 WebSocket 或行情线程 join。
+            with patch.object(bot, "_join_btc_worker_threads", side_effect=AssertionError("pause must not join workers")):
+                payload = bot.set_btc_runtime_paused(True)
+
+            self.assertTrue(payload["btc_runtime"]["paused"])
+            self.assertTrue(bot.btc_runtime()["paused"])
+
+    def test_btc_runtime_pause_skips_strategy_runner_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            with bot._lock:
+                bot.current_market = MarketRound(
+                    round_id="btc-updown-5m-btc-runtime-strategy-skip",
+                    symbol="BTC",
+                    started_at=now - 60,
+                    ends_at=now + 120,
+                    target_price=100.0,
+                    up_token="up-token",
+                    down_token="down-token",
+                )
+                bot.paper_price = {"chainlink": 101.0, "chainlink_updated_ms": int(now * 1000)}
+                bot.paper_quotes = {"Up": {"best_ask": 0.55, "ask_size": 10}}
+            bot.set_btc_runtime_paused(True)
+
+            with (
+                patch.object(bot, "_maybe_place_trade", side_effect=AssertionError("pause must skip trade path")),
+                patch.object(
+                    bot,
+                    "_run_strategy_experiments",
+                    side_effect=AssertionError("pause must skip experiments"),
+                ),
+                patch.object(bot, "_run_live_strategy", side_effect=AssertionError("pause must skip live path")),
+            ):
+                bot._run_strategy_from_state()
+
+            self.assertIn("BTC 数据业务已暂停", bot.snapshot()["runtime"]["last_signal"]["reason"])
+
+    def test_market_llm_terminal_logs_incrementally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+
+            initial = bot.market_llm_terminal(limit=10)
+
+            self.assertTrue(initial["ok"])
+            self.assertGreaterEqual(initial["latest_seq"], 1)
+            self.assertEqual(initial["status"]["state"], "idle")
+            self.assertTrue(any(row["event_type"] == "terminal_start" for row in initial["logs"]))
+
+            event = bot._append_market_llm_terminal_log(
+                level="pass",
+                module="llm",
+                event_type="decision",
+                title="LLM 分析",
+                message="测试推荐记录",
+                details=["市场: test-market", "置信度: 0.82"],
+            )
+            incremental = bot.market_llm_terminal(limit=10, after_seq=int(event["seq"]) - 1)
+
+            self.assertEqual(incremental["latest_seq"], event["seq"])
+            self.assertEqual(len([row for row in incremental["logs"] if row["seq"] == event["seq"]]), 1)
+            self.assertEqual(incremental["logs"][-1]["module"], "llm")
+            self.assertEqual(incremental["logs"][-1]["level"], "pass")
+
+            empty = bot.market_llm_terminal(limit=10, after_seq=int(incremental["latest_seq"]))
+            self.assertEqual(empty["logs"], [])
+
+    def test_market_scout_scans_non_btc_candidates_and_logs_llm_result(self) -> None:
+        class FakeQuote:
+            def __init__(self, outcome: str) -> None:
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "best_bid": 0.46 if self.outcome == "Yes" else 0.48,
+                    "best_ask": 0.48 if self.outcome == "Yes" else 0.50,
+                    "bid_size": 100.0,
+                    "ask_size": 90.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "slug": "will-example-candidate-win-2026",
+                        "question": "Will Example Candidate win the 2026 race?",
+                        "description": "Resolves Yes if Example Candidate wins the stated race.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+                        "outcomePrices": json.dumps(["0.48", "0.52"]),
+                        "liquidityNum": 25_000.0,
+                        "volume24hr": 12_000.0,
+                        "spread": 0.02,
+                    },
+                    {
+                        "slug": "bitcoin-above-100k",
+                        "question": "Will Bitcoin be above 100k?",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["btc-yes", "btc-no"]),
+                        "outcomePrices": json.dumps(["0.50", "0.50"]),
+                        "liquidityNum": 50_000.0,
+                        "volume24hr": 20_000.0,
+                        "spread": 0.01,
+                    },
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(outcome)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_evidence_enabled=False,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+
+            with patch.object(
+                bot,
+                "_call_market_scout_llm",
+                return_value={
+                    "decision": "RECOMMEND",
+                    "selected_slug": "will-example-candidate-win-2026",
+                    "outcome": "Yes",
+                    "confidence": 0.82,
+                    "max_entry_price": 0.49,
+                    "reason": "流动性和盘口质量满足只读推荐要求。",
+                    "risk_flags": ["需要确认最新新闻"],
+                    "news_checks_needed": ["核对权威新闻源"],
+                    "valid_for_seconds": 60,
+                },
+            ) as llm_call:
+                bot._run_market_scout_once()
+
+            payload = bot.market_llm_terminal(limit=80)
+            logs = payload["logs"]
+            self.assertEqual(llm_call.call_count, 1)
+            self.assertEqual(payload["status"]["state"], "analyzed")
+            self.assertEqual(payload["status"]["candidate_count"], 1)
+            self.assertEqual(payload["status"]["last_decision"]["selected_slug"], "will-example-candidate-win-2026")
+            self.assertTrue(any(row["event_type"] == "scan_complete" for row in logs))
+            self.assertTrue(any(row["event_type"] == "llm_result" for row in logs))
+            scan_log = next(row for row in logs if row["event_type"] == "scan_complete")
+            self.assertTrue(any("btc_market=1" in detail for detail in scan_log["details"]))
+
+    def test_market_scout_diversifies_llm_candidates_and_blocks_stale_sports(self) -> None:
+        class FakeQuote:
+            def __init__(self, outcome: str) -> None:
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "best_bid": 0.40 if self.outcome == "Yes" else 0.54,
+                    "best_ask": 0.42 if self.outcome == "Yes" else 0.56,
+                    "bid_size": 120.0,
+                    "ask_size": 110.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        def market(
+            slug: str,
+            question: str,
+            *,
+            event_slug: str,
+            end_date: str,
+            liquidity: float,
+            volume: float,
+            prices: tuple[str, str] = ("0.42", "0.58"),
+            description: str = "General candidate.",
+        ) -> dict[str, Any]:
+            return {
+                "slug": slug,
+                "question": question,
+                "description": description,
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "acceptingOrders": True,
+                "enableOrderBook": True,
+                "outcomes": json.dumps(["Yes", "No"]),
+                "clobTokenIds": json.dumps([f"{slug}-yes", f"{slug}-no"]),
+                "outcomePrices": json.dumps(list(prices)),
+                "liquidityNum": liquidity,
+                "volume24hr": volume,
+                "spread": 0.01,
+                "endDateIso": end_date,
+                "events": [
+                    {
+                        "slug": event_slug,
+                        "title": event_slug,
+                        "eventMetadata": {
+                            "context_description": "Official information and credible reporting are required for this market."
+                        },
+                    }
+                ],
+            }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                return [
+                    market(
+                        "stale-spread-alpha",
+                        "Spread: Alpha (-1.5)",
+                        event_slug="alpha-beta-match",
+                        end_date="2000-01-01T00:00:00Z",
+                        liquidity=9_000_000.0,
+                        volume=9_000_000.0,
+                    ),
+                    market(
+                        "stale-total-alpha",
+                        "Alpha vs. Beta: O/U 2.5",
+                        event_slug="alpha-beta-match",
+                        end_date="2000-01-01T00:00:00Z",
+                        liquidity=8_000_000.0,
+                        volume=8_000_000.0,
+                    ),
+                    market(
+                        "france-world-cup-outright",
+                        "Will France win the 2099 FIFA World Cup?",
+                        event_slug="world-cup-outrights",
+                        end_date="2099-07-15",
+                        liquidity=7_000_000.0,
+                        volume=7_000_000.0,
+                        prices=("0.16", "0.84"),
+                    ),
+                    market(
+                        "strait-of-hormuz-traffic-normal",
+                        "Strait of Hormuz traffic returns to normal by end of June?",
+                        event_slug="hormuz-traffic",
+                        end_date="2099-06-30",
+                        liquidity=500_000.0,
+                        volume=2_500_000.0,
+                        prices=("0.31", "0.69"),
+                        description="Resolves based on Strait of Hormuz traffic and official maritime reporting.",
+                    ),
+                    market(
+                        "us-iran-permanent-peace-deal",
+                        "US x Iran permanent peace deal by June 15, 2099?",
+                        event_slug="us-iran-peace",
+                        end_date="2099-06-15",
+                        liquidity=450_000.0,
+                        volume=2_000_000.0,
+                        prices=("0.62", "0.38"),
+                        description="Resolves based on official government statements or credible reporting.",
+                    ),
+                    market(
+                        "us-iran-temporary-ceasefire",
+                        "US x Iran temporary ceasefire by June 15, 2099?",
+                        event_slug="us-iran-peace",
+                        end_date="2099-06-15",
+                        liquidity=430_000.0,
+                        volume=1_900_000.0,
+                        prices=("0.55", "0.45"),
+                        description="Same event family as the peace deal market.",
+                    ),
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(outcome)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_analyze_top_n=3,
+                market_scout_evidence_enabled=False,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+
+            with patch.object(
+                bot,
+                "_call_market_scout_llm",
+                return_value={
+                    "decision": "RECOMMEND",
+                    "selected_slug": "strait-of-hormuz-traffic-normal",
+                    "outcome": "Yes",
+                    "confidence": 0.81,
+                    "max_entry_price": 0.44,
+                    "reason": "事件型市场优先进入分析。",
+                    "risk_flags": ["需要外部新闻核验"],
+                    "news_checks_needed": ["核验官方航运数据"],
+                    "valid_for_seconds": 60,
+                },
+            ) as llm_call:
+                bot._run_market_scout_once()
+
+            llm_candidates = llm_call.call_args.args[0]
+            llm_slugs = [candidate["slug"] for candidate in llm_candidates]
+            self.assertIn("strait-of-hormuz-traffic-normal", llm_slugs)
+            self.assertNotIn("stale-spread-alpha", llm_slugs)
+            self.assertNotIn("stale-total-alpha", llm_slugs)
+            self.assertLessEqual(
+                len([slug for slug in llm_slugs if slug.startswith("us-iran-")]),
+                1,
+            )
+            state = bot.market_scout_state()
+            displayed = state["status"]["top_candidates"]
+            self.assertGreater(len(displayed), 3)
+            self.assertTrue(any(candidate["llm_selected"] for candidate in displayed))
+            self.assertEqual(state["status"]["llm_candidate_count"], 3)
+            self.assertEqual(state["status"]["last_decision"]["selected_slug"], "strait-of-hormuz-traffic-normal")
+
+    def test_market_scout_settings_persist_and_live_stays_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+
+            state = bot.update_market_scout_settings(
+                {
+                    "scanner_enabled": False,
+                    "llm_enabled": False,
+                    "llm_model": "openai/gpt-5.4",
+                    "paper_auto_enabled": True,
+                    "live_auto_enabled": True,
+                    "paper_initial_balance": 250.0,
+                    "paper_stake_dollars": 3.5,
+                    "paper_max_open_positions": 4,
+                    "paper_probe_enabled": True,
+                    "paper_probe_max_open_positions": 1,
+                    "paper_probe_min_confidence": 0.55,
+                    "paper_probe_min_selection_score": 14.0,
+                    "paper_max_daily_loss": 12.0,
+                    "min_confidence": 0.8,
+                    "max_entry_price": 0.61,
+                    "max_spread": 0.03,
+                    "scan_interval_seconds": 18,
+                    "analyze_top_n": 5,
+                }
+            )
+
+            self.assertFalse(state["settings"]["scanner_enabled"])
+            self.assertFalse(state["settings"]["llm_enabled"])
+            self.assertEqual(state["settings"]["llm_model"], "openai/gpt-5.4")
+            self.assertTrue(state["settings"]["paper_auto_enabled"])
+            self.assertTrue(state["settings"]["paper_probe_enabled"])
+            self.assertFalse(state["settings"]["live_auto_enabled"])
+            self.assertTrue(state["settings"]["live_locked"])
+            self.assertEqual(state["paper_account"]["initial_balance"], 250.0)
+            self.assertEqual(state["settings"]["paper_stake_dollars"], 3.5)
+            self.assertEqual(state["settings"]["paper_probe_max_open_positions"], 1)
+            self.assertAlmostEqual(state["settings"]["paper_probe_min_confidence"], 0.55)
+            self.assertAlmostEqual(state["settings"]["paper_probe_min_selection_score"], 14.0)
+            self.assertEqual(state["settings"]["analyze_top_n"], 5)
+            self.assertTrue(Path(state["settings"]["settings_path"]).exists())
+            self.assertTrue(str(state["settings"]["paper_db_path"]).startswith(tmp))
+
+            restored = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            restored_state = restored.market_scout_state()
+            self.assertTrue(restored_state["settings"]["paper_auto_enabled"])
+            self.assertTrue(restored_state["settings"]["paper_probe_enabled"])
+            self.assertEqual(restored_state["settings"]["llm_model"], "openai/gpt-5.4")
+            self.assertFalse(restored_state["settings"]["live_auto_enabled"])
+            self.assertEqual(restored_state["paper_account"]["initial_balance"], 250.0)
+
+    def test_market_scout_paper_auto_bet_creates_isolated_order(self) -> None:
+        class FakeQuote:
+            def __init__(self, outcome: str) -> None:
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "best_bid": 0.46 if self.outcome == "Yes" else 0.50,
+                    "best_ask": 0.48 if self.outcome == "Yes" else 0.52,
+                    "bid_size": 100.0,
+                    "ask_size": 100.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "slug": "will-paper-auto-example-pass-2026",
+                        "question": "Will Paper Auto Example pass in 2026?",
+                        "description": "Resolves Yes if the example passes.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+                        "outcomePrices": json.dumps(["0.48", "0.52"]),
+                        "liquidityNum": 25_000.0,
+                        "volume24hr": 12_000.0,
+                        "spread": 0.02,
+                        "events": [
+                            {
+                                "slug": "paper-auto-examples",
+                                "title": "Paper Auto Examples",
+                            }
+                        ],
+                    },
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(outcome)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_evidence_enabled=False,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+            bot.update_market_scout_settings(
+                {
+                    "paper_auto_enabled": True,
+                    "paper_stake_dollars": 4.0,
+                    "min_confidence": 0.7,
+                    "max_entry_price": 0.6,
+                    "max_spread": 0.04,
+                }
+            )
+
+            with patch.object(
+                bot,
+                "_call_market_scout_llm",
+                return_value={
+                    "decision": "RECOMMEND",
+                    "selected_slug": "will-paper-auto-example-pass-2026",
+                    "outcome": "Yes",
+                    "confidence": 0.83,
+                    "max_entry_price": 0.5,
+                    "reason": "测试 Paper 自动下注。",
+                    "risk_flags": [],
+                    "news_checks_needed": [],
+                    "valid_for_seconds": 60,
+                },
+            ):
+                bot._run_market_scout_once()
+
+            state = bot.market_scout_state()
+            orders = state["paper_orders"]
+            self.assertEqual(len(orders), 1)
+            self.assertEqual(orders[0]["symbol"], "MARKET")
+            self.assertEqual(orders[0]["status"], STATUS_FILLED)
+            self.assertEqual(orders[0]["side"], "Yes")
+            self.assertEqual(orders[0]["event_slug"], "paper-auto-examples")
+            self.assertEqual(
+                orders[0]["url"],
+                "https://polymarket.com/market/will-paper-auto-example-pass-2026",
+            )
+            self.assertAlmostEqual(orders[0]["requested_cash"], 4.0)
+            self.assertAlmostEqual(orders[0]["current_bid"], 0.46)
+            self.assertIsNotNone(orders[0]["exit_value"])
+            self.assertIsNotNone(orders[0]["unrealized_pnl"])
+            self.assertIsNotNone(orders[0]["unrealized_roi_pct"])
+            self.assertGreater(orders[0]["max_payout"], orders[0]["cash_spent"])
+            self.assertGreater(orders[0]["max_profit"], 0)
+            self.assertAlmostEqual(orders[0]["max_loss"], orders[0]["cash_spent"])
+            self.assertTrue(state["status"]["last_auto_order"]["submitted"])
+            self.assertEqual(bot.store.paper_order_count("BTC", "all"), 0)
+
+            settled = bot.market_paper_store.settle_round_outcome(
+                orders[0]["round_id"],
+                "Yes",
+                now=time.time() + 1.0,
+            )
+            self.assertEqual(len(settled), 1)
+            state = bot.market_scout_state()
+            settled_order = state["paper_orders"][0]
+            self.assertEqual(settled_order["trade_status"], "SETTLED")
+            self.assertEqual(settled_order["settlement_result"], "WIN")
+            self.assertEqual(settled_order["settlement_result_label"], "赢")
+            self.assertGreater(settled_order["net_pnl"], 0)
+            self.assertGreater(settled_order["payout"], 0)
+            expected_roi = round(settled_order["net_pnl"] / settled_order["cash_spent"] * 100.0, 4)
+            self.assertEqual(settled_order["roi_pct"], expected_roi)
+
+    def test_market_scout_evidence_enriches_llm_candidates_and_filters_chinese_sources(self) -> None:
+        class FakeQuote:
+            def __init__(self, outcome: str) -> None:
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "token_id": f"{self.outcome.lower()}-token",
+                    "outcome": self.outcome,
+                    "best_bid": 0.44 if self.outcome == "Yes" else 0.52,
+                    "best_ask": 0.46 if self.outcome == "Yes" else 0.54,
+                    "bid_size": 80.0,
+                    "ask_size": 80.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "slug": "will-example-evidence-pass-2026",
+                        "question": "Will Example Evidence pass in 2026?",
+                        "description": "Resolves Yes if reliable evidence confirms the example.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+                        "outcomePrices": json.dumps(["0.46", "0.54"]),
+                        "liquidityNum": 25_000.0,
+                        "volume24hr": 12_000.0,
+                        "spread": 0.02,
+                        "events": [
+                            {
+                                "slug": "example-evidence",
+                                "title": "Example Evidence",
+                            }
+                        ],
+                    },
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(outcome)
+
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+                return None
+
+            def read(self, _size: int = -1) -> bytes:
+                return """<?xml version="1.0" encoding="utf-8"?>
+                <rss version="2.0" xmlns:News="https://www.bing.com/news/search">
+                  <channel>
+                    <item>
+                      <title>Reliable evidence confirms example progress</title>
+                      <link>http://www.bing.com/news/apiclick.aspx?url=https%3A%2F%2Fwww.reuters.com%2Fworld%2Fexample-progress</link>
+                      <description>Officials said the example is progressing after new evidence emerged.</description>
+                      <pubDate>Tue, 16 Jun 2026 01:00:00 GMT</pubDate>
+                      <News:Source>Reuters</News:Source>
+                    </item>
+                    <item>
+                      <title>中文来源</title>
+                      <link>https://news.example.cn/example</link>
+                      <description>这是中文内容</description>
+                      <pubDate>Tue, 16 Jun 2026 01:05:00 GMT</pubDate>
+                      <News:Source>Baidu</News:Source>
+                    </item>
+                  </channel>
+                </rss>""".encode("utf-8")
+
+        captured: dict[str, Any] = {}
+
+        def fake_urlopen(_request: Any, timeout: float) -> FakeResponse:
+            self.assertGreaterEqual(timeout, 1.0)
+            return FakeResponse()
+
+        def fake_llm(candidates: list[dict[str, Any]], now: float) -> dict[str, Any]:
+            captured["candidate"] = candidates[0]
+            return {
+                "decision": "NO_TRADE",
+                "selected_slug": "",
+                "outcome": "",
+                "confidence": 0.0,
+                "max_entry_price": None,
+                "reason": "证据测试不下注。",
+                "risk_flags": [],
+                "news_checks_needed": [],
+                "valid_for_seconds": 60,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_evidence_enabled=True,
+                market_scout_evidence_max_markets=1,
+                market_scout_evidence_results_per_market=4,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+            bot.market_evidence_scout.urlopen = fake_urlopen
+
+            with patch.object(bot, "_call_market_scout_llm", side_effect=fake_llm):
+                bot._run_market_scout_once()
+
+            evidence = captured["candidate"]["evidence"]
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["result_count"], 1)
+            self.assertEqual(evidence["blocked_count"], 1)
+            self.assertEqual(evidence["results"][0]["source"], "Reuters")
+            self.assertEqual(evidence["results"][0]["domain"], "reuters.com")
+            state = bot.market_scout_state()
+            self.assertEqual(state["status"]["evidence"]["ok_count"], 1)
+            self.assertEqual(state["status"]["top_candidates"][0]["evidence_status"], "ok")
+
+    def test_market_scout_paper_probe_creates_order_after_llm_no_trade(self) -> None:
+        class FakeQuote:
+            def __init__(self, outcome: str) -> None:
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                return {
+                    "best_bid": 0.86 if self.outcome == "Yes" else 0.11,
+                    "best_ask": 0.88 if self.outcome == "Yes" else 0.13,
+                    "bid_size": 100.0,
+                    "ask_size": 100.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "slug": "us-x-iran-permanent-peace-deal-by-june-15-2026",
+                        "question": "US x Iran permanent peace deal by June 15, 2026?",
+                        "description": "Resolves Yes if a permanent peace deal is signed by the deadline.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["yes-token", "no-token"]),
+                        "outcomePrices": json.dumps(["0.87", "0.13"]),
+                        "liquidityNum": 600_000.0,
+                        "volume24hr": 23_000_000.0,
+                        "spread": 0.02,
+                        "endDateIso": datetime.fromtimestamp(time.time() + 12 * 3600, tz=UTC).isoformat(),
+                    },
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(outcome)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_evidence_enabled=False,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+            bot.update_market_scout_settings(
+                {
+                    "paper_auto_enabled": True,
+                    "paper_probe_enabled": True,
+                    "paper_stake_dollars": 2.0,
+                    "paper_probe_max_open_positions": 1,
+                    "paper_probe_min_confidence": 0.55,
+                    "paper_probe_min_selection_score": 14.0,
+                    "max_entry_price": 0.65,
+                    "max_spread": 0.04,
+                }
+            )
+
+            with patch.object(
+                bot,
+                "_call_market_scout_llm",
+                return_value={
+                    "decision": "NO_TRADE",
+                    "selected_slug": "",
+                    "outcome": "",
+                    "confidence": 0.22,
+                    "max_entry_price": 0.0,
+                    "reason": "The strongest-looking setup is NO on US x Iran permanent peace deal by June 15, 2026, but external news verification is required.",
+                    "risk_flags": ["external_news_verification_required"],
+                    "news_checks_needed": ["check official statements"],
+                    "valid_for_seconds": 60,
+                },
+            ):
+                bot._run_market_scout_once()
+
+            state = bot.market_scout_state()
+            orders = state["paper_orders"]
+            self.assertEqual(len(orders), 1)
+            self.assertEqual(orders[0]["symbol"], "MARKET")
+            self.assertEqual(orders[0]["status"], STATUS_FILLED)
+            self.assertEqual(orders[0]["side"], "No")
+            self.assertAlmostEqual(orders[0]["requested_cash"], 2.0)
+            self.assertTrue(state["status"]["last_auto_order"]["submitted"])
+            self.assertTrue(state["status"]["last_auto_order"]["probe"])
+            self.assertEqual(state["status"]["last_auto_order"]["decision"], "PROBE")
+            self.assertIn("MARKET_SCOUT_PROBE", orders[0]["reason"])
+
+    def test_market_scout_paper_probe_skips_open_market_and_uses_next_candidate(self) -> None:
+        class FakeQuote:
+            def __init__(self, token_id: str, outcome: str) -> None:
+                self.token_id = token_id
+                self.outcome = outcome
+
+            def to_dict(self) -> dict[str, Any]:
+                if self.token_id.startswith("fed"):
+                    ask = 0.88 if self.outcome == "Yes" else 0.13
+                else:
+                    ask = 0.77 if self.outcome == "Yes" else 0.24
+                return {
+                    "best_bid": round(max(0.01, ask - 0.02), 4),
+                    "best_ask": ask,
+                    "bid_size": 100.0,
+                    "ask_size": 100.0,
+                    "updated_at_ms": int(time.time() * 1000),
+                }
+
+        class FakePolymarket:
+            def get_active_markets(self, *, limit: int, order: str, ascending: bool) -> list[dict[str, Any]]:
+                end = datetime.fromtimestamp(time.time() + 18 * 3600, tz=UTC).isoformat()
+                return [
+                    {
+                        "slug": "fed-rate-cut-before-july-2026",
+                        "question": "Fed rate cut before July 2026?",
+                        "description": "Resolves Yes if the Federal Reserve cuts rates before July.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["fed-yes-token", "fed-no-token"]),
+                        "outcomePrices": json.dumps(["0.87", "0.13"]),
+                        "liquidityNum": 2_000_000.0,
+                        "volume24hr": 90_000_000.0,
+                        "spread": 0.02,
+                        "endDateIso": end,
+                        "events": [{"slug": "fed-rate-cut-june-2026", "title": "Fed rate cut June 2026"}],
+                    },
+                    {
+                        "slug": "us-government-shutdown-before-july-2026",
+                        "question": "US government shutdown before July 2026?",
+                        "description": "Resolves Yes if the US government shuts down before July.",
+                        "active": True,
+                        "closed": False,
+                        "archived": False,
+                        "acceptingOrders": True,
+                        "enableOrderBook": True,
+                        "outcomes": json.dumps(["Yes", "No"]),
+                        "clobTokenIds": json.dumps(["gov-yes-token", "gov-no-token"]),
+                        "outcomePrices": json.dumps(["0.76", "0.24"]),
+                        "liquidityNum": 500_000.0,
+                        "volume24hr": 18_000_000.0,
+                        "spread": 0.02,
+                        "endDateIso": end,
+                        "events": [{"slug": "us-government-shutdown-june-2026", "title": "US government shutdown June 2026"}],
+                    },
+                ]
+
+            def get_quote(self, token_id: str, outcome: str) -> FakeQuote:
+                return FakeQuote(token_id, outcome)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+                llm_super_agent_api_key="test-key",
+                market_scout_min_liquidity=1_000.0,
+                market_scout_min_volume_24h=100.0,
+                market_scout_evidence_enabled=False,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.polymarket = FakePolymarket()  # type: ignore[assignment]
+            bot.update_market_scout_settings(
+                {
+                    "paper_auto_enabled": True,
+                    "paper_probe_enabled": True,
+                    "paper_stake_dollars": 2.0,
+                    "paper_probe_max_open_positions": 3,
+                    "paper_probe_min_confidence": 0.55,
+                    "paper_probe_min_selection_score": 14.0,
+                    "max_entry_price": 0.65,
+                    "max_spread": 0.04,
+                }
+            )
+            llm_no_trade = {
+                "decision": "NO_TRADE",
+                "selected_slug": "",
+                "outcome": "",
+                "confidence": 0.18,
+                "max_entry_price": 0.0,
+                "reason": "No trade because external news verification is required.",
+                "risk_flags": ["external_news_verification_required"],
+                "news_checks_needed": ["check official sources"],
+                "valid_for_seconds": 60,
+            }
+
+            with patch.object(bot, "_call_market_scout_llm", return_value=llm_no_trade):
+                bot._run_market_scout_once()
+
+            first_state = bot.market_scout_state()
+            self.assertEqual(first_state["paper_orders"][0]["round_id"], "fed-rate-cut-before-july-2026")
+            self.assertEqual(first_state["paper_orders"][0]["side"], "No")
+
+            bot._market_scout_last_candidate_signature = ""
+            bot._market_scout_last_llm_at = 0.0
+            with patch.object(bot, "_call_market_scout_llm", return_value=llm_no_trade):
+                bot._run_market_scout_once()
+
+            state = bot.market_scout_state()
+            orders = state["paper_orders"]
+            self.assertEqual(len(orders), 2)
+            self.assertEqual(orders[0]["round_id"], "us-government-shutdown-before-july-2026")
+            self.assertEqual(orders[0]["side"], "No")
+            self.assertTrue(state["status"]["last_auto_order"]["submitted"])
+            self.assertIn("该市场已有 Paper 持仓", " | ".join(state["status"]["last_auto_order"]["probe_skip_reasons"]))
+
+    def test_dashboard_live_snapshot_uses_btc_runtime_pause_before_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                btc_runtime_settings_path=Path(tmp) / "btc-runtime.json",
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.set_btc_runtime_paused(True)
+            server = DashboardServer(("127.0.0.1", 0), Handler, bot)
+            try:
+                result = server.live_snapshot(
+                    {
+                        "market": {"slug": "btc-updown-5m-btc-runtime-cache"},
+                        "price": {"chainlink": 101.0},
+                        "quotes": {},
+                    }
+                )
+            finally:
+                server.server_close()
+
+            self.assertEqual(result["ignored_snapshot"], "btc_runtime_paused")
+            self.assertTrue(result["btc_runtime"]["paused"])
+
     def test_post_only_rests_reserves_cash_and_later_fills_as_maker_queue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(db_path=Path(tmp) / "test.sqlite3", paper_entry_order_type="POST_ONLY", stake_dollars=5.0)
@@ -4964,6 +6087,84 @@ class TradingCoreTest(unittest.TestCase):
         self.assertEqual(tick["chainlink_updated_ms"], 1780120000000)
         self.assertEqual(tick["source"], "polymarket-rtds-chainlink")
 
+    def test_rtds_chainlink_parser_reads_untagged_initial_batch(self) -> None:
+        tick = rtds_chainlink_price_from_payload(
+            {
+                "payload": {
+                    "data": [
+                        {
+                            "timestamp": 1781171197000,
+                            "value": 62850.46089519568,
+                        },
+                        {
+                            "timestamp": 1781171198000,
+                            "value": 62851.00222454006,
+                        },
+                    ]
+                }
+            },
+            now=1781171199.0,
+        )
+
+        self.assertIsNotNone(tick)
+        assert tick is not None
+        self.assertEqual(tick["chainlink"], 62851.00222454006)
+        self.assertEqual(tick["chainlink_updated_ms"], 1781171198000)
+        self.assertEqual(tick["source"], "polymarket-rtds-chainlink")
+
+    def test_rtds_chainlink_parser_reads_payload_symbol_batch(self) -> None:
+        tick = rtds_chainlink_price_from_payload(
+            {
+                "topic": "crypto_prices",
+                "type": "subscribe",
+                "payload": {
+                    "symbol": "btc/usd",
+                    "data": [
+                        {
+                            "timestamp": 1781171940000,
+                            "value": 62853.15133519489,
+                        },
+                        {
+                            "timestamp": 1781171998000,
+                            "value": 62850.612795051624,
+                        },
+                    ],
+                },
+            },
+            now=1781171999.0,
+        )
+
+        self.assertIsNotNone(tick)
+        assert tick is not None
+        self.assertEqual(tick["chainlink"], 62850.612795051624)
+        self.assertEqual(tick["chainlink_updated_ms"], 1781171998000)
+        self.assertEqual(tick["source"], "polymarket-rtds-chainlink")
+
+    def test_rtds_spot_parser_reads_crypto_prices_btcusdt_update(self) -> None:
+        payload = {
+            "connection_id": "conn",
+            "payload": {
+                "full_accuracy_value": "62914.01000000",
+                "symbol": "btcusdt",
+                "timestamp": 1781172577000,
+                "value": 62914.01,
+            },
+            "timestamp": 1781172577124,
+            "topic": "crypto_prices",
+            "type": "update",
+        }
+
+        self.assertIsNone(rtds_chainlink_price_from_payload(payload, now=1781172577.5))
+        tick = rtds_spot_price_from_payload(payload, now=1781172577.5)
+
+        self.assertIsNotNone(tick)
+        assert tick is not None
+        self.assertEqual(tick["binance_market"], 62914.01)
+        self.assertEqual(tick["binance_market_updated_ms"], 1781172577500)
+        self.assertEqual(tick["binance_market_received_ms"], 1781172577500)
+        self.assertEqual(tick["binance_market_exchange_updated_ms"], 1781172577000)
+        self.assertEqual(tick["binance_market_source"], "polymarket-rtds-crypto-prices")
+
     def test_spot_ws_parsers_use_receive_time_for_strategy_freshness(self) -> None:
         okx = okx_spot_price_from_payload(
             {
@@ -5173,6 +6374,11 @@ class TradingCoreTest(unittest.TestCase):
                 },
                 {"state": "message", "topic": "crypto_prices_chainlink", "at": now},
             )
+            with bot._lock:
+                # 模拟浏览器快照或市场切换清空执行价格后，REST fallback 仍要能复用后端 Chainlink 缓存。
+                bot.latest_price = {}
+                bot.paper_price = {}
+                bot.execution_price = {}
             bot._refresh_backend_prices(market)
 
             paper_price, _paper_quotes, paper_source = bot._paper_market_data()
@@ -5242,6 +6448,117 @@ class TradingCoreTest(unittest.TestCase):
             snapshot = bot.snapshot()
             self.assertEqual(snapshot["runtime"]["ws_status"]["backend_okx_ws"], "message")
             self.assertEqual(snapshot["runtime"]["ws_status"]["backend_okx_ws_exchange_age_ms"], 10_000)
+
+    def test_backend_spot_ws_prices_merge_cached_chainlink_after_scope_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-spot-ws-cache",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+
+            bot._ingest_backend_chainlink_price(
+                {
+                    "chainlink": 100.0,
+                    "chainlink_updated_ms": now_ms,
+                    "source": "polymarket-rtds-chainlink",
+                },
+                {"state": "message", "topic": "crypto_prices_chainlink", "at": now},
+            )
+            with bot._lock:
+                # 现网 RTDS 首批可能只到一次，执行价格被清空后仍需要保留该锚定价等待 spot 刷新。
+                bot.latest_price = {}
+                bot.paper_price = {}
+                bot.execution_price = {}
+
+            bot._ingest_backend_spot_price(
+                {
+                    "okx": 101.0,
+                    "okx_updated_ms": now_ms,
+                    "okx_received_ms": now_ms,
+                    "okx_exchange_updated_ms": now_ms,
+                    "okx_source": "okx-spot-ws",
+                },
+                {"source": "okx", "state": "message", "at": now},
+            )
+
+            execution_price, _execution_quotes, execution_source = bot._execution_market_data()
+            self.assertEqual(execution_source, "backend")
+            self.assertAlmostEqual(execution_price["chainlink"], 100.0)
+            self.assertEqual(execution_price["chainlink_updated_ms"], now_ms)
+            self.assertAlmostEqual(execution_price["okx"], 101.0)
+            self.assertEqual(execution_price["okx_basis_samples"], 1)
+            self.assertAlmostEqual(execution_price["okx_basis_median_bps"], 100.0, places=6)
+            self.assertEqual(bot.snapshot()["runtime"]["ws_status"]["price"], "backend-rtds-chainlink+spot-ws")
+
+    def test_backend_rtds_crypto_price_updates_binance_fallback_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                live_trading_runtime_enabled=False,
+                max_quote_age_ms=3_000,
+            )
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-rtds-crypto",
+                symbol="BTC",
+                started_at=now - 60,
+                ends_at=now + 180,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            with bot._lock:
+                bot.current_market = market
+
+            bot._ingest_backend_rtds_price(
+                {
+                    "chainlink": 100.0,
+                    "chainlink_updated_ms": now_ms,
+                    "source": "polymarket-rtds-chainlink",
+                },
+                {"state": "message", "topic": "crypto_prices_chainlink", "at": now},
+            )
+            bot._ingest_backend_rtds_price(
+                {
+                    "binance_market": 101.0,
+                    "binance_market_updated_ms": now_ms,
+                    "binance_market_received_ms": now_ms,
+                    "binance_market_exchange_updated_ms": now_ms - 25,
+                    "binance_market_source": "polymarket-rtds-crypto-prices",
+                },
+                {"state": "message", "topic": "crypto_prices", "at": now},
+            )
+
+            execution_price, _execution_quotes, execution_source = bot._execution_market_data()
+            self.assertEqual(execution_source, "backend")
+            self.assertAlmostEqual(execution_price["chainlink"], 100.0)
+            self.assertAlmostEqual(execution_price["binance_market"], 101.0)
+            self.assertEqual(execution_price["binance_basis_samples"], 1)
+            snapshot = bot.snapshot()
+            self.assertEqual(snapshot["runtime"]["ws_status"]["backend_rtds_ws"], "message")
+            self.assertEqual(snapshot["runtime"]["ws_status"]["backend_rtds_ws_topic"], "crypto_prices")
+            self.assertEqual(snapshot["runtime"]["ws_status"]["backend_binance_ws"], "message")
 
     def test_backend_price_refresh_runs_when_chainlink_is_fresh_but_fallback_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9685,6 +11002,209 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID]["db_path"], str(v11_1_db_path))
             self.assertIn("sample_readiness", option_by_id[LIVE_AGGRESSIVE_EDGE_V11_1_VARIANT_ID])
 
+    def test_single_fak_aggressive_edge_v11_down_only_real_selects_independent_live_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11", count=160)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.live_trading.client = FakeLiveClient()
+
+            payload = bot.update_live_settings({"live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID})
+
+            v11_down_only_db_path = Path(tmp) / "single_fak_aggressive_edge_v11_down_only_real.sqlite3"
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_COMBO)
+            self.assertEqual(bot.live_trading.variant.signal_filter_mode, SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC)
+            self.assertEqual(bot.live_trading.store.db_path, v11_down_only_db_path)
+            self.assertTrue(v11_down_only_db_path.exists())
+            self.assertEqual(payload["live_trading"]["db_path"], str(v11_down_only_db_path))
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            self.assertEqual(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID]["signal_filter_mode"],
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC,
+            )
+            self.assertEqual(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID]["db_path"],
+                str(v11_down_only_db_path),
+            )
+            self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID]["sample_readiness"]["version"], "V11")
+            self.assertTrue(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID]["sample_readiness"][
+                    "eligible_for_live_review"
+                ]
+            )
+
+    def test_single_fak_aggressive_edge_v11_down_only_active_real_selects_independent_live_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11", count=160)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.live_trading.client = FakeLiveClient()
+
+            payload = bot.update_live_settings({"live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID})
+
+            active_db_path = Path(tmp) / "single_fak_aggressive_edge_v11_down_only_active_real.sqlite3"
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_COMBO)
+            self.assertEqual(bot.live_trading.variant.signal_filter_mode, SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC)
+            self.assertEqual(bot.live_trading.store.db_path, active_db_path)
+            self.assertTrue(active_db_path.exists())
+            self.assertEqual(payload["live_trading"]["db_path"], str(active_db_path))
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            active_option = option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID]
+            self.assertEqual(active_option["db_path"], str(active_db_path))
+            self.assertEqual(active_option["sample_readiness"]["version"], "V11")
+            self.assertEqual(active_option["sample_readiness"]["side"], "Down")
+            self.assertTrue(active_option["sample_readiness"]["eligible_for_live_review"])
+
+    def test_single_fak_aggressive_edge_v11_down_only_real_uses_down_readiness_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_v11_mixed_readiness_with_down_edge(settings)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            options = bot.snapshot()["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            v11_readiness = option_by_id[LIVE_AGGRESSIVE_EDGE_V11_VARIANT_ID]["sample_readiness"]
+            down_readiness = option_by_id[LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID]["sample_readiness"]
+            self.assertFalse(v11_readiness["eligible_for_live_review"])
+            self.assertIn("胜率 60.00% 低于 70.00%", v11_readiness["reasons"])
+            self.assertTrue(down_readiness["eligible_for_live_review"])
+            self.assertEqual(down_readiness["side"], "Down")
+            self.assertEqual(down_readiness["settled_count"], 80)
+            self.assertEqual(down_readiness["win_rate_pct"], 75.0)
+
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v11-down-only-readiness-scope",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 99.925,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 99.92,
+                "binance_market_updated_ms": now_ms,
+                "okx": 99.92,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.31, "size": 300}, {"price": 0.30, "size": 700}],
+                    "asks": [{"price": 0.32, "size": 700}, {"price": 0.33, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.67, "size": 700}, {"price": 0.66, "size": 300}],
+                    "asks": [{"price": 0.68, "size": 300}, {"price": 0.69, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            preflight = bot.live_trading.preflight(market, price, quotes)
+            sample_check = [row for row in preflight["checks"] if row["key"] == "sample_readiness"][0]
+            self.assertEqual(sample_check["status"], "PASS")
+            self.assertEqual(sample_check["side"], "Down")
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(fake_client.buy_calls[0]["token_id"], "down-token")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V11_DOWN_ONLY_REAL_GUARD PASS", bot.live_trading.last_signal["reason"])
+
+    def test_single_fak_aggressive_edge_v12_real_selects_independent_live_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V12")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            bot.live_trading.client = FakeLiveClient()
+
+            payload = bot.update_live_settings({"live_strategy_id": LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID})
+
+            v12_db_path = Path(tmp) / "single_fak_aggressive_edge_v12_real.sqlite3"
+            self.assertEqual(bot.live_trading.config.live_strategy_id, LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID)
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID)
+            self.assertEqual(bot.live_trading.combo, LIVE_AGGRESSIVE_EDGE_V12_COMBO)
+            self.assertEqual(bot.live_trading.variant.signal_filter_mode, SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC)
+            self.assertEqual(bot.live_trading.store.db_path, v12_db_path)
+            self.assertTrue(v12_db_path.exists())
+            self.assertEqual(payload["live_trading"]["db_path"], str(v12_db_path))
+            self.assertEqual(
+                payload["live_trading"]["live_strategy"]["signal_filter_mode"],
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
+            )
+            options = payload["snapshot"]["settings"]["live_trading"]["live_strategy_options"]
+            option_by_id = {row["variant_id"]: row for row in options}
+            self.assertEqual(
+                option_by_id[LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID]["signal_filter_mode"],
+                SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC,
+            )
+            self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID]["db_path"], str(v12_db_path))
+            self.assertIn("sample_readiness", option_by_id[LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID])
+            self.assertEqual(option_by_id[LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID]["sample_readiness"]["version"], "V12")
+            self.assertTrue(option_by_id[LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID]["sample_readiness"]["eligible_for_live_review"])
+
     def test_single_fak_aggressive_edge_real_blocks_same_mid_entry_band_as_paper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
@@ -10334,6 +11854,568 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIn("SINGLE_AGGRESSIVE_EDGE V11.1_REAL_GUARD BLOCK", bot.live_trading.last_signal["reason"])
             self.assertIn("V11_UP_WEAK_TOP_SKEW top=0.3000 min=0.35", bot.live_trading.last_signal["reason"])
             self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_v11_down_only_real_blocks_up_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11", count=160)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v11-down-only-block-up",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.075,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.08,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.08,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.67, "size": 700}, {"price": 0.66, "size": 300}],
+                    "asks": [{"price": 0.68, "size": 300}, {"price": 0.69, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.31, "size": 300}, {"price": 0.30, "size": 700}],
+                    "asks": [{"price": 0.32, "size": 700}, {"price": 0.33, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V11_DOWN_ONLY_REAL_GUARD BLOCK", bot.live_trading.last_signal["reason"])
+            self.assertIn("V11_DOWN_ONLY_BLOCK_UP", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_v11_down_only_real_allows_down_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11", count=160)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v11-down-only-allow-down",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 99.925,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 99.92,
+                "binance_market_updated_ms": now_ms,
+                "okx": 99.92,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.31, "size": 300}, {"price": 0.30, "size": 700}],
+                    "asks": [{"price": 0.32, "size": 700}, {"price": 0.33, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.67, "size": 700}, {"price": 0.66, "size": 300}],
+                    "asks": [{"price": 0.68, "size": 300}, {"price": 0.69, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(fake_client.buy_calls[0]["token_id"], "down-token")
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID)
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V11_DOWN_ONLY_REAL_GUARD PASS", bot.live_trading.last_signal["reason"])
+            rows = bot.live_trading.store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_REAL live FAK", rows[0]["reason"])
+            orders = bot.orders_page(
+                account_scope="live",
+                variant_id=LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
+            )["recent_orders"]
+            self.assertEqual(orders[0]["variant_id"], LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID)
+            self.assertEqual(orders[0]["signal_filter_mode"], SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC)
+
+    def test_single_fak_aggressive_edge_v11_down_only_active_real_relaxes_down_move_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V11", count=160)
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            now = time.time()
+            now_ms = int(now * 1000)
+            price = {
+                "chainlink": 99.954,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 99.954,
+                "binance_market_updated_ms": now_ms,
+                "okx": 99.954,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.33,
+                    "best_ask": 0.34,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.33, "size": 300}, {"price": 0.32, "size": 700}],
+                    "asks": [{"price": 0.34, "size": 700}, {"price": 0.35, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.65,
+                    "best_ask": 0.66,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.65, "size": 700}, {"price": 0.64, "size": 300}],
+                    "asks": [{"price": 0.66, "size": 300}, {"price": 0.67, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            old_market = MarketRound(
+                round_id="btc-updown-5m-live-v11-down-only-active-old-block",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+
+            bot.live_trading.run_from_state(old_market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("过滤历史亏损价格带", bot.live_trading.last_signal["reason"])
+
+            bot.live_trading.update_settings({"enabled": False})
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            active_market = MarketRound(
+                round_id="btc-updown-5m-live-v11-down-only-active-pass",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+
+            bot.live_trading.run_from_state(active_market, price, quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(fake_client.buy_calls[0]["token_id"], "down-token")
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_VARIANT_ID)
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE ACTIVE_DOWN PASS sweet_move_4.5_8bps", bot.live_trading.last_signal["reason"])
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V11_DOWN_ONLY_ACTIVE_REAL_GUARD PASS", bot.live_trading.last_signal["reason"])
+            rows = bot.live_trading.store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_REAL live FAK", rows[0]["reason"])
+
+    def test_single_fak_aggressive_edge_v12_real_blocks_intermediate_up_top_skew(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V12")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v12-intermediate-top",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.075,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.08,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.08,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 300,
+                    "ask_size": 700,
+                    "bids": [{"price": 0.67, "size": 300}, {"price": 0.66, "size": 700}],
+                    "asks": [{"price": 0.68, "size": 700}, {"price": 0.69, "size": 300}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 700,
+                    "ask_size": 300,
+                    "bids": [{"price": 0.31, "size": 700}, {"price": 0.30, "size": 300}],
+                    "asks": [{"price": 0.32, "size": 300}, {"price": 0.33, "size": 700}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V12_REAL_GUARD BLOCK", bot.live_trading.last_signal["reason"])
+            self.assertIn("V12_UP_WEAK_TOP_SKEW top=0.3000 min=0.35", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_v12_real_blocks_overextended_move(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                max_entry_price=0.95,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V12")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v12-overextended",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.085,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.085,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.085,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.74,
+                    "best_ask": 0.75,
+                    "bid_size": 1200,
+                    "ask_size": 200,
+                    "bids": [{"price": 0.74, "size": 1200}],
+                    "asks": [{"price": 0.75, "size": 200}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.24,
+                    "best_ask": 0.25,
+                    "bid_size": 200,
+                    "ask_size": 1200,
+                    "bids": [{"price": 0.24, "size": 200}],
+                    "asks": [{"price": 0.25, "size": 1200}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("V12_OVEREXTENDED_MOVE abs_move=8.50bps max=8.00", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_v12_real_blocks_weak_down_top_skew(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V12")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v12-down-weak-top",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 99.93,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 99.93,
+                "binance_market_updated_ms": now_ms,
+                "okx": 99.93,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 800,
+                    "ask_size": 200,
+                    "bids": [{"price": 0.31, "size": 800}],
+                    "asks": [{"price": 0.32, "size": 200}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 200,
+                    "ask_size": 800,
+                    "bids": [{"price": 0.67, "size": 200}, {"price": 0.66, "size": 1000}],
+                    "asks": [{"price": 0.68, "size": 800}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(fake_client.buy_calls, [])
+            self.assertEqual(bot.live_trading.last_signal["side"], "NO_TRADE")
+            self.assertIn("V12_DOWN_WEAK_TOP_SKEW top=0.2000 min=0.30", bot.live_trading.last_signal["reason"])
+            self.assertEqual(bot.live_trading.store.open_trades(), [])
+
+    def test_single_fak_aggressive_edge_v12_real_places_live_order_when_guard_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = Settings(
+                db_path=Path(tmp) / "main.sqlite3",
+                live_trading_db_path=Path(tmp) / "live.sqlite3",
+                live_trading_settings_path=Path(tmp) / "live-settings.json",
+                strategy_experiments_db_dir=Path(tmp) / "strategy-experiments",
+                min_confidence=0.55,
+                min_edge=0.0,
+                live_trading_default_stake_dollars=5.0,
+                max_quote_age_ms=60_000,
+            )
+            self._seed_live_aggressive_edge_readiness(settings, version="V12")
+            bot = PaperTradingBot(settings, TradeStore(settings.db_path, settings.initial_balance))
+            fake_client = FakeLiveClient()
+            bot.live_trading.client = fake_client
+            bot.live_trading.update_settings(
+                {
+                    "enabled": True,
+                    "live_strategy_id": LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID,
+                    "compliance_acknowledged": True,
+                    "initial_balance": 20.0,
+                    "stake_dollars": 5.0,
+                    "max_open_trades": 2,
+                }
+            )
+            now = time.time()
+            now_ms = int(now * 1000)
+            market = MarketRound(
+                round_id="btc-updown-5m-live-v12-pass",
+                symbol="BTC",
+                started_at=now - 150,
+                ends_at=now + 120,
+                target_price=100.0,
+                up_token="up-token",
+                down_token="down-token",
+            )
+            price = {
+                "chainlink": 100.075,
+                "chainlink_updated_ms": now_ms,
+                "binance_market": 100.075,
+                "binance_market_updated_ms": now_ms,
+                "okx": 100.075,
+                "okx_updated_ms": now_ms,
+            }
+            quotes = {
+                "Up": {
+                    "best_bid": 0.67,
+                    "best_ask": 0.68,
+                    "bid_size": 1200,
+                    "ask_size": 200,
+                    "bids": [{"price": 0.67, "size": 1200}],
+                    "asks": [{"price": 0.68, "size": 200}],
+                    "updated_at_ms": now_ms,
+                },
+                "Down": {
+                    "best_bid": 0.31,
+                    "best_ask": 0.32,
+                    "bid_size": 200,
+                    "ask_size": 1200,
+                    "bids": [{"price": 0.31, "size": 200}],
+                    "asks": [{"price": 0.32, "size": 1200}],
+                    "updated_at_ms": now_ms,
+                },
+            }
+
+            bot.live_trading.run_from_state(market, price, quotes)
+
+            self.assertEqual(len(fake_client.buy_calls), 1)
+            self.assertEqual(fake_client.buy_calls[0]["token_id"], "up-token")
+            self.assertEqual(bot.live_trading.variant_id, LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID)
+            self.assertIn("SINGLE_AGGRESSIVE_EDGE V12_REAL_GUARD PASS", bot.live_trading.last_signal["reason"])
+            rows = bot.live_trading.store.open_trades()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V12_REAL live FAK", rows[0]["reason"])
+            self.assertIn("V12_REAL_GUARD PASS", rows[0]["reason"])
+            orders = bot.orders_page(account_scope="live", variant_id=LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID)["recent_orders"]
+            self.assertEqual(orders[0]["variant_id"], LIVE_AGGRESSIVE_EDGE_V12_VARIANT_ID)
+            self.assertEqual(orders[0]["signal_filter_mode"], SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC)
 
     def test_single_fak_real_blocks_strategy_switch_with_open_live_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

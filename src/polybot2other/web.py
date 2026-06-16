@@ -65,7 +65,7 @@ class DashboardServer(ThreadingHTTPServer):
             if self._status_snapshot_cache is not None:
                 cached = self._status_snapshot_cache
                 self._start_status_snapshot_refresh()
-                return cached
+                return self.bot.refresh_status_runtime_overlay(cached)
             payload = self.bot.snapshot()
             self._status_snapshot_cache = payload
             self._status_snapshot_cache_at = time.time()
@@ -88,6 +88,9 @@ class DashboardServer(ThreadingHTTPServer):
         return True
 
     def live_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        btc_runtime_is_paused = getattr(self.bot, "btc_runtime_is_paused", None)
+        if callable(btc_runtime_is_paused) and btc_runtime_is_paused():
+            return self.bot.btc_runtime_paused_snapshot_response()
         market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
         key = str(market.get("slug") or "")
         now = time.time()
@@ -175,6 +178,18 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/polymarket-status":
             self._send_json(self.server.polymarket_status(force=False), include_body=False)
             return
+        if path == "/api/btc-runtime":
+            self._send_json({"btc_runtime": self.server.bot.btc_runtime()}, include_body=False)
+            return
+        if path == "/api/market-llm-terminal":
+            self._send_json(self.server.bot.market_llm_terminal(), include_body=False)
+            return
+        if path == "/api/market-scout-state":
+            self._send_json(self.server.bot.market_scout_state(), include_body=False)
+            return
+        if path == "/api/market-scout-settings":
+            self._send_json(self.server.bot.market_scout_settings(), include_body=False)
+            return
         if path == "/api/actor-analysis":
             self._send_json(self.server.bot.actor_analysis(force=False), include_body=False)
             return
@@ -245,6 +260,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self.server.polymarket_status(force=refresh))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/btc-runtime":
+            self._send_json({"btc_runtime": self.server.bot.btc_runtime()})
+            return
+        if path == "/api/market-llm-terminal":
+            try:
+                limit = _query_int(query, "limit", 80, 1, 200)
+                after_seq = _query_int(query, "after_seq", 0, 0, 1_000_000_000)
+                self._send_json(self.server.bot.market_llm_terminal(limit=limit, after_seq=after_seq))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/market-scout-state":
+            try:
+                order_limit = _query_int(query, "order_limit", 30, 1, 100)
+                order_offset = _query_int(query, "order_offset", 0, 0, 100_000)
+                quote_refresh = _query_bool_optional(query, "quote_refresh", False)
+                self._send_json(
+                    self.server.bot.market_scout_state(
+                        order_limit=order_limit,
+                        order_offset=order_offset,
+                        quote_refresh=quote_refresh,
+                    )
+                )
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if path == "/api/market-scout-settings":
+            self._send_json(self.server.bot.market_scout_settings())
             return
         if path == "/api/status-stream":
             self._send_status_stream()
@@ -464,6 +508,21 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_json_body()
                 paused = _read_bool(payload, "paused")
                 self._send_json(self.server.bot.set_paper_trading_paused(paused))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/btc-runtime":
+            try:
+                payload = self._read_json_body()
+                paused = _read_bool(payload, "paused")
+                self._send_json(self.server.bot.set_btc_runtime_paused(paused))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/market-scout-settings":
+            try:
+                payload = self._read_json_body()
+                self._send_json(self.server.bot.update_market_scout_settings(payload))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import socket
 import ssl
@@ -15,6 +16,7 @@ from typing import Any, Callable
 from .models import MarketRound
 
 
+logger = logging.getLogger(__name__)
 CLOB_MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 OKX_SPOT_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
@@ -26,9 +28,12 @@ CLOB_WS_READ_TIMEOUT_SECONDS = 1.0
 CLOB_WS_RECONNECT_INITIAL_SECONDS = 0.5
 CLOB_WS_RECONNECT_MAX_SECONDS = 5.0
 MAX_CLOB_WS_LEVELS = 50
+RTDS_UNPARSED_LOG_INTERVAL_SECONDS = 30.0
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 SPOT_WS_SOURCE_OKX = "okx"
 SPOT_WS_SOURCE_BINANCE = "binance"
+RTDS_CHAINLINK_BTC_SYMBOL_KEYS = {"btcusd"}
+RTDS_CRYPTO_BTC_SYMBOL_KEYS = {"btcusdt"}
 
 
 class WebSocketProtocolError(RuntimeError):
@@ -392,6 +397,7 @@ class RtdsChainlinkWebSocketFeed:
     def __init__(self, url: str = RTDS_WS_URL, timeout_seconds: float = 5.0) -> None:
         self.url = url
         self.timeout_seconds = timeout_seconds
+        self._last_unparsed_log_at = 0.0
 
     def run(
         self,
@@ -431,13 +437,19 @@ class RtdsChainlinkWebSocketFeed:
                         "topic": "crypto_prices_chainlink",
                         "type": "*",
                         "filters": "{\"symbol\":\"btc/usd\"}",
+                    },
+                    {
+                        "topic": "crypto_prices",
+                        "type": "update",
+                        # Polymarket RTDS 的 btcusdt filter 当前只稳定返回首批，本地过滤能拿到持续 update。
+                        "filters": "",
                     }
                 ],
             }
             ws.send_text(json.dumps(subscription, separators=(",", ":")))
             ws.send_text("PING")
             last_ping = time.time()
-            status_callback({"state": "connected", "topic": "crypto_prices_chainlink", "at": last_ping})
+            status_callback({"state": "connected", "topic": "crypto_prices_chainlink,crypto_prices", "at": last_ping})
             while not stop_event.is_set():
                 now = time.time()
                 if now - last_ping >= RTDS_WS_PING_SECONDS:
@@ -452,18 +464,51 @@ class RtdsChainlinkWebSocketFeed:
                     payload = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-                tick = rtds_chainlink_price_from_payload(payload, time.time())
+                message_at = time.time()
+                tick = rtds_chainlink_price_from_payload(payload, message_at)
                 if tick:
                     price_callback(
                         tick,
                         {
                             "state": "message",
-                            "topic": "crypto_prices_chainlink",
+                            "topic": _rtds_payload_topic(payload) or "crypto_prices_chainlink",
                             "at": time.time(),
                         },
                     )
+                    continue
+                spot_tick = rtds_spot_price_from_payload(payload, message_at)
+                if spot_tick:
+                    price_callback(
+                        spot_tick,
+                        {
+                            "state": "message",
+                            "topic": _rtds_payload_topic(payload) or "crypto_prices",
+                            "at": time.time(),
+                        },
+                    )
+                else:
+                    self._log_unparsed_payload(payload)
         finally:
             ws.close()
+
+    def _log_unparsed_payload(self, payload: Any) -> None:
+        now = time.time()
+        if now - self._last_unparsed_log_at < RTDS_UNPARSED_LOG_INTERVAL_SECONDS:
+            return
+        if isinstance(payload, dict) and _is_expected_ignored_rtds_crypto_payload(payload):
+            return
+        rows = _rtds_price_rows(payload) if isinstance(payload, dict) else []
+        if not rows:
+            return
+        self._last_unparsed_log_at = now
+        # RTDS 首批消息偶尔缺少 topic/symbol，保留摘要帮助定位是无推送还是解析丢弃。
+        logger.warning(
+            "RTDS Chainlink 消息未解析 rows=%s topic=%s symbol=%s keys=%s",
+            len(rows),
+            payload.get("topic") if isinstance(payload, dict) else None,
+            payload.get("symbol") if isinstance(payload, dict) else None,
+            sorted(payload.keys()) if isinstance(payload, dict) else [],
+        )
 
 
 class SpotPriceWebSocketFeed:
@@ -610,27 +655,114 @@ def binance_spot_price_from_payload(payload: Any, now: float | None = None) -> d
 def rtds_chainlink_price_from_payload(payload: Any, now: float | None = None) -> dict[str, Any] | None:
     now = time.time() if now is None else now
     messages = payload if isinstance(payload, list) else [payload]
+    latest_tick: dict[str, Any] | None = None
     for message in messages:
         if not isinstance(message, dict):
             continue
         topic = str(message.get("topic") or "")
         rows = _rtds_price_rows(message)
+        inferred_chainlink = _is_untagged_rtds_chainlink_payload(message, rows)
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        payload_symbol = str(payload.get("symbol") or "").strip().lower()
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            symbol = str(row.get("symbol") or message.get("symbol") or "").strip().lower()
-            if topic != "crypto_prices_chainlink" and symbol != "btc/usd":
+            symbol = str(row.get("symbol") or message.get("symbol") or payload_symbol or "").strip().lower()
+            if topic != "crypto_prices_chainlink" and not _is_rtds_chainlink_btc_symbol(symbol) and not inferred_chainlink:
                 continue
             value = _maybe_float(row.get("value") or row.get("price"))
             if value is None or value <= 0:
                 continue
             updated_ms = _normalize_timestamp_ms(row.get("timestamp") or message.get("timestamp"), now)
-            return {
+            tick = {
                 "chainlink": value,
                 "chainlink_updated_ms": updated_ms,
                 "source": "polymarket-rtds-chainlink",
             }
+            if latest_tick is None or updated_ms >= int(latest_tick["chainlink_updated_ms"]):
+                latest_tick = tick
+    return latest_tick
+
+
+def rtds_spot_price_from_payload(payload: Any, now: float | None = None) -> dict[str, Any] | None:
+    now = time.time() if now is None else now
+    received_ms = int(now * 1000)
+    messages = payload if isinstance(payload, list) else [payload]
+    latest_tick: dict[str, Any] | None = None
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        topic = str(message.get("topic") or "")
+        if topic and topic != "crypto_prices":
+            continue
+        payload_obj = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        payload_symbol = str(payload_obj.get("symbol") or "").strip().lower()
+        for row in _rtds_price_rows(message):
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or message.get("symbol") or payload_symbol or "").strip().lower()
+            if not _is_rtds_crypto_btc_symbol(symbol):
+                continue
+            value = _maybe_float(row.get("value") or row.get("price"))
+            if value is None or value <= 0:
+                continue
+            exchange_updated_ms = _normalize_timestamp_ms(row.get("timestamp") or message.get("timestamp"), now)
+            tick = {
+                "binance_market": value,
+                # 策略 freshness 使用收到时间，RTDS 原始时间保留给诊断。
+                "binance_market_updated_ms": received_ms,
+                "binance_market_received_ms": received_ms,
+                "binance_market_exchange_updated_ms": exchange_updated_ms,
+                "binance_market_source": "polymarket-rtds-crypto-prices",
+            }
+            if latest_tick is None or exchange_updated_ms >= int(latest_tick["binance_market_exchange_updated_ms"]):
+                latest_tick = tick
+    return latest_tick
+
+
+def _is_untagged_rtds_chainlink_payload(message: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    if message.get("topic") or message.get("symbol"):
+        return False
+    if "payload" not in message:
+        return False
+    if not rows:
+        return False
+    # Polymarket RTDS 的 crypto_prices_chainlink 初始批次可能只返回 timestamp/value 序列。
+    return all(_maybe_float(row.get("value") or row.get("price")) is not None for row in rows)
+
+
+def _rtds_symbol_key(symbol: str) -> str:
+    return "".join(ch for ch in str(symbol or "").lower() if ch.isalnum())
+
+
+def _is_rtds_chainlink_btc_symbol(symbol: str) -> bool:
+    return _rtds_symbol_key(symbol) in RTDS_CHAINLINK_BTC_SYMBOL_KEYS
+
+
+def _is_rtds_crypto_btc_symbol(symbol: str) -> bool:
+    return _rtds_symbol_key(symbol) in RTDS_CRYPTO_BTC_SYMBOL_KEYS
+
+
+def _rtds_payload_topic(payload: Any) -> str | None:
+    if isinstance(payload, dict) and payload.get("topic"):
+        return str(payload.get("topic"))
     return None
+
+
+def _is_expected_ignored_rtds_crypto_payload(message: dict[str, Any]) -> bool:
+    if str(message.get("topic") or "") != "crypto_prices":
+        return False
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    payload_symbol = str(payload.get("symbol") or "").strip().lower()
+    symbols = {
+        str(row.get("symbol") or message.get("symbol") or payload_symbol or "").strip().lower()
+        for row in _rtds_price_rows(message)
+        if isinstance(row, dict)
+    }
+    symbols.discard("")
+    if not symbols:
+        return False
+    return not any(_is_rtds_crypto_btc_symbol(symbol) or _is_rtds_chainlink_btc_symbol(symbol) for symbol in symbols)
 
 
 def _rtds_price_rows(message: dict[str, Any]) -> list[dict[str, Any]]:

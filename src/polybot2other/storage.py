@@ -16,7 +16,7 @@ from .models import MarketRound, PaperFill, PaperFillLevel, TradeIntent
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 ACTIVE_ORDER_STATUSES = ("RESTING", "PARTIAL_RESTING", "PENDING")
 PAPER_MIN_RESTING_FILL_CASH = 0.01
 PAPER_DUST_RELEASE_CASH = 0.05
@@ -29,6 +29,16 @@ AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED = 10
 AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT = 60.0
 AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED = 15
 AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT = 60.0
+# 2026-06-11 已确认 Chainlink 缺失窗口。默认统计会排除这些窗口内的 fallback 样本，
+# 原始样本仍保留在 SQLite 里，方便后续复盘 RTDS 异常链路。
+RTDS_ABNORMAL_SHADOW_SAMPLE_WINDOWS: tuple[tuple[float, float, str], ...] = (
+    (1781107200.0, 1781118000.0, "2026-06-11 00:00-03:00 SGT Chainlink 缺失"),
+    (1781150400.0, 1781157600.0, "2026-06-11 12:00-14:00 SGT Chainlink 缺失"),
+    (1781164800.0, 1781172000.0, "2026-06-11 16:00-18:00 SGT Chainlink 缺失"),
+)
+RTDS_ABNORMAL_SHADOW_SOURCE_KEYWORDS = ("fallback", "basis_adjusted", "okx", "binance")
+RTDS_ABNORMAL_SHADOW_FILTER_MODE = "exclude_rtds_abnormal_fallback_samples"
+RTDS_ABNORMAL_CHAINLINK_NEARBY_SECONDS = 15.0
 SETTLEMENT_SOURCE_POLYMARKET = "polymarket_official"
 SETTLEMENT_SOURCE_CHAINLINK = "chainlink_fallback"
 SETTLEMENT_SOURCE_EARLY_EXIT = "early_exit"
@@ -70,6 +80,55 @@ def _locked(method: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _qualified_column(alias: str, column: str) -> str:
+    prefix = str(alias or "aggressive_edge_v2_shadow_samples").strip()
+    return f"{prefix}.{column}" if prefix else column
+
+
+def _rtds_abnormal_shadow_sample_sql(alias: str = "") -> str:
+    symbol = _qualified_column(alias, "symbol")
+    created_at = _qualified_column(alias, "created_at")
+    signal_reason = f"LOWER(COALESCE({_qualified_column(alias, 'signal_reason')}, ''))"
+    window_sql = " OR ".join(
+        f"({created_at} >= {start:.6f} AND {created_at} < {end:.6f})"
+        for start, end, _label in RTDS_ABNORMAL_SHADOW_SAMPLE_WINDOWS
+    )
+    chainlink_gap_sql = (
+        "EXISTS ("
+        "SELECT 1 FROM price_ticks rtds_all "
+        f"WHERE rtds_all.symbol = {symbol} "
+        "AND LOWER(rtds_all.source) LIKE '%chainlink%' LIMIT 1"
+        ") AND NOT EXISTS ("
+        "SELECT 1 FROM price_ticks rtds_near "
+        f"WHERE rtds_near.symbol = {symbol} "
+        "AND LOWER(rtds_near.source) LIKE '%chainlink%' "
+        f"AND rtds_near.created_at BETWEEN {created_at} - {RTDS_ABNORMAL_CHAINLINK_NEARBY_SECONDS:.6f} "
+        f"AND {created_at} + {RTDS_ABNORMAL_CHAINLINK_NEARBY_SECONDS:.6f}"
+        ")"
+    )
+    source_sql = " OR ".join(
+        f"{signal_reason} LIKE '%{keyword}%'" for keyword in RTDS_ABNORMAL_SHADOW_SOURCE_KEYWORDS
+    )
+    return f"((({window_sql}) OR ({chainlink_gap_sql})) AND ({source_sql}))"
+
+
+def _rtds_normal_shadow_sample_sql(alias: str = "") -> str:
+    return f"NOT {_rtds_abnormal_shadow_sample_sql(alias)}"
+
+
+def _rtds_abnormal_filter_payload() -> dict[str, Any]:
+    return {
+        "mode": RTDS_ABNORMAL_SHADOW_FILTER_MODE,
+        "description": "默认排除已确认 RTDS Chainlink 缺失窗口内的 fallback 样本，原始数据不删除。",
+        "windows": [
+            {"start_at": start, "end_at": end, "label": label}
+            for start, end, label in RTDS_ABNORMAL_SHADOW_SAMPLE_WINDOWS
+        ],
+        "source_keywords": list(RTDS_ABNORMAL_SHADOW_SOURCE_KEYWORDS),
+        "chainlink_nearby_seconds": RTDS_ABNORMAL_CHAINLINK_NEARBY_SECONDS,
+    }
+
+
 class TradeStore:
     def __init__(self, db_path: Path, initial_balance: float) -> None:
         self.db_path = db_path
@@ -107,6 +166,7 @@ class TradeStore:
                 condition_id TEXT,
                 up_token TEXT,
                 down_token TEXT,
+                event_slug TEXT,
                 url TEXT,
                 final_price REAL,
                 outcome TEXT,
@@ -311,6 +371,7 @@ class TradeStore:
         self._ensure_column("market_rounds", "condition_id", "TEXT")
         self._ensure_column("market_rounds", "up_token", "TEXT")
         self._ensure_column("market_rounds", "down_token", "TEXT")
+        self._ensure_column("market_rounds", "event_slug", "TEXT")
         self._ensure_column("market_rounds", "url", "TEXT")
         self._ensure_column("market_rounds", "settlement_source", "TEXT")
         self._ensure_column("trades", "settlement_source", "TEXT")
@@ -841,8 +902,23 @@ class TradeStore:
     def aggressive_edge_v2_shadow_summary(self, symbol: str = "BTC") -> dict[str, Any]:
         """汇总 V2 影子样本；用于面板判断是否已经积累足够学习数据。"""
 
+        safe_symbol = str(symbol or "BTC")
+        normal_sample_sql = _rtds_normal_shadow_sample_sql()
+        abnormal_sample_sql = _rtds_abnormal_shadow_sample_sql()
+        quality_row = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS raw_total_count,
+                SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS raw_settled_count,
+                SUM(CASE WHEN {abnormal_sample_sql} THEN 1 ELSE 0 END) AS rtds_abnormal_excluded_count,
+                SUM(CASE WHEN {abnormal_sample_sql} AND settled_at IS NOT NULL THEN 1 ELSE 0 END) AS rtds_abnormal_settled_excluded_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+            """,
+            (safe_symbol,),
+        ).fetchone()
         rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total_count,
                 SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS settled_count,
@@ -953,11 +1029,12 @@ class TradeStore:
                 MAX(risk_score) AS max_risk_score
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
+              AND {normal_sample_sql}
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchone()
         v6_direction_rows = self.conn.execute(
-            """
+            f"""
             SELECT side,
                    COUNT(*) AS settled_count,
                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
@@ -966,13 +1043,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v6_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY side
             ORDER BY side
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v6_bucket_rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 CASE
                     WHEN sample_key LIKE 'm0:%' THEN 'm0'
@@ -989,13 +1067,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v6_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY bucket
             ORDER BY bucket
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v7_direction_rows = self.conn.execute(
-            """
+            f"""
             SELECT side,
                    COUNT(*) AS settled_count,
                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
@@ -1004,13 +1083,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v7_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY side
             ORDER BY side
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v7_bucket_rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 CASE
                     WHEN sample_key LIKE 'm0:%' THEN 'm0'
@@ -1027,13 +1107,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v7_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY bucket
             ORDER BY bucket
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v8_direction_rows = self.conn.execute(
-            """
+            f"""
             SELECT side,
                    COUNT(*) AS settled_count,
                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
@@ -1042,13 +1123,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v8_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY side
             ORDER BY side
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v8_bucket_rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 CASE
                     WHEN sample_key LIKE 'm0:%' THEN 'm0'
@@ -1065,13 +1147,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v8_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY bucket
             ORDER BY bucket
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v9_direction_rows = self.conn.execute(
-            """
+            f"""
             SELECT side,
                    COUNT(*) AS settled_count,
                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
@@ -1080,13 +1163,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v9_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY side
             ORDER BY side
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         v9_bucket_rows = self.conn.execute(
-            """
+            f"""
             SELECT
                 CASE
                     WHEN sample_key LIKE 'm0:%' THEN 'm0'
@@ -1103,13 +1187,14 @@ class TradeStore:
             WHERE symbol = ?
               AND v9_would_trade = 1
               AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
             GROUP BY bucket
             ORDER BY bucket
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, risk_score, risk_level,
                    base_would_trade, v1_would_trade, v2_would_trade,
                    v4_would_trade, v4_block_reason, v5_would_trade, v5_block_reason,
@@ -1120,84 +1205,92 @@ class TradeStore:
                    outcome, would_win, created_at, updated_at
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 5
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v6_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v6_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v6_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v7_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v7_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v7_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v8_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v8_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v8_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v9_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v9_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v9_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v10_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v10_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v10_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         recent_v12_rows = self.conn.execute(
-            """
+            f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
                    outcome, would_win, created_at, updated_at, settled_at, v12_block_reason
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND v12_would_trade = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT 8
             """,
-            (str(symbol or "BTC"),),
+            (safe_symbol,),
         ).fetchall()
         summary = dict(rows) if rows is not None else {}
+        quality = dict(quality_row) if quality_row is not None else {}
         version_columns = {
             "V4": "v4_would_trade",
             "V5": "v5_would_trade",
@@ -1327,8 +1420,23 @@ class TradeStore:
                 FROM aggressive_edge_v2_shadow_samples
                 WHERE symbol = ?
                   AND {column} = 1
+                  AND {normal_sample_sql}
                 """,
-                (str(symbol or "BTC"),),
+                (safe_symbol,),
+            ).fetchone()
+            excluded_aggregate = self.conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS excluded_count,
+                    SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS excluded_settled_count,
+                    SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS excluded_win_count,
+                    SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS excluded_loss_count
+                FROM aggressive_edge_v2_shadow_samples
+                WHERE symbol = ?
+                  AND {column} = 1
+                  AND {abnormal_sample_sql}
+                """,
+                (safe_symbol,),
             ).fetchone()
             direction_rows = self.conn.execute(
                 f"""
@@ -1340,10 +1448,11 @@ class TradeStore:
                 WHERE symbol = ?
                   AND {column} = 1
                   AND settled_at IS NOT NULL
+                  AND {normal_sample_sql}
                 GROUP BY side
                 ORDER BY side
                 """,
-                (str(symbol or "BTC"),),
+                (safe_symbol,),
             ).fetchall()
             bucket_rows = self.conn.execute(
                 f"""
@@ -1363,10 +1472,11 @@ class TradeStore:
                 WHERE symbol = ?
                   AND {column} = 1
                   AND settled_at IS NOT NULL
+                  AND {normal_sample_sql}
                 GROUP BY bucket
                 ORDER BY bucket
                 """,
-                (str(symbol or "BTC"),),
+                (safe_symbol,),
             ).fetchall()
             recent = self.conn.execute(
                 f"""
@@ -1375,12 +1485,16 @@ class TradeStore:
                 FROM aggressive_edge_v2_shadow_samples
                 WHERE symbol = ?
                   AND {column} = 1
+                  AND {normal_sample_sql}
                 ORDER BY updated_at DESC, id DESC
                 LIMIT 8
                 """,
-                (str(symbol or "BTC"),),
+                (safe_symbol,),
             ).fetchall()
             data = dict(aggregate) if aggregate is not None else {}
+            excluded_data = dict(excluded_aggregate) if excluded_aggregate is not None else {}
+            excluded_count = int(excluded_data.get("excluded_count") or 0)
+            excluded_settled_count = int(excluded_data.get("excluded_settled_count") or 0)
             win_count = int(data.get("win_count") or 0)
             loss_count = int(data.get("loss_count") or 0)
             stake_count = int(data.get("simulated_stake_count") or 0)
@@ -1390,10 +1504,16 @@ class TradeStore:
                 "version": version,
                 "column": column,
                 "would_trade_count": int(data.get("would_trade_count") or 0),
+                "raw_would_trade_count": int(data.get("would_trade_count") or 0) + excluded_count,
                 "settled_count": int(data.get("settled_count") or 0),
+                "raw_settled_count": int(data.get("settled_count") or 0) + excluded_settled_count,
                 "unsettled_count": int(data.get("unsettled_count") or 0),
                 "win_count": win_count,
                 "loss_count": loss_count,
+                "rtds_abnormal_excluded_count": excluded_count,
+                "rtds_abnormal_settled_excluded_count": excluded_settled_count,
+                "rtds_abnormal_win_excluded_count": int(excluded_data.get("excluded_win_count") or 0),
+                "rtds_abnormal_loss_excluded_count": int(excluded_data.get("excluded_loss_count") or 0),
                 "win_rate_pct": win_rate(win_count, loss_count),
                 "simulated_roi_pct": round(float(data.get("simulated_pnl") or 0.0) / stake_count * 100.0, 4)
                 if stake_count
@@ -1422,9 +1542,32 @@ class TradeStore:
         high_loss = integer("high_risk_loss_count")
         high_win = integer("high_risk_win_count")
         high_settled = high_loss + high_win
+        raw_total_count = int(quality.get("raw_total_count") or 0)
+        raw_settled_count = int(quality.get("raw_settled_count") or 0)
+        rtds_abnormal_excluded_count = int(quality.get("rtds_abnormal_excluded_count") or 0)
+        rtds_abnormal_settled_excluded_count = int(quality.get("rtds_abnormal_settled_excluded_count") or 0)
+        if rtds_abnormal_excluded_count:
+            logger.debug(
+                "RTDS 异常样本默认排除 symbol=%s excluded=%s settled_excluded=%s raw_total=%s",
+                safe_symbol,
+                rtds_abnormal_excluded_count,
+                rtds_abnormal_settled_excluded_count,
+                raw_total_count,
+            )
         return {
             "total_count": integer("total_count"),
+            "raw_total_count": raw_total_count,
             "settled_count": settled_count,
+            "raw_settled_count": raw_settled_count,
+            "rtds_abnormal_excluded_count": rtds_abnormal_excluded_count,
+            "rtds_abnormal_settled_excluded_count": rtds_abnormal_settled_excluded_count,
+            "data_quality_filter": {
+                **_rtds_abnormal_filter_payload(),
+                "raw_total_count": raw_total_count,
+                "raw_settled_count": raw_settled_count,
+                "rtds_abnormal_excluded_count": rtds_abnormal_excluded_count,
+                "rtds_abnormal_settled_excluded_count": rtds_abnormal_settled_excluded_count,
+            },
             "base_would_trade_count": integer("base_would_trade_count"),
             "base_would_trade_settled_count": integer("base_would_trade_settled_count"),
             "base_would_win_count": base_win,
@@ -1545,6 +1688,223 @@ class TradeStore:
             "diagnostic_version_summaries": diagnostic_version_summaries,
         }
 
+    def aggressive_edge_v2_shadow_live_readiness(
+        self,
+        symbol: str = "BTC",
+        version: str = "V11",
+        *,
+        side: str | None = None,
+    ) -> dict[str, Any]:
+        """按版本和可选方向读取实盘准入；Down-only REAL 使用方向过滤后的独立证据。"""
+
+        version_columns = {
+            "V4": "v4_would_trade",
+            "V5": "v5_would_trade",
+            "V6": "v6_would_trade",
+            "V7": "v7_would_trade",
+            "V8": "v8_would_trade",
+            "V9": "v9_would_trade",
+            "V10": "v10_would_trade",
+            "V11": "v11_would_trade",
+            "V12": "v12_would_trade",
+        }
+        normalized_version = str(version or "V11").strip().upper()
+        column = version_columns.get(normalized_version)
+        if column is None:
+            allowed = ", ".join(version_columns)
+            raise ValueError(f"unknown aggressive edge sample version: {normalized_version}; allowed: {allowed}")
+        safe_symbol = str(symbol or "BTC")
+        normalized_side = str(side or "").strip().lower()
+        side_filter = {"up": "Up", "down": "Down"}.get(normalized_side)
+        side_sql = "AND side = ?" if side_filter else ""
+        base_params: list[Any] = [safe_symbol]
+        if side_filter:
+            base_params.append(side_filter)
+        normal_sample_sql = _rtds_normal_shadow_sample_sql()
+
+        def win_rate(win_count: int, loss_count: int) -> float | None:
+            total = win_count + loss_count
+            return round(win_count / total * 100.0, 4) if total else None
+
+        def stat_row(row: sqlite3.Row, label_key: str) -> dict[str, Any]:
+            win_count = int(row["win_count"] or 0)
+            loss_count = int(row["loss_count"] or 0)
+            return {
+                label_key: row[label_key],
+                "settled_count": int(row["settled_count"] or 0),
+                "win_count": win_count,
+                "loss_count": loss_count,
+                "win_rate_pct": win_rate(win_count, loss_count),
+            }
+
+        def live_readiness(version_data: dict[str, Any]) -> dict[str, Any]:
+            """实盘准入规则；方向过滤后仍检查样本量、胜率、ROI 和时间桶。"""
+
+            settled = int(version_data.get("settled_count") or 0)
+            win_rate_pct = _maybe_float(version_data.get("win_rate_pct"))
+            roi_pct = _maybe_float(version_data.get("simulated_roi_pct"))
+            scope_prefix = f"{side_filter} 样本" if side_filter else ""
+            reasons: list[str] = []
+            bad_directions: list[dict[str, Any]] = []
+            bad_buckets: list[dict[str, Any]] = []
+            if settled < AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED:
+                settled_prefix = f"{scope_prefix}已结算" if scope_prefix else "已结算样本"
+                reasons.append(f"{settled_prefix} {settled}/{AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED}，继续采样")
+            if win_rate_pct is None:
+                reasons.append(f"{scope_prefix}胜率样本不足" if scope_prefix else "胜率样本不足")
+            elif win_rate_pct < AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT:
+                win_rate_prefix = f"{scope_prefix}胜率" if scope_prefix else "胜率"
+                reasons.append(
+                    f"{win_rate_prefix} {win_rate_pct:.2f}% 低于 {AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT:.2f}%"
+                )
+            if roi_pct is None:
+                reasons.append(f"{scope_prefix}模拟 ROI 样本不足" if scope_prefix else "模拟 ROI 样本不足")
+            elif roi_pct < AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT:
+                roi_prefix = f"{scope_prefix}模拟 ROI" if scope_prefix else "模拟 ROI"
+                reasons.append(
+                    f"{roi_prefix} {roi_pct:.2f}% 低于 {AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT:.2f}%"
+                )
+            for row in version_data.get("direction_stats") or []:
+                row_settled = int(row.get("settled_count") or 0)
+                row_win_rate = _maybe_float(row.get("win_rate_pct"))
+                if (
+                    row_settled >= AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED
+                    and row_win_rate is not None
+                    and row_win_rate < AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT
+                ):
+                    bad_directions.append(dict(row))
+            for row in version_data.get("bucket_stats") or []:
+                row_settled = int(row.get("settled_count") or 0)
+                row_win_rate = _maybe_float(row.get("win_rate_pct"))
+                if (
+                    row_settled >= AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED
+                    and row_win_rate is not None
+                    and row_win_rate < AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT
+                ):
+                    bad_buckets.append(dict(row))
+            if bad_directions:
+                names = ", ".join(str(row.get("side") or "-") for row in bad_directions)
+                reasons.append(f"方向分组未达标: {names}")
+            if bad_buckets:
+                names = ", ".join(str(row.get("bucket") or "-") for row in bad_buckets)
+                reasons.append(f"时间桶未达标: {names}")
+            eligible = not reasons
+            if eligible:
+                status = "READY_FOR_REAL_REVIEW"
+                label = "可准备 REAL 预检"
+            elif settled < AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED:
+                status = "WAITING_FOR_SAMPLE"
+                label = "继续采样"
+            else:
+                status = "FAILED_LIVE_GATES"
+                label = "未达实盘门槛"
+            return {
+                "status": status,
+                "label": label,
+                "eligible_for_live_review": eligible,
+                "reasons": reasons,
+                "bad_direction_stats": bad_directions,
+                "bad_bucket_stats": bad_buckets,
+                "thresholds": {
+                    "min_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_SETTLED,
+                    "min_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_WIN_RATE_PCT,
+                    "min_roi_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_ROI_PCT,
+                    "min_direction_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_SETTLED,
+                    "min_direction_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_DIRECTION_WIN_RATE_PCT,
+                    "min_bucket_settled": AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_SETTLED,
+                    "min_bucket_win_rate_pct": AGGRESSIVE_EDGE_LIVE_READY_MIN_BUCKET_WIN_RATE_PCT,
+                },
+            }
+
+        aggregate = self.conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS would_trade_count,
+                SUM(CASE WHEN settled_at IS NOT NULL THEN 1 ELSE 0 END) AS settled_count,
+                SUM(CASE WHEN settled_at IS NULL THEN 1 ELSE 0 END) AS unsettled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count,
+                SUM(
+                    CASE
+                        WHEN would_win = 1 AND entry_price > 0 THEN (1.0 / entry_price) - 1.0
+                        WHEN would_win = 0 AND entry_price > 0 THEN -1.0
+                        ELSE 0.0
+                    END
+                ) AS simulated_pnl,
+                SUM(CASE WHEN would_win IS NOT NULL AND entry_price > 0 THEN 1 ELSE 0 END) AS simulated_stake_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND {column} = 1
+              AND {normal_sample_sql}
+              {side_sql}
+            """,
+            tuple(base_params),
+        ).fetchone()
+        direction_rows = self.conn.execute(
+            f"""
+            SELECT side,
+                   COUNT(*) AS settled_count,
+                   SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                   SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND {column} = 1
+              AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
+              {side_sql}
+            GROUP BY side
+            ORDER BY side
+            """,
+            tuple(base_params),
+        ).fetchall()
+        bucket_rows = self.conn.execute(
+            f"""
+            SELECT
+                CASE
+                    WHEN sample_key LIKE 'm0:%' THEN 'm0'
+                    WHEN sample_key LIKE 'm1:%' THEN 'm1'
+                    WHEN sample_key LIKE 'm2:%' THEN 'm2'
+                    WHEN sample_key LIKE 'm3:%' THEN 'm3'
+                    WHEN sample_key LIKE 'm4:%' THEN 'm4'
+                    ELSE 'unknown'
+                END AS bucket,
+                COUNT(*) AS settled_count,
+                SUM(CASE WHEN would_win = 1 THEN 1 ELSE 0 END) AS win_count,
+                SUM(CASE WHEN would_win = 0 THEN 1 ELSE 0 END) AS loss_count
+            FROM aggressive_edge_v2_shadow_samples
+            WHERE symbol = ?
+              AND {column} = 1
+              AND settled_at IS NOT NULL
+              AND {normal_sample_sql}
+              {side_sql}
+            GROUP BY bucket
+            ORDER BY bucket
+            """,
+            tuple(base_params),
+        ).fetchall()
+        data = dict(aggregate) if aggregate is not None else {}
+        win_count = int(data.get("win_count") or 0)
+        loss_count = int(data.get("loss_count") or 0)
+        stake_count = int(data.get("simulated_stake_count") or 0)
+        result = {
+            "version": normalized_version,
+            "side": side_filter,
+            "column": column,
+            "would_trade_count": int(data.get("would_trade_count") or 0),
+            "settled_count": int(data.get("settled_count") or 0),
+            "unsettled_count": int(data.get("unsettled_count") or 0),
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "win_rate_pct": win_rate(win_count, loss_count),
+            "simulated_roi_pct": round(float(data.get("simulated_pnl") or 0.0) / stake_count * 100.0, 4)
+            if stake_count
+            else None,
+            "direction_stats": [stat_row(row, "side") for row in direction_rows],
+            "bucket_stats": [stat_row(row, "bucket") for row in bucket_rows],
+        }
+        result["live_readiness"] = live_readiness(result)
+        return result
+
     @_locked
     def aggressive_edge_v2_shadow_candidates(
         self,
@@ -1576,9 +1936,14 @@ class TradeStore:
         safe_symbol = str(symbol or "BTC")
         safe_limit = max(1, min(100, int(limit)))
         safe_offset = max(0, int(offset))
+        normal_sample_sql = _rtds_normal_shadow_sample_sql()
+        abnormal_sample_sql = _rtds_abnormal_shadow_sample_sql()
         total_row = self.conn.execute(
             f"""
-            SELECT COUNT(*) AS total
+            SELECT
+                COUNT(*) AS raw_total,
+                SUM(CASE WHEN {normal_sample_sql} THEN 1 ELSE 0 END) AS total,
+                SUM(CASE WHEN {abnormal_sample_sql} THEN 1 ELSE 0 END) AS rtds_abnormal_excluded_count
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND {column} = 1
@@ -1586,6 +1951,8 @@ class TradeStore:
             (safe_symbol,),
         ).fetchone()
         total = int((total_row or {})["total"] or 0)
+        raw_total = int((total_row or {})["raw_total"] or 0)
+        rtds_abnormal_excluded_count = int((total_row or {})["rtds_abnormal_excluded_count"] or 0)
         rows = self.conn.execute(
             f"""
             SELECT id, round_id, sample_key, side, entry_price, move_bps, risk_score, risk_level,
@@ -1593,6 +1960,7 @@ class TradeStore:
             FROM aggressive_edge_v2_shadow_samples
             WHERE symbol = ?
               AND {column} = 1
+              AND {normal_sample_sql}
             ORDER BY updated_at DESC, id DESC
             LIMIT ?
             OFFSET ?
@@ -1611,6 +1979,9 @@ class TradeStore:
                 "offset": safe_offset,
                 "loaded": loaded,
                 "total": total,
+                "raw_total": raw_total,
+                "rtds_abnormal_excluded_count": rtds_abnormal_excluded_count,
+                "data_quality_filter": _rtds_abnormal_filter_payload(),
                 "has_more": safe_offset + loaded < total,
                 "total_pages": math.ceil(total / safe_limit) if total else 0,
             },
@@ -1952,9 +2323,9 @@ class TradeStore:
             """
             INSERT INTO market_rounds(
                 round_id, symbol, started_at, ends_at, target_price,
-                question, condition_id, up_token, down_token, url
+                question, condition_id, up_token, down_token, event_slug, url
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(round_id) DO UPDATE SET
                 target_price = CASE
                     WHEN excluded.target_price > 0 THEN excluded.target_price
@@ -1964,6 +2335,7 @@ class TradeStore:
                 condition_id = COALESCE(NULLIF(excluded.condition_id, ''), market_rounds.condition_id),
                 up_token = COALESCE(NULLIF(excluded.up_token, ''), market_rounds.up_token),
                 down_token = COALESCE(NULLIF(excluded.down_token, ''), market_rounds.down_token),
+                event_slug = COALESCE(NULLIF(excluded.event_slug, ''), market_rounds.event_slug),
                 url = COALESCE(NULLIF(excluded.url, ''), market_rounds.url)
             """,
             (
@@ -1976,6 +2348,7 @@ class TradeStore:
                 market.condition_id,
                 market.up_token,
                 market.down_token,
+                market.event_slug,
                 market.url,
             ),
         )
@@ -2650,6 +3023,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url
             FROM paper_orders o
             JOIN market_rounds r ON r.round_id = o.round_id
@@ -2677,6 +3051,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url,
                 COALESCE(f.fill_count, 0) AS fill_count
             FROM paper_orders o
@@ -3510,6 +3885,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url,
                 r.final_price,
                 r.outcome,
@@ -3565,6 +3941,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url
             FROM trades t
             JOIN market_rounds r ON r.round_id = t.round_id
@@ -3610,6 +3987,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url
             FROM trades t
             JOIN market_rounds r ON r.round_id = t.round_id
@@ -3825,10 +4203,22 @@ class TradeStore:
                 o.*,
                 r.question,
                 r.condition_id,
+                r.up_token,
+                r.down_token,
+                r.event_slug,
                 r.url,
+                t.status AS trade_status,
+                t.settled_at AS trade_settled_at,
+                t.payout AS trade_payout,
+                t.pnl AS trade_pnl,
+                t.stake AS trade_stake,
+                t.shares AS trade_shares,
+                t.entry_price AS trade_entry_price,
+                t.settlement_source AS trade_settlement_source,
                 COALESCE(f.fill_count, 0) AS fill_count
             FROM paper_orders o
             JOIN market_rounds r ON r.round_id = o.round_id
+            LEFT JOIN trades t ON t.id = o.trade_id
             LEFT JOIN (
                 SELECT order_id, COUNT(*) AS fill_count
                 FROM paper_fills
@@ -3960,6 +4350,7 @@ class TradeStore:
                 r.condition_id,
                 r.up_token,
                 r.down_token,
+                r.event_slug,
                 r.url
             FROM paper_orders o
             JOIN market_rounds r ON r.round_id = o.round_id

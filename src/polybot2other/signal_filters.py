@@ -18,6 +18,8 @@ AGGRESSIVE_EDGE_SWEET_MIN_BPS = 6.0
 AGGRESSIVE_EDGE_SWEET_MAX_BPS = 8.0
 AGGRESSIVE_EDGE_SWEET_MIN_CONFIDENCE = 0.70
 AGGRESSIVE_EDGE_SWEET_MIN_EDGE = 0.04
+AGGRESSIVE_EDGE_ACTIVE_DOWN_SWEET_MIN_BPS = 4.5
+AGGRESSIVE_EDGE_ACTIVE_DOWN_SWEET_MIN_EDGE = 0.025
 AGGRESSIVE_EDGE_HIGH_MIN_CONFIDENCE = 0.75
 AGGRESSIVE_EDGE_HIGH_MIN_EDGE = 0.02
 AGGRESSIVE_EDGE_EXTERNAL_OPPOSITE_BPS = 2.0
@@ -35,6 +37,10 @@ def aggressive_edge_block_reason(
     signal: Signal,
     price: dict[str, Any],
     max_age_ms: int,
+    *,
+    sweet_min_bps: float = AGGRESSIVE_EDGE_SWEET_MIN_BPS,
+    sweet_min_edge: float = AGGRESSIVE_EDGE_SWEET_MIN_EDGE,
+    profile_label: str = "",
 ) -> str | None:
     """Aggressive Edge 入场过滤；Paper 和 REAL 共用同一份阈值。"""
 
@@ -56,9 +62,9 @@ def aggressive_edge_block_reason(
         and abs_bps >= 2.0
     )
     sweet_move = (
-        AGGRESSIVE_EDGE_SWEET_MIN_BPS <= abs_bps <= AGGRESSIVE_EDGE_SWEET_MAX_BPS
+        sweet_min_bps <= abs_bps <= AGGRESSIVE_EDGE_SWEET_MAX_BPS
         and confidence >= AGGRESSIVE_EDGE_SWEET_MIN_CONFIDENCE
-        and edge >= AGGRESSIVE_EDGE_SWEET_MIN_EDGE
+        and edge >= sweet_min_edge
     )
     high_confidence_high_entry = (
         entry_price >= AGGRESSIVE_EDGE_HIGH_ENTRY_MIN
@@ -69,9 +75,21 @@ def aggressive_edge_block_reason(
         return None
 
     if AGGRESSIVE_EDGE_MID_ENTRY_MIN <= entry_price < AGGRESSIVE_EDGE_MID_ENTRY_MAX:
+        if profile_label:
+            return (
+                f"{SINGLE_AGGRESSIVE_EDGE_MARKER} {profile_label} 过滤历史亏损价格带: "
+                f"entry {entry_price:.4f}, edge {edge:.4f}, abs_bps {abs_bps:.2f}, "
+                f"sweet_min {sweet_min_bps:.2f}, sweet_edge {sweet_min_edge:.3f}"
+            )
         return (
             f"{SINGLE_AGGRESSIVE_EDGE_MARKER} 过滤历史亏损价格带: "
             f"entry {entry_price:.4f}, edge {edge:.4f}, abs_bps {abs_bps:.2f}"
+        )
+    if profile_label:
+        return (
+            f"{SINGLE_AGGRESSIVE_EDGE_MARKER} {profile_label} 未命中激进入场样本区: "
+            f"entry {entry_price:.4f}, confidence {confidence:.4f}, edge {edge:.4f}, abs_bps {abs_bps:.2f}, "
+            f"sweet_min {sweet_min_bps:.2f}, sweet_edge {sweet_min_edge:.3f}"
         )
     return (
         f"{SINGLE_AGGRESSIVE_EDGE_MARKER} 未命中激进入场样本区: "
@@ -79,19 +97,25 @@ def aggressive_edge_block_reason(
     )
 
 
-def aggressive_edge_pass_note(signal: Signal) -> str:
+def aggressive_edge_pass_note(
+    signal: Signal,
+    *,
+    sweet_min_bps: float = AGGRESSIVE_EDGE_SWEET_MIN_BPS,
+    profile_label: str = "",
+) -> str:
     entry_price = _maybe_float(signal.entry_price) or 0.0
     confidence = _maybe_float(signal.confidence) or 0.0
     abs_bps = abs(_maybe_float(signal.move_bps) or 0.0)
     edge = confidence - entry_price
     if entry_price < AGGRESSIVE_EDGE_LOW_ENTRY_MAX:
         branch = "low_entry_high_edge"
-    elif AGGRESSIVE_EDGE_SWEET_MIN_BPS <= abs_bps <= AGGRESSIVE_EDGE_SWEET_MAX_BPS:
-        branch = "sweet_move_6_8bps"
+    elif sweet_min_bps <= abs_bps <= AGGRESSIVE_EDGE_SWEET_MAX_BPS:
+        branch = f"sweet_move_{sweet_min_bps:g}_8bps"
     else:
         branch = "high_confidence_high_entry"
+    profile_note = f" {profile_label}" if profile_label else ""
     return (
-        f"{SINGLE_AGGRESSIVE_EDGE_MARKER} PASS {branch}: "
+        f"{SINGLE_AGGRESSIVE_EDGE_MARKER}{profile_note} PASS {branch}: "
         f"entry {entry_price:.4f}, confidence {confidence:.4f}, edge {edge:.4f}, abs_bps {abs_bps:.2f}"
     )
 

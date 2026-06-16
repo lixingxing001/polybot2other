@@ -4,6 +4,7 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 const ids = {
   navItems: Array.from(document.querySelectorAll("[data-nav-page]")),
   botPage: document.getElementById("bot-page"),
+  marketPage: document.getElementById("market-page"),
   samplePage: document.getElementById("sample-page"),
   statusPage: document.getElementById("status-page"),
   polymarketStatusPill: document.getElementById("polymarket-status-pill"),
@@ -27,6 +28,49 @@ const ids = {
   sampleRecentNextPage: document.getElementById("sample-recent-next-page"),
   sampleRecentV7: document.getElementById("sample-recent-v7"),
   runtime: document.getElementById("runtime-pill"),
+  btcRuntimeToggle: document.getElementById("btc-runtime-toggle"),
+  btcRuntimeStatus: document.getElementById("btc-runtime-status"),
+  marketLlmTerminalMeta: document.getElementById("market-llm-terminal-meta"),
+  marketLlmTerminalLines: document.getElementById("market-llm-terminal-lines"),
+  marketScoutMeta: document.getElementById("market-scout-meta"),
+  marketScoutSummary: document.getElementById("market-scout-summary"),
+  marketConfigToggle: document.getElementById("market-config-toggle"),
+  marketConfigPanel: document.getElementById("market-config-panel"),
+  marketScannerToggle: document.getElementById("market-scanner-toggle"),
+  marketLlmToggle: document.getElementById("market-llm-toggle"),
+  marketEvidenceToggle: document.getElementById("market-evidence-toggle"),
+  marketPaperAutoToggle: document.getElementById("market-paper-auto-toggle"),
+  marketPaperProbeToggle: document.getElementById("market-paper-probe-toggle"),
+  marketLiveAutoToggle: document.getElementById("market-live-auto-toggle"),
+  marketSaveSettings: document.getElementById("market-save-settings"),
+  marketLlmModel: document.getElementById("market-llm-model"),
+  marketInitialBalance: document.getElementById("market-initial-balance"),
+  marketStakeDollars: document.getElementById("market-stake-dollars"),
+  marketMaxOpenPositions: document.getElementById("market-max-open-positions"),
+  marketProbeMaxOpenPositions: document.getElementById("market-probe-max-open-positions"),
+  marketProbeMinConfidence: document.getElementById("market-probe-min-confidence"),
+  marketProbeMinSelectionScore: document.getElementById("market-probe-min-selection-score"),
+  marketMaxDailyLoss: document.getElementById("market-max-daily-loss"),
+  marketMinConfidence: document.getElementById("market-min-confidence"),
+  marketMaxEntryPrice: document.getElementById("market-max-entry-price"),
+  marketMaxSpread: document.getElementById("market-max-spread"),
+  marketScanInterval: document.getElementById("market-scan-interval"),
+  marketAnalyzeTopN: document.getElementById("market-analyze-top-n"),
+  marketEvidenceMaxMarkets: document.getElementById("market-evidence-max-markets"),
+  marketEvidenceResultsPerMarket: document.getElementById("market-evidence-results-per-market"),
+  marketEvidenceTimeout: document.getElementById("market-evidence-timeout"),
+  marketEvidenceTtl: document.getElementById("market-evidence-ttl"),
+  marketPaperAccount: document.getElementById("market-paper-account"),
+  marketCandidates: document.getElementById("market-candidates"),
+  marketAnalysis: document.getElementById("market-analysis"),
+  marketRecommendation: document.getElementById("market-recommendation"),
+  marketPaperOrdersHead: document.getElementById("market-paper-orders-head"),
+  marketPaperOrders: document.getElementById("market-paper-orders"),
+  marketPaperOrdersMeta: document.getElementById("market-paper-orders-meta"),
+  marketPaperOrdersRefresh: document.getElementById("market-paper-orders-refresh"),
+  marketPaperOrderFieldOptions: document.getElementById("market-paper-order-field-options"),
+  marketLiveOrders: document.getElementById("market-live-orders"),
+  marketLiveOrdersMeta: document.getElementById("market-live-orders-meta"),
   paperPauseToggle: document.getElementById("paper-pause-toggle"),
   liveEnabled: document.getElementById("live-enabled"),
   liveStatus: document.getElementById("live-status"),
@@ -131,6 +175,9 @@ const EQUITY_CURVE_REFRESH_MS = 30_000;
 const METRIC_ANIMATION_MS = 360;
 const RECENT_SKELETON_ROWS = 8;
 const LIVE_LOG_LIMIT = 80;
+const MARKET_LLM_LOG_LIMIT = 120;
+const MARKET_LLM_TERMINAL_POLL_MS = 2_000;
+const MARKET_SCOUT_STATE_POLL_MS = 5_000;
 const REALTIME_SIGNAL_EVENT_LIMIT = 80;
 const REALTIME_SIGNAL_RECENT_WINDOW_MS = 10_000;
 const TABLE_INTERACTION_HOLD_MS = 500;
@@ -142,8 +189,9 @@ const FIELD_STORAGE_KEYS = {
   open: "polybot2other:open-trade-fields",
   order: "polybot2other:order-fields",
   recent: "polybot2other:recent-trade-fields",
+  marketPaperOrder: "polybot2other:market-paper-order-fields:v2",
 };
-const APP_PAGE_KEYS = new Set(["bot", "samples", "status"]);
+const APP_PAGE_KEYS = new Set(["bot", "market", "samples", "status"]);
 const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version:v12";
 const SAMPLE_DEFAULT_VERSION = "V12";
 const SAMPLE_VERSION_KEYS = ["V12", "V11", "V10", "V9", "V8", "V7", "V6", "V5", "V4"];
@@ -215,9 +263,15 @@ const LIVE_REAL_STOP_WIN_STRATEGY_ID = "SINGLE_FAK_REAL_STOP_WIN";
 const LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_REAL";
 const LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL";
 const LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V11_1_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_1_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_REAL";
+const LIVE_REAL_AGGRESSIVE_EDGE_V12_STRATEGY_ID = "SINGLE_FAK_AGGRESSIVE_EDGE_V12_REAL";
 
 let activeMarket = null;
 let activeAppPage = "bot";
+let btcRuntimePaused = false;
+let btcRuntimeSaving = false;
 let marketSocket = null;
 let priceSocket = null;
 let okxSocket = null;
@@ -307,9 +361,23 @@ let pendingOrderRender = false;
 let pendingLiveGateRender = false;
 let pendingLiveGateData = null;
 let pendingLiveTerminalRender = false;
+let pendingMarketTerminalRender = false;
 let scopedRecentRefreshInFlight = false;
 const tableInteractionHoldUntil = { open: 0, order: 0 };
 const liveCopyHoldUntil = { gate: 0, terminal: 0 };
+let marketLlmLogRows = [];
+let marketLlmLatestSeq = 0;
+let marketLlmTerminalLoading = false;
+let marketLlmTerminalStatus = {};
+let marketScoutState = null;
+let marketScoutStateLoading = false;
+let marketCandidateLastRenderSignature = "";
+let marketCandidateMarketSignature = "";
+let marketCandidateScrollTop = 0;
+let marketSelectedCandidateSlug = "";
+const marketSettingsDirtyFields = new Set();
+let marketSettingsLoaded = false;
+let marketConfigOpen = false;
 let foregroundRefreshTimer = null;
 let equityCurveRows = [];
 let equityCurveMeta = {};
@@ -413,6 +481,37 @@ const recentOrderFields = [
   { key: "reason", label: "原因", render: (row) => safe(row.reason), cellClass: "reason-cell" },
 ];
 
+const marketPaperOrderFields = [
+  { key: "created_at", label: "时间", render: (row) => fmtDateTimeCell(row.created_at) },
+  { key: "question", label: "市场", render: (row) => marketOrderQuestionCell(row), cellClass: "reason-cell market-question-cell" },
+  { key: "side", label: "方向", render: (row) => `<span class="${sideClass(row.side)}">${safe(row.side || "-")}</span>` },
+  { key: "status", label: "订单状态", render: (row) => orderStatusText(row.status) },
+  { key: "settlement_result", label: "结算结果", render: (row) => marketSettlementBadge(row) },
+  { key: "limit_price", label: "限价", render: (row) => fmtNumberCell(row.limit_price, 4), cellClass: "market-num-cell" },
+  { key: "avg_fill_price", label: "成交均价", render: (row) => fmtNumberCell(row.avg_fill_price, 4), cellClass: "market-num-cell" },
+  { key: "requested_cash", label: "预算", render: (row) => fmtMoneyCell(row.requested_cash), cellClass: "market-num-cell" },
+  { key: "cash_spent", label: "实际花费", render: (row) => fmtMoneyCell(row.cash_spent), cellClass: "market-num-cell" },
+  { key: "filled_shares", label: "成交份额", render: (row) => fmtNumberCell(row.filled_shares, 4), cellClass: "market-num-cell" },
+  { key: "current_bid", label: "当前买一", render: (row) => fmtMarketNumberCell(row, "current_bid", 4), cellClass: "market-num-cell" },
+  { key: "current_ask", label: "当前卖一", render: (row) => fmtMarketNumberCell(row, "current_ask", 4), cellClass: "market-num-cell" },
+  { key: "exit_value", label: "可退出回款", render: (row) => fmtMarketMoneyCell(row, "exit_value"), cellClass: "market-num-cell" },
+  { key: "unrealized_pnl", label: "未实现盈亏", render: (row) => fmtMarketSignedMoneyCell(row, "unrealized_pnl"), cellClass: "market-num-cell" },
+  { key: "unrealized_roi_pct", label: "未实现ROI", render: (row) => fmtMarketSignedPctCell(row, "unrealized_roi_pct"), cellClass: "market-num-cell" },
+  { key: "max_payout", label: "最大回款", render: (row) => fmtMarketMoneyCell(row, "max_payout"), cellClass: "market-num-cell" },
+  { key: "max_profit", label: "最大盈利", render: (row) => fmtMarketSignedMoneyCell(row, "max_profit"), cellClass: "market-num-cell" },
+  { key: "max_loss", label: "最大亏损", render: (row) => fmtMarketMoneyCell(row, "max_loss"), cellClass: "market-num-cell" },
+  { key: "payout", label: "结算回款", render: (row) => fmtMoneyCell(row.payout), cellClass: "market-num-cell" },
+  { key: "net_pnl", label: "净盈亏", render: (row) => fmtSignedMoneyCell(row.net_pnl), cellClass: "market-num-cell" },
+  { key: "roi_pct", label: "ROI", render: (row) => fmtSignedPctCell(row.roi_pct), cellClass: "market-num-cell" },
+  { key: "fill_count", label: "成交档", render: (row) => fmtNumberCell(row.fill_count, 0), cellClass: "market-num-cell" },
+  { key: "fee", label: "手续费", render: (row) => fmtMoneyCell(row.fee), cellClass: "market-num-cell" },
+  { key: "settled_at", label: "结算时间", render: (row) => fmtDateTimeCell(row.settled_at) },
+  { key: "trade_id", label: "持仓ID", render: (row) => safe(row.trade_id || "-"), cellClass: "mono-cell" },
+  { key: "id", label: "订单ID", render: (row) => safe(row.id || "-"), cellClass: "mono-cell" },
+  { key: "round_id", label: "市场ID", render: (row) => safe(row.round_id || "-"), cellClass: "mono-cell reason-cell" },
+  { key: "reason", label: "原因", render: (row) => safe(row.reason || "-"), cellClass: "reason-cell" },
+];
+
 const comboField = {
   key: "combo",
   label: "组合",
@@ -450,6 +549,12 @@ const defaultOrderFieldKeys = [
   "avg_fill_price", "filled_shares", "cash_spent", "fee", "fill_count", "reason",
 ];
 
+const defaultMarketPaperOrderFieldKeys = [
+  "created_at", "question", "side", "status", "settlement_result", "limit_price",
+  "avg_fill_price", "cash_spent", "filled_shares", "current_bid", "exit_value",
+  "unrealized_pnl", "unrealized_roi_pct", "max_payout", "max_profit", "net_pnl", "roi_pct",
+];
+
 function experimentFieldKeys(kind) {
   const base = selectedFields[kind] || [];
   const extra = kind === "open" ? ["live_sell_action"] : [];
@@ -460,6 +565,7 @@ let selectedFields = {
   open: loadSelectedFields("open", openTradeFields, defaultOpenFieldKeys),
   order: loadSelectedFields("order", recentOrderFields, defaultOrderFieldKeys),
   recent: loadSelectedFields("recent", recentTradeFields, defaultRecentFieldKeys),
+  marketPaperOrder: loadSelectedFields("marketPaperOrder", marketPaperOrderFields, defaultMarketPaperOrderFieldKeys),
 };
 
 function cls(value) {
@@ -630,6 +736,10 @@ function liveStrategyOptions(settings = {}, live = {}) {
     { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge REAL" },
     { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V10 REAL" },
     { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V11 REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V11_1_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V11.1 REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V11 Down-only REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V11 Down-only Active REAL" },
+    { variant_id: LIVE_REAL_AGGRESSIVE_EDGE_V12_STRATEGY_ID, combo: "SINGLE + FAK Aggressive Edge V12 REAL" },
   ];
   const rows = raw.length ? raw : fallback;
   const seen = new Set();
@@ -640,7 +750,15 @@ function liveStrategyOptions(settings = {}, live = {}) {
     const readinessLabel = readiness?.label
       ? `${readiness.label}${settled == null ? "" : ` ${fmtNumberCell(settled, 0)}/80`}`
       : "";
-    const label = (value === LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID || value === LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID) && readinessLabel
+    const readinessStrategyIds = new Set([
+      LIVE_REAL_AGGRESSIVE_EDGE_V10_STRATEGY_ID,
+      LIVE_REAL_AGGRESSIVE_EDGE_V11_STRATEGY_ID,
+      LIVE_REAL_AGGRESSIVE_EDGE_V11_1_STRATEGY_ID,
+      LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_STRATEGY_ID,
+      LIVE_REAL_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_STRATEGY_ID,
+      LIVE_REAL_AGGRESSIVE_EDGE_V12_STRATEGY_ID,
+    ]);
+    const label = readinessStrategyIds.has(value) && readinessLabel
       ? `${String(row?.combo || value)} · ${readinessLabel}`
       : String(row?.combo || value);
     return {
@@ -751,6 +869,113 @@ function bindLiveStopWinEstimate() {
   }
 }
 
+function applyBtcRuntimeState(data = latestStatus) {
+  const runtime = data?.runtime?.btc_runtime || {};
+  const paused = Boolean(runtime.paused);
+  const changed = paused !== btcRuntimePaused;
+  btcRuntimePaused = paused;
+  renderBtcRuntimeState(runtime);
+  if (paused) {
+    closeBtcSockets();
+    return;
+  }
+  if (changed && pageVisible) {
+    connectPriceSocket();
+    connectOkxSocket();
+    connectBinanceMarketSocket();
+    if (activeMarket?.up_token && activeMarket?.down_token) connectMarketSocket();
+    postSnapshotSoon(true);
+  }
+}
+
+function renderBtcRuntimeState(runtime = {}) {
+  const paused = Boolean(runtime.paused);
+  if (ids.btcRuntimeToggle) {
+    ids.btcRuntimeToggle.textContent = paused ? "恢复BTC" : "暂停BTC";
+    ids.btcRuntimeToggle.setAttribute("aria-pressed", paused ? "true" : "false");
+    ids.btcRuntimeToggle.classList.toggle("is-paused", paused);
+    ids.btcRuntimeToggle.disabled = btcRuntimeSaving;
+  }
+  if (ids.btcRuntimeStatus) {
+    ids.btcRuntimeStatus.textContent = paused ? "BTC已暂停" : "BTC采集中";
+    ids.btcRuntimeStatus.classList.toggle("is-paused", paused);
+    ids.btcRuntimeStatus.title = runtime.message || "";
+  }
+}
+
+function setMarketConfigOpen(open) {
+  marketConfigOpen = Boolean(open);
+  if (ids.marketConfigPanel) ids.marketConfigPanel.hidden = !marketConfigOpen;
+  if (ids.marketConfigToggle) ids.marketConfigToggle.setAttribute("aria-expanded", marketConfigOpen ? "true" : "false");
+}
+
+function toggleMarketConfigPanel() {
+  setMarketConfigOpen(!marketConfigOpen);
+}
+
+function mergeBtcRuntimeIntoLatestStatus(runtime = {}) {
+  const status = latestStatus && typeof latestStatus === "object" ? latestStatus : {};
+  const statusRuntime = status.runtime && typeof status.runtime === "object" ? status.runtime : {};
+  latestStatus = {
+    ...status,
+    runtime: {
+      ...statusRuntime,
+      btc_runtime: runtime,
+    },
+  };
+}
+
+async function toggleBtcRuntimePaused() {
+  if (btcRuntimeSaving) return;
+  btcRuntimeSaving = true;
+  renderBtcRuntimeState(latestStatus?.runtime?.btc_runtime || { paused: btcRuntimePaused });
+  try {
+    const res = await fetch("/api/btc-runtime", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: !btcRuntimePaused }),
+    });
+    if (!res.ok) throw new Error(`btc runtime HTTP ${res.status}`);
+    const payload = await res.json();
+    if (payload.snapshot) {
+      applyStatusPayload(payload.snapshot, { refreshAuxiliary: false });
+    } else {
+      const runtime = payload.btc_runtime || {};
+      mergeBtcRuntimeIntoLatestStatus(runtime);
+      applyBtcRuntimeState(latestStatus);
+    }
+  } finally {
+    btcRuntimeSaving = false;
+    renderBtcRuntimeState(latestStatus?.runtime?.btc_runtime || { paused: btcRuntimePaused });
+  }
+}
+
+function closeBtcSockets() {
+  releaseSnapshotLeadership();
+  const sockets = [marketSocket, priceSocket, okxSocket, binanceMarketSocket].filter(Boolean);
+  marketSocket = null;
+  priceSocket = null;
+  okxSocket = null;
+  binanceMarketSocket = null;
+  if (marketPing) clearInterval(marketPing);
+  if (pricePing) clearInterval(pricePing);
+  if (okxPing) clearInterval(okxPing);
+  marketPing = null;
+  pricePing = null;
+  okxPing = null;
+  for (const socket of sockets) {
+    try {
+      socket.close();
+    } catch (_) {
+      continue;
+    }
+  }
+  marketWsStatus = "paused";
+  priceWsStatus = "paused";
+  okxWsStatus = "paused";
+  binanceMarketWsStatus = "paused";
+}
+
 function appendLiveLog({ key = "", level = "info", title = "", message = "", details = [], code = "", at_ms = null } = {}) {
   if (!ids.liveTerminalLines) return;
   const normalizedDetails = Array.isArray(details) ? details.filter(Boolean).map((item) => String(item)) : [];
@@ -799,6 +1024,870 @@ function renderLiveTerminal() {
         `${row.message ? `<span class="live-log-message">${safe(row.message)}</span>` : ""}` +
       `</div>${details}${code}</div>`;
   }).join("");
+}
+
+function normalizeMarketLlmLog(row = {}) {
+  const seq = Number(row.seq) || 0;
+  const level = String(row.level || "info").toLowerCase();
+  const safeLevel = ["info", "pass", "warn", "error"].includes(level) ? level : "info";
+  const details = Array.isArray(row.details) ? row.details.filter(Boolean).map((item) => String(item)) : [];
+  const moduleName = String(row.module || "market").trim();
+  const title = String(row.title || "市场日志");
+  return {
+    seq,
+    at_ms: normalizeMs(row.at_ms || row.at || Date.now()),
+    level: safeLevel,
+    module: moduleName,
+    event_type: String(row.event_type || "log"),
+    title: moduleName ? `${moduleName} · ${title}` : title,
+    message: String(row.message || ""),
+    details,
+    code: String(row.code || ""),
+  };
+}
+
+function renderMarketLlmTerminal() {
+  if (!ids.marketLlmTerminalLines) return;
+  if (isLiveCopyInteractionActive("market-terminal")) {
+    pendingMarketTerminalRender = true;
+    scheduleProtectedLiveCopyFlush();
+    return;
+  }
+  pendingMarketTerminalRender = false;
+  if (!marketLlmLogRows.length) {
+    ids.marketLlmTerminalLines.innerHTML = `<div class="live-terminal-empty">等待市场日志</div>`;
+    return;
+  }
+  ids.marketLlmTerminalLines.innerHTML = marketLlmLogRows.map((row) => {
+    const details = row.details.length
+      ? `<div class="live-log-details">${row.details.map((item) => `<div>${safe(item)}</div>`).join("")}</div>`
+      : "";
+    const code = row.code ? `<pre class="live-log-code">${safe(row.code)}</pre>` : "";
+    return `<div class="live-log-entry ${safe(row.level)}">` +
+      `<div class="live-log-main">` +
+        `<span class="live-log-time">${safe(fmtMs(row.at_ms))}</span>` +
+        `<span class="live-log-title">${safe(row.title)}</span>` +
+        `${row.message ? `<span class="live-log-message">${safe(row.message)}</span>` : ""}` +
+      `</div>${details}${code}</div>`;
+  }).join("");
+}
+
+function applyMarketLlmTerminalPayload(payload = {}) {
+  const logs = Array.isArray(payload.logs) ? payload.logs.map(normalizeMarketLlmLog) : [];
+  const existingSeq = new Set(marketLlmLogRows.map((row) => row.seq).filter(Boolean));
+  for (const row of logs) {
+    if (row.seq && existingSeq.has(row.seq)) continue;
+    marketLlmLogRows.push(row);
+    if (row.seq) existingSeq.add(row.seq);
+  }
+  const payloadLatestSeq = Number(payload.latest_seq) || 0;
+  marketLlmLatestSeq = Math.max(marketLlmLatestSeq, payloadLatestSeq, ...logs.map((row) => row.seq || 0));
+  marketLlmTerminalStatus = payload.status && typeof payload.status === "object" ? payload.status : {};
+  marketLlmLogRows = marketLlmLogRows
+    .sort((left, right) => (toNumber(right.at_ms) || 0) - (toNumber(left.at_ms) || 0))
+    .slice(0, MARKET_LLM_LOG_LIMIT);
+  if (ids.marketLlmTerminalMeta) {
+    const state = String(marketLlmTerminalStatus.message || "等待日志");
+    const updatedAt = payload.updated_at ? fmtMs(normalizeMs(payload.updated_at)) : "-";
+    ids.marketLlmTerminalMeta.textContent = `${state} · ${updatedAt} · #${marketLlmLatestSeq}`;
+  }
+  renderMarketLlmTerminal();
+}
+
+async function loadMarketLlmTerminal(force = false) {
+  if (!ids.marketLlmTerminalLines || marketLlmTerminalLoading) return;
+  if (!force && !marketPageActive()) return;
+  marketLlmTerminalLoading = true;
+  try {
+    const params = new URLSearchParams({
+      limit: String(MARKET_LLM_LOG_LIMIT),
+      after_seq: String(marketLlmLatestSeq),
+    });
+    const res = await fetch(`/api/market-llm-terminal?${params.toString()}`);
+    if (!res.ok) throw new Error(`market terminal HTTP ${res.status}`);
+    applyMarketLlmTerminalPayload(await res.json());
+  } finally {
+    marketLlmTerminalLoading = false;
+  }
+}
+
+function marketSettingElements() {
+  return {
+    scanner_enabled: ids.marketScannerToggle,
+    llm_enabled: ids.marketLlmToggle,
+    llm_model: ids.marketLlmModel,
+    evidence_enabled: ids.marketEvidenceToggle,
+    paper_auto_enabled: ids.marketPaperAutoToggle,
+    paper_probe_enabled: ids.marketPaperProbeToggle,
+    paper_initial_balance: ids.marketInitialBalance,
+    paper_stake_dollars: ids.marketStakeDollars,
+    paper_max_open_positions: ids.marketMaxOpenPositions,
+    paper_probe_max_open_positions: ids.marketProbeMaxOpenPositions,
+    paper_probe_min_confidence: ids.marketProbeMinConfidence,
+    paper_probe_min_selection_score: ids.marketProbeMinSelectionScore,
+    paper_max_daily_loss: ids.marketMaxDailyLoss,
+    min_confidence: ids.marketMinConfidence,
+    max_entry_price: ids.marketMaxEntryPrice,
+    max_spread: ids.marketMaxSpread,
+    scan_interval_seconds: ids.marketScanInterval,
+    analyze_top_n: ids.marketAnalyzeTopN,
+    evidence_max_markets: ids.marketEvidenceMaxMarkets,
+    evidence_results_per_market: ids.marketEvidenceResultsPerMarket,
+    evidence_timeout_seconds: ids.marketEvidenceTimeout,
+    evidence_ttl_seconds: ids.marketEvidenceTtl,
+  };
+}
+
+function markMarketSettingDirty(event) {
+  const entry = Object.entries(marketSettingElements()).find(([, element]) => element === event.currentTarget);
+  if (entry) marketSettingsDirtyFields.add(entry[0]);
+}
+
+function setMarketInputValue(key, value) {
+  const element = marketSettingElements()[key];
+  if (!element || marketSettingsDirtyFields.has(key)) return;
+  if (element.type === "checkbox") {
+    element.checked = Boolean(value);
+    return;
+  }
+  if (value == null) return;
+  element.value = String(value);
+}
+
+function applyMarketSettingsToControls(settings = {}) {
+  setMarketInputValue("scanner_enabled", settings.scanner_enabled);
+  setMarketInputValue("llm_enabled", settings.llm_enabled);
+  setMarketInputValue("llm_model", settings.llm_model);
+  setMarketInputValue("evidence_enabled", settings.evidence_enabled);
+  setMarketInputValue("paper_auto_enabled", settings.paper_auto_enabled);
+  setMarketInputValue("paper_probe_enabled", settings.paper_probe_enabled);
+  setMarketInputValue("paper_initial_balance", settings.paper_initial_balance);
+  setMarketInputValue("paper_stake_dollars", settings.paper_stake_dollars);
+  setMarketInputValue("paper_max_open_positions", settings.paper_max_open_positions);
+  setMarketInputValue("paper_probe_max_open_positions", settings.paper_probe_max_open_positions);
+  setMarketInputValue("paper_probe_min_confidence", settings.paper_probe_min_confidence);
+  setMarketInputValue("paper_probe_min_selection_score", settings.paper_probe_min_selection_score);
+  setMarketInputValue("paper_max_daily_loss", settings.paper_max_daily_loss);
+  setMarketInputValue("min_confidence", settings.min_confidence);
+  setMarketInputValue("max_entry_price", settings.max_entry_price);
+  setMarketInputValue("max_spread", settings.max_spread);
+  setMarketInputValue("scan_interval_seconds", settings.scan_interval_seconds);
+  setMarketInputValue("analyze_top_n", settings.analyze_top_n);
+  setMarketInputValue("evidence_max_markets", settings.evidence_max_markets);
+  setMarketInputValue("evidence_results_per_market", settings.evidence_results_per_market);
+  setMarketInputValue("evidence_timeout_seconds", settings.evidence_timeout_seconds);
+  setMarketInputValue("evidence_ttl_seconds", settings.evidence_ttl_seconds);
+  if (ids.marketLiveAutoToggle) {
+    ids.marketLiveAutoToggle.checked = false;
+    ids.marketLiveAutoToggle.disabled = true;
+  }
+  marketSettingsLoaded = true;
+}
+
+function readMarketNumber(element, fallback = 0) {
+  const parsed = Number(element?.value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function marketSettingsPayloadFromControls() {
+  return {
+    scanner_enabled: Boolean(ids.marketScannerToggle?.checked),
+    llm_enabled: Boolean(ids.marketLlmToggle?.checked),
+    llm_model: String(ids.marketLlmModel?.value || "").trim(),
+    evidence_enabled: Boolean(ids.marketEvidenceToggle?.checked),
+    paper_auto_enabled: Boolean(ids.marketPaperAutoToggle?.checked),
+    paper_probe_enabled: Boolean(ids.marketPaperProbeToggle?.checked),
+    live_auto_enabled: false,
+    paper_initial_balance: readMarketNumber(ids.marketInitialBalance, 100),
+    paper_stake_dollars: readMarketNumber(ids.marketStakeDollars, 2),
+    paper_max_open_positions: Math.round(readMarketNumber(ids.marketMaxOpenPositions, 3)),
+    paper_probe_max_open_positions: Math.round(readMarketNumber(ids.marketProbeMaxOpenPositions, 1)),
+    paper_probe_min_confidence: readMarketNumber(ids.marketProbeMinConfidence, 0.55),
+    paper_probe_min_selection_score: readMarketNumber(ids.marketProbeMinSelectionScore, 14),
+    paper_max_daily_loss: readMarketNumber(ids.marketMaxDailyLoss, 10),
+    min_confidence: readMarketNumber(ids.marketMinConfidence, 0.72),
+    max_entry_price: readMarketNumber(ids.marketMaxEntryPrice, 0.65),
+    max_spread: readMarketNumber(ids.marketMaxSpread, 0.04),
+    scan_interval_seconds: readMarketNumber(ids.marketScanInterval, 30),
+    analyze_top_n: Math.round(readMarketNumber(ids.marketAnalyzeTopN, 10)),
+    evidence_max_markets: Math.round(readMarketNumber(ids.marketEvidenceMaxMarkets, 6)),
+    evidence_results_per_market: Math.round(readMarketNumber(ids.marketEvidenceResultsPerMarket, 4)),
+    evidence_timeout_seconds: readMarketNumber(ids.marketEvidenceTimeout, 6),
+    evidence_ttl_seconds: readMarketNumber(ids.marketEvidenceTtl, 900),
+  };
+}
+
+async function loadMarketScoutState(force = false, options = {}) {
+  if (!ids.marketPage || marketScoutStateLoading) return;
+  if (!force && !marketPageActive()) return;
+  marketScoutStateLoading = true;
+  const quoteRefresh = Boolean(options.quoteRefresh);
+  if (quoteRefresh && ids.marketPaperOrdersRefresh) {
+    ids.marketPaperOrdersRefresh.disabled = true;
+    ids.marketPaperOrdersRefresh.textContent = "刷新中";
+  }
+  try {
+    const params = new URLSearchParams({ order_limit: "30", order_offset: "0" });
+    if (quoteRefresh) params.set("quote_refresh", "1");
+    const res = await fetch(`/api/market-scout-state?${params.toString()}`);
+    if (!res.ok) throw new Error(`market scout HTTP ${res.status}`);
+    applyMarketScoutStatePayload(await res.json());
+  } finally {
+    marketScoutStateLoading = false;
+    if (quoteRefresh && ids.marketPaperOrdersRefresh) {
+      ids.marketPaperOrdersRefresh.disabled = false;
+      ids.marketPaperOrdersRefresh.textContent = "刷新";
+    }
+  }
+}
+
+async function refreshMarketPaperOrders() {
+  await loadMarketScoutState(true, { quoteRefresh: true });
+}
+
+async function saveMarketScoutSettings() {
+  const payload = marketSettingsPayloadFromControls();
+  const task = async () => {
+    const res = await fetch("/api/market-scout-settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`market settings HTTP ${res.status}`);
+    marketSettingsDirtyFields.clear();
+    applyMarketScoutStatePayload(await res.json());
+    setMarketConfigOpen(false);
+  };
+  return withButtonLoading(ids.marketSaveSettings, task);
+}
+
+function applyMarketScoutStatePayload(payload = {}) {
+  marketScoutState = payload;
+  const settings = payload.settings && typeof payload.settings === "object" ? payload.settings : {};
+  applyMarketSettingsToControls(settings);
+  renderMarketScoutState();
+}
+
+function renderMarketScoutState() {
+  if (!ids.marketPage) return;
+  const payload = marketScoutState || {};
+  const status = payload.status && typeof payload.status === "object" ? payload.status : {};
+  const settings = payload.settings && typeof payload.settings === "object" ? payload.settings : {};
+  const account = payload.paper_account && typeof payload.paper_account === "object" ? payload.paper_account : {};
+  if (ids.marketScoutMeta) {
+    const updated = payload.updated_at ? fmtMs(normalizeMs(payload.updated_at)) : "-";
+    ids.marketScoutMeta.textContent = `${status.message || "等待扫描器"} · ${updated}`;
+  }
+  if (ids.marketScoutSummary) {
+    ids.marketScoutSummary.innerHTML = [
+      marketSummaryPill("扫描", status.scanner_running ? "运行中" : (settings.scanner_enabled ? "开启" : "关闭")),
+      marketSummaryPill("LLM", status.llm_enabled ? "开启" : "关闭"),
+      marketSummaryPill("证据", settings.evidence_enabled ? (status.evidence?.ok_count ? `${fmtNumberCell(status.evidence.ok_count, 0)}命中` : "开启") : "关闭"),
+      marketSummaryPill("探针", settings.paper_probe_enabled ? "开启" : "关闭"),
+      marketSummaryPill("候选", fmtNumberCell(status.candidate_count, 0)),
+      marketSummaryPill("展示", fmtNumberCell(status.display_candidate_count, 0)),
+      marketSummaryPill("LLM候选", fmtNumberCell(status.llm_candidate_count, 0)),
+    ].join("");
+  }
+  const candidates = status.top_candidates || [];
+  selectedMarketCandidate(candidates, status.last_decision || null);
+  renderMarketPaperAccount(account);
+  renderMarketCandidates(candidates, status);
+  renderMarketRecommendation(status.last_decision || null, status.last_auto_order || null);
+  renderMarketPaperOrders(payload.paper_orders || [], payload.paper_orders_meta || {});
+  renderMarketLiveOrders(payload.live || {});
+}
+
+function selectedMarketCandidate(candidates, decision = null) {
+  if (!Array.isArray(candidates) || !candidates.length) {
+    marketSelectedCandidateSlug = "";
+    return null;
+  }
+  const bySlug = new Map(candidates.map((candidate) => [String(candidate.slug || ""), candidate]));
+  if (marketSelectedCandidateSlug && bySlug.has(marketSelectedCandidateSlug)) {
+    return bySlug.get(marketSelectedCandidateSlug);
+  }
+  marketSelectedCandidateSlug = "";
+  return null;
+}
+
+function marketSummaryPill(label, value) {
+  return `<span><b>${safe(label)}</b>${safe(String(value ?? "-"))}</span>`;
+}
+
+function renderMarketPaperAccount(account = {}) {
+  if (!ids.marketPaperAccount) return;
+  if (!marketScoutState) {
+    ids.marketPaperAccount.innerHTML = `<div class="market-scout-empty">等待账户数据</div>`;
+    return;
+  }
+  const rows = [
+    ["总权益", fmtMoneyCell(account.total_equity)],
+    ["可用资金", fmtMoneyCell(account.cash_balance)],
+    ["持仓风险", fmtMoneyCell(account.open_risk)],
+    ["总盈亏", fmtSignedMoneyCell(account.total_pnl)],
+    ["胜率", fmtPctCell(account.win_rate)],
+    ["开仓", fmtNumberCell(account.open_trades, 0)],
+  ];
+  ids.marketPaperAccount.innerHTML = rows.map(([label, value]) => `
+    <div class="market-account-metric">
+      <span>${safe(label)}</span>
+      <strong>${value}</strong>
+    </div>
+  `).join("");
+}
+
+function renderMarketCandidates(candidates, status = {}) {
+  if (!ids.marketCandidates) return;
+  const nextSignature = marketCandidateRenderSignature(candidates, status);
+  const nextMarketSignature = marketCandidateListSignature(candidates);
+  const existingList = ids.marketCandidates.querySelector(".market-candidate-list");
+  if (existingList) marketCandidateScrollTop = existingList.scrollTop;
+  if (nextSignature && nextSignature === marketCandidateLastRenderSignature) return;
+  const shouldRestoreScroll = Boolean(nextMarketSignature && nextMarketSignature === marketCandidateMarketSignature);
+  const body = candidates.length
+    ? `<div class="market-candidate-list">${candidates.map((candidate, index) => marketCandidateCard(candidate, index, status)).join("")}</div>`
+    : `<div class="market-scout-empty">暂无候选</div>`;
+  ids.marketCandidates.innerHTML = `<strong>候选市场</strong>${body}`;
+  const nextList = ids.marketCandidates.querySelector(".market-candidate-list");
+  if (nextList && shouldRestoreScroll) {
+    nextList.scrollTop = marketCandidateScrollTop;
+    requestAnimationFrame(() => {
+      nextList.scrollTop = marketCandidateScrollTop;
+    });
+  } else if (!shouldRestoreScroll) {
+    marketCandidateScrollTop = 0;
+  }
+  marketCandidateLastRenderSignature = nextSignature;
+  marketCandidateMarketSignature = nextMarketSignature;
+}
+
+function marketCandidateRenderSignature(candidates, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  const decision = status.last_decision && typeof status.last_decision === "object" ? status.last_decision : {};
+  const autoOrder = status.last_auto_order && typeof status.last_auto_order === "object" ? status.last_auto_order : {};
+  if (!Array.isArray(candidates) || !candidates.length) return `empty:${isAnalyzing ? "1" : "0"}`;
+  return JSON.stringify({
+    analyzing: Boolean(isAnalyzing),
+    selected: marketSelectedCandidateSlug,
+    decision: [
+      decision.decision,
+      decision.selected_slug,
+      decision.outcome,
+      decision.confidence,
+      decision.max_entry_price,
+      decision.reason,
+    ],
+    autoOrder: [
+      autoOrder.submitted,
+      autoOrder.probe,
+      autoOrder.slug,
+      autoOrder.outcome,
+      autoOrder.order_id,
+      autoOrder.reason,
+    ],
+    rows: candidates.map((candidate) => [
+      candidate.slug,
+      candidate.llm_selected,
+      candidate.llm_rank,
+      candidate.llm_block_reason,
+      candidate.selection_bucket,
+      candidate.selection_score,
+      candidate.score,
+      candidate.spread,
+      candidate.seconds_to_end,
+      candidate.evidence_status,
+      candidate.evidence_result_count,
+      Array.isArray(candidate.outcome_prices) ? candidate.outcome_prices.join(",") : "",
+    ]),
+  });
+}
+
+function marketCandidateListSignature(candidates) {
+  if (!Array.isArray(candidates) || !candidates.length) return "";
+  return candidates.map((candidate) => candidate.slug || "").join("|");
+}
+
+function marketCandidateCard(candidate, index, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  const decision = status.last_decision || null;
+  const autoOrder = status.last_auto_order || null;
+  const prices = Array.isArray(candidate.outcome_prices) ? candidate.outcome_prices : [];
+  const outcomes = Array.isArray(candidate.outcomes) ? candidate.outcomes : [];
+  const priceText = outcomes.map((outcome, i) => `${outcome} ${fmtNumberCell(prices[i], 4)}`).join(" / ");
+  const link = candidate.url ? `<a href="${safe(candidate.url)}" target="_blank" rel="noreferrer">${safe(candidate.slug || "打开")}</a>` : safe(candidate.slug || "-");
+  const analyzingBadge = isAnalyzing && candidate.llm_selected ? `<span class="market-candidate-badge is-analyzing"><span class="market-loading-dot"></span>分析中</span>` : "";
+  const llmBadge = candidate.llm_selected ? `<span class="market-candidate-badge is-llm">已送LLM #${safe(candidate.llm_rank || "?")}</span>` : "";
+  const blockBadge = candidate.llm_block_reason ? `<span class="market-candidate-badge is-blocked">${safe(candidate.llm_block_reason)}</span>` : "";
+  const resultBadge = marketCandidateResultBadge(candidate, decision, autoOrder, status);
+  const bucketBadge = candidate.selection_bucket ? `<span class="market-candidate-badge">${safe(candidate.selection_bucket)}</span>` : "";
+  const selected = String(candidate.slug || "") === marketSelectedCandidateSlug;
+  const itemClass = [
+    "market-candidate-row",
+    candidate.llm_selected ? "pass" : (candidate.llm_block_reason ? "warn" : ""),
+    isAnalyzing && candidate.llm_selected ? "is-analyzing" : "",
+    selected ? "is-selected" : "",
+    selected ? "has-detail" : "",
+  ].filter(Boolean).join(" ");
+  return `
+    <div class="${itemClass}" data-market-candidate-slug="${safe(candidate.slug || "")}">
+      <div class="market-candidate-status">
+        ${analyzingBadge}${resultBadge}${llmBadge}${bucketBadge}${blockBadge}<span class="market-candidate-badge">rank ${fmtNumberCell(candidate.base_rank || index + 1, 0)}</span>
+      </div>
+      <div class="market-candidate-main">
+        <strong>${safe(candidate.question || "-")}</strong>
+        <span>${link}</span>
+      </div>
+      <div class="market-candidate-prices">${marketCandidatePriceChips(outcomes, prices) || safe(priceText || "price -")}</div>
+      <div class="market-candidate-metrics">
+        <span>liq ${fmtMoneyCell(candidate.liquidity)}</span>
+        <span>vol24h ${fmtMoneyCell(candidate.volume_24h)}</span>
+        <span>spread ${fmtNumberCell(candidate.spread, 4)}</span>
+        <span>scout ${fmtNumberCell(candidate.selection_score, 3)}</span>
+        <span>left ${formatMarketSecondsLeft(candidate.seconds_to_end)}</span>
+      </div>
+      <div class="market-candidate-actions">
+        <button type="button" class="market-detail-button" data-market-detail-slug="${safe(candidate.slug || "")}">${selected ? "收起" : "详情"}</button>
+      </div>
+      ${selected ? marketCandidateInlineAnalysis(candidate, decision, autoOrder, status) : ""}
+    </div>
+  `;
+}
+
+function marketCandidateResultBadge(candidate, decision, autoOrder, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  const matchedDecision = marketDecisionMatchesCandidate(decision, candidate);
+  const matchedOrder = marketAutoOrderMatchesCandidate(autoOrder, candidate);
+  if (matchedOrder && autoOrder?.submitted) {
+    const label = autoOrder.probe ? "探针已下" : "Paper已下";
+    return `<span class="market-candidate-badge is-order">${safe(label)}</span>`;
+  }
+  if (isAnalyzing && candidate?.llm_selected) return "";
+  if (matchedDecision && decision?.decision === "RECOMMEND") {
+    return `<span class="market-candidate-badge is-decision">推荐</span>`;
+  }
+  if (matchedDecision && decision?.decision === "NO_TRADE") {
+    return `<span class="market-candidate-badge is-no-trade">不下注</span>`;
+  }
+  if (candidate?.llm_block_reason) {
+    return `<span class="market-candidate-badge is-blocked">拦截</span>`;
+  }
+  return "";
+}
+
+function marketAutoOrderMatchesCandidate(autoOrder, candidate) {
+  if (!autoOrder || !candidate) return false;
+  const orderSlug = String(autoOrder.slug || autoOrder.selected_slug || "").trim();
+  const candidateSlug = String(candidate.slug || "").trim();
+  if (orderSlug && candidateSlug && orderSlug === candidateSlug) return true;
+  const orderQuestion = String(autoOrder.question || "").trim();
+  const candidateQuestion = String(candidate.question || "").trim();
+  return Boolean(orderQuestion && candidateQuestion && orderQuestion === candidateQuestion);
+}
+
+function marketCandidateInlineAnalysis(candidate, decision, autoOrder, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  const matchedDecision = marketDecisionMatchesCandidate(decision, candidate);
+  return `
+    <div class="market-candidate-inline-analysis">
+      ${isAnalyzing && candidate.llm_selected ? marketCandidateInlineLoading(status) : ""}
+      ${marketCandidateInlineStats(candidate)}
+      ${marketCandidateInlineEvidence(candidate)}
+      ${matchedDecision ? marketCandidateInlineDecision(decision, autoOrder) : marketCandidateInlineLlmStatus(candidate, decision, autoOrder, status)}
+    </div>
+  `;
+}
+
+function marketCandidateInlineLoading(status = {}) {
+  return `
+    <div class="market-candidate-inline-loading">
+      <span class="market-spinner"></span>
+      <div>
+        <strong>LLM 分析中</strong>
+        <span>${fmtNumberCell(status.llm_candidate_count || 0, 0)} 个候选正在等待结构化判断</span>
+      </div>
+    </div>
+  `;
+}
+
+function marketCandidateInlineStats(candidate) {
+  return `
+    <div class="market-candidate-detail-stats">
+      ${marketCandidateDetailStat("bucket", candidate.selection_bucket || "-")}
+      ${marketCandidateDetailStat("scout", fmtNumberCell(candidate.selection_score, 3))}
+      ${marketCandidateDetailStat("基础分", fmtNumberCell(candidate.score, 3))}
+      ${marketCandidateDetailStat("剩余", formatMarketSecondsLeft(candidate.seconds_to_end))}
+      ${marketCandidateDetailStat("流动性", fmtMoneyCell(candidate.liquidity))}
+      ${marketCandidateDetailStat("24h量", fmtMoneyCell(candidate.volume_24h))}
+      ${marketCandidateDetailStat("价差", fmtNumberCell(candidate.spread, 4))}
+      ${marketCandidateDetailStat("原始rank", fmtNumberCell(candidate.base_rank, 0))}
+    </div>
+    ${marketCandidateInlineTags("选择标签", Array.isArray(candidate.selection_notes) ? candidate.selection_notes : [], "check")}
+  `;
+}
+
+function marketCandidateDetailStat(label, value) {
+  return `
+    <span class="market-candidate-detail-stat">
+      <em>${safe(label)}</em>
+      <strong>${safe(String(value ?? "-"))}</strong>
+    </span>
+  `;
+}
+
+function marketCandidateInlineDecision(decision, autoOrder) {
+  const flags = Array.isArray(decision?.risk_flags) ? decision.risk_flags : [];
+  const checks = Array.isArray(decision?.news_checks_needed) ? decision.news_checks_needed : [];
+  const decisionText = decision?.decision || "NO_TRADE";
+  const autoText = autoOrder?.reason ? safe(autoOrder.reason) : "";
+  return `
+    <div class="market-candidate-inline-decision">
+      <div class="market-candidate-inline-head">
+        <span class="market-analysis-decision ${marketAnalysisDecisionClass(decisionText)}">${safe(decisionText)}</span>
+        <strong>${safe(decision?.outcome || "-")} · ${fmtNumberCell(decision?.confidence, 4)} · 最高价 ${fmtNumberCell(decision?.max_entry_price, 4)}</strong>
+      </div>
+      <p>${safe(decision?.reason || "-")}</p>
+      ${marketCandidateInlineTags("风险", flags, "risk")}
+      ${marketCandidateInlineTags("需核查", checks, "check")}
+      ${autoText ? `<div class="market-candidate-inline-execution"><span>执行</span><strong>${autoText}</strong></div>` : ""}
+    </div>
+  `;
+}
+
+function marketCandidateInlineEvidence(candidate) {
+  const evidence = candidate?.evidence && typeof candidate.evidence === "object" ? candidate.evidence : null;
+  if (!evidence) {
+    return `
+      <div class="market-candidate-inline-status">
+        <span>Web 证据</span>
+        <p>该市场最近一轮没有进入 Evidence Scout。</p>
+        <strong>未检索</strong>
+      </div>
+    `;
+  }
+  const results = Array.isArray(evidence.results) ? evidence.results : [];
+  const status = evidence.status || "-";
+  const query = evidence.query || "-";
+  const notes = Array.isArray(evidence.notes) ? evidence.notes : [];
+  return `
+    <div class="market-candidate-inline-evidence">
+      <div class="market-candidate-inline-head">
+        <span class="market-analysis-decision ${status === "ok" ? "is-recommend" : "is-neutral"}">${safe(status)}</span>
+        <strong>${fmtNumberCell(evidence.result_count, 0)} 条英文证据 · ${safe(evidence.provider || "-")}</strong>
+      </div>
+      <p>${safe(query)}</p>
+      ${results.length ? `
+        <div class="market-evidence-list">
+          ${results.slice(0, 4).map((item) => marketEvidenceItem(item)).join("")}
+        </div>
+      ` : marketCandidateInlineTags("证据提示", notes, "check")}
+    </div>
+  `;
+}
+
+function marketEvidenceItem(item) {
+  const source = item.source || item.domain || "source";
+  const url = safeHttpUrl(item.url);
+  const title = item.title || "-";
+  const age = toNumber(item.age_hours);
+  const ageText = age == null ? "" : ` · ${fmtNumberCell(age, 1)}h`;
+  const titleHtml = url
+    ? `<a href="${safe(url)}" target="_blank" rel="noreferrer">${safe(title)}</a>`
+    : safe(title);
+  return `
+    <div class="market-evidence-item">
+      <strong>${titleHtml}</strong>
+      <span>${safe(source)}${safe(ageText)}</span>
+      <p>${safe(item.snippet || "")}</p>
+    </div>
+  `;
+}
+
+function marketCandidateInlineLlmStatus(candidate, decision, autoOrder, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  let message = "该市场当前只在候选列表展示，最近一轮没有进入 LLM 输入。";
+  if (candidate.llm_selected && isAnalyzing) {
+    message = "该市场已进入本轮 LLM 输入，等待结果返回。";
+  } else if (candidate.llm_selected) {
+    message = "该市场进入过最近一轮 LLM 输入，整体结果没有选中它。";
+  } else if (candidate.llm_block_reason) {
+    message = `该市场被本地漏斗拦截：${candidate.llm_block_reason}`;
+  }
+  const decisionText = decision?.decision ? `整体结果 ${decision.decision}` : "整体结果等待中";
+  const execution = autoOrder?.reason ? `执行 ${autoOrder.reason}` : "";
+  return `
+    <div class="market-candidate-inline-status">
+      <span>LLM 状态</span>
+      <p>${safe(message)}</p>
+      <strong>${safe(decisionText)}${execution ? ` · ${safe(execution)}` : ""}</strong>
+    </div>
+  `;
+}
+
+function marketCandidateInlineTags(label, items, kind) {
+  if (!Array.isArray(items) || !items.length) return "";
+  return `
+    <div class="market-candidate-inline-tags">
+      <span>${safe(label)}</span>
+      <div>
+        ${items.map((item) => `<em class="market-analysis-tag ${safe(kind)}">${safe(item)}</em>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function marketCandidatePriceChips(outcomes, prices) {
+  if (!Array.isArray(outcomes) || !outcomes.length) return "";
+  return outcomes.map((outcome, index) => `
+    <span class="market-candidate-price">
+      <b>${safe(outcome)}</b>
+      ${fmtNumberCell(prices[index], 4)}
+    </span>
+  `).join("");
+}
+
+function formatMarketSecondsLeft(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "-";
+  if (seconds <= 0) return "0s";
+  const days = Math.floor(seconds / 86400);
+  if (days >= 1) return `${days}d`;
+  const hours = Math.floor(seconds / 3600);
+  if (hours >= 1) return `${hours}h`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes >= 1) return `${minutes}m`;
+  return `${Math.round(seconds)}s`;
+}
+
+function renderMarketAnalysis(candidate, decision, autoOrder, status = {}) {
+  if (!ids.marketAnalysis) return;
+  const isAnalyzing = status.state === "analyzing";
+  if (!candidate) {
+    ids.marketAnalysis.innerHTML = `<strong>LLM 分析</strong><div class="market-scout-empty">点击候选市场详情查看</div>`;
+    return;
+  }
+  if (isAnalyzing) {
+    const count = status.llm_candidate_count || 0;
+    const matched = marketDecisionMatchesCandidate(decision, candidate);
+    const previous = matched ? marketAnalysisDecisionItem(decision, autoOrder, { title: "上次完成结果", previous: true }) : marketAnalysisCandidateLlmStatus(candidate, decision, autoOrder, status);
+    ids.marketAnalysis.innerHTML = `
+      <strong>LLM 分析</strong>
+      <div class="market-analysis-list">
+        <div class="market-analysis-item is-analyzing">
+          <div class="market-analysis-loading">
+            <span class="market-spinner"></span>
+            <div>
+              <strong>正在分析 ${fmtNumberCell(count, 0)} 个候选</strong>
+              <span>等待 LLM 返回结构化结果</span>
+            </div>
+          </div>
+        </div>
+        ${marketAnalysisCandidateDetail(candidate, status)}
+        ${previous}
+      </div>
+    `;
+    return;
+  }
+  const matched = marketDecisionMatchesCandidate(decision, candidate);
+  ids.marketAnalysis.innerHTML = `
+    <strong>LLM 分析</strong>
+    <div class="market-analysis-list">
+      ${marketAnalysisCandidateDetail(candidate, status)}
+      ${matched ? marketAnalysisDecisionItem(decision, autoOrder, { title: "该市场LLM结果" }) : marketAnalysisCandidateLlmStatus(candidate, decision, autoOrder, status)}
+    </div>
+  `;
+}
+
+function marketDecisionMatchesCandidate(decision, candidate) {
+  return Boolean(decision?.selected_slug && candidate?.slug && String(decision.selected_slug) === String(candidate.slug));
+}
+
+function marketAnalysisCandidateDetail(candidate, status = {}) {
+  const outcomes = Array.isArray(candidate.outcomes) ? candidate.outcomes : [];
+  const prices = Array.isArray(candidate.outcome_prices) ? candidate.outcome_prices : [];
+  const isAnalyzing = status.state === "analyzing";
+  return `
+    <div class="market-analysis-item market-analysis-candidate-detail">
+      <div class="market-analysis-header">
+        <span class="market-analysis-decision ${candidate.llm_selected ? "is-recommend" : "is-neutral"}">${candidate.llm_selected ? `LLM #${safe(candidate.llm_rank || "?")}` : "展示"}</span>
+        <strong>${safe(candidate.question || "-")}</strong>
+      </div>
+      ${isAnalyzing && candidate.llm_selected ? `<div class="market-analysis-inline-loading"><span class="market-loading-dot"></span>该市场正在随本轮候选提交给 LLM</div>` : ""}
+      <div class="market-analysis-price-row">${marketCandidatePriceChips(outcomes, prices) || "-"}</div>
+      <div class="market-analysis-metrics">
+        ${marketAnalysisMetric("bucket", candidate.selection_bucket || "-")}
+        ${marketAnalysisMetric("scout", fmtNumberCell(candidate.selection_score, 3))}
+        ${marketAnalysisMetric("基础分", fmtNumberCell(candidate.score, 3))}
+        ${marketAnalysisMetric("剩余", formatMarketSecondsLeft(candidate.seconds_to_end))}
+        ${marketAnalysisMetric("流动性", fmtMoneyCell(candidate.liquidity))}
+        ${marketAnalysisMetric("24h量", fmtMoneyCell(candidate.volume_24h))}
+        ${marketAnalysisMetric("价差", fmtNumberCell(candidate.spread, 4))}
+        ${marketAnalysisMetric("原始rank", fmtNumberCell(candidate.base_rank, 0))}
+      </div>
+      ${marketAnalysisTagGroup("选择标签", Array.isArray(candidate.selection_notes) ? candidate.selection_notes : [], "check")}
+      ${candidate.url ? `<a class="market-analysis-link" href="${safe(candidate.url)}" target="_blank" rel="noreferrer">打开 Polymarket</a>` : ""}
+    </div>
+  `;
+}
+
+function marketAnalysisCandidateLlmStatus(candidate, decision, autoOrder, status = {}) {
+  const isAnalyzing = status.state === "analyzing";
+  let message = "该市场当前仅展示，最近一轮没有送入 LLM。";
+  if (candidate.llm_selected && isAnalyzing) {
+    message = "该市场已进入本轮 LLM 输入，正在等待结果。";
+  } else if (candidate.llm_selected) {
+    message = "该市场已进入最近一轮 LLM 输入，当前整体结果没有选择该市场。";
+  } else if (candidate.llm_block_reason) {
+    message = `该市场被本地漏斗拦截：${candidate.llm_block_reason}`;
+  }
+  const decisionText = decision?.decision ? `当前整体结果：${decision.decision}` : "当前还没有整体 LLM 结果";
+  const execution = autoOrder?.reason ? `执行：${autoOrder.reason}` : "";
+  return `
+    <div class="market-analysis-item is-previous">
+      <span class="market-analysis-section-label">该市场LLM状态</span>
+      <div class="market-analysis-reason">
+        <span>状态</span>
+        <p>${safe(message)}</p>
+      </div>
+      <div class="market-analysis-execution">
+        <span>整体结果</span>
+        <strong>${safe(decisionText)}${execution ? ` · ${safe(execution)}` : ""}</strong>
+      </div>
+    </div>
+  `;
+}
+
+function marketAnalysisDecisionItem(decision, autoOrder, options = {}) {
+  const flags = Array.isArray(decision.risk_flags) ? decision.risk_flags : [];
+  const checks = Array.isArray(decision.news_checks_needed) ? decision.news_checks_needed : [];
+  const autoText = autoOrder?.reason ? safe(autoOrder.reason) : "";
+  const decisionText = decision.decision || "NO_TRADE";
+  const className = [
+    decisionText === "RECOMMEND" ? "warn" : "",
+    options.previous ? "is-previous" : "",
+  ].filter(Boolean).join(" ");
+  return `
+    <div class="market-analysis-item ${className}">
+      ${options.title ? `<span class="market-analysis-section-label">${safe(options.title)}</span>` : ""}
+      <div class="market-analysis-header">
+        <span class="market-analysis-decision ${marketAnalysisDecisionClass(decisionText)}">${safe(decisionText)}</span>
+        <strong>${safe(decision.selected_slug || decision.question || "-")}</strong>
+      </div>
+      <div class="market-analysis-metrics">
+        ${marketAnalysisMetric("方向", decision.outcome || "-")}
+        ${marketAnalysisMetric("置信度", fmtNumberCell(decision.confidence, 4))}
+        ${marketAnalysisMetric("最高价", fmtNumberCell(decision.max_entry_price, 4))}
+        ${marketAnalysisMetric("有效期", `${fmtNumberCell(decision.valid_for_seconds, 0)}s`)}
+      </div>
+      <div class="market-analysis-reason">
+        <span>理由</span>
+        <p>${safe(decision.reason || "-")}</p>
+      </div>
+      ${marketAnalysisTagGroup("风险", flags, "risk")}
+      ${marketAnalysisTagGroup("需核查", checks, "check")}
+      ${autoText ? `<div class="market-analysis-execution"><span>执行</span><strong>${autoText}</strong></div>` : ""}
+    </div>
+  `;
+}
+
+function marketAnalysisDecisionClass(decision) {
+  if (decision === "RECOMMEND") return "is-recommend";
+  if (decision === "NO_TRADE") return "is-no-trade";
+  return "is-neutral";
+}
+
+function marketAnalysisMetric(label, value) {
+  return `
+    <div class="market-analysis-metric">
+      <span>${safe(label)}</span>
+      <strong>${safe(String(value ?? "-"))}</strong>
+    </div>
+  `;
+}
+
+function marketAnalysisTagGroup(label, items, kind) {
+  if (!Array.isArray(items) || !items.length) return "";
+  return `
+    <div class="market-analysis-tag-group">
+      <span>${safe(label)}</span>
+      <div>
+        ${items.map((item) => `<em class="market-analysis-tag ${safe(kind)}">${safe(item)}</em>`).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderMarketRecommendation(decision, autoOrder) {
+  if (!ids.marketRecommendation) return;
+  if (autoOrder?.submitted && autoOrder?.probe) {
+    ids.marketRecommendation.innerHTML = `
+      <strong>推荐下注</strong>
+      <div class="market-recommendation-list">
+        <div class="market-recommendation-item warn">
+          <strong>Paper 探针 · ${safe(autoOrder.outcome || "-")} · ${fmtNumberCell(autoOrder.confidence, 4)}</strong>
+          <span>${safe(autoOrder.question || autoOrder.slug || "-")}</span>
+          <span>入场价 ${fmtNumberCell(autoOrder.entry_price, 4)} · stake ${fmtMoneyCell(autoOrder.stake)}</span>
+          <span>订单 ${safe(autoOrder.order_id || "-")} · ${safe(autoOrder.reason || "探针放行")}</span>
+        </div>
+      </div>
+    `;
+    return;
+  }
+  if (!decision || decision.decision !== "RECOMMEND") {
+    ids.marketRecommendation.innerHTML = `<strong>推荐下注</strong><div class="market-scout-empty">暂无推荐</div>`;
+    return;
+  }
+  const submitted = Boolean(autoOrder?.submitted);
+  ids.marketRecommendation.innerHTML = `
+    <strong>推荐下注</strong>
+    <div class="market-recommendation-list">
+      <div class="market-recommendation-item ${submitted ? "pass" : "warn"}">
+        <strong>${safe(decision.outcome || "-")} · ${fmtNumberCell(decision.confidence, 4)}</strong>
+        <span>${safe(decision.question || decision.selected_slug || "-")}</span>
+        <span>最高入场价 ${fmtNumberCell(decision.max_entry_price, 4)}</span>
+        <span>Paper ${submitted ? `已执行 订单 ${safe(autoOrder?.order_id || "-")}` : `未执行 ${safe(autoOrder?.reason || "等待 Paper 开关")}`}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderMarketPaperOrders(rows, meta = {}) {
+  if (!ids.marketPaperOrders) return;
+  const visibleFields = marketPaperOrderFields.filter((field) => selectedFields.marketPaperOrder.includes(field.key));
+  if (ids.marketPaperOrdersMeta) {
+    ids.marketPaperOrdersMeta.textContent = `${fmtNumberCell(meta.total || rows.length, 0)} 条`;
+  }
+  if (ids.marketPaperOrdersHead) {
+    ids.marketPaperOrdersHead.innerHTML = `<tr>${visibleFields.map((field) => `<th class="${field.cellClass || ""}">${safe(field.label)}</th>`).join("")}</tr>`;
+  }
+  if (!rows.length) {
+    ids.marketPaperOrders.innerHTML = `<tr><td colspan="${Math.max(1, visibleFields.length)}" class="empty">暂无 Paper 下注记录</td></tr>`;
+    return;
+  }
+  ids.marketPaperOrders.innerHTML = rows.map((row) => `
+    <tr>
+      ${visibleFields.map((field) => `<td class="${field.cellClass || ""}">${field.render(row)}</td>`).join("")}
+    </tr>
+  `).join("");
+}
+
+function marketOrderQuestionCell(row) {
+  const text = row.question || row.round_id || "-";
+  const href = officialMarketUrl(row);
+  if (!href) return safe(text);
+  return `<a class="market-link" href="${safe(href)}" target="_blank" rel="noreferrer">${safe(text)}</a>`;
+}
+
+function marketSettlementBadge(row) {
+  const result = String(row?.settlement_result || "OPEN").toLowerCase().replaceAll("_", "-");
+  const label = row?.settlement_result_label || (row?.trade_id ? "未结算" : "无持仓");
+  return `<span class="market-settlement-badge is-${safe(result)}">${safe(label)}</span>`;
+}
+
+function renderMarketLiveOrders(live = {}) {
+  if (ids.marketLiveOrdersMeta) ids.marketLiveOrdersMeta.textContent = live.locked ? "已锁定" : "0 条";
+  if (!ids.marketLiveOrders) return;
+  ids.marketLiveOrders.textContent = live.message || "市场页实盘自动下注未接入";
 }
 
 async function withButtonLoading(button, task, after = null) {
@@ -896,7 +1985,12 @@ function setActiveAppPage(page, options = {}) {
     if (selected) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  for (const [key, element] of [["bot", ids.botPage], ["samples", ids.samplePage], ["status", ids.statusPage]]) {
+  for (const [key, element] of [
+    ["bot", ids.botPage],
+    ["market", ids.marketPage],
+    ["samples", ids.samplePage],
+    ["status", ids.statusPage],
+  ]) {
     if (!element) continue;
     const selected = key === nextPage;
     element.classList.toggle("is-active", selected);
@@ -917,10 +2011,18 @@ function setActiveAppPage(page, options = {}) {
     window.setTimeout(() => renderSampleProgress(latestStatus.runtime || {}, { force: true }), 120);
     window.setTimeout(() => loadSampleCandidates({ renderLoading: true }).catch(showError), 160);
   }
+  if (nextPage === "market") {
+    window.setTimeout(() => loadMarketLlmTerminal(true).catch(showError), 80);
+    window.setTimeout(() => loadMarketScoutState(true).catch(showError), 120);
+  }
   if (nextPage === "status") {
     renderPolymarketStatus();
     window.setTimeout(() => loadPolymarketStatus(true).catch(handlePolymarketStatusError), 120);
   }
+}
+
+function marketPageActive() {
+  return document.body?.dataset?.page === "market";
 }
 
 function statusPageActive() {
@@ -2313,6 +3415,10 @@ function sampleVersionSummary(summary = {}, version = selectedSampleVersion) {
     unsettled_count: Math.max(0, total - settled),
     win_count: toNumber(summary[`${prefix}_would_win_count`]) || 0,
     loss_count: toNumber(summary[`${prefix}_would_loss_count`]) || 0,
+    raw_would_trade_count: summary[`raw_${prefix}_would_trade_count`] || total,
+    raw_settled_count: summary[`raw_${prefix}_would_trade_settled_count`] || settled,
+    rtds_abnormal_excluded_count: summary[`${prefix}_rtds_abnormal_excluded_count`] || 0,
+    rtds_abnormal_settled_excluded_count: summary[`${prefix}_rtds_abnormal_settled_excluded_count`] || 0,
     win_rate_pct: summary[`${prefix}_would_win_rate_pct`],
     simulated_roi_pct: summary[`${prefix}_simulated_roi_pct`],
     direction_stats: summary[`${prefix}_direction_stats`] || [],
@@ -2330,7 +3436,10 @@ function sampleProgressRenderKey(runtime = {}) {
     variant_id: variant?.variant_id || "",
     selected_version: selectedSampleVersion,
     total: summary.total_count || 0,
+    raw_total: summary.raw_total_count || summary.total_count || 0,
+    rtds_abnormal_excluded: summary.rtds_abnormal_excluded_count || 0,
     settled: summary.settled_count || 0,
+    raw_settled: summary.raw_settled_count || summary.settled_count || 0,
     base_settled: summary.base_would_trade_settled_count || 0,
     base_win_rate: summary.base_would_win_rate_pct,
     version_summary: selected,
@@ -2362,6 +3471,12 @@ function renderSampleRecentPanel(selected = {}, versionLabel = selectedSampleVer
   const fallbackRecent = sampleRecentPage === 1 && Array.isArray(selected.recent_samples) ? selected.recent_samples : [];
   const recent = currentCandidatePageReady ? sampleRecentRows : fallbackRecent;
   const totalCandidates = currentCandidatePageReady ? Number(sampleRecentMeta.total || 0) : versionTotal;
+  const rawTotalCandidates = currentCandidatePageReady
+    ? Number(sampleRecentMeta.raw_total || sampleRecentMeta.total || 0)
+    : (toNumber(selected.raw_would_trade_count) || versionTotal);
+  const excludedCandidates = currentCandidatePageReady
+    ? Number(sampleRecentMeta.rtds_abnormal_excluded_count || 0)
+    : (toNumber(selected.rtds_abnormal_excluded_count) || 0);
   const totalPages = currentCandidatePageReady
     ? sampleRecentTotalPages(sampleRecentMeta)
     : (totalCandidates > 0 ? Math.ceil(totalCandidates / SAMPLE_RECENT_PAGE_SIZE) : 0);
@@ -2374,7 +3489,7 @@ function renderSampleRecentPanel(selected = {}, versionLabel = selectedSampleVer
     const visibleCount = sampleRecentLoading && !currentCandidatePageReady ? SAMPLE_RECENT_PAGE_SIZE : recent.length;
     const loadedEnd = totalCandidates > 0 ? Math.min(expectedOffset + visibleCount, totalCandidates) : 0;
     ids.sampleRecentPageInfo.textContent = totalCandidates > 0
-      ? `第 ${displayPage} / ${totalPages} 页 · ${loadedStart}-${loadedEnd} / ${totalCandidates} 条`
+      ? `第 ${displayPage} / ${totalPages} 页 · ${loadedStart}-${loadedEnd} / ${totalCandidates} 条 · 原始 ${rawTotalCandidates} · RTDS排除 ${excludedCandidates}`
       : "第 0 / 0 页 · 共 0 条";
   }
   if (ids.sampleRecentPrevPage) {
@@ -2426,10 +3541,16 @@ function renderSampleProgress(runtime = {}, options = {}) {
   const selected = sampleVersionSummary(summary);
   const versionLabel = selected.version || selectedSampleVersion;
   const allTotal = toNumber(summary.total_count) || 0;
+  const rawAllTotal = toNumber(summary.raw_total_count) || allTotal;
+  const rtdsExcluded = toNumber(summary.rtds_abnormal_excluded_count) || 0;
   const allSettled = toNumber(summary.settled_count) || 0;
+  const rawAllSettled = toNumber(summary.raw_settled_count) || allSettled;
   const baseSettled = toNumber(summary.base_would_trade_settled_count) || 0;
   const versionTotal = toNumber(selected.would_trade_count) || 0;
+  const rawVersionTotal = toNumber(selected.raw_would_trade_count) || versionTotal;
+  const versionRtdsExcluded = toNumber(selected.rtds_abnormal_excluded_count) || 0;
   const versionSettled = toNumber(selected.settled_count) || 0;
+  const rawVersionSettled = toNumber(selected.raw_settled_count) || versionSettled;
   const versionUnsettled = Math.max(0, toNumber(selected.unsettled_count) ?? (versionTotal - versionSettled));
   const versionWin = toNumber(selected.win_count) || 0;
   const versionLoss = toNumber(selected.loss_count) || 0;
@@ -2440,7 +3561,8 @@ function renderSampleProgress(runtime = {}, options = {}) {
   const liveReadinessLabel = liveReadiness.label || "继续采样";
   const liveReadinessReason = liveReadinessReasons.length ? liveReadinessReasons[0] : "实盘预检通过后再准备 REAL";
 
-  ids.sampleProgressMeta.textContent = `${safe(versionLabel)} 统一样本池 · ${safe(variant.combo || "Aggressive Edge")} · tick ${experiments.run_count || 0}`;
+  const qualityText = rtdsExcluded > 0 ? ` · RTDS异常排除 ${fmtNumberCell(rtdsExcluded, 0)}` : "";
+  ids.sampleProgressMeta.textContent = `${safe(versionLabel)} 统一样本池 · ${safe(variant.combo || "Aggressive Edge")} · tick ${experiments.run_count || 0}${qualityText}`;
   ids.sampleProgressSummary.innerHTML = [
     sampleSummaryItem("状态", versionSettled >= SAMPLE_REVIEW_TARGET ? "可完整复盘" : "继续采样"),
     sampleSummaryItem("实盘", liveReadinessLabel),
@@ -2452,12 +3574,15 @@ function renderSampleProgress(runtime = {}, options = {}) {
     sampleProgressBar("100 单稳定性线", versionSettled, SAMPLE_STABILITY_TARGET),
   ].join("");
   ids.sampleProgressCards.innerHTML = [
-    sampleMetricCard("全部影子样本", fmtNumberCell(allTotal, 0), "观察样本"),
-    sampleMetricCard("已结算影子样本", fmtNumberCell(allSettled, 0), "可回填结果"),
+    sampleMetricCard("全部影子样本", fmtNumberCell(allTotal, 0), "净化口径"),
+    sampleMetricCard("原始影子样本", fmtNumberCell(rawAllTotal, 0), "未删除"),
+    sampleMetricCard("RTDS异常排除", fmtNumberCell(rtdsExcluded, 0), "fallback窗口"),
+    sampleMetricCard("已结算影子样本", fmtNumberCell(allSettled, 0), `原始 ${fmtNumberCell(rawAllSettled, 0)}`),
     sampleMetricCard("原始会下注样本", `${fmtNumberCell(baseSettled, 0)} 已结算`, "Aggressive Edge"),
     sampleMetricCard("原始会下注胜率", samplePctText(summary.base_would_win_rate_pct), "基准口径"),
     sampleMetricCard(`${versionLabel} 会放行样本`, fmtNumberCell(versionTotal, 0), "诊断候选"),
-    sampleMetricCard(`${versionLabel} 已结算样本`, fmtNumberCell(versionSettled, 0), "复盘有效"),
+    sampleMetricCard(`${versionLabel} 原始候选`, fmtNumberCell(rawVersionTotal, 0), `RTDS排除 ${fmtNumberCell(versionRtdsExcluded, 0)}`),
+    sampleMetricCard(`${versionLabel} 已结算样本`, fmtNumberCell(versionSettled, 0), `原始 ${fmtNumberCell(rawVersionSettled, 0)}`),
     sampleMetricCard(`${versionLabel} 未结算样本`, fmtNumberCell(versionUnsettled, 0), "等待终局"),
     sampleMetricCard(`${versionLabel} 胜`, fmtNumberCell(versionWin, 0), "已结算"),
     sampleMetricCard(`${versionLabel} 负`, fmtNumberCell(versionLoss, 0), "已结算"),
@@ -3183,6 +4308,7 @@ function tableWrap(kind) {
 function liveCopyRoot(kind) {
   if (kind === "gate") return ids.liveGateStatus;
   if (kind === "terminal") return ids.liveTerminalLines?.closest(".live-terminal") || ids.liveTerminalLines;
+  if (kind === "market-terminal") return ids.marketLlmTerminalLines?.closest(".market-llm-terminal") || ids.marketLlmTerminalLines;
   return null;
 }
 
@@ -3286,6 +4412,11 @@ function flushPendingLiveTerminalRender() {
   renderLiveTerminal();
 }
 
+function flushPendingMarketTerminalRender() {
+  if (!pendingMarketTerminalRender || isLiveCopyInteractionActive("market-terminal")) return;
+  renderMarketLlmTerminal();
+}
+
 function flushPendingTableRenders() {
   flushPendingOpenRender();
   flushPendingOrderRender();
@@ -3299,6 +4430,7 @@ function scheduleProtectedTableFlush() {
 function flushPendingLiveCopyRenders() {
   flushPendingLiveGateRender();
   flushPendingLiveTerminalRender();
+  flushPendingMarketTerminalRender();
 }
 
 function scheduleProtectedLiveCopyFlush() {
@@ -3490,9 +4622,11 @@ function initFieldOptions() {
   renderFieldOptions("open", openTradeFields, ids.openFieldOptions);
   renderFieldOptions("order", recentOrderFields, ids.orderFieldOptions);
   renderFieldOptions("recent", recentTradeFields, ids.recentFieldOptions);
+  renderFieldOptions("marketPaperOrder", marketPaperOrderFields, ids.marketPaperOrderFieldOptions);
 }
 
 function renderFieldOptions(kind, fields, container) {
+  if (!container) return;
   container.innerHTML = fields.map((field) => {
     const checked = selectedFields[kind].includes(field.key) ? "checked" : "";
     return `
@@ -3516,9 +4650,14 @@ function renderFieldOptions(kind, fields, container) {
     }
     selectedFields[kind] = fields.filter((field) => next.has(field.key)).map((field) => field.key);
     localStorage.setItem(FIELD_STORAGE_KEYS[kind], JSON.stringify(selectedFields[kind]));
+    console.info("[table] 字段配置已更新", { kind, fields: selectedFields[kind] });
     if (kind === "open") lastOpenRenderKey = "";
     if (kind === "recent") lastRecentRenderKey = "";
     if (kind === "order") lastOrderRenderKey = "";
+    if (kind === "marketPaperOrder") {
+      renderMarketPaperOrders(marketScoutState?.paper_orders || [], marketScoutState?.paper_orders_meta || {});
+      return;
+    }
     renderAll(latestStatus, { forceOpen: kind === "open", forceOrder: kind === "order" });
   });
 }
@@ -3554,12 +4693,12 @@ function marketLinkCell(row) {
 }
 
 function officialMarketUrl(row) {
-  // 市场字段优先使用后端保存的官方 URL，历史行缺 URL 时再按 slug 生成官方 event 地址。
-  const directUrl = safeHttpUrl(row?.url);
-  if (directUrl) return directUrl;
+  // 市场链接优先走 Polymarket 的 market 跳转入口，避免历史 event URL 路由过期导致 404。
   const slug = String(row?.round_id || "").trim();
-  if (!/^[a-z0-9][a-z0-9-]*$/i.test(slug)) return null;
-  return `https://polymarket.com/event/${encodeURIComponent(slug)}`;
+  if (/^[a-z0-9][a-z0-9-]*$/i.test(slug)) {
+    return `https://polymarket.com/market/${encodeURIComponent(slug)}`;
+  }
+  return safeHttpUrl(row?.url);
 }
 
 function safeHttpUrl(value) {
@@ -3583,6 +4722,48 @@ function fmtSignedMoneyCell(value) {
   const parsed = toNumber(value);
   if (parsed == null) return "-";
   return `<span class="${cls(parsed)}">${money.format(parsed)}</span>`;
+}
+
+function marketValuationTitle(row, key) {
+  if (["current_bid", "current_ask", "exit_value", "unrealized_pnl", "unrealized_roi_pct"].includes(key)) {
+    if (row?.valuation_error) return row.valuation_error;
+    if (row?.valuation_source) {
+      return `按当前盘口估值，来源 ${row.valuation_source}`;
+    }
+    return "未结算持仓按当前买一价估值";
+  }
+  if (key === "max_payout") return "最大回款 = 成交份额 * 1.00";
+  if (key === "max_profit") return "最大盈利 = 最大回款 - 已投入现金";
+  if (key === "max_loss") return "最大亏损 = 已投入现金";
+  return "";
+}
+
+function fmtMarketMoneyCell(row, key) {
+  const parsed = toNumber(row?.[key]);
+  const title = marketValuationTitle(row, key);
+  if (parsed == null) return `<span class="market-money is-empty" title="${safe(title)}">-</span>`;
+  return `<span class="market-money" title="${safe(title)}">${money.format(parsed)}</span>`;
+}
+
+function fmtMarketSignedMoneyCell(row, key) {
+  const parsed = toNumber(row?.[key]);
+  const title = marketValuationTitle(row, key);
+  if (parsed == null) return `<span class="market-money is-empty" title="${safe(title)}">-</span>`;
+  return `<span class="market-money ${cls(parsed)}" title="${safe(title)}">${parsed > 0 ? "+" : ""}${money.format(parsed)}</span>`;
+}
+
+function fmtMarketSignedPctCell(row, key) {
+  const parsed = toNumber(row?.[key]);
+  const title = marketValuationTitle(row, key);
+  if (parsed == null) return `<span class="market-money is-empty" title="${safe(title)}">-</span>`;
+  return `<span class="market-money ${cls(parsed)}" title="${safe(title)}">${parsed > 0 ? "+" : ""}${new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(parsed)}%</span>`;
+}
+
+function fmtMarketNumberCell(row, key, digits = 4) {
+  const parsed = toNumber(row?.[key]);
+  const title = marketValuationTitle(row, key);
+  if (parsed == null) return `<span class="market-money is-empty" title="${safe(title)}">-</span>`;
+  return `<span class="market-money" title="${safe(title)}">${new Intl.NumberFormat("en-US", { maximumFractionDigits: digits }).format(parsed)}</span>`;
 }
 
 function fmtNumberCell(value, digits = 4) {
@@ -3886,6 +5067,7 @@ function applyStatusPayload(data, options = {}) {
   const manual = Boolean(options.manual);
   const refreshAuxiliary = options.refreshAuxiliary !== false;
   latestStatus = data;
+  applyBtcRuntimeState(data);
   if (data.runtime.current_market) applyMarket(data.runtime.current_market);
   if (data.runtime.latest_quotes && !Object.keys(quotes).length) quotes = data.runtime.latest_quotes;
   if (data.runtime.latest_price && !priceState.chainlink && !priceState.binance) {
@@ -4944,11 +6126,13 @@ function applyMarket(market) {
   if (!sameMarket || tokenChanged) {
     quotes = {};
     resetRealtimeSignalForMarket(activeMarket);
+    if (btcRuntimePaused) return;
     connectMarketSocket();
   }
 }
 
 function connectMarketSocket() {
+  if (btcRuntimePaused) return;
   if (!activeMarket?.up_token || !activeMarket?.down_token) return;
   if (marketSocket) marketSocket.close();
   if (marketPing) clearInterval(marketPing);
@@ -4970,6 +6154,7 @@ function connectMarketSocket() {
     postSnapshotSoon(true);
   };
   socket.onmessage = (event) => {
+    if (btcRuntimePaused) return;
     const message = parseMessage(event.data);
     if (!message) return;
     if (message.event_type === "book") {
@@ -5021,6 +6206,7 @@ function connectMarketSocket() {
     if (socket !== marketSocket) return;
     marketWsStatus = "closed";
     if (marketPing) clearInterval(marketPing);
+    if (btcRuntimePaused) return;
     setTimeout(connectMarketSocket, 1500);
   };
   socket.onerror = () => {
@@ -5030,6 +6216,7 @@ function connectMarketSocket() {
 }
 
 function connectPriceSocket() {
+  if (btcRuntimePaused) return;
   if (priceSocket && priceSocket.readyState <= 1) return;
   if (pricePing) clearInterval(pricePing);
   priceWsStatus = "connecting";
@@ -5043,7 +6230,8 @@ function connectPriceSocket() {
       action: "subscribe",
       subscriptions: [
         { topic: "crypto_prices_chainlink", type: "*", filters: "{\"symbol\":\"btc/usd\"}" },
-        { topic: "crypto_prices", type: "update", filters: "{\"symbol\":\"btcusdt\"}" },
+        // RTDS 的 btcusdt filter 只稳定返回首批，空 filter 后在本地只接收 BTC 更新。
+        { topic: "crypto_prices", type: "update", filters: "" },
       ],
     }));
     pricePing = setInterval(() => {
@@ -5051,6 +6239,7 @@ function connectPriceSocket() {
     }, RTDS_PING_MS);
   };
   socket.onmessage = (event) => {
+    if (btcRuntimePaused) return;
     const message = parseMessage(event.data);
     if (!message) return;
     processPriceMessage(message);
@@ -5061,6 +6250,7 @@ function connectPriceSocket() {
     if (socket !== priceSocket) return;
     priceWsStatus = "closed";
     if (pricePing) clearInterval(pricePing);
+    if (btcRuntimePaused) return;
     setTimeout(connectPriceSocket, 1500);
   };
   socket.onerror = () => {
@@ -5070,6 +6260,7 @@ function connectPriceSocket() {
 }
 
 function connectOkxSocket() {
+  if (btcRuntimePaused) return;
   if (okxSocket && okxSocket.readyState <= 1) return;
   if (okxPing) clearInterval(okxPing);
   okxWsStatus = "connecting";
@@ -5087,6 +6278,7 @@ function connectOkxSocket() {
     }, OKX_PING_MS);
   };
   socket.onmessage = (event) => {
+    if (btcRuntimePaused) return;
     if (event.data === "pong") return;
     const message = parseMessage(event.data);
     if (!message) return;
@@ -5098,6 +6290,7 @@ function connectOkxSocket() {
     if (socket !== okxSocket) return;
     okxWsStatus = "closed";
     if (okxPing) clearInterval(okxPing);
+    if (btcRuntimePaused) return;
     setTimeout(connectOkxSocket, 1500);
   };
   socket.onerror = () => {
@@ -5107,6 +6300,7 @@ function connectOkxSocket() {
 }
 
 function connectBinanceMarketSocket() {
+  if (btcRuntimePaused) return;
   if (binanceMarketSocket && binanceMarketSocket.readyState <= 1) return;
   binanceMarketWsStatus = "connecting";
   const socket = new WebSocket(BINANCE_MARKET_WS);
@@ -5116,6 +6310,7 @@ function connectBinanceMarketSocket() {
     binanceMarketWsStatus = "connected";
   };
   socket.onmessage = (event) => {
+    if (btcRuntimePaused) return;
     const message = parseMessage(event.data);
     if (!message) return;
     processBinanceMarketMessage(message);
@@ -5125,6 +6320,7 @@ function connectBinanceMarketSocket() {
   socket.onclose = () => {
     if (socket !== binanceMarketSocket) return;
     binanceMarketWsStatus = "closed";
+    if (btcRuntimePaused) return;
     setTimeout(connectBinanceMarketSocket, 1500);
   };
   socket.onerror = () => {
@@ -5142,8 +6338,9 @@ function processPriceMessage(message) {
     const value = toNumber(row?.value);
     if (!row || value == null) continue;
     const symbol = row.symbol || payload.symbol;
+    const symbolKey = String(symbol || "").toLowerCase().replace(/[^a-z0-9]/g, "");
     const ts = normalizeMs(row.timestamp || payload.timestamp || message.timestamp || now);
-    if (topic === "crypto_prices_chainlink" || symbol === "btc/usd") {
+    if (topic === "crypto_prices_chainlink" || symbolKey === "btcusd") {
       priceState.chainlink = value;
       priceState.chainlink_updated_ms = ts;
       priceState.source = "polymarket-rtds-chainlink";
@@ -5154,7 +6351,7 @@ function processPriceMessage(message) {
         priceState.target_price_fallback = true;
         priceState.target_price_updated_ms = ts;
       }
-    } else if (topic === "crypto_prices" || symbol === "btcusdt") {
+    } else if (topic === "crypto_prices" && symbolKey === "btcusdt") {
       priceState.binance = value;
       priceState.binance_updated_ms = now;
       if (!priceState.source) priceState.source = "polymarket-rtds-binance";
@@ -5242,6 +6439,7 @@ function parseMessage(data) {
 }
 
 function postSnapshotSoon(force = false) {
+  if (btcRuntimePaused) return;
   const now = Date.now();
   if (!force && now - lastSnapshotPostMs < SNAPSHOT_POST_MS) return;
   if (!claimSnapshotLeadership(now)) return;
@@ -5274,6 +6472,7 @@ function releaseSnapshotLeadership() {
 }
 
 async function postSnapshot() {
+  if (btcRuntimePaused) return;
   if (!activeMarket) return;
   if (snapshotInFlight) return;
   snapshotInFlight = true;
@@ -5330,6 +6529,7 @@ function showError(error) {
 }
 
 async function refreshMarketBoundary() {
+  if (btcRuntimePaused) return;
   if (!pageVisible) return;
   if (activeMarket && Date.now() / 1000 < activeMarket.end_ts - 1) return;
   await loadStatus();
@@ -5339,6 +6539,12 @@ function handleVisibilityChange() {
   pageVisible = document.visibilityState !== "hidden";
   if (!pageVisible) return;
   connectStatusStream();
+  if (!btcRuntimePaused) {
+    connectPriceSocket();
+    connectOkxSocket();
+    connectBinanceMarketSocket();
+    if (activeMarket?.up_token && activeMarket?.down_token) connectMarketSocket();
+  }
   if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer);
   renderAll(latestStatus, { force: true, forceChart: true });
   loadEquityCurve(false).catch(showError);
@@ -5396,6 +6602,7 @@ window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), 
 setActiveAppPage(locationAppPage(), { syncHash: false });
 
 ids.tickButton.addEventListener("click", () => runManualTick().catch(showError));
+ids.btcRuntimeToggle?.addEventListener("click", () => toggleBtcRuntimePaused().catch(showError));
 ids.paperPauseToggle?.addEventListener("click", () => togglePaperPause().catch(showError));
 ids.liveEnabled?.addEventListener("change", () => saveLiveSettings({ enabled: ids.liveEnabled.checked }).catch(showError));
 ids.liveStrategyId?.addEventListener("change", () => saveLiveStrategySelection().catch(showError));
@@ -5404,6 +6611,23 @@ ids.liveSettingsToggle?.addEventListener("click", (event) => {
   toggleLiveSettingsPanel();
 });
 ids.liveSettingsPanel?.addEventListener("click", (event) => event.stopPropagation());
+ids.marketConfigToggle?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleMarketConfigPanel();
+});
+ids.marketConfigPanel?.addEventListener("click", (event) => event.stopPropagation());
+ids.marketPaperOrdersRefresh?.addEventListener("click", () => refreshMarketPaperOrders().catch(showError));
+ids.marketCandidates?.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  const button = target?.closest("[data-market-detail-slug]");
+  if (!button) return;
+  const slug = String(button.dataset.marketDetailSlug || "");
+  if (!slug) return;
+  marketSelectedCandidateSlug = marketSelectedCandidateSlug === slug ? "" : slug;
+  marketCandidateLastRenderSignature = "";
+  console.info("[market] 候选市场详情切换", { slug, expanded: marketSelectedCandidateSlug === slug });
+  renderMarketScoutState();
+});
 ids.liveSaveSettings?.addEventListener("click", () => saveLiveSettings().catch(showError));
 ids.liveReloadCredentials?.addEventListener("click", () => reloadLiveCredentials().catch(showError));
 ids.livePreflight?.addEventListener("click", () => runLivePreflight().catch(showError));
@@ -5413,9 +6637,11 @@ ids.liveOpenOrdersRefresh?.addEventListener("click", () => refreshLiveOpenOrders
 ids.liveEmergencyStop?.addEventListener("click", () => liveEmergencyStop().catch(showError));
 document.addEventListener("click", () => {
   if (liveSettingsOpen) setLiveSettingsOpen(false);
+  if (marketConfigOpen) setMarketConfigOpen(false);
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && liveSettingsOpen) setLiveSettingsOpen(false);
+  if (event.key === "Escape" && marketConfigOpen) setMarketConfigOpen(false);
 });
 ids.accountScopeSelect.addEventListener("change", handleAccountScopeChange);
 ids.strategyExperiments.addEventListener("click", (event) => {
@@ -5469,6 +6695,15 @@ bindProtectedTableInteraction("open");
 bindProtectedTableInteraction("order");
 bindProtectedLiveCopyInteraction("gate");
 bindProtectedLiveCopyInteraction("terminal");
+bindProtectedLiveCopyInteraction("market-terminal");
+if (ids.marketSaveSettings) {
+  ids.marketSaveSettings.addEventListener("click", () => saveMarketScoutSettings().catch(showError));
+}
+for (const element of Object.values(marketSettingElements())) {
+  if (!element || element === ids.marketLiveAutoToggle) continue;
+  element.addEventListener("input", markMarketSettingDirty);
+  element.addEventListener("change", markMarketSettingDirty);
+}
 document.addEventListener("selectionchange", scheduleProtectedTableFlush);
 document.addEventListener("selectionchange", scheduleProtectedLiveCopyFlush);
 document.addEventListener("focusout", scheduleProtectedTableFlush);
@@ -5483,10 +6718,16 @@ setRecentLoading(true);
 loadPolymarketStatus(false).catch(handlePolymarketStatusError);
 loadStatus().then(() => {
   if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
+  if (marketPageActive()) {
+    loadMarketLlmTerminal(true).catch(showError);
+    loadMarketScoutState(true).catch(showError);
+  }
   connectStatusStream();
-  connectPriceSocket();
-  connectOkxSocket();
-  connectBinanceMarketSocket();
+  if (!btcRuntimePaused) {
+    connectPriceSocket();
+    connectOkxSocket();
+    connectBinanceMarketSocket();
+  }
 }).catch(showError);
 setInterval(() => {
   if (!pageVisible) return;
@@ -5497,6 +6738,14 @@ setInterval(() => {
   if (!pageVisible) return;
   loadPolymarketStatus(false).catch(handlePolymarketStatusError);
 }, POLYMARKET_STATUS_REFRESH_MS);
+setInterval(() => {
+  if (!pageVisible || !marketPageActive()) return;
+  loadMarketLlmTerminal(false).catch(showError);
+}, MARKET_LLM_TERMINAL_POLL_MS);
+setInterval(() => {
+  if (!pageVisible || !marketPageActive()) return;
+  loadMarketScoutState(false).catch(showError);
+}, MARKET_SCOUT_STATE_POLL_MS);
 setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));

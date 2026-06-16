@@ -76,6 +76,44 @@ class PolymarketClient:
         market_raw = _first_event_market(raw) if raw else None
         return self._parse_market(market_raw or raw)
 
+    def get_market_raw_by_slug(self, slug: str) -> dict[str, Any] | None:
+        """按 Gamma market slug 读取原始市场，用于恢复事件 slug 和官方页面链接。"""
+
+        normalized = str(slug or "").strip()
+        if not normalized:
+            return None
+        data = self._get_json(f"{self.gamma_url}/markets", {"slug": normalized})
+        if not isinstance(data, list) or not data:
+            return None
+        first = data[0]
+        return dict(first) if isinstance(first, dict) else None
+
+    def get_active_markets(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        order: str = "volume24hr",
+        ascending: bool = False,
+    ) -> list[dict[str, Any]]:
+        """读取 Gamma 活跃市场列表；返回原始市场字典供非 BTC 扫描器做通用过滤。"""
+
+        data = self._get_json(
+            f"{self.gamma_url}/markets",
+            {
+                "closed": "false",
+                "active": "true",
+                "archived": "false",
+                "limit": str(max(1, min(500, int(limit)))),
+                "offset": str(max(0, int(offset))),
+                "order": str(order or "volume24hr"),
+                "ascending": "true" if ascending else "false",
+            },
+        )
+        if not isinstance(data, list):
+            return []
+        return [row for row in data if isinstance(row, dict)]
+
     def get_quotes(self, market: MarketRound) -> dict[str, PolymarketQuote]:
         quote_inputs = (("Up", market.up_token), ("Down", market.down_token))
         try:

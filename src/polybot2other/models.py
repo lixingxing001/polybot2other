@@ -39,6 +39,7 @@ class MarketRound:
     up_token: str = ""
     down_token: str = ""
     slug: str = ""
+    event_slug: str = ""
     url: str = ""
 
 

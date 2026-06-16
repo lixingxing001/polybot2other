@@ -1,0 +1,1457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Market Scout 非 BTC 市场扫描到 Paper 下注流程</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101419;
+      --panel: #151c23;
+      --panel-2: #1b2530;
+      --panel-3: #0d1217;
+      --line: #2e3a46;
+      --text: #e8eef5;
+      --muted: #9dacba;
+      --strong: #ffffff;
+      --green: #72e0aa;
+      --blue: #8cc8ff;
+      --yellow: #f6cf5d;
+      --red: #ff7b8d;
+      --violet: #b9a6ff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.64;
+    }
+
+    main {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 64px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      color: var(--strong);
+      line-height: 1.22;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 4vw, 40px);
+    }
+
+    h2 {
+      margin: 34px 0 14px;
+      font-size: 23px;
+    }
+
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 18px;
+    }
+
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    code {
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-3);
+      color: #d9ecff;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+
+    .hero {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .hero p {
+      max-width: 920px;
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #111821;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .pill.good {
+      border-color: rgba(114, 224, 170, 0.45);
+      color: var(--green);
+    }
+
+    .pill.info {
+      border-color: rgba(140, 200, 255, 0.45);
+      color: var(--blue);
+    }
+
+    .pill.warn {
+      border-color: rgba(246, 207, 93, 0.45);
+      color: var(--yellow);
+    }
+
+    .pill.danger {
+      border-color: rgba(255, 123, 141, 0.48);
+      color: var(--red);
+    }
+
+    .notice,
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 16px;
+    }
+
+    .notice strong,
+    .card strong {
+      color: var(--strong);
+    }
+
+    .notice.warn {
+      border-color: rgba(246, 207, 93, 0.48);
+      background: rgba(246, 207, 93, 0.08);
+    }
+
+    .notice.danger {
+      border-color: rgba(255, 123, 141, 0.5);
+      background: rgba(255, 123, 141, 0.08);
+    }
+
+    .notice.good {
+      border-color: rgba(114, 224, 170, 0.42);
+      background: rgba(114, 224, 170, 0.07);
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0 28px;
+    }
+
+    .toc a {
+      min-height: 42px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .toc a:hover {
+      border-color: rgba(140, 200, 255, 0.56);
+      text-decoration: none;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin: 16px 0 24px;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 132px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .flow-step b {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--strong);
+      font-size: 14px;
+    }
+
+    .flow-step span {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 26px;
+      margin-bottom: 10px;
+      border-radius: 50%;
+      background: rgba(140, 200, 255, 0.14);
+      color: var(--blue);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .flow-step p {
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin: 14px 0 24px;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 14px 0 24px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 24px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: var(--panel-2);
+      color: var(--strong);
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr:hover {
+      background: rgba(140, 200, 255, 0.05);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .tag.scan {
+      border-color: rgba(140, 200, 255, 0.45);
+      color: var(--blue);
+    }
+
+    .tag.llm {
+      border-color: rgba(185, 166, 255, 0.45);
+      color: var(--violet);
+    }
+
+    .tag.paper {
+      border-color: rgba(114, 224, 170, 0.45);
+      color: var(--green);
+    }
+
+    .tag.block {
+      border-color: rgba(255, 123, 141, 0.48);
+      color: var(--red);
+    }
+
+    .tag.wait {
+      border-color: rgba(246, 207, 93, 0.45);
+      color: var(--yellow);
+    }
+
+    .callout-title {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--strong);
+      font-weight: 800;
+    }
+
+    .terminal {
+      overflow: auto;
+      margin: 14px 0 24px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #090d12;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+
+    .terminal div {
+      display: grid;
+      grid-template-columns: 86px 86px 1fr;
+      gap: 10px;
+      padding: 9px 12px;
+      border-bottom: 1px solid rgba(46, 58, 70, 0.8);
+      white-space: nowrap;
+    }
+
+    .terminal div:last-child {
+      border-bottom: 0;
+    }
+
+    .terminal .pass {
+      color: var(--green);
+    }
+
+    .terminal .warn {
+      color: var(--yellow);
+    }
+
+    .terminal .error {
+      color: var(--red);
+    }
+
+    .terminal .info {
+      color: var(--blue);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .formula {
+      margin: 12px 0 18px;
+      padding: 14px;
+      border: 1px solid rgba(140, 200, 255, 0.35);
+      border-radius: 8px;
+      background: rgba(140, 200, 255, 0.07);
+      color: var(--text);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 14px;
+      overflow-x: auto;
+    }
+
+    ul,
+    ol {
+      margin: 0 0 18px;
+      padding-left: 22px;
+      color: var(--muted);
+    }
+
+    li {
+      margin: 6px 0;
+    }
+
+    strong {
+      color: var(--strong);
+    }
+
+    @media (max-width: 980px) {
+      .toc,
+      .flow,
+      .grid-3 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 680px) {
+      main {
+        width: min(100% - 20px, 1240px);
+        padding-top: 18px;
+      }
+
+      .hero {
+        padding: 18px;
+      }
+
+      .toc,
+      .flow,
+      .grid-2,
+      .grid-3 {
+        grid-template-columns: 1fr;
+      }
+
+      th,
+      td {
+        font-size: 13px;
+      }
+
+      .terminal div {
+        grid-template-columns: 72px 72px minmax(220px, 1fr);
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- 本文档记录 Market Scout 从非 BTC 市场扫描到 Paper 自动下注的真实代码链路。 -->
+  <main>
+    <section class="hero">
+      <h1>Market Scout 非 BTC 市场扫描到 Paper 下注流程</h1>
+      <p>
+        这份文档按当前代码实现写清楚市场页的完整链路：从 Gamma API 拉取非 BTC 活跃市场，
+        本地过滤和排序，CLOB 盘口增强，LLM 输出结构化判断，再经过 Paper 自动下注闸门和模拟成交写入独立账本。
+        重点是把每一道关口、每一个阈值、每个会阻止下注的条件讲清楚，方便你判断这套逻辑到底有没有在工作。
+      </p>
+      <div class="meta">
+        <span class="pill good">当前接入：候选扫描</span>
+        <span class="pill info">当前接入：LLM 实时分析</span>
+        <span class="pill good">当前接入：Paper 自动下注</span>
+        <span class="pill danger">Live 自动下注：锁定</span>
+        <span class="pill warn">外部新闻核验：未自动接入</span>
+      </div>
+    </section>
+
+    <nav class="toc" aria-label="目录">
+      <a href="#overview">1. 总览</a>
+      <a href="#entry">2. 运行入口</a>
+      <a href="#config">3. 配置来源</a>
+      <a href="#scan">4. 扫描市场</a>
+      <a href="#filter">5. 本地过滤</a>
+      <a href="#score">6. 候选打分</a>
+      <a href="#quotes">7. 盘口增强</a>
+      <a href="#llm">8. LLM 分析</a>
+      <a href="#normalize">9. 结果归一化</a>
+      <a href="#paper">10. Paper 下注</a>
+      <a href="#ledger">11. 成交和账本</a>
+      <a href="#ui">12. 页面和日志</a>
+      <a href="#limits">13. 策略边界</a>
+      <a href="#pressure">14. 压力测试</a>
+    </nav>
+
+    <section id="overview">
+      <h2>1. 总览</h2>
+      <div class="notice warn">
+        <span class="callout-title">严肃边界</span>
+        <p>
+          当前 Market Scout 能做的是扫描、筛选、让 LLM 给出结构化建议、在 Paper 隔离账户里自动模拟下注。
+          它目前没有接入真钱 Live 自动下单，也没有自动浏览新闻源。任何“胜率保证”都不成立，只有可审计的闸门和日志。
+        </p>
+      </div>
+
+      <div class="flow">
+        <div class="flow-step">
+          <span>1</span>
+          <b>启动扫描器</b>
+          <p><code>_start_market_scout()</code> 启动后台线程，按市场页配置决定是否扫描。</p>
+        </div>
+        <div class="flow-step">
+          <span>2</span>
+          <b>拉取市场</b>
+          <p>从 Gamma API 拉活跃市场，按 24h 成交量倒序取样。</p>
+        </div>
+        <div class="flow-step">
+          <span>3</span>
+          <b>过滤候选</b>
+          <p>去掉 BTC、非二元、关闭、低流动性、低成交量、极端价格、宽价差市场。</p>
+        </div>
+        <div class="flow-step">
+          <span>4</span>
+          <b>盘口增强</b>
+          <p>对 top 候选补充 CLOB best bid、best ask、size 和 spread。</p>
+        </div>
+        <div class="flow-step">
+          <span>5</span>
+          <b>LLM 判断</b>
+          <p>只允许输出 JSON，决策只能是 <code>RECOMMEND</code> 或 <code>NO_TRADE</code>。</p>
+        </div>
+        <div class="flow-step">
+          <span>6</span>
+          <b>归一化</b>
+          <p>校验 slug、outcome、confidence、max entry、有效期和风险字段。</p>
+        </div>
+        <div class="flow-step">
+          <span>7</span>
+          <b>Paper 闸门</b>
+          <p>本地再次检查置信度、入场价、价差、持仓数、重复持仓、日亏损和现金。</p>
+        </div>
+        <div class="flow-step">
+          <span>8</span>
+          <b>模拟成交</b>
+          <p>使用 <code>simulate_fak_buy()</code> 按 FAK 限价模拟买入。</p>
+        </div>
+        <div class="flow-step">
+          <span>9</span>
+          <b>写入账本</b>
+          <p>订单和成交写入 Market 独立 Paper SQLite，和 BTC 账本隔离。</p>
+        </div>
+        <div class="flow-step">
+          <span>10</span>
+          <b>页面展示</b>
+          <p>候选、LLM 分析、推荐、Paper 账户、下注列表和 Terminal 日志持续刷新。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="entry">
+      <h2>2. 运行入口</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>环节</th>
+            <th>代码位置</th>
+            <th>实际作用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="tag scan">扫描线程</span></td>
+            <td><code>src/polybot2other/bot.py</code>，<code>_start_market_scout()</code></td>
+            <td>如果全局 Market Scout 开关和页面扫描开关都打开，就启动 <code>polybot2other-market-llm-scout</code> 后台线程。</td>
+          </tr>
+          <tr>
+            <td><span class="tag scan">单轮扫描</span></td>
+            <td><code>_run_market_scout_once()</code></td>
+            <td>完成一轮市场拉取、解析、过滤、排序、盘口补充和 LLM 分析触发。</td>
+          </tr>
+          <tr>
+            <td><span class="tag llm">LLM 分析</span></td>
+            <td><code>_maybe_analyze_market_scout_candidates()</code></td>
+            <td>检查 LLM 开关、全局开关、API key、候选签名和 TTL，再决定是否发起 LLM 请求。</td>
+          </tr>
+          <tr>
+            <td><span class="tag paper">Paper 执行</span></td>
+            <td><code>_maybe_execute_market_scout_paper_order()</code></td>
+            <td>只有市场页 Paper 自动下注开关打开时才进入本地执行闸门。</td>
+          </tr>
+          <tr>
+            <td><span class="tag block">Live 执行</span></td>
+            <td><code>update_market_scout_settings()</code> 和 <code>_sanitize_market_scout_runtime_settings()</code></td>
+            <td><code>live_auto_enabled</code> 被强制写成 <code>false</code>，当前没有真钱自动下注路径。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice good">
+        <span class="callout-title">和 BTC 页面的关系</span>
+        <p>
+          BTC 页面控制的是 BTC 数据采集、BTC websocket、BTC 策略 tick。Market Scout 由市场页自己的
+          <code>scanner_enabled</code> 控制。关闭 BTC 业务不会自动关闭 Market Scout，关闭市场页扫描开关才会停止非 BTC 市场扫描。
+        </p>
+      </div>
+    </section>
+
+    <section id="config">
+      <h2>3. 配置来源</h2>
+      <p>
+        Market Scout 配置分两层：环境变量给首次启动默认值，市场页齿轮配置会保存为运行态 JSON。
+        页面保存后，后端会清洗数值范围，防止异常输入把扫描器或 Paper 账本搞坏。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>配置</th>
+            <th>默认值</th>
+            <th>环境变量</th>
+            <th>用途和调参影响</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>market_scout_enabled</code></td>
+            <td><code>true</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_ENABLED</code></td>
+            <td>非 BTC 扫描器总开关。关闭后市场页不会扫描。</td>
+          </tr>
+          <tr>
+            <td><code>scan_interval_seconds</code></td>
+            <td><code>30</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_INTERVAL_SECONDS</code></td>
+            <td>扫描间隔，页面可调，后端允许范围是 5 到 3600 秒。越低越频繁，API 和 LLM 成本越高。</td>
+          </tr>
+          <tr>
+            <td><code>market_scout_scan_limit</code></td>
+            <td><code>120</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_SCAN_LIMIT</code></td>
+            <td>每轮从 Gamma 拉取市场数量，后端夹在 20 到 500。</td>
+          </tr>
+          <tr>
+            <td><code>analyze_top_n</code></td>
+            <td><code>10</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_ANALYZE_TOP_N</code></td>
+            <td>每轮送入 LLM 的候选数量，页面可调，后端范围 1 到 20。</td>
+          </tr>
+          <tr>
+            <td><code>market_scout_min_liquidity</code></td>
+            <td><code>5000</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_MIN_LIQUIDITY</code></td>
+            <td>候选最低流动性。越高越稳，机会越少。</td>
+          </tr>
+          <tr>
+            <td><code>market_scout_min_volume_24h</code></td>
+            <td><code>1000</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_MIN_VOLUME_24H</code></td>
+            <td>候选最低 24h 成交量。越高越偏向主流热门市场。</td>
+          </tr>
+          <tr>
+            <td><code>market_scout_llm_ttl_seconds</code></td>
+            <td><code>120</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_LLM_TTL_SECONDS</code></td>
+            <td>同一组候选重复出现时，TTL 内不重复打 LLM，减少无意义请求。</td>
+          </tr>
+          <tr>
+            <td><code>market_scout_llm_timeout_seconds</code></td>
+            <td><code>8</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_LLM_TIMEOUT_SECONDS</code></td>
+            <td>LLM 分析超时。你之前调到 60 秒后，慢模型更容易返回，但单轮扫描等待也更久。</td>
+          </tr>
+          <tr>
+            <td><code>paper_initial_balance</code></td>
+            <td><code>100</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_INITIAL_BALANCE</code></td>
+            <td>市场页独立 Paper 初始资金，页面修改后会按差额修正账户现金。</td>
+          </tr>
+          <tr>
+            <td><code>paper_stake_dollars</code></td>
+            <td><code>2</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_STAKE_DOLLARS</code></td>
+            <td>单笔 Paper 预算，后端范围 0.1 到 10000。</td>
+          </tr>
+          <tr>
+            <td><code>paper_max_open_positions</code></td>
+            <td><code>3</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_OPEN_POSITIONS</code></td>
+            <td>最多同时持仓数量，后端范围 1 到 50。</td>
+          </tr>
+          <tr>
+            <td><code>paper_max_daily_loss</code></td>
+            <td><code>10</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_DAILY_LOSS</code></td>
+            <td>24 小时已实现亏损上限。触达后停止 Paper 自动下注。</td>
+          </tr>
+          <tr>
+            <td><code>min_confidence</code></td>
+            <td><code>0.72</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_MIN_CONFIDENCE</code></td>
+            <td>LLM 推荐进入 Paper 执行前的最低置信度。</td>
+          </tr>
+          <tr>
+            <td><code>max_entry_price</code></td>
+            <td><code>0.65</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_ENTRY_PRICE</code></td>
+            <td>后端允许的最高买入价，还会和 LLM 给出的 <code>max_entry_price</code> 取更低值。</td>
+          </tr>
+          <tr>
+            <td><code>max_spread</code></td>
+            <td><code>0.04</code></td>
+            <td><code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_MAX_SPREAD</code></td>
+            <td>Paper 执行前允许的最大盘口价差。越小越少下单，越大越容易吃滑点。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="grid-2">
+        <div class="card">
+          <strong>运行态配置文件</strong>
+          <p><code>data/market-scout/settings.json</code></p>
+          <p>保存市场页齿轮里扫描、LLM、Paper 自动下注和风控参数。路径可用 <code>POLYBOT2OTHER_MARKET_SCOUT_SETTINGS_PATH</code> 改。</p>
+        </div>
+        <div class="card">
+          <strong>Market Paper 账本</strong>
+          <p><code>data/market-scout/paper.sqlite3</code></p>
+          <p>市场页独立 Paper 账户和订单表。路径可用 <code>POLYBOT2OTHER_MARKET_SCOUT_PAPER_DB_PATH</code> 改。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="scan">
+      <h2>4. 扫描市场</h2>
+      <p>
+        单轮扫描由 <code>_run_market_scout_once()</code> 执行。它调用
+        <code>PolymarketClient.get_active_markets(limit=scan_limit, order="volume24hr", ascending=False)</code>，
+        从 Gamma API 拉取活跃市场，优先覆盖最近 24 小时成交量较高的市场。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Gamma 参数</th>
+            <th>值</th>
+            <th>意义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>closed</code></td>
+            <td><code>false</code></td>
+            <td>只拉未关闭市场。</td>
+          </tr>
+          <tr>
+            <td><code>active</code></td>
+            <td><code>true</code></td>
+            <td>只拉活跃市场。</td>
+          </tr>
+          <tr>
+            <td><code>archived</code></td>
+            <td><code>false</code></td>
+            <td>排除归档市场。</td>
+          </tr>
+          <tr>
+            <td><code>order</code></td>
+            <td><code>volume24hr</code></td>
+            <td>按 24 小时成交量排序。</td>
+          </tr>
+          <tr>
+            <td><code>ascending</code></td>
+            <td><code>false</code></td>
+            <td>成交量从高到低。</td>
+          </tr>
+          <tr>
+            <td><code>limit</code></td>
+            <td><code>20..500</code></td>
+            <td>实际值来自配置，后端强制夹紧。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>解析字段</h3>
+      <p>
+        每个 Gamma row 会进入 <code>_market_scout_candidate_from_raw()</code>，解析为内部候选对象。
+        这里会提取市场 slug、问题、事件标题、描述、outcomes、CLOB token ids、outcome prices、流动性、成交量、spread、best bid、best ask、结束时间和市场状态。
+      </p>
+    </section>
+
+    <section id="filter">
+      <h2>5. 本地过滤</h2>
+      <p>
+        本地过滤由 <code>_market_scout_reject_reason()</code> 执行。任何一条命中都会让该市场退出候选池，
+        过滤统计会写入 Market LLM Terminal，方便看清楚本轮机会少的根因。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>过滤原因</th>
+            <th>触发条件</th>
+            <th>目的</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>btc_market</code></td>
+            <td>slug、question、event_title、description 包含 <code>btc</code> 或 <code>bitcoin</code></td>
+            <td>市场页专门做非 BTC，避免和 BTC 页面策略混在一起。</td>
+          </tr>
+          <tr>
+            <td><code>inactive</code></td>
+            <td>非 active，或 closed，或 archived</td>
+            <td>避免分析已经失效的市场。</td>
+          </tr>
+          <tr>
+            <td><code>orders_closed</code></td>
+            <td><code>acceptingOrders</code> 关闭，或 <code>enableOrderBook</code> 关闭</td>
+            <td>有市场但无可执行盘口时直接排除。</td>
+          </tr>
+          <tr>
+            <td><code>non_binary</code></td>
+            <td>outcomes 数量或 token ids 数量不等于 2</td>
+            <td>当前执行和账本按二元市场设计，复杂多选市场先排除。</td>
+          </tr>
+          <tr>
+            <td><code>missing_prices</code></td>
+            <td>可用 outcome price 少于 2 个</td>
+            <td>缺价格时无法估算入场价和市场状态。</td>
+          </tr>
+          <tr>
+            <td><code>resolved_or_extreme_price</code></td>
+            <td>最高价大于等于 0.97，或最低价小于等于 0.03</td>
+            <td>排除基本已分出胜负或赔率极端的市场。</td>
+          </tr>
+          <tr>
+            <td><code>low_liquidity</code></td>
+            <td>liquidity 低于 <code>market_scout_min_liquidity</code></td>
+            <td>减少进入薄盘口市场的概率。</td>
+          </tr>
+          <tr>
+            <td><code>low_volume_24h</code></td>
+            <td>24h volume 低于 <code>market_scout_min_volume_24h</code></td>
+            <td>过滤冷门市场，降低价格不连续风险。</td>
+          </tr>
+          <tr>
+            <td><code>wide_spread</code></td>
+            <td>Gamma spread 存在且大于 0.08</td>
+            <td>先在候选阶段过滤明显宽价差。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice warn">
+        <span class="callout-title">机会少时先看过滤统计</span>
+        <p>
+          如果终端里一直显示候选很少，先看 <code>过滤统计</code> 中是 <code>low_liquidity</code>、<code>low_volume_24h</code>、
+          <code>wide_spread</code> 还是 <code>orders_closed</code> 占比高。盲目调低所有阈值会让 Paper 下单变多，同时会把薄盘口和垃圾机会放进来。
+        </p>
+      </div>
+    </section>
+
+    <section id="score">
+      <h2>6. 候选打分和排序</h2>
+      <p>
+        过滤后的市场先按 <code>_market_scout_candidate_score()</code> 计算基础分，再进入 Market Scout 选择画像。
+        基础分不代表胜率，它只是流动性、成交量、价格不确定性和价差的粗排序。
+      </p>
+
+      <div class="formula">
+score = log1p(liquidity) * 0.35
+      + log1p(volume_24h) * 0.45
+      + uncertainty * 4.0
+      + (1.0 - spread_penalty) * 2.0
+
+uncertainty = max(min(price, 1 - price))
+spread_penalty = clamp(spread / 0.08, 0, 1)
+      </div>
+
+      <div class="grid-3">
+        <div class="card">
+          <strong>流动性权重</strong>
+          <p>流动性越高，理论上越容易进出，分数增加。使用 <code>log1p</code> 避免大市场把所有候选碾压。</p>
+        </div>
+        <div class="card">
+          <strong>24h 成交量权重</strong>
+          <p>最近交易更活跃的市场优先送入 LLM，避免把模型预算浪费在死市场。</p>
+        </div>
+        <div class="card">
+          <strong>不确定性权重</strong>
+          <p>价格接近 0.5 的市场 uncertainty 更高，说明仍有争议空间。太接近 0 或 1 的市场前面已经过滤。</p>
+        </div>
+      </div>
+
+      <p>
+        新漏斗会额外计算 <code>selection_score</code>：事件驱动市场加分，体育盘降权，长期 outright 降权，
+        过期体育盘会被阻断，同主题和同事件优先只占一个 LLM 坑。页面展示前 20 个候选，真正送入 LLM 的数量由
+        <code>analyze_top_n</code> 控制，当前运行态是 10。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>选择画像</th>
+            <th>处理方式</th>
+            <th>目的</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>event</code></td>
+            <td>地缘政治、宏观、监管、选举、战争、航运、官方公告类市场加分。</td>
+            <td>把更适合 LLM 做事件分析的市场送到前面。</td>
+          </tr>
+          <tr>
+            <td><code>sports</code></td>
+            <td>体育比赛、spread、O/U、按日期胜负市场降权。</td>
+            <td>减少同一场比赛和实时比分依赖市场长期占坑。</td>
+          </tr>
+          <tr>
+            <td><code>outright</code></td>
+            <td>世界杯冠军、长期冠军盘这类长周期 outright 降权。</td>
+            <td>降低长期叙事盘压住短期事件盘的概率。</td>
+          </tr>
+          <tr>
+            <td><code>stale_sports_market</code></td>
+            <td>结束时间已过的体育盘不送入 LLM。</td>
+            <td>避免 LLM 因赛况缺失反复返回 <code>NO_TRADE</code>。</td>
+          </tr>
+          <tr>
+            <td>同主题和同事件去重</td>
+            <td>第一轮同一个事件 slug 或同一个主题只占一个坑，不够时才放宽到两个。</td>
+            <td>防止同一市场族的不同到期日吃掉全部 LLM 输入。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="quotes">
+      <h2>7. CLOB 盘口增强</h2>
+      <p>
+        <code>_market_scout_enrich_quotes()</code> 会遍历每个候选市场的两个 outcome token，
+        通过 <code>polymarket.get_quote(token_id, outcome)</code> 拉取盘口。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>字段</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>best_bid</code></td>
+            <td>当前最高买盘，用于判断市场买卖价差。</td>
+          </tr>
+          <tr>
+            <td><code>best_ask</code></td>
+            <td>当前最低卖盘，Paper 自动下注优先用它作为入场价。</td>
+          </tr>
+          <tr>
+            <td><code>bid_size</code></td>
+            <td>买盘深度，用于观察盘口厚度。</td>
+          </tr>
+          <tr>
+            <td><code>ask_size</code></td>
+            <td>卖盘深度，Paper 模拟成交需要它。</td>
+          </tr>
+          <tr>
+            <td><code>spread</code></td>
+            <td>Paper 执行前会用它和 <code>max_spread</code> 比较。</td>
+          </tr>
+          <tr>
+            <td><code>updated_at_ms</code></td>
+            <td>盘口更新时间，用于页面和日志观察。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice good">
+        <span class="callout-title">容错方式</span>
+        <p>
+          单个 outcome 盘口请求失败只会在该 outcome 的 quotes 中写入 error，不会让整轮扫描失败。
+          这能保证扫描器持续运行，但也意味着缺盘口的候选很可能在 Paper 执行闸门里被拦截。
+        </p>
+      </div>
+    </section>
+
+    <section id="llm">
+      <h2>8. LLM 分析</h2>
+      <p>
+        LLM 分析由 <code>_maybe_analyze_market_scout_candidates()</code> 控制。它先做本地闸门，再调用
+        <code>_call_market_scout_llm()</code>。这个环节只输出判断，不直接下单。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>LLM 前置闸门</th>
+            <th>条件</th>
+            <th>失败后的日志</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>市场页 LLM 开关</td>
+            <td><code>llm_enabled</code> 必须为 true</td>
+            <td>写入 <code>LLM 分析未运行</code>，不会下注。</td>
+          </tr>
+          <tr>
+            <td>全局 LLM 开关</td>
+            <td><code>llm_super_agent_enabled</code> 必须为 true</td>
+            <td>提示 LLM 配置关闭。</td>
+          </tr>
+          <tr>
+            <td>API key</td>
+            <td><code>POLYBOT2OTHER_LLM_API_KEY</code> 或 <code>HAOAI_API_KEY</code> 必须存在</td>
+            <td>提示 API key 未配置。</td>
+          </tr>
+          <tr>
+            <td>候选签名 TTL</td>
+            <td>候选签名重复且还在 TTL 内</td>
+            <td>沿用上一轮 LLM 分析，减少重复请求。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Prompt 约束</h3>
+      <ul>
+        <li>身份是严格的 Polymarket 非 BTC 市场分析员。</li>
+        <li>只允许返回 JSON。</li>
+        <li>最多选一个市场。</li>
+        <li>证据陈旧、含糊、接近结算、价差过大、信心不足时优先 <code>NO_TRADE</code>。</li>
+        <li>当前调用不能浏览网页，必须说明哪些外部新闻需要人工核查。</li>
+        <li>LLM 不负责下单，只输出结构化建议。</li>
+      </ul>
+
+      <table>
+        <thead>
+          <tr>
+            <th>LLM 输出字段</th>
+            <th>含义</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>decision</code></td>
+            <td>只能是 <code>RECOMMEND</code> 或 <code>NO_TRADE</code>。</td>
+          </tr>
+          <tr>
+            <td><code>selected_slug</code></td>
+            <td>推荐市场 slug，必须来自本轮候选列表。</td>
+          </tr>
+          <tr>
+            <td><code>outcome</code></td>
+            <td>推荐方向，必须和该市场 outcomes 精确匹配。</td>
+          </tr>
+          <tr>
+            <td><code>confidence</code></td>
+            <td>0 到 1 的置信度，后端会夹紧。</td>
+          </tr>
+          <tr>
+            <td><code>max_entry_price</code></td>
+            <td>LLM 认为最多能接受的买入价。</td>
+          </tr>
+          <tr>
+            <td><code>reason</code></td>
+            <td>推荐或不交易的理由，最多保留 800 字符。</td>
+          </tr>
+          <tr>
+            <td><code>risk_flags</code></td>
+            <td>风险点列表，最多保留 12 条。</td>
+          </tr>
+          <tr>
+            <td><code>news_checks_needed</code></td>
+            <td>需要外部新闻核验的事项，最多保留 12 条。</td>
+          </tr>
+          <tr>
+            <td><code>valid_for_seconds</code></td>
+            <td>建议有效期，后端夹在 10 到 600 秒。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="normalize">
+      <h2>9. LLM 结果归一化</h2>
+      <p>
+        LLM 原始返回会进入 <code>_normalize_market_scout_llm_decision()</code>。这一步的目标是把模型输出压成后端能信任的结构。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>校验项</th>
+            <th>处理方式</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>非法 decision</td>
+            <td>改为 <code>NO_TRADE</code>。</td>
+          </tr>
+          <tr>
+            <td>selected_slug 不在候选里</td>
+            <td>如果原本是 <code>RECOMMEND</code>，会降级为 <code>NO_TRADE</code>。</td>
+          </tr>
+          <tr>
+            <td>outcome 不匹配</td>
+            <td>如果是 <code>RECOMMEND</code>，会降级为 <code>NO_TRADE</code>。</td>
+          </tr>
+          <tr>
+            <td>confidence 超范围</td>
+            <td>夹到 0 到 1，并保留 4 位小数。</td>
+          </tr>
+          <tr>
+            <td>max_entry_price</td>
+            <td>解析为数字，保留 4 位小数，解析失败则为空。</td>
+          </tr>
+          <tr>
+            <td>valid_for_seconds</td>
+            <td>夹到 10 到 600 秒。</td>
+          </tr>
+          <tr>
+            <td>risk 和 news 字段</td>
+            <td>只保留列表前 12 条，并裁剪单条长度。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice warn">
+        <span class="callout-title">关键点</span>
+        <p>
+          LLM 说推荐还不够。只有归一化后仍是 <code>RECOMMEND</code>，并且后续 Paper 闸门全部通过，系统才会尝试模拟下注。
+        </p>
+      </div>
+    </section>
+
+    <section id="paper">
+      <h2>10. Paper 自动下注闸门</h2>
+      <p>
+        <code>_maybe_execute_market_scout_paper_order()</code> 先检查市场页 Paper 自动下注开关。
+        如果开关关闭，会记录 <code>Paper 自动下注开关关闭</code>，不会继续执行。开关打开后才进入
+        <code>_build_market_scout_paper_order_result()</code>。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>执行闸门</th>
+            <th>通过条件</th>
+            <th>拦截原因示例</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>LLM 决策</td>
+            <td><code>decision == RECOMMEND</code></td>
+            <td><code>LLM 未给出 RECOMMEND</code></td>
+          </tr>
+          <tr>
+            <td>候选市场</td>
+            <td><code>selected_slug</code> 必须在本轮候选里</td>
+            <td><code>推荐市场不在本轮候选列表</code></td>
+          </tr>
+          <tr>
+            <td>推荐方向</td>
+            <td><code>outcome</code> 必须存在于市场 outcomes</td>
+            <td><code>推荐方向不在市场 outcomes 中</code></td>
+          </tr>
+          <tr>
+            <td>最低置信度</td>
+            <td>LLM confidence 大于等于 <code>min_confidence</code></td>
+            <td><code>置信度 0.xxxx 低于阈值 0.xxxx</code></td>
+          </tr>
+          <tr>
+            <td>入场价</td>
+            <td>优先用 CLOB <code>best_ask</code>，缺失时使用对应 outcome price</td>
+            <td><code>缺少可执行买入价</code></td>
+          </tr>
+          <tr>
+            <td>最高入场价</td>
+            <td><code>entry_price <= min(页面最高入场价, LLM最高入场价)</code></td>
+            <td><code>入场价 0.xxxx 高于上限 0.xxxx</code></td>
+          </tr>
+          <tr>
+            <td>最大价差</td>
+            <td>盘口 spread 小于等于 <code>max_spread</code></td>
+            <td><code>盘口价差 0.xxxx 高于上限 0.xxxx</code></td>
+          </tr>
+          <tr>
+            <td>最大持仓</td>
+            <td>Market Paper 当前 open trade 数量小于上限</td>
+            <td><code>Paper 持仓数已达上限</code></td>
+          </tr>
+          <tr>
+            <td>同市场重复持仓</td>
+            <td>同一个 slug 不能已有 open trade</td>
+            <td><code>该市场已有 Paper 持仓</code></td>
+          </tr>
+          <tr>
+            <td>24h 日亏损</td>
+            <td>已实现亏损未触达 <code>paper_max_daily_loss</code></td>
+            <td><code>Paper 24小时已实现亏损 ... 触达上限</code></td>
+          </tr>
+          <tr>
+            <td>单笔预算</td>
+            <td><code>paper_stake_dollars > 0</code></td>
+            <td><code>单笔预算无效</code></td>
+          </tr>
+          <tr>
+            <td>现金余额</td>
+            <td>Market Paper 隔离账户 cash 大于等于 stake</td>
+            <td><code>Paper 隔离账户可用资金不足</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice danger">
+        <span class="callout-title">真钱 Live 当前状态</span>
+        <p>
+          市场页 <code>live_auto_enabled</code> 在后端被强制锁定为 <code>false</code>。页面显示 Live 锁定和 Live 订单只是状态展示，
+          当前没有把非 BTC LLM 推荐接到真钱交易接口。
+        </p>
+      </div>
+    </section>
+
+    <section id="ledger">
+      <h2>11. 模拟成交和账本写入</h2>
+      <p>
+        Paper 闸门通过后，后端会构造一个二元市场兼容的 <code>MarketRound</code>，再构造
+        <code>Signal</code> 和 <code>TradeIntent</code>，最后交给 <code>simulate_fak_buy()</code>。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>对象</th>
+            <th>字段策略</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>MarketRound</code></td>
+            <td><code>symbol="MARKET"</code>，<code>round_id=slug</code></td>
+            <td>用于和 BTC 账本隔离，同时复用已有 Paper 订单和持仓表结构。</td>
+          </tr>
+          <tr>
+            <td><code>up_token</code></td>
+            <td>放入 LLM 选中的 outcome token</td>
+            <td>这里只是账本兼容映射，不代表方向一定叫 Up。</td>
+          </tr>
+          <tr>
+            <td><code>down_token</code></td>
+            <td>放入另一个 outcome token</td>
+            <td>用于保持二元市场结构完整。</td>
+          </tr>
+          <tr>
+            <td><code>Signal.side</code></td>
+            <td>使用原始 outcome 文本，例如 Yes 或 No</td>
+            <td>下注列表里展示的方向来自这里。</td>
+          </tr>
+          <tr>
+            <td><code>limit_price</code></td>
+            <td>使用闸门通过的 <code>entry_price</code></td>
+            <td>FAK 模拟买入不会用高于限价的价格成交。</td>
+          </tr>
+          <tr>
+            <td><code>taker_fee_rate</code></td>
+            <td>来自 <code>settings.paper_taker_fee_rate</code>，默认 <code>0.07</code></td>
+            <td>沿用当前 Paper 手续费假设。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>写入顺序</h3>
+      <ol>
+        <li><code>market_paper_store.upsert_round(market)</code> 写入或更新市场轮次。</li>
+        <li><code>market_paper_store.place_execution_result(intent, execution)</code> 写入 Paper 订单和可能的成交持仓。</li>
+        <li>如果 <code>trade_ids</code> 非空，状态视为已提交。</li>
+        <li>读取最近一条 <code>MARKET</code> Paper order 作为页面展示的订单 ID。</li>
+      </ol>
+
+      <div class="notice warn">
+        <span class="callout-title">当前未完成的账本能力</span>
+        <p>
+          非 BTC 市场当前主要是记录 Paper 买入和持仓。自动结算、按真实市场 resolution 回填输赢、跨市场复盘归因还没有完整接入。
+          所以 Paper 盈亏在没有结算机制前只能作为下单行为审计，不能当成最终胜率报告。
+        </p>
+      </div>
+    </section>
+
+    <section id="ui">
+      <h2>12. 页面状态和日志</h2>
+      <p>
+        市场页通过独立接口刷新状态、配置和终端日志。用户主要看三块：右上角状态摘要、齿轮配置、Market LLM Terminal。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>接口</th>
+            <th>前端调用</th>
+            <th>返回内容</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>GET /api/market-scout-state</code></td>
+            <td><code>loadMarketScoutState()</code></td>
+            <td>扫描状态、运行配置、Paper 账户、Paper 下注列表、Paper 交易、Live 锁定状态。</td>
+          </tr>
+          <tr>
+            <td><code>GET /api/market-scout-settings</code></td>
+            <td>页面初始化时复用 state</td>
+            <td>返回同一份市场状态，配置在 <code>settings</code> 字段。</td>
+          </tr>
+          <tr>
+            <td><code>POST /api/market-scout-settings</code></td>
+            <td><code>saveMarketScoutSettings()</code></td>
+            <td>保存齿轮配置，并返回新的市场状态。</td>
+          </tr>
+          <tr>
+            <td><code>GET /api/market-llm-terminal</code></td>
+            <td><code>loadMarketLlmTerminal()</code></td>
+            <td>增量返回终端日志，支持 <code>limit</code> 和 <code>after_seq</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>终端日志模块</h3>
+      <div class="terminal" aria-label="终端日志示例">
+        <div><span class="info">scanner</span><span>start</span><span>开始只读扫描非 BTC 活跃市场</span></div>
+        <div><span class="pass">scanner</span><span>complete</span><span>扫描 120 个市场，保留候选，展示 20 个，送 LLM 10 个</span></div>
+        <div><span class="info">llm</span><span>request</span><span>发送多样化后的非 BTC 候选市场</span></div>
+        <div><span class="pass">llm</span><span>result</span><span>LLM 推荐 outcome、confidence、max_entry_price 和风险说明</span></div>
+        <div><span class="warn">paper</span><span>blocked</span><span>Paper 自动下注未执行，原因写在 message</span></div>
+        <div><span class="pass">paper</span><span>submitted</span><span>Paper 自动下注已执行，写入订单 ID 和持仓 ID</span></div>
+        <div><span class="info">settings</span><span>update</span><span>市场页控制参数已保存</span></div>
+        <div><span class="info">operator</span><span>heartbeat</span><span>运行心跳，展示扫描、LLM、Paper 和 Live 状态</span></div>
+      </div>
+
+      <div class="grid-3">
+        <div class="card">
+          <strong>候选市场</strong>
+          <p>展示扫描后保留的前 20 个候选，包括问题、价格、流动性、24h 成交量、spread、基础分、scout 分和 LLM 标记。</p>
+        </div>
+        <div class="card">
+          <strong>LLM 分析</strong>
+          <p>展示最近一次结构化判断，包括推荐市场、方向、置信度、最高入场价、理由、风险和需核查事项。</p>
+        </div>
+        <div class="card">
+          <strong>下注列表</strong>
+          <p>展示 Market Paper 订单，字段包括时间、市场、方向、状态、限价、预算、成交和原因。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>13. 当前策略边界</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>边界</th>
+            <th>当前状态</th>
+            <th>影响</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Live 自动下注</td>
+            <td><span class="tag block">锁定</span></td>
+            <td>市场页不会触发真钱订单。要接 Live 必须重新设计权限、限额、撤单、签名、订单回执、失败恢复和人工熔断。</td>
+          </tr>
+          <tr>
+            <td>外部新闻实时核验</td>
+            <td><span class="tag wait">未自动接入</span></td>
+            <td>LLM 只能分析传入的市场字段和描述，遇到新闻型市场会要求人工核查。没有实时新闻源时，时效性判断会有硬缺口。</td>
+          </tr>
+          <tr>
+            <td>非二元市场</td>
+            <td><span class="tag block">过滤</span></td>
+            <td>当前执行链路只处理 2 outcome 市场，多选市场会直接排除。</td>
+          </tr>
+          <tr>
+            <td>非 BTC 市场自动结算</td>
+            <td><span class="tag wait">未完整接入</span></td>
+            <td>Paper 下单和持仓可审计，但不能自动形成最终胜负统计。</td>
+          </tr>
+          <tr>
+            <td>胜率保证</td>
+            <td><span class="tag block">无保证</span></td>
+            <td>当前系统提供筛选、判断和闸门，不能承诺 80% 胜率。任何策略上线前都需要真实回放、Paper 结算、样本分桶和故障演练。</td>
+          </tr>
+          <tr>
+            <td>市场来源</td>
+            <td><span class="tag scan">Gamma 和 CLOB</span></td>
+            <td>如果 Polymarket API 字段延迟、盘口短暂缺失、市场描述不完整，LLM 判断会受到影响。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="pressure">
+      <h2>14. 压力测试和下一步建议</h2>
+      <p>
+        下面是我对当前链路的压力测试。它能帮助你判断下一步该加什么，避免只盯着“让它多下单”。
+      </p>
+
+      <div class="grid-2">
+        <div class="notice danger">
+          <span class="callout-title">如果想更激进</span>
+          <p>
+            直接降低 <code>min_confidence</code>、提高 <code>max_entry_price</code>、放宽 <code>max_spread</code> 会让订单更多，
+            同时会显著增加薄盘口、追高和噪音市场暴露。激进参数必须和可结算 Paper 复盘一起上。
+          </p>
+        </div>
+        <div class="notice warn">
+          <span class="callout-title">如果想更像实盘策略</span>
+          <p>
+            下一步优先接外部可信新闻源、市场类别白名单、结算回填、LLM 决策归因统计、按类别胜率分桶。
+            只有这些补齐后，才有资格讨论 Live 自动下注。
+          </p>
+        </div>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>建议优先级</th>
+            <th>改进项</th>
+            <th>理由</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>高</td>
+            <td>接入可信外部新闻和事件源</td>
+            <td>非 BTC 市场大量依赖实时事件，LLM 只看市场描述会错过最新信息。</td>
+          </tr>
+          <tr>
+            <td>高</td>
+            <td>补齐非 BTC Paper 自动结算</td>
+            <td>没有结算就无法验证 LLM 推荐质量，也无法统计真实胜率。</td>
+          </tr>
+          <tr>
+            <td>高</td>
+            <td>按市场类别分桶</td>
+            <td>体育、政治、宏观、加密、娱乐的信号来源完全不同，混在一起看总胜率会误导调参。</td>
+          </tr>
+          <tr>
+            <td>中</td>
+            <td>加入黑名单和白名单</td>
+            <td>排除长尾、争议性高、难结算、信息源不透明的市场，保留更可解释的类别。</td>
+          </tr>
+          <tr>
+            <td>中</td>
+            <td>记录 LLM prompt、候选快照和盘口快照</td>
+            <td>方便复盘某一单为什么下注，避免只看到最终亏赢却找不到当时输入。</td>
+          </tr>
+          <tr>
+            <td>中</td>
+            <td>Live 前置人工确认</td>
+            <td>在 Live 自动化之前，加一个人工确认队列能先观察推荐质量，降低资金暴露。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="notice good">
+        <span class="callout-title">判断系统有没有工作的方法</span>
+        <p>
+          先看 Market LLM Terminal 是否持续出现 scanner 心跳和 scan complete，再看过滤统计是否合理，
+          再看 LLM 是否产生结构化 JSON，最后看 Paper 模块日志是 submitted 还是 blocked。
+          如果 blocked，message 就是最直接的闸门原因。
+        </p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

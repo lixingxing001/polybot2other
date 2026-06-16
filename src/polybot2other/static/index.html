@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20260611-polymarket-status">
+    <link rel="stylesheet" href="/static/styles.css?v=20260616-market-evidence-scout">
   </head>
   <body>
     <main class="app-shell">
@@ -18,13 +18,16 @@
           </div>
         </div>
         <nav class="app-nav" aria-label="页面导航">
-          <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">Bot</button>
+          <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">BTC</button>
+          <button id="nav-market" class="app-nav-item" type="button" data-nav-page="market">市场</button>
           <button id="nav-samples" class="app-nav-item" type="button" data-nav-page="samples">样本</button>
           <button id="nav-status" class="app-nav-item" type="button" data-nav-page="status">状态</button>
         </nav>
         <div class="top-actions">
-          <button id="paper-pause-toggle" class="paper-pause-button" type="button" aria-pressed="false">暂停Paper</button>
-          <label class="live-toggle">
+          <button id="btc-runtime-toggle" class="btc-runtime-button btc-only-action" type="button" aria-pressed="false">暂停BTC</button>
+          <span id="btc-runtime-status" class="btc-runtime-status btc-only-action">BTC采集中</span>
+          <button id="paper-pause-toggle" class="paper-pause-button btc-only-action" type="button" aria-pressed="false">暂停Paper</button>
+          <label class="live-toggle btc-only-action">
             <input id="live-enabled" type="checkbox">
             <span></span>
             实盘
@@ -48,6 +51,10 @@
                 <option value="SINGLE_FAK_AGGRESSIVE_EDGE_REAL">SINGLE + FAK Aggressive Edge REAL</option>
                 <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V10_REAL">SINGLE + FAK Aggressive Edge V10 REAL</option>
                 <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V11_REAL">SINGLE + FAK Aggressive Edge V11 REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V11_1_REAL">SINGLE + FAK Aggressive Edge V11.1 REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_REAL">SINGLE + FAK Aggressive Edge V11 Down-only REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V11_DOWN_ONLY_ACTIVE_REAL">SINGLE + FAK Aggressive Edge V11 Down-only Active REAL</option>
+                <option value="SINGLE_FAK_AGGRESSIVE_EDGE_V12_REAL">SINGLE + FAK Aggressive Edge V12 REAL</option>
               </select>
             </label>
             <span id="live-status">实盘关闭</span>
@@ -341,6 +348,170 @@
         </div>
       </section>
       </section>
+      <section id="market-page" class="app-page is-hidden" data-page="market" aria-labelledby="nav-market" aria-hidden="true">
+        <section class="panel market-scout-panel">
+          <div class="panel-head market-page-head">
+            <div>
+              <h2>非 BTC 市场</h2>
+              <span id="market-scout-meta">等待扫描器</span>
+            </div>
+            <div class="market-head-actions">
+              <div id="market-scout-summary" class="market-scout-summary"></div>
+              <button id="market-config-toggle" class="icon-button market-config-toggle" type="button" title="市场配置" aria-label="市场配置" aria-expanded="false">&#9881;</button>
+            </div>
+          </div>
+          <div id="market-config-panel" class="market-config-panel" hidden>
+            <div class="market-control-panel">
+              <div class="market-control-head">
+                <strong>运行控制</strong>
+                <button id="market-save-settings" type="button">保存市场配置</button>
+              </div>
+              <div class="market-toggle-row">
+                <label class="market-switch">
+                  <input id="market-scanner-toggle" type="checkbox">
+                  <span></span>
+                  扫描
+                </label>
+                <label class="market-switch">
+                  <input id="market-llm-toggle" type="checkbox">
+                  <span></span>
+                  LLM
+                </label>
+                <label class="market-switch">
+                  <input id="market-evidence-toggle" type="checkbox">
+                  <span></span>
+                  Web证据
+                </label>
+                <label class="market-switch">
+                  <input id="market-paper-auto-toggle" type="checkbox">
+                  <span></span>
+                  Paper自动下注
+                </label>
+                <label class="market-switch">
+                  <input id="market-paper-probe-toggle" type="checkbox">
+                  <span></span>
+                  Paper探针
+                </label>
+                <label class="market-switch is-locked">
+                  <input id="market-live-auto-toggle" type="checkbox" disabled>
+                  <span></span>
+                  Live锁定
+                </label>
+              </div>
+              <div class="market-control-grid">
+                <label class="market-control-wide">LLM模型
+                  <input id="market-llm-model" type="text" spellcheck="false" autocomplete="off" placeholder="openai/gpt-5.4-mini">
+                </label>
+                <label>初始金额
+                  <input id="market-initial-balance" type="number" min="1" step="1">
+                </label>
+                <label>单笔预算
+                  <input id="market-stake-dollars" type="number" min="0.1" step="0.1">
+                </label>
+                <label>最大持仓
+                  <input id="market-max-open-positions" type="number" min="1" step="1">
+                </label>
+                <label>探针持仓
+                  <input id="market-probe-max-open-positions" type="number" min="1" max="10" step="1">
+                </label>
+                <label>探针置信度
+                  <input id="market-probe-min-confidence" type="number" min="0" max="1" step="0.01">
+                </label>
+                <label>探针候选分
+                  <input id="market-probe-min-selection-score" type="number" min="0" max="100" step="0.1">
+                </label>
+                <label>日亏损上限
+                  <input id="market-max-daily-loss" type="number" min="0" step="1">
+                </label>
+                <label>最低置信度
+                  <input id="market-min-confidence" type="number" min="0" max="1" step="0.01">
+                </label>
+                <label>最高入场价
+                  <input id="market-max-entry-price" type="number" min="0.01" max="0.99" step="0.01">
+                </label>
+                <label>最大价差
+                  <input id="market-max-spread" type="number" min="0" max="0.99" step="0.01">
+                </label>
+                <label>扫描间隔秒
+                  <input id="market-scan-interval" type="number" min="5" step="1">
+                </label>
+                <label>LLM候选数
+                  <input id="market-analyze-top-n" type="number" min="1" max="20" step="1">
+                </label>
+                <label>证据市场数
+                  <input id="market-evidence-max-markets" type="number" min="0" max="20" step="1">
+                </label>
+                <label>证据条数
+                  <input id="market-evidence-results-per-market" type="number" min="1" max="8" step="1">
+                </label>
+                <label>证据超时秒
+                  <input id="market-evidence-timeout" type="number" min="1" max="30" step="1">
+                </label>
+                <label>证据缓存秒
+                  <input id="market-evidence-ttl" type="number" min="30" max="86400" step="30">
+                </label>
+              </div>
+            </div>
+          </div>
+          <div class="market-account-layout">
+            <div class="market-account-panel">
+              <strong>Paper 账户</strong>
+              <div id="market-paper-account" class="market-account-grid">
+                <div class="market-scout-empty">等待账户数据</div>
+              </div>
+            </div>
+          </div>
+          <div class="market-scout-grid">
+            <div id="market-candidates" class="market-scout-column">
+              <strong>候选市场</strong>
+              <div class="market-scout-empty">暂无候选</div>
+            </div>
+            <div id="market-recommendation" class="market-scout-column">
+              <strong>推荐下注</strong>
+              <div class="market-scout-empty">暂无推荐</div>
+            </div>
+          </div>
+          <div class="market-orders-grid">
+            <div class="market-orders-panel">
+              <div class="market-orders-head">
+                <div class="market-orders-title">
+                  <strong>Paper 下注列表</strong>
+                  <span id="market-paper-orders-meta">0 条</span>
+                </div>
+                <button id="market-paper-orders-refresh" class="market-orders-refresh" type="button">刷新</button>
+                <details class="field-menu market-order-field-menu">
+                  <summary>字段</summary>
+                  <div id="market-paper-order-field-options" class="field-options market-paper-order-field-options"></div>
+                </details>
+              </div>
+              <div class="table-wrap market-orders-wrap">
+                <table class="market-orders-table">
+                  <thead id="market-paper-orders-head"></thead>
+                  <tbody id="market-paper-orders"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="market-orders-panel">
+              <div class="market-orders-head">
+                <div class="market-orders-title">
+                  <strong>Live 订单</strong>
+                  <span id="market-live-orders-meta">已锁定</span>
+                </div>
+              </div>
+              <div id="market-live-orders" class="market-live-locked">市场页实盘自动下注未接入</div>
+            </div>
+          </div>
+          <div id="market-llm-terminal" class="live-terminal market-llm-terminal" aria-live="polite">
+            <div class="live-terminal-head">
+              <strong>Market LLM Terminal</strong>
+              <span id="market-llm-terminal-meta">等待日志</span>
+            </div>
+            <div id="market-llm-terminal-lines" class="live-terminal-lines">
+              <div class="live-terminal-empty">等待市场日志</div>
+            </div>
+          </div>
+        </section>
+      </section>
       <section id="sample-page" class="app-page is-hidden" data-page="samples" aria-labelledby="nav-samples" aria-hidden="true">
         <section class="panel sample-progress-panel">
           <div class="panel-head sample-progress-head">
@@ -484,6 +655,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260611-polymarket-status"></script>
+    <script src="/static/app.js?v=20260616-market-evidence-scout"></script>
   </body>
 </html>

@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import Counter, deque
 from dataclasses import replace
 from pathlib import Path
@@ -23,7 +26,14 @@ from .clob_ws import (
     RtdsChainlinkWebSocketFeed,
     SpotPriceWebSocketFeed,
 )
-from .config import Settings, reload_live_credential_env
+from .config import (
+    DEFAULT_BTC_RUNTIME_SETTINGS_PATH,
+    DEFAULT_DB_PATH,
+    DEFAULT_MARKET_SCOUT_PAPER_DB_PATH,
+    DEFAULT_MARKET_SCOUT_SETTINGS_PATH,
+    Settings,
+    reload_live_credential_env,
+)
 from .execution import (
     ORDER_TYPE_GTC,
     ORDER_TYPE_GTD,
@@ -39,6 +49,7 @@ from .execution import (
     sweep_taker_buy_by_shares,
     taker_fee,
 )
+from .evidence import MarketEvidenceScout
 from .experiments import (
     ANTI_BOT_GUARD_MODE_NONE,
     MARKET_DATA_MODE_BASE,
@@ -76,6 +87,8 @@ from .llm_agent import (
     LLM_MIN_CONFIDENCE_TO_TRADE,
     LLM_ROUTE_NO_TRADE,
     LlmSuperAgentRouter,
+    _chat_completion_content,
+    _extract_json_object,
     build_llm_market_features,
     route_execution_modes,
 )
@@ -124,6 +137,54 @@ LIVE_DIAGNOSTIC_HISTORY_LIMIT = 600
 LIVE_TICK_PROFILE_HISTORY_LIMIT = 240
 LIVE_SLOW_TICK_LOG_INTERVAL_SECONDS = 15.0
 LIVE_SLOW_TICK_WARN_MS = 3_000.0
+MARKET_LLM_TERMINAL_LOG_LIMIT = 240
+MARKET_LLM_TERMINAL_HEARTBEAT_SECONDS = 15.0
+MARKET_SCOUT_REJECT_LOG_LIMIT = 6
+MARKET_SCOUT_DISPLAY_CANDIDATE_LIMIT = 20
+MARKET_SCOUT_SCAN_LOG_CANDIDATE_LIMIT = 10
+MARKET_SCOUT_ORDER_SKIP_LOG_LIMIT = 8
+MARKET_SCOUT_PROMPT_CANDIDATE_LIMIT = 20
+MARKET_SCOUT_PROMPT_MAX_CHARS = 28_000
+MARKET_SCOUT_SYMBOL = "MARKET"
+MARKET_SCOUT_LIVE_LOCKED_MESSAGE = "市场页实盘自动下注未接入，本版本只允许 Paper 自动下注"
+BTC_RUNTIME_PAUSED_REASON = "BTC 数据业务已暂停，跳过行情采集和策略执行"
+BTC_RUNTIME_PAUSED_MESSAGE = "BTC 数据采集已暂停"
+BTC_RUNTIME_RUNNING_MESSAGE = "BTC 数据采集中"
+
+
+def _resolve_btc_runtime_settings_path(settings: Settings) -> Path:
+    """自定义数据库实例默认使用同目录运行态文件，避免不同实例共享暂停状态。"""
+
+    if (
+        settings.btc_runtime_settings_path == DEFAULT_BTC_RUNTIME_SETTINGS_PATH
+        and settings.db_path != DEFAULT_DB_PATH
+    ):
+        return settings.db_path.parent / DEFAULT_BTC_RUNTIME_SETTINGS_PATH.name
+    return settings.btc_runtime_settings_path
+
+
+def _resolve_market_scout_settings_path(settings: Settings) -> Path:
+    """自定义数据库实例默认使用同目录市场配置，避免测试或多实例共享运行态。"""
+
+    if (
+        settings.market_scout_settings_path == DEFAULT_MARKET_SCOUT_SETTINGS_PATH
+        and settings.db_path != DEFAULT_DB_PATH
+    ):
+        return settings.db_path.parent / "market-scout-settings.json"
+    return settings.market_scout_settings_path
+
+
+def _resolve_market_scout_paper_db_path(settings: Settings) -> Path:
+    """自定义数据库实例默认使用同目录市场 Paper 账本，保持 BTC 与市场账户隔离。"""
+
+    if (
+        settings.market_scout_paper_db_path == DEFAULT_MARKET_SCOUT_PAPER_DB_PATH
+        and settings.db_path != DEFAULT_DB_PATH
+    ):
+        return settings.db_path.parent / "market-scout-paper.sqlite3"
+    return settings.market_scout_paper_db_path
+
+
 OFFICIAL_RECHECK_INTERVAL_SECONDS = 10.0
 OFFICIAL_RECHECK_WINDOW_SECONDS = 24 * 60 * 60
 OFFICIAL_RECHECK_LIMIT = 5
@@ -334,6 +395,8 @@ class PaperTradingBot:
         self._okx_spot_ws_thread: threading.Thread | None = None
         self._binance_spot_ws_thread: threading.Thread | None = None
         self._price_refresh_thread: threading.Thread | None = None
+        self._market_scout_thread: threading.Thread | None = None
+        self._market_scout_stop = threading.Event()
         self.last_error: str | None = None
         self.last_tick_at: float | None = None
         self.last_signal: dict[str, Any] | None = None
@@ -344,6 +407,8 @@ class PaperTradingBot:
         self.paper_quotes: dict[str, dict[str, Any]] = {}
         self.execution_price: dict[str, Any] = {}
         self.execution_quotes: dict[str, dict[str, Any]] = {}
+        # 保存最近一次后端 RTDS Chainlink 价格，避免市场切换或浏览器快照覆盖后丢失锚定价。
+        self._latest_backend_chainlink_price: dict[str, Any] = {}
         self._last_live_snapshot_ingest_at = 0.0
         self._last_backend_market_data_refresh_at = 0.0
         self._last_backend_quote_refresh_at = 0.0
@@ -351,6 +416,44 @@ class PaperTradingBot:
         self._live_gate_diagnostics = deque(maxlen=LIVE_DIAGNOSTIC_HISTORY_LIMIT)
         self._tick_profile_history = deque(maxlen=LIVE_TICK_PROFILE_HISTORY_LIMIT)
         self._last_slow_tick_log_at = 0.0
+        self._market_llm_terminal_logs = deque(maxlen=MARKET_LLM_TERMINAL_LOG_LIMIT)
+        self._market_llm_terminal_seq = 0
+        self._market_llm_terminal_last_heartbeat_at = 0.0
+        self._market_paper_quote_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._market_scout_link_cache: dict[str, dict[str, str]] = {}
+        self.market_evidence_scout = MarketEvidenceScout(settings)
+        self.market_scout_settings_path = _resolve_market_scout_settings_path(settings)
+        self.market_scout_paper_db_path = _resolve_market_scout_paper_db_path(settings)
+        self._market_scout_runtime_settings = self._load_market_scout_runtime_settings()
+        self.market_paper_store = TradeStore(
+            self.market_scout_paper_db_path,
+            float(self._market_scout_runtime_settings["paper_initial_balance"]),
+        )
+        self._market_scout_status: dict[str, Any] = {
+            "state": "idle",
+            "message": "等待 Market Scout 启动",
+            "scanner_enabled": bool(settings.market_scout_enabled and self._market_scout_runtime_settings["scanner_enabled"]),
+            "scanner_running": False,
+            "llm_enabled": bool(
+                self._market_scout_runtime_settings["llm_enabled"]
+                and settings.llm_super_agent_enabled
+                and settings.llm_super_agent_api_key
+            ),
+            "auto_order_enabled": bool(self._market_scout_runtime_settings["paper_auto_enabled"]),
+            "paper_auto_enabled": bool(self._market_scout_runtime_settings["paper_auto_enabled"]),
+            "live_auto_enabled": False,
+            "live_locked": True,
+            "last_scan_at": None,
+            "last_llm_at": None,
+            "candidate_count": 0,
+            "analyzed_slug": "",
+            "last_error": "",
+            "last_auto_order": None,
+        }
+        self._market_scout_last_candidate_signature = ""
+        self._market_scout_last_llm_at = 0.0
+        self._market_scout_last_scan_log_at = 0.0
+        self._market_scout_last_no_key_log_at = 0.0
         self._official_recheck_next_at: dict[str, float] = {}
         self._official_price_backfill_next_at: dict[str, float] = {}
         self.pair_strategy_enabled = False
@@ -372,6 +475,19 @@ class PaperTradingBot:
         self.llm_super_agent_router = LlmSuperAgentRouter(settings)
         self.llm_super_agent_variant_id = "MAIN"
         self._llm_super_agent_last_logged_key: str | None = None
+        self.btc_runtime_settings_path = _resolve_btc_runtime_settings_path(settings)
+        btc_runtime_payload = self._load_btc_runtime_settings()
+        self.btc_runtime_paused = bool(btc_runtime_payload.get("paused", False))
+        self.last_btc_runtime_event: dict[str, Any] | None = (
+            dict(btc_runtime_payload.get("event"))
+            if isinstance(btc_runtime_payload.get("event"), dict)
+            else {
+                "type": "BTC_RUNTIME_PAUSE" if self.btc_runtime_paused else "BTC_RUNTIME_RESUME",
+                "paused": self.btc_runtime_paused,
+                "message": BTC_RUNTIME_PAUSED_MESSAGE if self.btc_runtime_paused else BTC_RUNTIME_RUNNING_MESSAGE,
+                "at": _maybe_float(btc_runtime_payload.get("updated_at")) or time.time(),
+            }
+        )
         self.paper_trading_paused = False
         self.last_paper_pause_event: dict[str, Any] | None = None
         self.price_basis_tracker = PriceBasisTracker()
@@ -412,6 +528,22 @@ class PaperTradingBot:
         self.live_paper_stop_win_trading = (
             LivePaperStopWinStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
         )
+        self._append_market_llm_terminal_log(
+            level="info",
+            module="system",
+            event_type="terminal_start",
+            title="Market LLM Terminal",
+            message="非 BTC 市场日志终端已启动",
+            details=[
+                f"候选市场扫描: {'已启用' if self._market_scout_effective_scanner_enabled_unlocked() else '已关闭'}",
+                f"LLM 实时分析: {'已启用' if self._market_scout_effective_llm_enabled_unlocked() else '未配置或已关闭'}",
+                f"LLM 模型: {self._market_scout_runtime_settings.get('llm_model') or self.settings.llm_super_agent_model}",
+                f"Evidence Scout: {'已启用' if self._market_scout_runtime_settings.get('evidence_enabled') else '已关闭'}",
+                f"Paper 自动下注: {'已启用' if self._market_scout_runtime_settings['paper_auto_enabled'] else '已关闭'}",
+                f"Paper 探针: {'已启用' if self._market_scout_runtime_settings.get('paper_probe_enabled') else '已关闭'}",
+                f"Live 自动下注: 已锁定，{MARKET_SCOUT_LIVE_LOCKED_MESSAGE}",
+            ],
+        )
 
     def configure_strategy_experiment_variant(self, variant: StrategyVariant) -> None:
         """绑定实验组合元数据；版本化组合必须隔离过滤路径和复盘文件。"""
@@ -435,6 +567,10 @@ class PaperTradingBot:
             )
 
     def start(self) -> None:
+        self._start_market_scout()
+        if self.btc_runtime_is_paused():
+            logger.info("BTC 数据业务处于暂停态，后台行情线程不启动")
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
@@ -472,21 +608,77 @@ class PaperTradingBot:
         self._thread.start()
 
     def stop(self) -> None:
+        self._market_scout_stop.set()
         self._stop.set()
+        self._join_btc_worker_threads()
+        self._join_market_scout_thread()
+
+    def _join_btc_worker_threads(self) -> None:
+        current_thread = threading.current_thread()
         if self._thread:
-            self._thread.join(timeout=3)
+            if self._thread is not current_thread:
+                self._thread.join(timeout=3)
         if self._market_data_thread:
-            self._market_data_thread.join(timeout=3)
+            if self._market_data_thread is not current_thread:
+                self._market_data_thread.join(timeout=3)
         if self._clob_ws_thread:
-            self._clob_ws_thread.join(timeout=3)
+            if self._clob_ws_thread is not current_thread:
+                self._clob_ws_thread.join(timeout=3)
         if self._rtds_ws_thread:
-            self._rtds_ws_thread.join(timeout=3)
+            if self._rtds_ws_thread is not current_thread:
+                self._rtds_ws_thread.join(timeout=3)
         if self._okx_spot_ws_thread:
-            self._okx_spot_ws_thread.join(timeout=3)
+            if self._okx_spot_ws_thread is not current_thread:
+                self._okx_spot_ws_thread.join(timeout=3)
         if self._binance_spot_ws_thread:
-            self._binance_spot_ws_thread.join(timeout=3)
+            if self._binance_spot_ws_thread is not current_thread:
+                self._binance_spot_ws_thread.join(timeout=3)
         if self._price_refresh_thread:
-            self._price_refresh_thread.join(timeout=3)
+            if self._price_refresh_thread is not current_thread:
+                self._price_refresh_thread.join(timeout=3)
+
+    def _join_market_scout_thread(self) -> None:
+        current_thread = threading.current_thread()
+        if self._market_scout_thread and self._market_scout_thread is not current_thread:
+            self._market_scout_thread.join(timeout=3)
+
+    def _start_market_scout(self) -> None:
+        if not self._market_scout_effective_scanner_enabled():
+            self._set_market_scout_status(
+                state="disabled",
+                message="Market Scout 已关闭",
+                scanner_running=False,
+            )
+            return
+        if self._market_scout_thread and self._market_scout_thread.is_alive():
+            return
+        self._market_scout_stop.clear()
+        self._market_scout_thread = threading.Thread(
+            target=self._run_market_scout,
+            name="polybot2other-market-llm-scout",
+            daemon=True,
+        )
+        self._market_scout_thread.start()
+
+    def _set_market_scout_status(self, **updates: Any) -> None:
+        with self._lock:
+            status = dict(self._market_scout_status)
+            status.update(updates)
+            runtime = self._market_scout_runtime_settings
+            status["scanner_enabled"] = bool(self.settings.market_scout_enabled and runtime.get("scanner_enabled", True))
+            status["scanner_running"] = bool(
+                updates.get(
+                    "scanner_running",
+                    self._market_scout_thread is not None and self._market_scout_thread.is_alive(),
+                )
+            )
+            status["llm_enabled"] = self._market_scout_effective_llm_enabled_unlocked()
+            status["auto_order_enabled"] = bool(runtime.get("paper_auto_enabled", False))
+            status["paper_auto_enabled"] = bool(runtime.get("paper_auto_enabled", False))
+            status["live_auto_enabled"] = False
+            status["live_locked"] = True
+            status["settings"] = self._market_scout_public_settings_unlocked()
+            self._market_scout_status = status
 
     def set_pair_strategy_enabled(self, enabled: bool) -> dict[str, Any]:
         with self._lock:
@@ -499,6 +691,133 @@ class PaperTradingBot:
             if not enabled:
                 self.pair_stop_loss_streak = 0
         return self.snapshot()
+
+    def set_btc_runtime_paused(self, paused: bool) -> dict[str, Any]:
+        """切换 BTC 数据业务总开关；暂停请求只发停止信号，避免接口被后台网络线程拖慢。"""
+
+        now = time.time()
+        self._set_btc_runtime_pause_state(paused, now, persist=True)
+        if paused:
+            # HTTP 按钮必须快速返回；线程会在各自循环里看到 _stop 和暂停态后退出。
+            self._stop.set()
+            self._set_btc_runtime_paused_runtime_state(now)
+            logger.info("BTC 数据业务已暂停，已发送后台线程停止信号 settings_path=%s", self.btc_runtime_settings_path)
+        else:
+            self._stop.clear()
+            logger.info("BTC 数据业务已恢复，准备启动后台行情线程 settings_path=%s", self.btc_runtime_settings_path)
+            self.start()
+        return {"btc_runtime": self.btc_runtime()}
+
+    def btc_runtime_is_paused(self) -> bool:
+        with self._lock:
+            return bool(self.btc_runtime_paused)
+
+    def btc_runtime(self) -> dict[str, Any]:
+        with self._lock:
+            return self._btc_runtime_payload_locked()
+
+    def _btc_runtime_payload_locked(self) -> dict[str, Any]:
+        event = dict(self.last_btc_runtime_event or {})
+        paused = bool(self.btc_runtime_paused)
+        worker_running = bool(self._thread and self._thread.is_alive())
+        market_data_running = bool(self._market_data_thread and self._market_data_thread.is_alive())
+        return {
+            "paused": paused,
+            "message": event.get("message") or (BTC_RUNTIME_PAUSED_MESSAGE if paused else BTC_RUNTIME_RUNNING_MESSAGE),
+            "updated_at": event.get("at"),
+            "event": event,
+            "settings_path": str(self.btc_runtime_settings_path),
+            "worker_running": worker_running,
+            "market_data_running": market_data_running,
+        }
+
+    def btc_runtime_paused_snapshot_response(self) -> dict[str, Any]:
+        now = time.time()
+        return {
+            "ok": True,
+            "ignored_snapshot": "btc_runtime_paused",
+            "paused": True,
+            "message": BTC_RUNTIME_PAUSED_REASON,
+            "btc_runtime": self.btc_runtime(),
+            "updated_at": now,
+        }
+
+    def _btc_runtime_stop_requested(self) -> bool:
+        """主 tick 内部快速刹车；暂停或关服信号出现后跳过后续策略和实盘动作。"""
+
+        if self._stop.is_set():
+            if self.btc_runtime_is_paused():
+                self._set_btc_runtime_paused_runtime_state(time.time())
+            return True
+        if self.btc_runtime_is_paused():
+            self._set_btc_runtime_paused_runtime_state(time.time())
+            return True
+        return False
+
+    def _set_btc_runtime_pause_state(self, paused: bool, now: float, *, persist: bool) -> None:
+        message = BTC_RUNTIME_PAUSED_MESSAGE if paused else BTC_RUNTIME_RUNNING_MESSAGE
+        event = {
+            "type": "BTC_RUNTIME_PAUSE" if paused else "BTC_RUNTIME_RESUME",
+            "paused": bool(paused),
+            "message": message,
+            "at": now,
+        }
+        with self._lock:
+            self.btc_runtime_paused = bool(paused)
+            self.last_btc_runtime_event = event
+        if persist:
+            self._save_btc_runtime_settings(event)
+
+    def _load_btc_runtime_settings(self) -> dict[str, Any]:
+        path = self.btc_runtime_settings_path
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("读取 BTC 运行态配置失败 path=%s error=%s", path, exc)
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_btc_runtime_settings(self, event: dict[str, Any]) -> None:
+        payload = {
+            "paused": bool(event.get("paused")),
+            "updated_at": _maybe_float(event.get("at")) or time.time(),
+            "event": dict(event),
+        }
+        path = self.btc_runtime_settings_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _set_btc_runtime_paused_runtime_state(self, now: float) -> None:
+        with self._lock:
+            self.last_signal = {
+                "symbol": "BTC",
+                "side": "NO_TRADE",
+                "confidence": 0.0,
+                "entry_price": 0.0,
+                "move_bps": 0.0,
+                "reason": BTC_RUNTIME_PAUSED_REASON,
+            }
+            self.ws_status.update(
+                {
+                    "market": "paused",
+                    "price": "paused",
+                    "backend_clob_ws": "paused",
+                    "backend_clob_ws_at": now,
+                    "backend_rtds_ws": "paused",
+                    "backend_rtds_ws_at": now,
+                    "backend_okx_ws": "paused",
+                    "backend_okx_ws_at": now,
+                    "backend_binance_ws": "paused",
+                    "backend_binance_ws_at": now,
+                    "backend_market_data_loop_at": now,
+                }
+            )
+            self.last_error = None
+            self.last_tick_at = now
 
     def set_paper_trading_paused(self, paused: bool) -> dict[str, Any]:
         now = time.time()
@@ -553,17 +872,892 @@ class PaperTradingBot:
             "event": event,
         }
 
+    def _append_market_llm_terminal_log(
+        self,
+        *,
+        level: str,
+        module: str,
+        event_type: str,
+        title: str,
+        message: str,
+        details: list[str] | None = None,
+        code: str = "",
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """追加非 BTC 市场终端日志；后续扫描器和 LLM 分析器统一写这里。"""
+
+        at = time.time() if now is None else float(now)
+        normalized_level = str(level or "info").strip().lower()
+        if normalized_level not in {"info", "pass", "warn", "error"}:
+            normalized_level = "info"
+        event = {
+            "seq": 0,
+            "at": at,
+            "at_ms": int(at * 1000),
+            "level": normalized_level,
+            "module": str(module or "market").strip() or "market",
+            "event_type": str(event_type or "log").strip() or "log",
+            "title": str(title or "市场日志"),
+            "message": str(message or ""),
+            "details": [str(item) for item in (details or []) if str(item or "").strip()],
+            "code": str(code or ""),
+        }
+        with self._lock:
+            self._market_llm_terminal_seq += 1
+            event["seq"] = self._market_llm_terminal_seq
+            self._market_llm_terminal_logs.append(event)
+        return dict(event)
+
+    def _append_market_llm_terminal_heartbeat(self, now: float) -> None:
+        with self._lock:
+            if now - self._market_llm_terminal_last_heartbeat_at < MARKET_LLM_TERMINAL_HEARTBEAT_SECONDS:
+                return
+            self._market_llm_terminal_last_heartbeat_at = now
+            status = dict(self._market_scout_status)
+        self._append_market_llm_terminal_log(
+            level="info",
+            module="operator",
+            event_type="heartbeat",
+            title="运行心跳",
+            message=str(status.get("message") or "市场终端在线"),
+            details=[
+                f"候选市场扫描: {'运行中' if status.get('scanner_running') else ('已启用' if status.get('scanner_enabled') else '已关闭')}",
+                f"LLM 实时分析: {'已启用' if status.get('llm_enabled') else '未配置或已关闭'}",
+                f"LLM 模型: {status.get('settings', {}).get('llm_model') or self.settings.llm_super_agent_model}",
+                f"Evidence Scout: {'已启用' if status.get('settings', {}).get('evidence_enabled') else '已关闭'}",
+                f"Paper 自动下注: {'已启用' if status.get('paper_auto_enabled') else '已关闭'}",
+                f"Paper 探针: {'已启用' if status.get('settings', {}).get('paper_probe_enabled') else '已关闭'}",
+                f"Live 自动下注: 已锁定，{MARKET_SCOUT_LIVE_LOCKED_MESSAGE}",
+            ],
+            now=now,
+        )
+
+    def market_llm_terminal(self, *, limit: int = 80, after_seq: int = 0) -> dict[str, Any]:
+        """返回市场页 LLM 终端日志；只读接口，不触发下单。"""
+
+        now = time.time()
+        self._append_market_llm_terminal_heartbeat(now)
+        safe_limit = max(1, min(200, int(limit)))
+        safe_after_seq = max(0, int(after_seq or 0))
+        with self._lock:
+            latest_seq = int(self._market_llm_terminal_seq)
+            rows = [dict(row) for row in self._market_llm_terminal_logs if int(row.get("seq") or 0) > safe_after_seq]
+            status = dict(self._market_scout_status)
+        rows = rows[-safe_limit:]
+        return {
+            "ok": True,
+            "updated_at": now,
+            "latest_seq": latest_seq,
+            "logs": rows,
+            "status": status,
+        }
+
+    def market_scout_state(
+        self,
+        *,
+        order_limit: int = 30,
+        order_offset: int = 0,
+        quote_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """市场页只读状态；包含独立配置、Paper 账户、推荐、订单和实盘锁定说明。"""
+
+        safe_limit = max(1, min(100, int(order_limit)))
+        safe_offset = max(0, int(order_offset))
+        force_quote_refresh = bool(quote_refresh)
+        with self._lock:
+            status = dict(self._market_scout_status)
+            runtime_settings = self._market_scout_public_settings_unlocked()
+        total_orders = self.market_paper_store.paper_order_count(MARKET_SCOUT_SYMBOL, "all")
+        recent_orders = self.market_paper_store.recent_paper_orders(
+            safe_limit,
+            safe_offset,
+            MARKET_SCOUT_SYMBOL,
+            "all",
+        )
+        recent_trades = self.market_paper_store.recent_trades(20, 0, MARKET_SCOUT_SYMBOL)
+        loaded = min(total_orders, safe_offset + len(recent_orders))
+        return {
+            "ok": True,
+            "updated_at": time.time(),
+            "status": status,
+            "settings": runtime_settings,
+            "paper_account": self.market_paper_store.metrics(),
+            "paper_orders": self._decorate_market_paper_orders(
+                recent_orders,
+                force_quote_refresh=force_quote_refresh,
+            ),
+            "paper_orders_meta": {
+                "limit": safe_limit,
+                "offset": safe_offset,
+                "loaded": loaded,
+                "total": total_orders,
+                "has_more": loaded < total_orders,
+            },
+            "paper_trades": self._decorate_recent_trades(recent_trades),
+            "paper_order_summary": self.market_paper_store.paper_order_summary(MARKET_SCOUT_SYMBOL),
+            "live": {
+                "enabled": False,
+                "locked": True,
+                "auto_enabled": False,
+                "message": MARKET_SCOUT_LIVE_LOCKED_MESSAGE,
+                "orders": [],
+            },
+        }
+
+    def market_scout_settings(self) -> dict[str, Any]:
+        return self.market_scout_state()
+
+    def update_market_scout_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """更新市场页运行配置；实盘自动下注保持锁定，所有真钱动作需要单独开发确认。"""
+
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+        now = time.time()
+        with self._lock:
+            current = dict(self._market_scout_runtime_settings)
+            next_settings = _sanitize_market_scout_runtime_settings(payload, current, self.settings, now=now)
+            previous_initial = float(current.get("paper_initial_balance") or self.settings.market_scout_default_paper_initial_balance)
+            next_initial = float(next_settings.get("paper_initial_balance") or previous_initial)
+            self._market_scout_runtime_settings = next_settings
+            self._save_market_scout_runtime_settings(next_settings)
+        self._set_market_scout_status(
+            message="市场页配置已更新",
+            scanner_enabled=bool(self.settings.market_scout_enabled and next_settings.get("scanner_enabled")),
+        )
+        if abs(previous_initial - next_initial) >= 0.000001:
+            self.market_paper_store.rebase_initial_balance(next_initial)
+        if self._market_scout_effective_scanner_enabled():
+            self._start_market_scout()
+        self._append_market_llm_terminal_log(
+            level="info",
+            module="settings",
+            event_type="settings_update",
+            title="市场配置更新",
+            message="市场页控制参数已保存",
+            details=[
+                f"扫描: {'开启' if next_settings.get('scanner_enabled') else '关闭'}",
+                f"LLM: {'开启' if next_settings.get('llm_enabled') else '关闭'}",
+                f"LLM 模型: {next_settings.get('llm_model') or self.settings.llm_super_agent_model}",
+                f"Paper 自动下注: {'开启' if next_settings.get('paper_auto_enabled') else '关闭'}",
+                f"Paper 探针: {'开启' if next_settings.get('paper_probe_enabled') else '关闭'}",
+                f"探针持仓上限: {int(next_settings.get('paper_probe_max_open_positions') or 1)}",
+                f"Live 自动下注: 已锁定，{MARKET_SCOUT_LIVE_LOCKED_MESSAGE}",
+                f"Paper 初始资金: {next_initial:.2f}",
+                f"单笔预算: {float(next_settings.get('paper_stake_dollars') or 0.0):.2f}",
+            ],
+            now=now,
+        )
+        return self.market_scout_state()
+
+    def _market_scout_effective_scanner_enabled(self) -> bool:
+        with self._lock:
+            return self._market_scout_effective_scanner_enabled_unlocked()
+
+    def _market_scout_effective_scanner_enabled_unlocked(self) -> bool:
+        return bool(self.settings.market_scout_enabled and self._market_scout_runtime_settings.get("scanner_enabled", True))
+
+    def _market_scout_runtime_llm_enabled(self) -> bool:
+        with self._lock:
+            return bool(self._market_scout_runtime_settings.get("llm_enabled", True))
+
+    def _market_scout_effective_llm_enabled_unlocked(self) -> bool:
+        return bool(
+            self._market_scout_runtime_settings.get("llm_enabled", True)
+            and self.settings.llm_super_agent_enabled
+            and self.settings.llm_super_agent_api_key
+        )
+
+    def _market_scout_llm_model(self) -> str:
+        """返回市场页当前使用的 LLM 模型；页面配置为空时回退环境变量模型。"""
+
+        with self._lock:
+            raw_model = self._market_scout_runtime_settings.get("llm_model")
+        return _sanitize_market_scout_model(raw_model, self.settings.llm_super_agent_model)
+
+    def _market_scout_public_settings_unlocked(self) -> dict[str, Any]:
+        settings = dict(self._market_scout_runtime_settings)
+        settings["live_auto_enabled"] = False
+        settings["live_locked"] = True
+        settings["live_locked_message"] = MARKET_SCOUT_LIVE_LOCKED_MESSAGE
+        settings["settings_path"] = str(self.market_scout_settings_path)
+        settings["paper_db_path"] = str(self.market_scout_paper_db_path)
+        return settings
+
+    def _load_market_scout_runtime_settings(self) -> dict[str, Any]:
+        defaults = _default_market_scout_runtime_settings(self.settings, now=time.time())
+        path = self.market_scout_settings_path if hasattr(self, "market_scout_settings_path") else self.settings.market_scout_settings_path
+        if not path.exists():
+            return defaults
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("读取市场页运行配置失败 path=%s error=%s", path, exc)
+            return defaults
+        if not isinstance(payload, dict):
+            return defaults
+        return _sanitize_market_scout_runtime_settings(payload, defaults, self.settings, now=time.time())
+
+    def _save_market_scout_runtime_settings(self, payload: dict[str, Any]) -> None:
+        path = self.market_scout_settings_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    def _maybe_execute_market_scout_paper_order(
+        self,
+        decision: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            runtime_settings = dict(self._market_scout_runtime_settings)
+        if not runtime_settings.get("paper_auto_enabled"):
+            result = {
+                "submitted": False,
+                "reason": "Paper 自动下注开关关闭",
+                "at": now,
+            }
+            self._set_market_scout_status(last_auto_order=result)
+            return result
+        result = self._build_market_scout_paper_order_result(decision, candidates, runtime_settings, now)
+        self._set_market_scout_status(last_auto_order=result)
+        if result.get("submitted"):
+            is_probe = bool(result.get("probe"))
+            skip_details = [
+                f"候选跳过: {item}"
+                for item in list(result.get("probe_skip_reasons") or [])[:MARKET_SCOUT_ORDER_SKIP_LOG_LIMIT]
+            ]
+            self._append_market_llm_terminal_log(
+                level="warn" if is_probe else "pass",
+                module="paper",
+                event_type="paper_order_submitted",
+                title="Paper 探针下注已执行" if is_probe else "Paper 自动下注已执行",
+                message=(
+                    f"探针 {result.get('outcome')} @ {result.get('entry_price')} stake={result.get('stake')}"
+                    if is_probe
+                    else f"{result.get('outcome')} @ {result.get('entry_price')} stake={result.get('stake')}"
+                ),
+                details=[
+                    f"市场: {result.get('question') or result.get('slug')}",
+                    f"订单ID: {result.get('order_id')}",
+                    f"持仓ID: {result.get('trade_ids')}",
+                    f"来源: {'LLM NO_TRADE 探针放行' if is_probe else 'LLM RECOMMEND'}",
+                    f"原因: {result.get('reason')}",
+                    *skip_details,
+                ],
+                now=now,
+            )
+        else:
+            is_probe = bool(result.get("probe"))
+            skip_details = [
+                f"候选跳过: {item}"
+                for item in list(result.get("probe_skip_reasons") or [])[:MARKET_SCOUT_ORDER_SKIP_LOG_LIMIT]
+            ]
+            open_details = [
+                f"当前持仓: {item}"
+                for item in list(result.get("open_position_summary") or [])[:MARKET_SCOUT_ORDER_SKIP_LOG_LIMIT]
+            ]
+            self._append_market_llm_terminal_log(
+                level="warn",
+                module="paper",
+                event_type="paper_order_blocked",
+                title="Paper 探针未执行" if is_probe else "Paper 自动下注未执行",
+                message=str(result.get("reason") or "未知拦截"),
+                details=[
+                    f"市场: {result.get('question') or result.get('slug') or '-'}",
+                    f"方向: {result.get('outcome') or '-'}",
+                    f"置信度: {_format_optional_float(result.get('confidence'), 4)}",
+                    f"入场价: {_format_optional_float(result.get('entry_price'), 4)}",
+                    f"来源: {'LLM NO_TRADE 探针链路' if is_probe else result.get('source_decision') or result.get('decision') or '-'}",
+                    *skip_details,
+                    *open_details,
+                ],
+                now=now,
+            )
+        return result
+
+    def _market_scout_open_position_context(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """汇总市场页 Paper 未结算暴露，供候选递补和同事件族去重使用。"""
+
+        candidate_by_slug = {str(candidate.get("slug") or ""): candidate for candidate in candidates}
+        open_slugs: set[str] = set()
+        open_event_keys: set[str] = set()
+        open_source_event_keys: set[str] = set()
+        summaries: list[str] = []
+        for row in self.market_paper_store.open_trades():
+            if str(row.get("symbol") or "") != MARKET_SCOUT_SYMBOL:
+                continue
+            slug = str(row.get("round_id") or "").strip()
+            if not slug:
+                continue
+            open_slugs.add(slug)
+            candidate = candidate_by_slug.get(slug) or {
+                "slug": slug,
+                "question": row.get("question") or "",
+                "condition_id": row.get("condition_id") or "",
+                "event_title": row.get("question") or "",
+            }
+            event_key = str(candidate.get("event_key") or _market_scout_event_key(candidate)).strip().lower()
+            source_event_key = str(candidate.get("source_event_key") or _market_scout_source_event_key(candidate)).strip().lower()
+            if event_key:
+                open_event_keys.add(event_key)
+            if source_event_key:
+                open_source_event_keys.add(source_event_key)
+            summaries.append(
+                f"{slug} side={row.get('side') or '-'} stake={_format_optional_float(row.get('stake'), 2)} "
+                f"event={_market_scout_compact_key(event_key or source_event_key)}"
+            )
+        return {
+            "open_count": len(open_slugs),
+            "open_slugs": open_slugs,
+            "open_event_keys": open_event_keys,
+            "open_source_event_keys": open_source_event_keys,
+            "summaries": summaries,
+        }
+
+    def _build_market_scout_paper_order_result(
+        self,
+        decision: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        runtime_settings: dict[str, Any],
+        now: float,
+    ) -> dict[str, Any]:
+        probe_mode = False
+        order_decision = dict(decision)
+        exposure_context = self._market_scout_open_position_context(candidates)
+        if order_decision.get("decision") != "RECOMMEND":
+            probe_max_open_positions = int(runtime_settings.get("paper_probe_max_open_positions") or 1)
+            if int(exposure_context.get("open_count") or 0) >= probe_max_open_positions:
+                return {
+                    "submitted": False,
+                    "mode": "PAPER",
+                    "decision": decision.get("decision"),
+                    "source_decision": decision.get("decision"),
+                    "slug": decision.get("selected_slug") or "",
+                    "question": decision.get("question") or "",
+                    "outcome": decision.get("outcome") or "",
+                    "confidence": decision.get("confidence"),
+                    "entry_price": None,
+                    "stake": runtime_settings.get("paper_stake_dollars"),
+                    "at": now,
+                    "probe": True,
+                    "reason": f"Paper 探针持仓数已达上限 {probe_max_open_positions}",
+                    "open_position_summary": list(exposure_context.get("summaries") or []),
+                    "probe_skip_reasons": [],
+                }
+            probe_decision, probe_block_reason, probe_skip_reasons = _market_scout_build_probe_decision(
+                order_decision,
+                candidates,
+                runtime_settings,
+                exposure_context=exposure_context,
+            )
+            if not probe_decision:
+                return {
+                    "submitted": False,
+                    "mode": "PAPER",
+                    "decision": decision.get("decision"),
+                    "slug": decision.get("selected_slug") or "",
+                    "question": decision.get("question") or "",
+                    "outcome": decision.get("outcome") or "",
+                    "confidence": decision.get("confidence"),
+                    "entry_price": None,
+                    "stake": runtime_settings.get("paper_stake_dollars"),
+                    "at": now,
+                    "probe": False,
+                    "reason": probe_block_reason or "LLM 未给出 RECOMMEND",
+                    "open_position_summary": list(exposure_context.get("summaries") or []),
+                    "probe_skip_reasons": probe_skip_reasons,
+                }
+            order_decision = probe_decision
+            probe_mode = True
+        base_result = {
+            "submitted": False,
+            "mode": "PAPER",
+            "decision": "PROBE" if probe_mode else order_decision.get("decision"),
+            "source_decision": decision.get("decision"),
+            "slug": order_decision.get("selected_slug") or "",
+            "question": order_decision.get("question") or "",
+            "outcome": order_decision.get("outcome") or "",
+            "confidence": order_decision.get("confidence"),
+            "entry_price": None,
+            "stake": runtime_settings.get("paper_stake_dollars"),
+            "at": now,
+            "probe": probe_mode,
+            "probe_reason": order_decision.get("probe_reason") or "",
+            "probe_skip_reasons": list(order_decision.get("probe_skip_reasons") or []),
+            "open_position_summary": list(exposure_context.get("summaries") or []),
+        }
+        candidate_by_slug = {str(candidate.get("slug") or ""): candidate for candidate in candidates}
+        slug = str(order_decision.get("selected_slug") or "").strip()
+        candidate = candidate_by_slug.get(slug)
+        if not candidate:
+            return {**base_result, "reason": "推荐市场不在本轮候选列表"}
+        outcome = str(order_decision.get("outcome") or "").strip()
+        outcome_index = _market_scout_outcome_index(candidate, outcome)
+        if outcome_index < 0:
+            return {**base_result, "question": candidate.get("question"), "reason": "推荐方向不在市场 outcomes 中"}
+        quote = _market_scout_outcome_quote(candidate, outcome)
+        entry_price = _market_scout_entry_price(candidate, outcome_index, quote)
+        spread = _maybe_float(quote.get("spread")) if isinstance(quote, dict) else _maybe_float(candidate.get("spread"))
+        result = {
+            **base_result,
+            "question": candidate.get("question"),
+            "url": candidate.get("url"),
+            "outcome": outcome,
+            "entry_price": entry_price,
+            "spread": spread,
+        }
+        confidence = _maybe_float(order_decision.get("confidence")) or 0.0
+        min_confidence = float(
+            runtime_settings.get("paper_probe_min_confidence" if probe_mode else "min_confidence")
+            or 0.0
+        )
+        if confidence < min_confidence:
+            return {**result, "reason": f"置信度 {confidence:.4f} 低于阈值 {min_confidence:.4f}"}
+        if entry_price is None:
+            return {**result, "reason": "缺少可执行买入价"}
+        decision_max_entry = _maybe_float(order_decision.get("max_entry_price"))
+        configured_max_entry = float(runtime_settings.get("max_entry_price") or 0.99)
+        max_entry = min(configured_max_entry, decision_max_entry if decision_max_entry is not None else configured_max_entry)
+        if entry_price > max_entry + 0.000001:
+            return {**result, "reason": f"入场价 {entry_price:.4f} 高于上限 {max_entry:.4f}"}
+        max_spread = float(runtime_settings.get("max_spread") or 1.0)
+        if spread is not None and spread > max_spread:
+            return {**result, "reason": f"盘口价差 {spread:.4f} 高于上限 {max_spread:.4f}"}
+        exposure_block = _market_scout_candidate_exposure_block(candidate, exposure_context)
+        if exposure_block:
+            return {**result, "reason": exposure_block}
+        max_open_positions = int(
+            runtime_settings.get("paper_probe_max_open_positions" if probe_mode else "paper_max_open_positions")
+            or 1
+        )
+        if int(exposure_context.get("open_count") or 0) >= max_open_positions:
+            return {**result, "reason": f"Paper 持仓数已达上限 {max_open_positions}"}
+        round_id = str(candidate.get("slug") or "").strip()
+        if self.market_paper_store.open_trade_exists_for_round(round_id):
+            return {**result, "reason": "该市场已有 Paper 持仓"}
+        max_daily_loss = float(runtime_settings.get("paper_max_daily_loss") or 0.0)
+        daily_pnl = self.market_paper_store.daily_realized_pnl()
+        if max_daily_loss > 0 and daily_pnl <= -max_daily_loss:
+            return {**result, "reason": f"Paper 24小时已实现亏损 {daily_pnl:.4f} 触达上限 {max_daily_loss:.4f}"}
+        stake = round(float(runtime_settings.get("paper_stake_dollars") or 0.0), 6)
+        account = self.market_paper_store.account()
+        if stake <= 0:
+            return {**result, "reason": "单笔预算无效"}
+        if float(account.get("cash_balance") or 0.0) + 0.000001 < stake:
+            return {**result, "reason": "Paper 隔离账户可用资金不足"}
+        market = _market_scout_market_round(candidate, outcome_index, now)
+        signal = Signal(
+            symbol=MARKET_SCOUT_SYMBOL,
+            side=outcome,
+            confidence=confidence,
+            entry_price=entry_price,
+            move_bps=0.0,
+            reason=_market_scout_order_reason(order_decision, probe_mode)[:900],
+        )
+        intent = TradeIntent(market=market, signal=signal, stake_dollars=stake)
+        execution_quote = dict(quote) if isinstance(quote, dict) else {}
+        if not execution_quote.get("best_ask"):
+            execution_quote["best_ask"] = entry_price
+        if not execution_quote.get("ask_size"):
+            execution_quote["ask_size"] = max(stake / max(entry_price, 0.01) * 1.2, stake)
+        execution = simulate_fak_buy(
+            intent,
+            execution_quote,
+            taker_fee_rate=self.settings.paper_taker_fee_rate,
+            limit_price=entry_price,
+        )
+        self.market_paper_store.upsert_round(market)
+        trade_ids = self.market_paper_store.place_execution_result(intent, execution)
+        order_id = None
+        recent = self.market_paper_store.recent_paper_orders(1, 0, MARKET_SCOUT_SYMBOL, "all")
+        if recent:
+            order_id = recent[0].get("id")
+        submitted = bool(trade_ids)
+        return {
+            **result,
+            "submitted": submitted,
+            "order_id": order_id,
+            "trade_ids": trade_ids,
+            "stake": stake,
+            "reason": execution.reason if submitted else f"执行模拟未成交: {execution.reason}",
+            "status": execution.status,
+        }
+
+    def _run_market_scout(self) -> None:
+        self._set_market_scout_status(
+            state="running",
+            message="Market Scout 已启动，准备扫描非 BTC 市场",
+            scanner_running=True,
+        )
+        self._append_market_llm_terminal_log(
+            level="info",
+            module="scanner",
+            event_type="scanner_start",
+            title="扫描器启动",
+            message="开始只读扫描非 BTC 活跃市场",
+            details=[
+                f"扫描数量上限: {self.settings.market_scout_scan_limit}",
+                f"LLM 分析候选数: {self._market_scout_runtime_settings.get('analyze_top_n')}",
+                f"LLM 模型: {self._market_scout_llm_model()}",
+                f"Evidence Scout: {'已启用' if self._market_scout_runtime_settings.get('evidence_enabled') else '已关闭'}",
+                f"Paper 自动下注: {'已启用' if self._market_scout_runtime_settings.get('paper_auto_enabled') else '已关闭'}",
+                f"Paper 探针: {'已启用' if self._market_scout_runtime_settings.get('paper_probe_enabled') else '已关闭'}",
+                f"Live 自动下注: 已锁定，{MARKET_SCOUT_LIVE_LOCKED_MESSAGE}",
+            ],
+        )
+        while not self._market_scout_stop.is_set():
+            try:
+                if self._market_scout_effective_scanner_enabled():
+                    self._run_market_scout_once()
+                else:
+                    self._set_market_scout_status(
+                        state="disabled",
+                        message="Market Scout 已通过市场页控制关闭",
+                        scanner_running=True,
+                    )
+            except Exception as exc:  # noqa: BLE001 - 扫描线程不能因为单轮失败退出。
+                now = time.time()
+                error = f"{type(exc).__name__}: {exc}"
+                self._set_market_scout_status(
+                    state="error",
+                    message="Market Scout 本轮扫描失败",
+                    scanner_running=True,
+                    last_error=error,
+                    last_scan_at=now,
+                )
+                self._append_market_llm_terminal_log(
+                    level="error",
+                    module="scanner",
+                    event_type="scan_error",
+                    title="扫描失败",
+                    message=error,
+                    now=now,
+                )
+            with self._lock:
+                interval = max(5.0, float(self._market_scout_runtime_settings.get("scan_interval_seconds") or self.settings.market_scout_interval_seconds))
+            self._market_scout_stop.wait(interval)
+        self._set_market_scout_status(
+            state="stopped",
+            message="Market Scout 已停止",
+            scanner_running=False,
+        )
+
+    def _run_market_scout_once(self) -> None:
+        now = time.time()
+        scan_limit = max(20, min(500, int(self.settings.market_scout_scan_limit)))
+        self._set_market_scout_status(
+            state="scanning",
+            message=f"正在扫描非 BTC 市场 limit={scan_limit}",
+            scanner_running=True,
+            last_error="",
+        )
+        rows = self.polymarket.get_active_markets(limit=scan_limit, order="volume24hr", ascending=False)
+        candidates: list[dict[str, Any]] = []
+        reject_counts: Counter[str] = Counter()
+        reject_examples: dict[str, str] = {}
+        for row in rows:
+            candidate = _market_scout_candidate_from_raw(row, now=now)
+            if candidate is None:
+                reject_counts["parse_failed"] += 1
+                continue
+            reject_reason = _market_scout_reject_reason(candidate, self.settings)
+            if reject_reason:
+                reject_counts[reject_reason] += 1
+                reject_examples.setdefault(reject_reason, str(candidate.get("question") or candidate.get("slug") or "")[:120])
+                continue
+            candidates.append(candidate)
+        candidates.sort(key=lambda item: _maybe_float(item.get("score")) or 0.0, reverse=True)
+        prepared_candidates = [
+            _market_scout_prepare_candidate_for_selection(candidate, base_rank=index)
+            for index, candidate in enumerate(candidates, start=1)
+        ]
+        prepared_candidates.sort(key=lambda item: _maybe_float(item.get("selection_score")) or 0.0, reverse=True)
+        with self._lock:
+            runtime_settings = dict(self._market_scout_runtime_settings)
+            top_n = max(1, min(20, int(runtime_settings.get("analyze_top_n") or self.settings.market_scout_analyze_top_n)))
+        display_candidates = prepared_candidates[:MARKET_SCOUT_DISPLAY_CANDIDATE_LIMIT]
+        llm_seed_candidates = _market_scout_select_llm_candidates(prepared_candidates, top_n)
+        llm_candidates = [self._market_scout_enrich_quotes(candidate) for candidate in llm_seed_candidates]
+        llm_candidates, evidence_report = self._market_scout_enrich_evidence(llm_candidates, runtime_settings, now)
+        llm_rank_by_slug = {str(candidate.get("slug") or ""): index for index, candidate in enumerate(llm_candidates, start=1)}
+        evidence_by_slug = {
+            str(candidate.get("slug") or ""): candidate.get("evidence")
+            for candidate in llm_candidates
+            if candidate.get("evidence")
+        }
+        display_candidates = [
+            _market_scout_attach_candidate_evidence(
+                _market_scout_mark_llm_selection(candidate, llm_rank_by_slug),
+                evidence_by_slug,
+            )
+            for candidate in display_candidates
+        ]
+        llm_candidates = [
+            _market_scout_mark_llm_selection(candidate, llm_rank_by_slug)
+            for candidate in llm_candidates
+        ]
+        self._set_market_scout_status(
+            state="scanned",
+            message=f"扫描完成，候选 {len(candidates)} 个，送 LLM {len(llm_candidates)} 个",
+            scanner_running=True,
+            last_scan_at=now,
+            candidate_count=len(candidates),
+            display_candidate_count=len(display_candidates),
+            llm_candidate_count=len(llm_candidates),
+            evidence=evidence_report,
+            rejected=dict(reject_counts),
+            top_candidates=[_market_scout_candidate_public(candidate) for candidate in display_candidates],
+            llm_candidates=[_market_scout_candidate_public(candidate) for candidate in llm_candidates],
+        )
+        self._append_market_llm_terminal_log(
+            level="pass" if llm_candidates else "warn",
+            module="scanner",
+            event_type="scan_complete",
+            title="候选扫描完成",
+            message=f"扫描 {len(rows)} 个市场，保留 {len(candidates)} 个候选，展示 {len(display_candidates)} 个，送 LLM {len(llm_candidates)} 个",
+            details=_market_scout_scan_details(display_candidates, reject_counts, reject_examples, llm_candidates=llm_candidates),
+            now=now,
+        )
+        if not llm_candidates:
+            return
+        self._maybe_analyze_market_scout_candidates(llm_candidates, now)
+
+    def _market_scout_enrich_evidence(
+        self,
+        candidates: list[dict[str, Any]],
+        runtime_settings: dict[str, Any],
+        now: float,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """在 LLM 前补充英文新闻证据；失败会写日志并保留原候选。"""
+
+        if not candidates:
+            return candidates, {
+                "enabled": bool(runtime_settings.get("evidence_enabled")),
+                "searched_count": 0,
+                "ok_count": 0,
+                "error_count": 0,
+                "no_result_count": 0,
+                "skipped_count": 0,
+                "details": [],
+            }
+        if runtime_settings.get("evidence_enabled", True):
+            self._set_market_scout_status(
+                state="evidence",
+                message=f"正在检索 Web 证据 {min(len(candidates), int(runtime_settings.get('evidence_max_markets') or 0))} 个市场",
+                scanner_running=True,
+            )
+        started = time.perf_counter()
+        enriched, report = self.market_evidence_scout.enrich_candidates(
+            candidates,
+            runtime_settings,
+            now=now,
+        )
+        report = dict(report)
+        report["elapsed_ms"] = round(_elapsed_ms(started), 3)
+        if report.get("enabled"):
+            self._append_market_llm_terminal_log(
+                level="pass" if int(report.get("ok_count") or 0) else "warn",
+                module="evidence",
+                event_type="evidence_search",
+                title="Web 证据检索完成",
+                message=(
+                    f"检索 {report.get('searched_count')} 个市场，"
+                    f"命中 {report.get('ok_count')} 个，空结果 {report.get('no_result_count')} 个，错误 {report.get('error_count')} 个"
+                ),
+                details=[
+                    f"搜索入口: {report.get('provider')}",
+                    f"耗时: {_format_optional_float(report.get('elapsed_ms'), 1)}ms",
+                    *[str(item) for item in list(report.get("details") or [])[:8]],
+                ],
+                now=now,
+            )
+        return enriched, report
+
+    def _market_scout_enrich_quotes(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(candidate)
+        outcomes = list(enriched.get("outcomes") or [])
+        token_ids = list(enriched.get("token_ids") or [])
+        quotes: dict[str, dict[str, Any]] = {}
+        for outcome, token_id in zip(outcomes, token_ids):
+            if not token_id:
+                continue
+            try:
+                quote = self.polymarket.get_quote(str(token_id), str(outcome)).to_dict()
+            except Exception as exc:  # noqa: BLE001 - 单个盘口失败只降低该候选质量。
+                quotes[str(outcome)] = {"error": f"{type(exc).__name__}: {exc}"}
+                continue
+            quotes[str(outcome)] = {
+                "best_bid": quote.get("best_bid"),
+                "best_ask": quote.get("best_ask"),
+                "bid_size": quote.get("bid_size"),
+                "ask_size": quote.get("ask_size"),
+                "spread": _spread_from_quote_payload(quote),
+                "updated_at_ms": quote.get("updated_at_ms"),
+            }
+        if quotes:
+            enriched["quotes"] = quotes
+        return enriched
+
+    def _maybe_analyze_market_scout_candidates(self, candidates: list[dict[str, Any]], now: float) -> None:
+        if not self._market_scout_runtime_llm_enabled():
+            self._set_market_scout_status(state="scanned", message="扫描完成，市场页 LLM 开关已关闭", scanner_running=True)
+            self._append_market_scout_llm_unavailable(now, "市场页 LLM 开关已关闭")
+            return
+        if not self.settings.llm_super_agent_enabled:
+            self._set_market_scout_status(state="scanned", message="扫描完成，LLM 配置已关闭", scanner_running=True)
+            self._append_market_scout_llm_unavailable(now, "LLM 配置已关闭")
+            return
+        if not self.settings.llm_super_agent_api_key:
+            self._set_market_scout_status(state="scanned", message="扫描完成，LLM API key 未配置", scanner_running=True)
+            self._append_market_scout_llm_unavailable(now, "LLM API key 未配置")
+            return
+        signature = _market_scout_candidate_signature(candidates)
+        if signature == self._market_scout_last_candidate_signature and now - self._market_scout_last_llm_at < self.settings.market_scout_llm_ttl_seconds:
+            self._set_market_scout_status(
+                state="scanned",
+                message="候选未变化，沿用上一轮 LLM 分析",
+                scanner_running=True,
+            )
+            return
+        self._set_market_scout_status(
+            state="analyzing",
+            message=f"正在调用 LLM 分析 {len(candidates)} 个候选",
+            scanner_running=True,
+        )
+        self._append_market_llm_terminal_log(
+            level="info",
+            module="llm",
+            event_type="llm_request",
+            title="LLM 分析开始",
+            message=f"发送 {len(candidates)} 个非 BTC 候选市场",
+            details=[
+                f"LLM 模型: {self._market_scout_llm_model()}",
+                *[_market_scout_candidate_line(candidate, index) for index, candidate in enumerate(candidates, start=1)],
+            ],
+            now=now,
+        )
+        started = time.perf_counter()
+        try:
+            raw = self._call_market_scout_llm(candidates, now)
+            decision = _normalize_market_scout_llm_decision(raw, candidates)
+        except Exception as exc:  # noqa: BLE001 - LLM 失败必须写日志，但不能停止扫描。
+            error = f"{type(exc).__name__}: {exc}"
+            self._set_market_scout_status(
+                state="error",
+                message="LLM 分析失败",
+                scanner_running=True,
+                last_error=error,
+                last_llm_at=time.time(),
+            )
+            self._append_market_llm_terminal_log(
+                level="error",
+                module="llm",
+                event_type="llm_error",
+                title="LLM 分析失败",
+                message=error,
+                details=["本轮不会产生推荐，也不会触发任何下单动作"],
+            )
+            return
+        elapsed_ms = _elapsed_ms(started)
+        self._market_scout_last_candidate_signature = signature
+        self._market_scout_last_llm_at = time.time()
+        selected_slug = str(decision.get("selected_slug") or "")
+        self._set_market_scout_status(
+            state="analyzed",
+            message=_market_scout_decision_status_message(decision),
+            scanner_running=True,
+            last_llm_at=self._market_scout_last_llm_at,
+            analyzed_slug=selected_slug,
+            last_decision=decision,
+        )
+        level = "pass" if decision.get("decision") == "RECOMMEND" and (_maybe_float(decision.get("confidence")) or 0.0) >= 0.7 else "info"
+        if decision.get("decision") == "RECOMMEND" and (_maybe_float(decision.get("confidence")) or 0.0) < 0.7:
+            level = "warn"
+        self._append_market_llm_terminal_log(
+            level=level,
+            module="llm",
+            event_type="llm_result",
+            title="LLM 分析结果",
+            message=_market_scout_decision_status_message(decision),
+            details=_market_scout_decision_details(decision, elapsed_ms),
+            code=json.dumps(decision.get("raw") or {}, ensure_ascii=False, indent=2)[:2_000],
+        )
+        self._maybe_execute_market_scout_paper_order(decision, candidates)
+
+    def _append_market_scout_llm_unavailable(self, now: float, reason: str) -> None:
+        if now - self._market_scout_last_no_key_log_at < 60.0:
+            return
+        self._market_scout_last_no_key_log_at = now
+        self._append_market_llm_terminal_log(
+            level="warn",
+            module="llm",
+            event_type="llm_unavailable",
+            title="LLM 分析未运行",
+            message=reason,
+            details=[
+                "候选扫描仍在运行",
+                "当前不会产生 LLM 推荐",
+                "自动下注执行: 当前没有 LLM 推荐可执行",
+            ],
+            now=now,
+        )
+
+    def _call_market_scout_llm(self, candidates: list[dict[str, Any]], now: float) -> dict[str, Any]:
+        base_url = self.settings.llm_super_agent_base_url.rstrip("/")
+        model = self._market_scout_llm_model()
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _market_scout_llm_system_prompt()},
+                {"role": "user", "content": _market_scout_llm_user_prompt(candidates, now)},
+            ],
+            "temperature": 0.1,
+        }
+        request = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=json.dumps(body, ensure_ascii=True).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.settings.llm_super_agent_api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        timeout = max(1.0, float(self.settings.market_scout_llm_timeout_seconds))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise RuntimeError("LLM 认证失败 HTTP 401，请检查 POLYBOT2OTHER_LLM_API_KEY 或 HAOAI_API_KEY") from exc
+            raise RuntimeError(f"LLM HTTP {exc.code}") from exc
+        content = _chat_completion_content(payload)
+        parsed = _extract_json_object(content)
+        parsed["_provider_usage"] = payload.get("usage") if isinstance(payload, dict) else None
+        return parsed
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            if self.btc_runtime_is_paused():
+                self._set_btc_runtime_paused_runtime_state(time.time())
+                self._stop.wait(self.settings.tick_seconds)
+                continue
             self.tick()
             self._stop.wait(self.settings.tick_seconds)
 
     def _run_market_data(self) -> None:
         while not self._stop.is_set():
+            if self.btc_runtime_is_paused():
+                self._set_btc_runtime_paused_runtime_state(time.time())
+                self._stop.wait(BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS)
+                continue
             self._refresh_backend_market_data_once()
             self._stop.wait(BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS)
 
     def _run_clob_ws(self) -> None:
+        if self.btc_runtime_is_paused():
+            return
         self.clob_ws_feed.run(
             self._stop,
             self._clob_ws_market,
@@ -572,13 +1766,17 @@ class PaperTradingBot:
         )
 
     def _run_rtds_chainlink_ws(self) -> None:
+        if self.btc_runtime_is_paused():
+            return
         self.rtds_chainlink_feed.run(
             self._stop,
-            self._ingest_backend_chainlink_price,
+            self._ingest_backend_rtds_price,
             self._set_backend_rtds_ws_status,
         )
 
     def _run_okx_spot_ws(self) -> None:
+        if self.btc_runtime_is_paused():
+            return
         self.okx_spot_ws_feed.run(
             self._stop,
             self._ingest_backend_spot_price,
@@ -586,6 +1784,8 @@ class PaperTradingBot:
         )
 
     def _run_binance_spot_ws(self) -> None:
+        if self.btc_runtime_is_paused():
+            return
         self.binance_spot_ws_feed.run(
             self._stop,
             self._ingest_backend_spot_price,
@@ -593,11 +1793,16 @@ class PaperTradingBot:
         )
 
     def _clob_ws_market(self) -> MarketRound | None:
+        if self.btc_runtime_is_paused():
+            return None
         with self._lock:
             return self.current_market
 
     def _refresh_backend_market_data_once(self) -> None:
         now = time.time()
+        if self.btc_runtime_is_paused():
+            self._set_btc_runtime_paused_runtime_state(now)
+            return
         try:
             with self._lock:
                 market = self.current_market
@@ -618,12 +1823,17 @@ class PaperTradingBot:
 
     def tick(self) -> None:
         now = time.time()
+        if self._btc_runtime_stop_requested():
+            return
         tick_started = time.perf_counter()
         profile: dict[str, Any] = {"started_at": now, "status": "ok"}
         try:
             step_started = time.perf_counter()
             market = self._refresh_market()
             profile["refresh_market_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             if market is None:
                 profile["status"] = "market_unavailable"
                 self._set_error("current_btc_5m_market_unavailable", now)
@@ -632,18 +1842,33 @@ class PaperTradingBot:
                 step_started = time.perf_counter()
                 self._backend_market_data_snapshot(market)
                 profile["backend_market_data_snapshot_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             step_started = time.perf_counter()
             self._settle_due(now)
             profile["settle_due_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             step_started = time.perf_counter()
             self._reconcile_official_settlements(now)
             profile["official_reconcile_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             step_started = time.perf_counter()
             self._backfill_official_final_prices(now)
             profile["official_backfill_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             step_started = time.perf_counter()
             self._run_strategy_from_state()
             profile["strategy_and_live_ms"] = _elapsed_ms(step_started)
+            if self._btc_runtime_stop_requested():
+                profile["status"] = "btc_runtime_paused"
+                return
             step_started = time.perf_counter()
             self.store.record_equity()
             if self.live_trading is not None:
@@ -662,6 +1887,8 @@ class PaperTradingBot:
 
     def ingest_live_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         now = time.time()
+        if self.btc_runtime_is_paused():
+            return self.btc_runtime_paused_snapshot_response()
         client_market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
         with self._lock:
             cached_market = self.current_market
@@ -755,6 +1982,10 @@ class PaperTradingBot:
         }
 
     def _refresh_market(self):
+        if self.btc_runtime_is_paused():
+            self._set_btc_runtime_paused_runtime_state(time.time())
+            with self._lock:
+                return self.current_market
         try:
             market = self.polymarket.find_current_btc_5m_market()
         except Exception:  # noqa: BLE001 - keep dashboard alive during short upstream failures.
@@ -800,6 +2031,9 @@ class PaperTradingBot:
         self._refresh_backend_prices(market)
 
     def _refresh_backend_quotes(self, market: MarketRound) -> None:
+        if self.btc_runtime_is_paused():
+            self._set_btc_runtime_paused_runtime_state(time.time())
+            return
         quotes = self.market_data_polymarket.get_quotes(market)
         now = time.time()
         backend_quotes = {side: quote.to_dict() for side, quote in quotes.items()}
@@ -814,6 +2048,9 @@ class PaperTradingBot:
             self._last_backend_quote_refresh_at = now
 
     def _refresh_backend_prices(self, market: MarketRound) -> None:
+        if self.btc_runtime_is_paused():
+            self._set_btc_runtime_paused_runtime_state(time.time())
+            return
         now = time.time()
         ticks = self.market_data_price_fallback.fetch_sources("BTC", now)
         fallback_tick = ticks.get("coinbase") or ticks.get("binance") or ticks.get("okx")
@@ -822,6 +2059,7 @@ class PaperTradingBot:
         now_ms = int(time.time() * 1000)
         with self._lock:
             price = dict(self.execution_price or self.paper_price or {})
+            price = self._merge_backend_chainlink_cache_locked(price, now_ms)
         price.update(
             {
                 "binance": ticks.get("binance").price if ticks.get("binance") else fallback_tick.price,
@@ -863,6 +2101,36 @@ class PaperTradingBot:
         with self._price_basis_lock:
             return self.price_basis_tracker.enrich(payload, now_ms)
 
+    def _merge_backend_chainlink_cache_locked(
+        self,
+        price: dict[str, Any],
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """把最近后端 Chainlink 缓存合并进价格负载；调用方必须已持有 bot 锁。"""
+
+        merged = dict(price)
+        existing_chainlink = _maybe_float(merged.get("chainlink"))
+        existing_updated_ms = _maybe_int(merged.get("chainlink_updated_ms"))
+        if existing_chainlink is not None and existing_chainlink > 0 and existing_updated_ms:
+            return merged
+        cached = dict(self._latest_backend_chainlink_price)
+        cached_chainlink = _maybe_float(cached.get("chainlink"))
+        cached_updated_ms = _maybe_int(cached.get("chainlink_updated_ms"))
+        if cached_chainlink is None or cached_chainlink <= 0 or not cached_updated_ms:
+            return merged
+        merged["chainlink"] = cached_chainlink
+        merged["chainlink_updated_ms"] = cached_updated_ms
+        if cached.get("source") and not merged.get("source"):
+            merged["source"] = cached["source"]
+        age_ms = max(0, (int(time.time() * 1000) if now_ms is None else int(now_ms)) - cached_updated_ms)
+        logger.debug(
+            "后端价格合并 Chainlink 缓存 chainlink=%s age_ms=%s source=%s",
+            cached_chainlink,
+            age_ms,
+            cached.get("source"),
+        )
+        return merged
+
     def _set_backend_rtds_ws_status(self, status: dict[str, Any]) -> None:
         state = str(status.get("state") or "unknown")
         with self._lock:
@@ -880,18 +2148,25 @@ class PaperTradingBot:
         price: dict[str, Any],
         status: dict[str, Any] | None = None,
     ) -> None:
+        if self.btc_runtime_is_paused():
+            return
         chainlink = _maybe_float(price.get("chainlink"))
         updated_ms = _maybe_int(price.get("chainlink_updated_ms"))
         if chainlink is None or chainlink <= 0 or not updated_ms:
             return
         now = time.time()
+        now_ms = int(now * 1000)
+        chainlink_payload = {
+            "chainlink": chainlink,
+            "chainlink_updated_ms": updated_ms,
+            "source": str(price.get("source") or "polymarket-rtds-chainlink"),
+        }
         with self._lock:
             market = self.current_market
-            merged = dict(self.execution_price or self.paper_price or {})
-        merged["chainlink"] = chainlink
-        merged["chainlink_updated_ms"] = updated_ms
-        merged["source"] = str(price.get("source") or "polymarket-rtds-chainlink")
-        enriched = self._backend_price_payload(market, merged, int(now * 1000))
+            self._latest_backend_chainlink_price = dict(chainlink_payload)
+            merged = self._merge_backend_chainlink_cache_locked(dict(self.execution_price or self.paper_price or {}), now_ms)
+        merged.update(chainlink_payload)
+        enriched = self._backend_price_payload(market, merged, now_ms)
         with self._lock:
             self.latest_price = dict(enriched)
             self.paper_price = dict(enriched)
@@ -902,6 +2177,36 @@ class PaperTradingBot:
             self.ws_status["backend_rtds_ws_at"] = _maybe_float((status or {}).get("at")) or now
             self.ws_status["backend_rtds_ws_topic"] = str((status or {}).get("topic") or "crypto_prices_chainlink")
             self.ws_status.pop("backend_rtds_ws_error", None)
+        logger.debug(
+            "后端 Chainlink 价格已缓存 chainlink=%s age_ms=%s source=%s",
+            chainlink,
+            max(0, now_ms - updated_ms),
+            chainlink_payload["source"],
+        )
+
+    def _ingest_backend_rtds_price(
+        self,
+        price: dict[str, Any],
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        """接收 Polymarket RTDS 价格；Chainlink 和 crypto spot 共用同一条连接。"""
+
+        if _maybe_float(price.get("chainlink")) is not None:
+            self._ingest_backend_chainlink_price(price, status)
+            return
+        if _maybe_float(price.get("binance_market")) is not None:
+            rtds_status = dict(status or {})
+            rtds_status.setdefault("state", "message")
+            rtds_status.setdefault("topic", "crypto_prices")
+            self._set_backend_rtds_ws_status(rtds_status)
+            spot_status = {
+                "source": SPOT_WS_SOURCE_BINANCE,
+                "state": str(rtds_status.get("state") or "message"),
+                "at": _maybe_float(rtds_status.get("at")) or time.time(),
+                "topic": str(rtds_status.get("topic") or "crypto_prices"),
+                "transport": "polymarket-rtds",
+            }
+            self._ingest_backend_spot_price(price, spot_status)
 
     def _ingest_backend_spot_price(
         self,
@@ -910,6 +2215,8 @@ class PaperTradingBot:
     ) -> None:
         """接收后端 OKX/Binance WS 现货价格；只更新后端行情作用域。"""
 
+        if self.btc_runtime_is_paused():
+            return
         okx = _maybe_float(price.get("okx"))
         binance = _maybe_float(price.get("binance_market"))
         if (okx is None or okx <= 0) and (binance is None or binance <= 0):
@@ -931,6 +2238,7 @@ class PaperTradingBot:
         with self._lock:
             market = self.current_market
             merged = dict(self.execution_price or self.paper_price or self.latest_price or {})
+            merged = self._merge_backend_chainlink_cache_locked(merged, now_ms)
         merged.update(merged_update)
         merged["source"] = (
             "backend-rtds-chainlink+spot-ws"
@@ -998,6 +2306,8 @@ class PaperTradingBot:
         quotes: dict[str, dict[str, Any]],
         status: dict[str, Any] | None = None,
     ) -> None:
+        if self.btc_runtime_is_paused():
+            return
         now = time.time()
         cleaned = _clean_quotes(quotes)
         if not cleaned:
@@ -1369,6 +2679,8 @@ class PaperTradingBot:
             )
 
     def _run_strategy_from_state(self) -> None:
+        if self._btc_runtime_stop_requested():
+            return
         with self._lock:
             market = self.current_market
             price, quotes, _source = self._paper_market_data_locked()
@@ -1387,10 +2699,14 @@ class PaperTradingBot:
             self._set_paper_paused_signal()
             if self.strategy_experiments is not None:
                 self.strategy_experiments.set_paper_trading_paused(True, cancel_active=True, now=now)
+            if self._btc_runtime_stop_requested():
+                return
             self._run_strategy_experiments(market, price, quotes)
             self._run_live_strategy(market, price, quotes)
             return
         self._manage_resting_orders(market, quotes)
+        if self._btc_runtime_stop_requested():
+            return
         if self.realtime_maker_enabled:
             self._run_realtime_maker_strategy_from_state(market, price, quotes)
             return
@@ -1399,6 +2715,8 @@ class PaperTradingBot:
             return
         if pair_enabled:
             self._run_pair_strategy_from_state(market, price, quotes)
+            if self._btc_runtime_stop_requested():
+                return
             self._run_strategy_experiments(market, price, quotes)
             self._run_live_strategy(market, price, quotes)
             return
@@ -1420,7 +2738,11 @@ class PaperTradingBot:
                 "move_bps": signal.move_bps,
                 "reason": signal.reason,
             }
+        if self._btc_runtime_stop_requested():
+            return
         trade_ids = self._maybe_place_trade(market, signal, quotes)
+        if self._btc_runtime_stop_requested():
+            return
         replay_event = "entry_fill" if trade_ids else "strategy_tick"
         self._record_aggressive_edge_loss_replay_sample(
             market,
@@ -1440,6 +2762,8 @@ class PaperTradingBot:
         price: dict[str, Any],
         quotes: dict[str, dict[str, Any]],
     ) -> None:
+        if self._btc_runtime_stop_requested():
+            return
         if self.strategy_experiments is None:
             return
         self.strategy_experiments.run_from_state(market, price, quotes)
@@ -1450,6 +2774,8 @@ class PaperTradingBot:
         price: dict[str, Any],
         quotes: dict[str, dict[str, Any]],
     ) -> None:
+        if self._btc_runtime_stop_requested():
+            return
         live_paper_runners = self._live_paper_runners()
         if self.live_trading is None and not live_paper_runners:
             return
@@ -1462,6 +2788,8 @@ class PaperTradingBot:
                 runner.last_error = f"live paper market data error {type(exc).__name__}: {exc}"
             return
         if self.live_trading is not None:
+            if self._btc_runtime_stop_requested():
+                return
             live_started = time.perf_counter()
             live_error = None
             try:
@@ -1479,6 +2807,8 @@ class PaperTradingBot:
                     error=live_error,
                 )
         for runner in live_paper_runners:
+            if self._btc_runtime_stop_requested():
+                return
             try:
                 with self._lock:
                     paper_paused = self.paper_trading_paused
@@ -4181,6 +5511,51 @@ class PaperTradingBot:
             self.last_error = message
             self.last_tick_at = now
 
+    def refresh_status_runtime_overlay(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """用当前内存行情覆盖过期 status cache，避免界面展示上一拍价格源诊断。"""
+
+        payload = dict(snapshot)
+        runtime = dict(payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {})
+        live_snapshot = dict(
+            runtime.get("live_trading") if isinstance(runtime.get("live_trading"), dict) else {}
+        )
+        with self._lock:
+            current_market = self.current_market
+            execution_price = dict(self.execution_price)
+            execution_quotes = _copy_quotes(self.execution_quotes)
+            btc_runtime = self._btc_runtime_payload_locked()
+            runtime.update(
+                {
+                    "last_error": self.last_error,
+                    "last_tick_at": self.last_tick_at,
+                    "last_signal": dict(self.last_signal or {}),
+                    "btc_runtime": btc_runtime,
+                    "current_market": market_to_payload(current_market),
+                    "latest_price": dict(self.latest_price),
+                    "latest_quotes": dict(self.latest_quotes),
+                    "paper_price": dict(self.paper_price),
+                    "paper_quotes": _copy_quotes(self.paper_quotes),
+                    "execution_price": execution_price,
+                    "execution_quotes": execution_quotes,
+                    "ws_status": dict(self.ws_status),
+                }
+            )
+        if self.live_trading is not None:
+            live_snapshot["last_signal"] = dict(self.live_trading.last_signal or {})
+            live_snapshot["last_error"] = self.live_trading.last_error
+            live_snapshot["gate_status"] = self.live_trading.gate_status(
+                current_market,
+                execution_price,
+                execution_quotes,
+                readiness=live_snapshot.get("readiness") if isinstance(live_snapshot.get("readiness"), dict) else None,
+                official_open_orders=(
+                    live_snapshot.get("open_orders") if isinstance(live_snapshot.get("open_orders"), dict) else None
+                ),
+            )
+            runtime["live_trading"] = live_snapshot
+        payload["runtime"] = runtime
+        return payload
+
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             live_runner = self.live_trading
@@ -4189,6 +5564,7 @@ class PaperTradingBot:
             current_market = self.current_market
             execution_price = dict(self.execution_price)
             execution_quotes = _copy_quotes(self.execution_quotes)
+            btc_runtime = self._btc_runtime_payload_locked()
             paper_pause_event = dict(self.last_paper_pause_event or {})
             paper_paused = bool(self.paper_trading_paused)
             runtime = {
@@ -4201,6 +5577,7 @@ class PaperTradingBot:
                     "updated_at": paper_pause_event.get("at"),
                     "event": paper_pause_event,
                 },
+                "btc_runtime": btc_runtime,
                 "last_error": self.last_error,
                 "last_tick_at": self.last_tick_at,
                 "last_signal": dict(self.last_signal or {}),
@@ -5145,6 +6522,161 @@ class PaperTradingBot:
                     item["exit_value"] = _round_money(exit_value)
                     item["unrealized_pnl"] = _round_money(unrealized_pnl)
                     item["unrealized_roi_pct"] = _roi_pct(unrealized_pnl, _maybe_float(row.get("stake")))
+            decorated.append(item)
+        return decorated
+
+    def _market_paper_order_quote(
+        self,
+        row: dict[str, Any],
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """读取市场页 Paper 持仓盘口；用短缓存降低页面轮询带来的 CLOB 请求量。"""
+
+        token_id = str(row.get("up_token") or "").strip()
+        side = str(row.get("side") or "").strip()
+        if not token_id or not side:
+            return None, "missing_token_or_side"
+        now = time.time()
+        cache_key = f"{token_id}:{side}"
+        cached = self._market_paper_quote_cache.get(cache_key)
+        if not force_refresh and cached and now - cached[0] <= 8.0:
+            return dict(cached[1]), "cache"
+        try:
+            quote = self.polymarket.get_quote(token_id, side).to_dict()
+        except Exception as exc:  # noqa: BLE001 - 列表估值失败不能影响市场页状态接口。
+            logger.debug(
+                "market paper quote failed round=%s side=%s token=%s error=%s",
+                row.get("round_id"),
+                side,
+                token_id,
+                exc,
+            )
+            return None, f"{type(exc).__name__}: {exc}"
+        self._market_paper_quote_cache[cache_key] = (now, dict(quote))
+        if len(self._market_paper_quote_cache) > 120:
+            expired_keys = [
+                key
+                for key, (cached_at, _payload) in self._market_paper_quote_cache.items()
+                if now - cached_at > 30.0
+            ]
+            for key in expired_keys:
+                self._market_paper_quote_cache.pop(key, None)
+        return dict(quote), "clob"
+
+    def _market_scout_order_link_payload(self, row: dict[str, Any]) -> dict[str, str]:
+        """为历史 Paper 订单补正 Polymarket 链接，统一走官方 market 跳转入口。"""
+
+        market_slug = str(row.get("round_id") or "").strip()
+        stored_event_slug = str(row.get("event_slug") or "").strip()
+        if not market_slug:
+            return {"event_slug": stored_event_slug, "url": str(row.get("url") or "")}
+        if stored_event_slug:
+            return {
+                "event_slug": stored_event_slug,
+                "url": _market_scout_polymarket_url(market_slug, stored_event_slug),
+            }
+        cached = self._market_scout_link_cache.get(market_slug)
+        if cached:
+            return dict(cached)
+        payload = {
+            "event_slug": "",
+            "url": _market_scout_polymarket_url(market_slug, ""),
+        }
+        try:
+            raw = self.polymarket.get_market_raw_by_slug(market_slug)
+        except Exception as exc:  # noqa: BLE001 - 链接兜底失败不能影响市场页状态接口。
+            logger.debug("market scout link lookup failed slug=%s error=%s", market_slug, exc)
+            raw = None
+        if isinstance(raw, dict):
+            event = _market_scout_first_event(raw)
+            event_slug = str(event.get("slug") or "").strip() if event else ""
+            payload = {
+                "event_slug": event_slug,
+                "url": _market_scout_polymarket_url(market_slug, event_slug),
+            }
+        self._market_scout_link_cache[market_slug] = payload
+        return dict(payload)
+
+    def _decorate_market_paper_orders(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        force_quote_refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """补齐市场页 Paper 订单的结算和未结算估值，前端无需再猜测交易输赢。"""
+
+        decorated: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            link_payload = self._market_scout_order_link_payload(item)
+            item["event_slug"] = link_payload.get("event_slug") or item.get("event_slug") or ""
+            item["url"] = link_payload.get("url") or item.get("url") or ""
+            trade_status = str(item.get("trade_status") or "").upper()
+            trade_id = item.get("trade_id")
+            settled_at = _maybe_float(item.get("trade_settled_at"))
+            pnl = _maybe_float(item.get("trade_pnl"))
+            payout = _maybe_float(item.get("trade_payout"))
+            spent = _maybe_float(item.get("cash_spent"))
+            requested = _maybe_float(item.get("requested_cash"))
+            trade_stake = _maybe_float(item.get("trade_stake"))
+            shares = _maybe_float(item.get("trade_shares")) or _maybe_float(item.get("filled_shares"))
+            stake_basis = trade_stake if trade_stake and trade_stake > 0 else spent if spent and spent > 0 else requested
+
+            item["settled_at"] = settled_at
+            item["payout"] = _round_money(payout)
+            item["net_pnl"] = _round_money(pnl) if settled_at is not None or trade_status == "SETTLED" else None
+            item["roi_pct"] = _roi_pct(pnl, stake_basis) if item["net_pnl"] is not None else None
+            item["settlement_source"] = item.get("trade_settlement_source")
+            item["max_payout"] = _round_money(shares)
+            item["max_profit"] = _round_money((shares or 0.0) - (stake_basis or 0.0)) if shares is not None and stake_basis is not None else None
+            item["max_loss"] = _round_money(stake_basis)
+            item["current_bid"] = None
+            item["current_ask"] = None
+            item["exit_value"] = None
+            item["unrealized_pnl"] = None
+            item["unrealized_roi_pct"] = None
+            item["valuation_source"] = ""
+            item["valuation_error"] = ""
+            item["quote_refresh_forced"] = force_quote_refresh
+
+            if trade_id and item["net_pnl"] is None and shares and shares > 0 and stake_basis and stake_basis > 0:
+                quote, quote_source = self._market_paper_order_quote(item, force_refresh=force_quote_refresh)
+                item["valuation_source"] = quote_source
+                if quote:
+                    bid = _maybe_float(quote.get("best_bid"))
+                    ask = _maybe_float(quote.get("best_ask"))
+                    item["current_bid"] = _round_float(bid, 4)
+                    item["current_ask"] = _round_float(ask, 4)
+                    if bid is not None and bid > 0:
+                        exit_value = shares * bid
+                        unrealized_pnl = exit_value - stake_basis
+                        item["exit_value"] = _round_money(exit_value)
+                        item["unrealized_pnl"] = _round_money(unrealized_pnl)
+                        item["unrealized_roi_pct"] = _roi_pct(unrealized_pnl, stake_basis)
+                    else:
+                        item["valuation_error"] = "缺少当前买一价"
+                else:
+                    item["valuation_error"] = quote_source
+
+            if not trade_id:
+                result = "NO_POSITION"
+                label = "无持仓"
+            elif item["net_pnl"] is None:
+                result = "OPEN"
+                label = "未结算"
+            elif item["net_pnl"] > 0:
+                result = "WIN"
+                label = "赢"
+            elif item["net_pnl"] < 0:
+                result = "LOSS"
+                label = "输"
+            else:
+                result = "FLAT"
+                label = "走平"
+
+            item["settlement_result"] = result
+            item["settlement_result_label"] = label
             decorated.append(item)
         return decorated
 
@@ -6947,6 +8479,1174 @@ def _sanitize_live_audit_payload(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_sanitize_live_audit_payload(item) for item in value]
     return value
+
+
+def _default_market_scout_runtime_settings(settings: Settings, *, now: float) -> dict[str, Any]:
+    """市场页运行配置默认值；页面配置优先，环境变量提供首次启动默认值。"""
+
+    return {
+        "scanner_enabled": bool(settings.market_scout_enabled),
+        "llm_enabled": bool(settings.llm_super_agent_enabled),
+        "llm_model": _sanitize_market_scout_model(settings.llm_super_agent_model, "openai/gpt-5.4-mini"),
+        "paper_auto_enabled": False,
+        "live_auto_enabled": False,
+        "paper_initial_balance": round(float(settings.market_scout_default_paper_initial_balance), 2),
+        "paper_stake_dollars": round(float(settings.market_scout_default_paper_stake_dollars), 2),
+        "paper_max_open_positions": int(settings.market_scout_default_paper_max_open_positions),
+        "paper_probe_enabled": bool(settings.market_scout_default_paper_probe_enabled),
+        "paper_probe_max_open_positions": int(settings.market_scout_default_paper_probe_max_open_positions),
+        "paper_probe_min_confidence": round(float(settings.market_scout_default_paper_probe_min_confidence), 4),
+        "paper_probe_min_selection_score": round(float(settings.market_scout_default_paper_probe_min_selection_score), 3),
+        "paper_max_daily_loss": round(float(settings.market_scout_default_paper_max_daily_loss), 2),
+        "min_confidence": round(float(settings.market_scout_default_paper_min_confidence), 4),
+        "max_entry_price": round(float(settings.market_scout_default_paper_max_entry_price), 4),
+        "max_spread": round(float(settings.market_scout_default_paper_max_spread), 4),
+        "scan_interval_seconds": round(float(settings.market_scout_interval_seconds), 3),
+        "analyze_top_n": int(settings.market_scout_analyze_top_n),
+        "evidence_enabled": bool(settings.market_scout_evidence_enabled),
+        "evidence_max_markets": int(settings.market_scout_evidence_max_markets),
+        "evidence_results_per_market": int(settings.market_scout_evidence_results_per_market),
+        "evidence_timeout_seconds": round(float(settings.market_scout_evidence_timeout_seconds), 3),
+        "evidence_ttl_seconds": round(float(settings.market_scout_evidence_ttl_seconds), 3),
+        "updated_at": now,
+    }
+
+
+def _sanitize_market_scout_runtime_settings(
+    payload: dict[str, Any],
+    current: dict[str, Any],
+    settings: Settings,
+    *,
+    now: float,
+) -> dict[str, Any]:
+    """清洗市场页配置，避免页面输入异常值破坏运行态。"""
+
+    base = _default_market_scout_runtime_settings(settings, now=now)
+    base.update({key: current.get(key, value) for key, value in base.items() if key in current})
+    if "scanner_enabled" in payload:
+        base["scanner_enabled"] = _market_scout_bool(payload.get("scanner_enabled"), bool(base["scanner_enabled"]))
+    if "llm_enabled" in payload:
+        base["llm_enabled"] = _market_scout_bool(payload.get("llm_enabled"), bool(base["llm_enabled"]))
+    if "llm_model" in payload:
+        base["llm_model"] = _sanitize_market_scout_model(payload.get("llm_model"), settings.llm_super_agent_model)
+    else:
+        base["llm_model"] = _sanitize_market_scout_model(base.get("llm_model"), settings.llm_super_agent_model)
+    if "evidence_enabled" in payload:
+        base["evidence_enabled"] = _market_scout_bool(payload.get("evidence_enabled"), bool(base["evidence_enabled"]))
+    if "paper_auto_enabled" in payload:
+        base["paper_auto_enabled"] = _market_scout_bool(payload.get("paper_auto_enabled"), bool(base["paper_auto_enabled"]))
+    if "paper_probe_enabled" in payload:
+        base["paper_probe_enabled"] = _market_scout_bool(payload.get("paper_probe_enabled"), bool(base["paper_probe_enabled"]))
+    # 市场页实盘自动下注这版强制锁定，防止误把 LLM 推荐接到真钱接口。
+    base["live_auto_enabled"] = False
+    base["paper_initial_balance"] = _bounded_market_scout_float(
+        payload.get("paper_initial_balance", base["paper_initial_balance"]),
+        base["paper_initial_balance"],
+        minimum=1.0,
+        maximum=1_000_000.0,
+        digits=2,
+    )
+    base["paper_stake_dollars"] = _bounded_market_scout_float(
+        payload.get("paper_stake_dollars", base["paper_stake_dollars"]),
+        base["paper_stake_dollars"],
+        minimum=0.1,
+        maximum=10_000.0,
+        digits=2,
+    )
+    base["paper_max_open_positions"] = _bounded_market_scout_int(
+        payload.get("paper_max_open_positions", base["paper_max_open_positions"]),
+        int(base["paper_max_open_positions"]),
+        minimum=1,
+        maximum=50,
+    )
+    base["paper_probe_max_open_positions"] = _bounded_market_scout_int(
+        payload.get("paper_probe_max_open_positions", base["paper_probe_max_open_positions"]),
+        int(base["paper_probe_max_open_positions"]),
+        minimum=1,
+        maximum=10,
+    )
+    base["paper_probe_min_confidence"] = _bounded_market_scout_float(
+        payload.get("paper_probe_min_confidence", base["paper_probe_min_confidence"]),
+        base["paper_probe_min_confidence"],
+        minimum=0.0,
+        maximum=1.0,
+        digits=4,
+    )
+    base["paper_probe_min_selection_score"] = _bounded_market_scout_float(
+        payload.get("paper_probe_min_selection_score", base["paper_probe_min_selection_score"]),
+        base["paper_probe_min_selection_score"],
+        minimum=0.0,
+        maximum=100.0,
+        digits=3,
+    )
+    base["paper_max_daily_loss"] = _bounded_market_scout_float(
+        payload.get("paper_max_daily_loss", base["paper_max_daily_loss"]),
+        base["paper_max_daily_loss"],
+        minimum=0.0,
+        maximum=1_000_000.0,
+        digits=2,
+    )
+    base["min_confidence"] = _bounded_market_scout_float(
+        payload.get("min_confidence", base["min_confidence"]),
+        base["min_confidence"],
+        minimum=0.0,
+        maximum=1.0,
+        digits=4,
+    )
+    base["max_entry_price"] = _bounded_market_scout_float(
+        payload.get("max_entry_price", base["max_entry_price"]),
+        base["max_entry_price"],
+        minimum=0.01,
+        maximum=0.99,
+        digits=4,
+    )
+    base["max_spread"] = _bounded_market_scout_float(
+        payload.get("max_spread", base["max_spread"]),
+        base["max_spread"],
+        minimum=0.0,
+        maximum=0.99,
+        digits=4,
+    )
+    base["scan_interval_seconds"] = _bounded_market_scout_float(
+        payload.get("scan_interval_seconds", base["scan_interval_seconds"]),
+        base["scan_interval_seconds"],
+        minimum=5.0,
+        maximum=3600.0,
+        digits=3,
+    )
+    base["analyze_top_n"] = _bounded_market_scout_int(
+        payload.get("analyze_top_n", base["analyze_top_n"]),
+        int(base["analyze_top_n"]),
+        minimum=1,
+        maximum=20,
+    )
+    base["evidence_max_markets"] = _bounded_market_scout_int(
+        payload.get("evidence_max_markets", base["evidence_max_markets"]),
+        int(base["evidence_max_markets"]),
+        minimum=0,
+        maximum=20,
+    )
+    base["evidence_results_per_market"] = _bounded_market_scout_int(
+        payload.get("evidence_results_per_market", base["evidence_results_per_market"]),
+        int(base["evidence_results_per_market"]),
+        minimum=1,
+        maximum=8,
+    )
+    base["evidence_timeout_seconds"] = _bounded_market_scout_float(
+        payload.get("evidence_timeout_seconds", base["evidence_timeout_seconds"]),
+        base["evidence_timeout_seconds"],
+        minimum=1.0,
+        maximum=30.0,
+        digits=3,
+    )
+    base["evidence_ttl_seconds"] = _bounded_market_scout_float(
+        payload.get("evidence_ttl_seconds", base["evidence_ttl_seconds"]),
+        base["evidence_ttl_seconds"],
+        minimum=30.0,
+        maximum=86_400.0,
+        digits=3,
+    )
+    base["updated_at"] = now
+    return base
+
+
+def _sanitize_market_scout_model(value: Any, default: str) -> str:
+    """清洗页面输入的模型名，空值回退环境变量，避免空模型请求 LLM。"""
+
+    fallback = str(default or "openai/gpt-5.4-mini").strip() or "openai/gpt-5.4-mini"
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    text = " ".join(text.split())
+    if any(ch.isspace() for ch in text):
+        return fallback
+    return text[:120]
+
+
+def _market_scout_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _bounded_market_scout_float(
+    value: Any,
+    default: Any,
+    *,
+    minimum: float,
+    maximum: float,
+    digits: int,
+) -> float:
+    parsed = _maybe_float(value)
+    if parsed is None:
+        parsed = _maybe_float(default)
+    if parsed is None:
+        parsed = minimum
+    parsed = max(float(minimum), min(float(maximum), float(parsed)))
+    return round(parsed, int(digits))
+
+
+def _bounded_market_scout_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    parsed = _maybe_int(value)
+    if parsed is None:
+        parsed = int(default)
+    return max(int(minimum), min(int(maximum), int(parsed)))
+
+
+def _market_scout_outcome_index(candidate: dict[str, Any], outcome: str) -> int:
+    normalized = str(outcome or "").strip().lower()
+    for index, item in enumerate(candidate.get("outcomes") or []):
+        if str(item or "").strip().lower() == normalized:
+            return index
+    return -1
+
+
+def _market_scout_outcome_quote(candidate: dict[str, Any], outcome: str) -> dict[str, Any]:
+    quotes = candidate.get("quotes")
+    if not isinstance(quotes, dict):
+        return {}
+    direct = quotes.get(outcome)
+    if isinstance(direct, dict):
+        return dict(direct)
+    normalized = str(outcome or "").strip().lower()
+    for key, value in quotes.items():
+        if str(key or "").strip().lower() == normalized and isinstance(value, dict):
+            return dict(value)
+    return {}
+
+
+def _market_scout_entry_price(
+    candidate: dict[str, Any],
+    outcome_index: int,
+    quote: dict[str, Any],
+) -> float | None:
+    ask = _maybe_float(quote.get("best_ask")) if isinstance(quote, dict) else None
+    if ask is not None and 0.0 < ask < 1.0:
+        return round(ask, 4)
+    prices = candidate.get("outcome_prices") if isinstance(candidate.get("outcome_prices"), list) else []
+    if 0 <= outcome_index < len(prices):
+        price = _maybe_float(prices[outcome_index])
+        if price is not None and 0.0 < price < 1.0:
+            return round(price, 4)
+    return None
+
+
+def _market_scout_compact_key(value: Any, limit: int = 72) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    safe_limit = max(12, int(limit))
+    return text if len(text) <= safe_limit else f"{text[: safe_limit - 3]}..."
+
+
+def _market_scout_candidate_log_name(candidate: dict[str, Any]) -> str:
+    return _market_scout_compact_key(candidate.get("question") or candidate.get("slug") or "-", 96)
+
+
+def _market_scout_candidate_exposure_block(
+    candidate: dict[str, Any],
+    exposure_context: dict[str, Any] | None,
+) -> str:
+    """识别候选是否已经有同市场或同事件族 Paper 暴露。"""
+
+    if not exposure_context:
+        return ""
+    slug = str(candidate.get("slug") or "").strip()
+    if slug and slug in set(exposure_context.get("open_slugs") or set()):
+        return f"该市场已有 Paper 持仓 slug={slug}"
+    event_key = str(candidate.get("event_key") or _market_scout_event_key(candidate)).strip().lower()
+    source_event_key = str(candidate.get("source_event_key") or _market_scout_source_event_key(candidate)).strip().lower()
+    open_event_keys = set(exposure_context.get("open_event_keys") or set())
+    open_source_event_keys = set(exposure_context.get("open_source_event_keys") or set())
+    if event_key and event_key in open_event_keys:
+        return f"同事件族已有 Paper 持仓 event={_market_scout_compact_key(event_key)}"
+    if source_event_key and source_event_key in open_source_event_keys:
+        return f"同源事件已有 Paper 持仓 event={_market_scout_compact_key(source_event_key)}"
+    return ""
+
+
+def _market_scout_build_probe_decision(
+    decision: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    runtime_settings: dict[str, Any],
+    *,
+    exposure_context: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str, list[str]]:
+    """LLM 给出 NO_TRADE 时构造小额 Paper 探针决策，只用于采样复盘。"""
+
+    if not runtime_settings.get("paper_probe_enabled"):
+        return None, "LLM 未给出 RECOMMEND，Paper 探针关闭", []
+    if not candidates:
+        return None, "LLM 未给出 RECOMMEND，探针没有候选市场", []
+    max_entry = float(runtime_settings.get("max_entry_price") or 0.99)
+    max_spread = float(runtime_settings.get("max_spread") or 1.0)
+    min_score = float(runtime_settings.get("paper_probe_min_selection_score") or 0.0)
+    min_confidence = float(runtime_settings.get("paper_probe_min_confidence") or 0.0)
+    rejection_samples: list[str] = []
+    for candidate in candidates:
+        candidate_name = _market_scout_candidate_log_name(candidate)
+        exposure_block = _market_scout_candidate_exposure_block(candidate, exposure_context)
+        if exposure_block:
+            rejection_samples.append(f"{candidate_name}: {exposure_block}")
+            continue
+        score = _maybe_float(candidate.get("selection_score")) or 0.0
+        if score < min_score:
+            rejection_samples.append(f"{candidate_name}: 分数 {score:.3f} 低于 {min_score:.3f}")
+            continue
+        choice = _market_scout_probe_outcome(candidate, decision, max_entry=max_entry, max_spread=max_spread)
+        if choice is None:
+            rejection_samples.append(f"{candidate_name}: 无可执行方向")
+            continue
+        outcome, entry_price, spread = choice
+        probe_confidence = _market_scout_probe_confidence(candidate, entry_price, spread, min_score)
+        if probe_confidence < min_confidence:
+            rejection_samples.append(f"{candidate_name}: 探针置信度 {probe_confidence:.4f} 低于 {min_confidence:.4f}")
+            continue
+        reason = str(decision.get("reason") or "").strip()
+        return {
+            "decision": "RECOMMEND",
+            "selected_slug": candidate.get("slug") or "",
+            "question": candidate.get("question"),
+            "url": candidate.get("url"),
+            "outcome": outcome,
+            "confidence": probe_confidence,
+            "max_entry_price": min(max_entry, entry_price),
+            "reason": (
+                f"MARKET_SCOUT_PROBE Paper 探针放行。"
+                f"LLM 原始决策={decision.get('decision') or 'NO_TRADE'}，"
+                f"本地候选分={score:.3f}，价差={_format_optional_float(spread, 4)}，"
+                f"原始理由={reason[:500]}"
+            ),
+            "risk_flags": list(decision.get("risk_flags") or [])[:8] + ["paper_probe_sample"],
+            "news_checks_needed": list(decision.get("news_checks_needed") or [])[:8],
+            "valid_for_seconds": decision.get("valid_for_seconds") or 60,
+            "probe_reason": f"LLM NO_TRADE 探针放行，候选分 {score:.3f}",
+            "probe_skip_reasons": rejection_samples[:MARKET_SCOUT_ORDER_SKIP_LOG_LIMIT],
+            "raw": decision.get("raw") or {},
+        }, "", rejection_samples
+    suffix = "; ".join(rejection_samples[:3])
+    return None, f"LLM 未给出 RECOMMEND，探针未满足阈值{': ' + suffix if suffix else ''}", rejection_samples
+
+
+def _market_scout_probe_outcome(
+    candidate: dict[str, Any],
+    decision: dict[str, Any],
+    *,
+    max_entry: float,
+    max_spread: float,
+) -> tuple[str, float, float | None] | None:
+    outcomes = [str(item) for item in (candidate.get("outcomes") or []) if str(item or "").strip()]
+    if not outcomes:
+        return None
+    hinted = _market_scout_probe_hinted_outcomes(candidate, decision, outcomes)
+    ordered_outcomes = hinted + [outcome for outcome in outcomes if outcome not in hinted]
+    choices: list[tuple[int, float, str, float, float | None]] = []
+    for outcome in ordered_outcomes:
+        outcome_index = _market_scout_outcome_index(candidate, outcome)
+        if outcome_index < 0:
+            continue
+        quote = _market_scout_outcome_quote(candidate, outcome)
+        entry_price = _market_scout_entry_price(candidate, outcome_index, quote)
+        if entry_price is None or entry_price > max_entry + 0.000001 or entry_price < 0.03:
+            continue
+        spread = _maybe_float(quote.get("spread")) if isinstance(quote, dict) else _maybe_float(candidate.get("spread"))
+        if spread is not None and spread > max_spread:
+            continue
+        hinted_rank = 0 if outcome in hinted else 1
+        choices.append((hinted_rank, entry_price, outcome, entry_price, spread))
+    if not choices:
+        return None
+    choices.sort(key=lambda item: (item[0], item[1]))
+    _, _, outcome, entry_price, spread = choices[0]
+    return outcome, entry_price, spread
+
+
+def _market_scout_probe_hinted_outcomes(
+    candidate: dict[str, Any],
+    decision: dict[str, Any],
+    outcomes: list[str],
+) -> list[str]:
+    reason = str(decision.get("reason") or "").lower()
+    if not reason:
+        return []
+    question = str(candidate.get("question") or "").lower()
+    slug = str(candidate.get("slug") or "").lower()
+    compact_question = re.sub(r"[^a-z0-9]+", " ", question).strip()
+    probe_texts = [text for text in (question, slug, compact_question) if text]
+    mentioned = any(text in reason for text in probe_texts)
+    if not mentioned:
+        words = compact_question.split()
+        mentioned = len(words) >= 5 and " ".join(words[:5]) in reason
+    if not mentioned:
+        return []
+    hinted: list[str] = []
+    for outcome in outcomes:
+        normalized = str(outcome or "").strip().lower()
+        if normalized and re.search(rf"\b{re.escape(normalized)}\b", reason):
+            hinted.append(outcome)
+    return hinted
+
+
+def _market_scout_probe_confidence(
+    candidate: dict[str, Any],
+    entry_price: float,
+    spread: float | None,
+    min_score: float,
+) -> float:
+    score = _maybe_float(candidate.get("selection_score")) or 0.0
+    score_lift = max(0.0, score - min_score) * 0.018
+    spread_penalty = max(0.0, spread or 0.0) * 1.2
+    price_penalty = max(0.0, entry_price - 0.35) * 0.18
+    confidence = 0.55 + score_lift - spread_penalty - price_penalty
+    return round(max(0.0, min(0.68, confidence)), 4)
+
+
+def _market_scout_order_reason(decision: dict[str, Any], probe_mode: bool) -> str:
+    if probe_mode:
+        return f"MARKET_SCOUT_PROBE Paper 探针放行 | {decision.get('reason') or ''}"
+    return f"MARKET_SCOUT_LLM Paper 自动下注 | {decision.get('reason') or ''}"
+
+
+def _market_scout_polymarket_url(market_slug: str, event_slug: str | None = "") -> str:
+    """生成 Polymarket 官方页面链接；market 入口会重定向到当前 canonical 事件页。"""
+
+    market = str(market_slug or "").strip().strip("/")
+    if not market:
+        return ""
+    return f"https://polymarket.com/market/{market}"
+
+
+def _market_scout_market_round(candidate: dict[str, Any], outcome_index: int, now: float) -> MarketRound:
+    token_ids = list(candidate.get("token_ids") or [])
+    selected_token = str(token_ids[outcome_index]) if 0 <= outcome_index < len(token_ids) else ""
+    other_token = ""
+    for index, token_id in enumerate(token_ids):
+        if index != outcome_index:
+            other_token = str(token_id or "")
+            break
+    ends_at = _maybe_float(candidate.get("end_ts")) or now + 3600.0
+    return MarketRound(
+        round_id=str(candidate.get("slug") or ""),
+        symbol=MARKET_SCOUT_SYMBOL,
+        started_at=now,
+        ends_at=max(now + 1.0, float(ends_at)),
+        target_price=0.0,
+        question=str(candidate.get("question") or ""),
+        condition_id=str(candidate.get("condition_id") or ""),
+        up_token=selected_token,
+        down_token=other_token,
+        event_slug=str(candidate.get("event_slug") or ""),
+        url=str(candidate.get("url") or ""),
+    )
+
+
+def _market_scout_candidate_from_raw(raw: dict[str, Any], *, now: float) -> dict[str, Any] | None:
+    slug = str(raw.get("slug") or "").strip()
+    question = str(raw.get("question") or "").strip()
+    if not slug or not question:
+        return None
+    event = _market_scout_first_event(raw)
+    event_title = str(event.get("title") or event.get("slug") or "").strip() if event else ""
+    event_slug = str(event.get("slug") or "").strip() if event else ""
+    event_metadata = event.get("eventMetadata") if isinstance(event.get("eventMetadata"), dict) else {}
+    context_description = str(event_metadata.get("context_description") or "").strip() if event_metadata else ""
+    base_description = str(raw.get("description") or (event.get("description") if event else "") or "").strip()
+    description = _market_scout_join_description(base_description, context_description)
+    outcomes = [str(item) for item in _jsonish_list_value(raw.get("outcomes"))]
+    token_ids = [str(item) for item in _jsonish_list_value(raw.get("clobTokenIds"))]
+    outcome_prices = [_maybe_float(item) for item in _jsonish_list_value(raw.get("outcomePrices"))]
+    liquidity = _first_float(raw, ("liquidityNum", "liquidityClob", "liquidity"))
+    volume_24h = _first_float(raw, ("volume24hr", "volume24hrClob"))
+    volume = _first_float(raw, ("volumeNum", "volumeClob", "volume"))
+    spread = _maybe_float(raw.get("spread"))
+    best_bid = _maybe_float(raw.get("bestBid"))
+    best_ask = _maybe_float(raw.get("bestAsk"))
+    if spread is None and best_bid is not None and best_ask is not None:
+        spread = max(0.0, best_ask - best_bid)
+    end_ts = _parse_market_scout_ts(raw.get("endDateIso") or raw.get("endDate"))
+    score = _market_scout_candidate_score(
+        liquidity=liquidity,
+        volume_24h=volume_24h,
+        spread=spread,
+        outcome_prices=outcome_prices,
+    )
+    return {
+        "slug": slug,
+        "question": question,
+        "event_title": event_title,
+        "event_slug": event_slug,
+        "description": description[:1600],
+        "event_context": context_description[:1200],
+        "category": str(raw.get("category") or event.get("category") or "").strip() if event else str(raw.get("category") or "").strip(),
+        "tags": _market_scout_tag_names(raw, event),
+        "url": _market_scout_polymarket_url(slug, event_slug),
+        "condition_id": str(raw.get("conditionId") or ""),
+        "outcomes": outcomes,
+        "token_ids": token_ids,
+        "outcome_prices": outcome_prices,
+        "liquidity": liquidity,
+        "volume_24h": volume_24h,
+        "volume": volume,
+        "spread": spread,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "last_trade_price": _maybe_float(raw.get("lastTradePrice")),
+        "one_day_price_change": _maybe_float(raw.get("oneDayPriceChange")),
+        "end_ts": end_ts,
+        "seconds_to_end": max(0.0, end_ts - now) if end_ts else None,
+        "active": _truthy_value(raw.get("active")),
+        "closed": _truthy_value(raw.get("closed")),
+        "archived": _truthy_value(raw.get("archived")),
+        "accepting_orders": _truthy_value(raw.get("acceptingOrders")),
+        "enable_order_book": _truthy_value(raw.get("enableOrderBook")),
+        "restricted": _truthy_value(raw.get("restricted")),
+        "score": score,
+    }
+
+
+def _market_scout_reject_reason(candidate: dict[str, Any], settings: Settings) -> str:
+    text = " ".join(
+        str(candidate.get(key) or "")
+        for key in ("slug", "question", "event_title", "description")
+    ).lower()
+    if "btc" in text or "bitcoin" in text:
+        return "btc_market"
+    if not candidate.get("active") or candidate.get("closed") or candidate.get("archived"):
+        return "inactive"
+    if not candidate.get("accepting_orders") or not candidate.get("enable_order_book"):
+        return "orders_closed"
+    outcomes = list(candidate.get("outcomes") or [])
+    token_ids = list(candidate.get("token_ids") or [])
+    if len(outcomes) != 2 or len(token_ids) != 2:
+        return "non_binary"
+    prices = [_maybe_float(item) for item in (candidate.get("outcome_prices") or [])]
+    valid_prices = [price for price in prices if price is not None]
+    if len(valid_prices) < 2:
+        return "missing_prices"
+    if max(valid_prices) >= 0.97 or min(valid_prices) <= 0.03:
+        return "resolved_or_extreme_price"
+    liquidity = _maybe_float(candidate.get("liquidity")) or 0.0
+    if liquidity < settings.market_scout_min_liquidity:
+        return "low_liquidity"
+    volume_24h = _maybe_float(candidate.get("volume_24h")) or 0.0
+    if volume_24h < settings.market_scout_min_volume_24h:
+        return "low_volume_24h"
+    spread = _maybe_float(candidate.get("spread"))
+    if spread is not None and spread > 0.08:
+        return "wide_spread"
+    return ""
+
+
+def _market_scout_prepare_candidate_for_selection(candidate: dict[str, Any], *, base_rank: int) -> dict[str, Any]:
+    """生成 Market Scout 候选画像；用于页面展示和 LLM 输入前的多样化筛选。"""
+
+    prepared = dict(candidate)
+    profile = _market_scout_selection_profile(prepared)
+    base_score = _maybe_float(prepared.get("score")) or 0.0
+    selection_score = round(base_score + float(profile["score_delta"]), 6)
+    prepared.update(
+        {
+            "base_rank": int(base_rank),
+            "selection_score": selection_score,
+            "selection_bucket": profile["bucket"],
+            "selection_notes": profile["notes"],
+            "llm_block_reason": profile["block_reason"],
+            "event_key": _market_scout_event_key(prepared),
+            "source_event_key": _market_scout_source_event_key(prepared),
+            "llm_selected": False,
+            "llm_rank": None,
+        }
+    )
+    return prepared
+
+
+def _market_scout_selection_profile(candidate: dict[str, Any]) -> dict[str, Any]:
+    text = _market_scout_candidate_text(candidate)
+    seconds_to_end = _maybe_float(candidate.get("seconds_to_end"))
+    score_delta = 0.0
+    notes: list[str] = []
+    bucket = "general"
+    block_reason = ""
+
+    is_sports = _market_scout_is_sports_market(text)
+    raw_event_driven = _market_scout_is_event_driven_market(text)
+    is_event_driven = raw_event_driven and not is_sports
+    is_outright = _market_scout_is_long_dated_outright(candidate, text)
+
+    if is_sports:
+        bucket = "sports"
+        score_delta -= 1.6
+        notes.append("sports")
+    if is_event_driven:
+        bucket = "event"
+        score_delta += 2.35
+        notes.append("event_driven")
+    if is_outright:
+        bucket = "outright"
+        score_delta -= 2.5
+        notes.append("long_dated_outright")
+    if seconds_to_end is not None:
+        if seconds_to_end <= 0:
+            score_delta -= 1.5
+            notes.append("end_time_stale")
+            if is_sports:
+                score_delta -= 8.0
+                block_reason = "stale_sports_market"
+        elif seconds_to_end <= 36 * 3600:
+            score_delta += 0.4 if is_sports else 0.7
+            notes.append("near_term")
+        elif seconds_to_end >= 45 * 86400 and not is_event_driven:
+            score_delta -= 0.6
+            notes.append("long_horizon")
+    if not notes:
+        notes.append("base_liquidity_volume_score")
+
+    return {
+        "bucket": bucket,
+        "score_delta": round(score_delta, 6),
+        "notes": notes[:8],
+        "block_reason": block_reason,
+    }
+
+
+def _market_scout_select_llm_candidates(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """从展示池里挑 LLM 输入；控制同事件占坑，并跳过明显过期的体育市场。"""
+
+    safe_limit = max(1, min(20, int(limit)))
+    eligible = [candidate for candidate in candidates if not candidate.get("llm_block_reason")]
+    selected: list[dict[str, Any]] = []
+    selected_slugs: set[str] = set()
+    event_counts: Counter[str] = Counter()
+    source_event_counts: Counter[str] = Counter()
+
+    def add_candidates(*, event_cap: int) -> None:
+        for candidate in eligible:
+            if len(selected) >= safe_limit:
+                return
+            slug = str(candidate.get("slug") or "")
+            if not slug or slug in selected_slugs:
+                continue
+            event_key = _market_scout_event_key(candidate)
+            source_event_key = _market_scout_source_event_key(candidate)
+            if event_key and event_counts[event_key] >= event_cap:
+                continue
+            if source_event_key and source_event_counts[source_event_key] >= event_cap:
+                continue
+            selected.append(candidate)
+            selected_slugs.add(slug)
+            if event_key:
+                event_counts[event_key] += 1
+            if source_event_key:
+                source_event_counts[source_event_key] += 1
+
+    add_candidates(event_cap=1)
+    add_candidates(event_cap=2)
+    if len(selected) < safe_limit:
+        for candidate in eligible:
+            if len(selected) >= safe_limit:
+                break
+            slug = str(candidate.get("slug") or "")
+            if slug and slug not in selected_slugs:
+                selected.append(candidate)
+                selected_slugs.add(slug)
+
+    if not selected:
+        selected = candidates[:safe_limit]
+    return selected[:safe_limit]
+
+
+def _market_scout_mark_llm_selection(candidate: dict[str, Any], llm_rank_by_slug: dict[str, int]) -> dict[str, Any]:
+    marked = dict(candidate)
+    rank = llm_rank_by_slug.get(str(marked.get("slug") or ""))
+    marked["llm_selected"] = rank is not None
+    marked["llm_rank"] = rank
+    return marked
+
+
+def _market_scout_candidate_text(candidate: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("slug", "question", "event_title", "description", "event_context", "category"):
+        value = candidate.get(key)
+        if value:
+            parts.append(str(value))
+    tags = candidate.get("tags")
+    if isinstance(tags, list):
+        parts.extend(str(tag) for tag in tags if str(tag or "").strip())
+    return " ".join(parts).lower()
+
+
+def _market_scout_event_key(candidate: dict[str, Any]) -> str:
+    text = _market_scout_candidate_text(candidate)
+    topic_key = _market_scout_topic_key(candidate)
+    if topic_key and not _market_scout_is_sports_market(text):
+        return topic_key
+    return str(
+        candidate.get("event_slug")
+        or candidate.get("event_title")
+        or candidate.get("condition_id")
+        or candidate.get("slug")
+        or ""
+    ).strip().lower()
+
+
+def _market_scout_source_event_key(candidate: dict[str, Any]) -> str:
+    return str(
+        candidate.get("event_slug")
+        or candidate.get("event_title")
+        or candidate.get("condition_id")
+        or candidate.get("slug")
+        or ""
+    ).strip().lower()
+
+
+def _market_scout_topic_key(candidate: dict[str, Any]) -> str:
+    question = str(candidate.get("question") or "").lower()
+    if not question:
+        return ""
+    text = re.sub(r"[?!.]", " ", question)
+    month = r"january|february|march|april|may|june|july|august|september|october|november|december"
+    text = re.sub(rf"\bby\s+end\s+of\s+({month})\b", "", text)
+    text = re.sub(rf"\bby\s+({month})\s+\d{{1,2}}(,\s*\d{{4}})?\b", "", text)
+    text = re.sub(r"\bby\s+20\d\d-\d\d-\d\d\b", "", text)
+    text = re.sub(r"\bbefore\s+20\d\d\b", "before-year", text)
+    text = re.sub(r"\s+", " ", text).strip(" -")
+    return text[:120] if len(text) >= 18 else ""
+
+
+def _market_scout_is_sports_market(text: str) -> bool:
+    if re.search(r"\bvs\.?\b|spread:|\bo/u\b|\bwin on 20\d\d-\d\d-\d\d\b", text):
+        return True
+    if re.search(r"\b(nba|wnba|nfl|mlb|nhl|ufc|fifa|soccer|tennis|match)\b", text):
+        return True
+    sports_phrases = (
+        "world cup",
+        "premier league",
+        "champions league",
+    )
+    return any(term in text for term in sports_phrases)
+
+
+def _market_scout_is_event_driven_market(text: str) -> bool:
+    event_terms = (
+        "iran",
+        "israel",
+        "hormuz",
+        "ceasefire",
+        "peace deal",
+        "war",
+        "missile",
+        "nuclear",
+        "trump",
+        "fed",
+        "rate cut",
+        "interest rate",
+        "cpi",
+        "inflation",
+        "gdp",
+        "election",
+        "tariff",
+        "court",
+        "sec",
+        "lawsuit",
+        "approval",
+        "government",
+        "shutdown",
+        "strike",
+        "etf",
+        "earnings",
+        "ipo",
+        "bankruptcy",
+        "oil",
+        "opec",
+        "ukraine",
+        "russia",
+        "china",
+        "taiwan",
+        "gaza",
+        "traffic returns",
+    )
+    return any(term in text for term in event_terms)
+
+
+def _market_scout_is_long_dated_outright(candidate: dict[str, Any], text: str) -> bool:
+    seconds_to_end = _maybe_float(candidate.get("seconds_to_end"))
+    long_horizon = seconds_to_end is not None and seconds_to_end >= 21 * 86400
+    outright_terms = (
+        "win the 2026 fifa world cup",
+        "win the world cup",
+        "champion",
+        "championship winner",
+        "tournament winner",
+        "winner of",
+    )
+    return long_horizon and any(term in text for term in outright_terms)
+
+
+def _market_scout_candidate_score(
+    *,
+    liquidity: float | None,
+    volume_24h: float | None,
+    spread: float | None,
+    outcome_prices: list[float | None],
+) -> float:
+    liq = max(0.0, float(liquidity or 0.0))
+    vol = max(0.0, float(volume_24h or 0.0))
+    spread_penalty = max(0.0, min(1.0, float(spread or 0.0) / 0.08))
+    prices = [price for price in outcome_prices if price is not None and 0.0 < price < 1.0]
+    uncertainty = max((min(price, 1.0 - price) for price in prices), default=0.0)
+    return round(
+        math.log1p(liq) * 0.35
+        + math.log1p(vol) * 0.45
+        + uncertainty * 4.0
+        + (1.0 - spread_penalty) * 2.0,
+        6,
+    )
+
+
+def _market_scout_scan_details(
+    candidates: list[dict[str, Any]],
+    reject_counts: Counter[str],
+    reject_examples: dict[str, str],
+    *,
+    llm_candidates: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    details = [
+        _market_scout_candidate_line(candidate, index)
+        for index, candidate in enumerate(candidates[:MARKET_SCOUT_SCAN_LOG_CANDIDATE_LIMIT], start=1)
+    ]
+    if len(candidates) > MARKET_SCOUT_SCAN_LOG_CANDIDATE_LIMIT:
+        details.append(f"展示候选还有 {len(candidates) - MARKET_SCOUT_SCAN_LOG_CANDIDATE_LIMIT} 个，页面可继续查看")
+    if llm_candidates:
+        llm_text = ", ".join(
+            f"{index}.{candidate.get('question') or candidate.get('slug')}"
+            for index, candidate in enumerate(llm_candidates, start=1)
+        )
+        details.append(f"送入 LLM: {llm_text}")
+    if reject_counts:
+        rejected = ", ".join(f"{key}={value}" for key, value in reject_counts.most_common(MARKET_SCOUT_REJECT_LOG_LIMIT))
+        details.append(f"过滤统计: {rejected}")
+        for key, example in list(reject_examples.items())[:3]:
+            details.append(f"过滤样例 {key}: {example}")
+    return details or ["没有通过过滤的候选市场"]
+
+
+def _market_scout_candidate_line(candidate: dict[str, Any], index: int) -> str:
+    prices = candidate.get("outcome_prices") if isinstance(candidate.get("outcome_prices"), list) else []
+    outcomes = candidate.get("outcomes") if isinstance(candidate.get("outcomes"), list) else []
+    price_text = " / ".join(
+        f"{outcome}={_format_optional_float(price, 4)}"
+        for outcome, price in zip(outcomes, prices)
+    )
+    route = f"LLM#{candidate.get('llm_rank')}" if candidate.get("llm_selected") else "display"
+    notes = ",".join(str(item) for item in (candidate.get("selection_notes") or [])[:3])
+    return (
+        f"{index}. {candidate.get('question')} | {price_text or 'price=-'} | "
+        f"liq={_format_optional_float(candidate.get('liquidity'), 0)} "
+        f"vol24h={_format_optional_float(candidate.get('volume_24h'), 0)} "
+        f"spread={_format_optional_float(candidate.get('spread'), 4)} "
+        f"score={_format_optional_float(candidate.get('score'), 3)} "
+        f"scout={_format_optional_float(candidate.get('selection_score'), 3)} "
+        f"{route} bucket={candidate.get('selection_bucket') or '-'} notes={notes or '-'}"
+    )
+
+
+def _market_scout_candidate_signature(candidates: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for candidate in candidates[:MARKET_SCOUT_PROMPT_CANDIDATE_LIMIT]:
+        prices = ",".join(_format_optional_float(price, 4) for price in candidate.get("outcome_prices") or [])
+        parts.append(f"{candidate.get('slug')}:{prices}:{_format_optional_float(candidate.get('spread'), 4)}")
+    return "|".join(parts)
+
+
+def _market_scout_candidate_public(candidate: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "slug",
+        "question",
+        "url",
+        "outcomes",
+        "outcome_prices",
+        "liquidity",
+        "volume_24h",
+        "spread",
+        "score",
+        "selection_score",
+        "selection_bucket",
+        "selection_notes",
+        "llm_block_reason",
+        "llm_selected",
+        "llm_rank",
+        "base_rank",
+        "event_title",
+        "event_slug",
+        "event_key",
+        "source_event_key",
+        "seconds_to_end",
+        "evidence_status",
+        "evidence_result_count",
+        "evidence",
+    )
+    return {key: candidate.get(key) for key in keys}
+
+
+def _market_scout_attach_candidate_evidence(
+    candidate: dict[str, Any],
+    evidence_by_slug: dict[str, Any],
+) -> dict[str, Any]:
+    """把 LLM 候选证据同步到展示候选，保证详情面板能看到同一份 Web 证据。"""
+
+    slug = str(candidate.get("slug") or "")
+    evidence = evidence_by_slug.get(slug)
+    if not isinstance(evidence, dict):
+        return candidate
+    merged = dict(candidate)
+    merged["evidence"] = dict(evidence)
+    merged["evidence_status"] = evidence.get("status")
+    merged["evidence_result_count"] = evidence.get("result_count", 0)
+    return merged
+
+
+def _market_scout_llm_system_prompt() -> str:
+    return (
+        "You are a strict Polymarket non-BTC market analyst. Return JSON only. "
+        "You receive active binary markets with liquidity, volume, prices, spread, description, orderbook quotes, and Evidence Scout news results when available. "
+        "Select at most one market. Prefer NO_TRADE if evidence is stale, ambiguous, over-resolved, too spread-wide, or outside your confidence. "
+        "You cannot browse the web inside this call. Use provided evidence only and list missing external checks in news_checks_needed. "
+        "Do not place orders. Output schema: decision, selected_slug, outcome, confidence, max_entry_price, reason, risk_flags, news_checks_needed, valid_for_seconds."
+    )
+
+
+def _market_scout_llm_user_prompt(candidates: list[dict[str, Any]], now: float) -> str:
+    payload = {
+        "now": now,
+        "instruction": (
+            "Analyze these non-BTC Polymarket candidates. Return decision RECOMMEND or NO_TRADE. "
+            "If RECOMMEND, choose one selected_slug and one exact outcome from that market. "
+            "Use confidence 0-1. Keep max_entry_price conservative. "
+            "Candidates were pre-ranked for diversity, event relevance, liquidity, volume, spread, and orderbook quality. "
+            "This LLM call is advisory; backend Paper gates decide whether to simulate an order after the response."
+        ),
+        "candidates": [_market_scout_prompt_candidate(candidate) for candidate in candidates[:MARKET_SCOUT_PROMPT_CANDIDATE_LIMIT]],
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(text) > MARKET_SCOUT_PROMPT_MAX_CHARS:
+        text = text[:MARKET_SCOUT_PROMPT_MAX_CHARS] + "...TRUNCATED"
+    return text
+
+
+def _market_scout_prompt_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "slug": candidate.get("slug"),
+        "question": candidate.get("question"),
+        "event_title": candidate.get("event_title"),
+        "event_slug": candidate.get("event_slug"),
+        "description": str(candidate.get("description") or "")[:900],
+        "event_context": str(candidate.get("event_context") or "")[:900],
+        "category": candidate.get("category"),
+        "tags": candidate.get("tags"),
+        "url": candidate.get("url"),
+        "outcomes": candidate.get("outcomes"),
+        "outcome_prices": candidate.get("outcome_prices"),
+        "liquidity": candidate.get("liquidity"),
+        "volume_24h": candidate.get("volume_24h"),
+        "spread": candidate.get("spread"),
+        "last_trade_price": candidate.get("last_trade_price"),
+        "one_day_price_change": candidate.get("one_day_price_change"),
+        "seconds_to_end": candidate.get("seconds_to_end"),
+        "evidence": _market_scout_prompt_evidence(candidate.get("evidence")),
+        "quotes": candidate.get("quotes"),
+        "score": candidate.get("score"),
+        "selection_score": candidate.get("selection_score"),
+        "selection_bucket": candidate.get("selection_bucket"),
+        "selection_notes": candidate.get("selection_notes"),
+        "base_rank": candidate.get("base_rank"),
+    }
+
+
+def _market_scout_prompt_evidence(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    results = value.get("results") if isinstance(value.get("results"), list) else []
+    return {
+        "status": value.get("status"),
+        "provider": value.get("provider"),
+        "query": value.get("query"),
+        "result_count": value.get("result_count"),
+        "blocked_count": value.get("blocked_count"),
+        "notes": list(value.get("notes") or [])[:5] if isinstance(value.get("notes"), list) else [],
+        "results": [
+            {
+                "title": result.get("title"),
+                "source": result.get("source"),
+                "domain": result.get("domain"),
+                "published_at": result.get("published_at"),
+                "age_hours": result.get("age_hours"),
+                "snippet": result.get("snippet"),
+                "url": result.get("url"),
+            }
+            for result in results[:4]
+            if isinstance(result, dict)
+        ],
+    }
+
+
+def _normalize_market_scout_llm_decision(raw: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    candidate_by_slug = {str(candidate.get("slug") or ""): candidate for candidate in candidates}
+    decision = str(raw.get("decision") or "NO_TRADE").strip().upper()
+    if decision not in {"RECOMMEND", "NO_TRADE"}:
+        decision = "NO_TRADE"
+    selected_slug = str(raw.get("selected_slug") or "").strip()
+    if selected_slug not in candidate_by_slug:
+        if decision == "RECOMMEND":
+            selected_slug = str(candidates[0].get("slug") or "") if candidates else ""
+            decision = "NO_TRADE"
+        else:
+            selected_slug = ""
+    selected = candidate_by_slug.get(selected_slug, candidates[0] if selected_slug and candidates else {})
+    outcomes = {str(outcome).lower(): str(outcome) for outcome in selected.get("outcomes") or []}
+    raw_outcome = str(raw.get("outcome") or "").strip()
+    outcome = outcomes.get(raw_outcome.lower(), "")
+    if decision == "RECOMMEND" and not outcome:
+        decision = "NO_TRADE"
+    confidence = max(0.0, min(1.0, _maybe_float(raw.get("confidence")) or 0.0))
+    max_entry_price = _maybe_float(raw.get("max_entry_price"))
+    risk_flags = raw.get("risk_flags")
+    if not isinstance(risk_flags, list):
+        risk_flags = []
+    news_checks = raw.get("news_checks_needed")
+    if not isinstance(news_checks, list):
+        news_checks = []
+    return {
+        "decision": decision,
+        "selected_slug": selected_slug,
+        "question": selected.get("question"),
+        "url": selected.get("url"),
+        "outcome": outcome or None,
+        "confidence": round(confidence, 4),
+        "max_entry_price": _round_float(max_entry_price, 4),
+        "reason": str(raw.get("reason") or "LLM 未提供理由")[:800],
+        "risk_flags": [str(item)[:120] for item in risk_flags[:12]],
+        "news_checks_needed": [str(item)[:160] for item in news_checks[:12]],
+        "valid_for_seconds": max(10, min(600, _maybe_int(raw.get("valid_for_seconds")) or 60)),
+        "raw": raw,
+    }
+
+
+def _market_scout_decision_status_message(decision: dict[str, Any]) -> str:
+    if decision.get("decision") == "RECOMMEND":
+        return (
+            f"LLM 推荐 {decision.get('outcome')} @ {decision.get('confidence')} "
+            f"市场={decision.get('selected_slug')}"
+        )
+    return f"LLM 暂无下注建议 市场={decision.get('selected_slug') or '-'}"
+
+
+def _market_scout_decision_details(decision: dict[str, Any], elapsed_ms: float) -> list[str]:
+    details = [
+        f"市场: {decision.get('question') or decision.get('selected_slug')}",
+        f"方向: {decision.get('outcome') or '-'}",
+        f"置信度: {_format_optional_float(decision.get('confidence'), 4)}",
+        f"最高入场价: {_format_optional_float(decision.get('max_entry_price'), 4)}",
+        f"耗时: {_format_optional_float(elapsed_ms, 1)}ms",
+        f"理由: {decision.get('reason')}",
+    ]
+    for flag in decision.get("risk_flags") or []:
+        details.append(f"风险: {flag}")
+    for check in decision.get("news_checks_needed") or []:
+        details.append(f"需核查: {check}")
+    details.append("自动下注执行: 按市场页 Paper 开关和本地闸门决定")
+    return details
+
+
+def _market_scout_first_event(raw: dict[str, Any]) -> dict[str, Any]:
+    events = raw.get("events")
+    if isinstance(events, list) and events and isinstance(events[0], dict):
+        return events[0]
+    return {}
+
+
+def _market_scout_join_description(description: str, context_description: str) -> str:
+    parts: list[str] = []
+    for value in (description, context_description):
+        text = str(value or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _market_scout_tag_names(raw: dict[str, Any], event: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    for payload in (raw, event):
+        raw_tags = payload.get("tags") if isinstance(payload, dict) else None
+        for item in _jsonish_list_value(raw_tags):
+            if isinstance(item, dict):
+                text = str(item.get("label") or item.get("name") or item.get("slug") or "").strip()
+            else:
+                text = str(item or "").strip()
+            if text and text not in tags:
+                tags.append(text)
+    return tags[:12]
+
+
+def _jsonish_list_value(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _first_float(payload: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _maybe_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _parse_market_scout_ts(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        from datetime import datetime, time as datetime_time, timezone
+
+        # Polymarket 的 date-only endDateIso 表示自然日，按当天结束处理，避免整天机会被误判过期。
+        return datetime.combine(datetime.fromisoformat(text).date(), datetime_time(23, 59, 59), tzinfo=timezone.utc).timestamp()
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _spread_from_quote_payload(quote: dict[str, Any]) -> float | None:
+    bid = _maybe_float(quote.get("best_bid"))
+    ask = _maybe_float(quote.get("best_ask"))
+    if bid is None or ask is None:
+        return None
+    return round(max(0.0, ask - bid), 6)
 
 
 def _audit_filename_part(value: Any) -> str:
