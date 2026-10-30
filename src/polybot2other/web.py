@@ -169,6 +169,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib handler API
         path = urllib.parse.urlparse(self.path).path
+        if path == "/strategy-review.html":
+            self._send_static("strategy-review.html", include_body=False)
+            return
         if path == "/":
             self._send_static("index.html", include_body=False)
             return
@@ -248,6 +251,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if path == "/strategy-review.html":
+            self._send_static("strategy-review.html")
+            return
         if path == "/":
             self._send_static("index.html")
             return
@@ -1243,8 +1249,11 @@ def main(argv: list[str] | None = None) -> int:
     stop_event = threading.Event()
 
     def _stop(_signum, _frame) -> None:
+        if stop_event.is_set():
+            return
         stop_event.set()
-        server.shutdown()
+        # shutdown() waits for serve_forever(), so it must run off the main thread.
+        threading.Thread(target=server.shutdown, name="polybot2other-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)

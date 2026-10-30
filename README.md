@@ -1,5 +1,15 @@
 # EdgePulse
 
+The dashboard has four isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. The optimized account has its own authenticated read-only PolyBolt spot/TWAP feed, CLOB feed, ledger, candidate journal and official-only settlement loop.
+
+The exit experiment reads the original main ledger in SQLite read-only mode and mirrors only new Paper FAK entries, retaining their actual cost, buy fees and shares for a matched-entry comparison. It does not retroactively copy old positions or re-enter after an early sale. Its initial test thresholds are +20% net profit and −40% net loss, with a 500 ms simulated sell delay, half of displayed bid depth and a one-cent adverse price haircut. Thresholds are experimental; stop loss is a trigger, not a guaranteed maximum loss. Partial exits preserve unsold shares, and unfilled exits do not receive invented proceeds. The account stores its own sales, entry links and policy in `data/strategy-experiments/main_tp_sl.sqlite3`; observations continue after early sales until expiry in `main_tp_sl.observations.jsonl`. The dashboard compares only officially resolved matched entries and reports both saved losses and forgone winner profits. Late observations, insufficient funds and paused entries are recorded as skipped instead of backfilled. The original main account supplies entry decisions and its existing entry risk controls; this exit experiment only adds its own cash constraint. It never enables live orders.
+
+Read the optimized-account specification at `http://127.0.0.1:8791/static/optimized-main.html`. Its initial virtual equity is aligned with the original main account at creation; subsequent restarts neither re-fund it nor reset comparison history. The dashboard's same-period comparison excludes original historical profit and carryover positions, distinguishes pending exposure, and reports actual P&L/percentage-point differences only after trades exist. Model changes and the early mid-price filter are forward-testing hypotheses, not proven profit improvements.
+
+The packaged [historical review](src/polybot2other/static/strategy-review.html) remains available. Detailed loss, exit and trading-hour analyses are generated locally under `reports/`. Their Python analysis/rendering scripts are versioned; database snapshots, generated reports, audit manifests and local configuration are excluded from Git. These research scripts require the corresponding local snapshots and backup metadata. Retired strategy sources and ledgers are archived under `data/backups/strategy-retirement-20261026-225605/`. Value Confirm retains its own $100 initial history and $2 / 2%, $6 daily / $20 total loss controls. Real-money trading remains disabled in the Mac launcher.
+
+The reference notes below also document legacy features retained for historical compatibility; they do not re-enable retired strategies.
+
 Real Polymarket BTC 5-minute Up/Down paper and live-trading dashboard.
 
 The runtime package and existing data paths still use `polybot2other` for command and database compatibility.
@@ -16,7 +26,7 @@ The default mode still runs Paper trading continuously. Live trading is opt-in a
 - GTC/GTD/POST_ONLY are simulated as resting maker orders. GTC can rest until market end, GTD expires after `POLYBOT2OTHER_PAPER_GTD_SECONDS`, and POST_ONLY additionally requires queue time, price-through-limit movement, and partial queue fills.
 - Resting maker partial fills from the same paper order are aggregated into one open position. Tiny resting fills below `$0.01` are ignored, and residual reserved cash at or below `$0.05` is released as dust instead of creating `$0.00` open positions.
 - Paper order attempts and per-level paper fills are stored separately from positions for execution-quality review.
-- Strategy experiments can run 8 active isolated Paper combinations. See `docs/strategy-combinations-guide.html` for the account-scope and variant guide.
+- The current Paper configuration contains the original main account and three isolated experiments. `docs/strategy-combinations-guide.html` describes legacy combinations retained for historical reference.
 - `SINGLE_FAK_REAL` uses a separate live SQLite database and follows the current `SINGLE_FAK` paper strategy behavior: FAK taker entry and legacy same-market opposite-side reversal allowed after any pending live buy for that market has settled. `SINGLE_FAK_AGGRESSIVE_EDGE_REAL` uses its own live SQLite database and applies the same Aggressive Edge filter as the `SINGLE_FAK_AGGRESSIVE_EDGE` Paper strategy before the live FAK entry path.
 - Live trading uses a configured soft budget cap (`initial_balance`) instead of trusting the full wallet balance. This is a software guard, not an on-chain limit.
 - If `stake_dollars` is changed while the current market already has a live position, that current market keeps using the original position stake for any same-market reversal leg. The new configured stake applies to the next market.
@@ -42,6 +52,18 @@ rtk proxy python3 -m venv .venv
 rtk proxy .venv/bin/python -m pip install -e .
 rtk proxy env PYTHONPATH=src .venv/bin/python -m polybot2other.web --host 127.0.0.1 --port 8787
 ```
+
+On macOS, keep an imported Linux virtual environment intact and install a native runtime separately:
+
+```bash
+uv venv --python 3.12 .venv/macos
+uv pip install --python .venv/macos/bin/python -e . 'py_clob_client_v2==1.0.1'
+./start-macos.sh
+# Stop the Mac process when needed:
+./stop-macos.sh
+```
+
+The Mac launcher runs in the background at `http://127.0.0.1:8791`, reuses the existing `data/` databases and settings, and forces the real-money runtime off. Logs are written to `logs/polybot2other-macos-8791.log`. Existing BTC and Market Scout pause settings remain in effect. The original Paper control retains its legacy fallback to the five-minute window's `openPrice` when Gamma omits `priceToBeat`. That generic opening price is not a verified TWAP60 settlement reference; the optimized account separately requires a matching TWAP contract and verified opening value. Original-account Paper results do not establish live execution readiness.
 
 The service automatically reads local `.env.live`, `.env.local`, and `.env` files for `POLYBOT2OTHER_*` keys. Existing process environment variables always win. To use a different file, set `POLYBOT2OTHER_ENV_FILE=/path/to/file`.
 Live readiness reports env file paths, geoblock status, and credential presence booleans only; it does not return private key, API secret, passphrase, or public IP values.

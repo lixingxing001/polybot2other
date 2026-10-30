@@ -3814,3 +3814,12 @@ tbody tr:hover {
     transition: none;
   }
 }
+
+/* Retired strategy workspaces remain inaccessible in the two-account dashboard. */
+.retired-feature { display: none !important; }
+
+#optimized-main-panel[hidden] { display: none; }
+#main-comparison-summary, .optimized-reference-status, .optimized-comparison-note { margin: 12px 18px; }
+.optimized-reference-status, .optimized-comparison-note { font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+
+#main-comparison-period { display: block; margin-top: 6px; font-size: 12px; color: var(--muted, #9cabb9); }

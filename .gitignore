@@ -11,3 +11,12 @@ logs/
 .env.live
 .env.local
 .idea/
+
+# Machine-local configuration and backup metadata.
+.claude/settings.local.json
+/BACKUP_MANIFEST.json
+
+# Keep research source code, but never version generated ledger snapshots/reports.
+/reports/**
+!/reports/**/
+!/reports/**/*.py

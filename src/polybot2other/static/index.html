@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20260616-market-evidence-scout">
+    <link rel="stylesheet" href="/static/styles.css?v=20261030-main-exit-v1">
   </head>
   <body>
     <main class="app-shell">
@@ -13,21 +13,21 @@
         <div class="brand-lockup">
           <img class="brand-mark" src="/static/edgepulse.svg" alt="" aria-hidden="true">
           <div>
-            <div class="eyebrow">Paper + Live Trading</div>
+            <div class="eyebrow">Paper · 策略对照</div>
             <h1>EdgePulse</h1>
           </div>
         </div>
         <nav class="app-nav" aria-label="页面导航">
           <button id="nav-bot" class="app-nav-item is-active" type="button" data-nav-page="bot" aria-current="page">BTC</button>
-          <button id="nav-market" class="app-nav-item" type="button" data-nav-page="market">市场</button>
-          <button id="nav-samples" class="app-nav-item" type="button" data-nav-page="samples">样本</button>
+          <button id="nav-market" class="app-nav-item retired-feature" type="button" data-nav-page="market">市场</button>
+          <button id="nav-samples" class="app-nav-item retired-feature" type="button" data-nav-page="samples">样本</button>
           <button id="nav-status" class="app-nav-item" type="button" data-nav-page="status">状态</button>
         </nav>
         <div class="top-actions">
           <button id="btc-runtime-toggle" class="btc-runtime-button btc-only-action" type="button" aria-pressed="false">暂停BTC</button>
           <span id="btc-runtime-status" class="btc-runtime-status btc-only-action">BTC采集中</span>
           <button id="paper-pause-toggle" class="paper-pause-button btc-only-action" type="button" aria-pressed="false">暂停Paper</button>
-          <label class="live-toggle btc-only-action">
+          <label class="live-toggle btc-only-action retired-feature">
             <input id="live-enabled" type="checkbox">
             <span></span>
             实盘
@@ -40,7 +40,7 @@
 
       <div class="page-stack">
       <section id="bot-page" class="app-page is-active" data-page="bot" aria-labelledby="nav-bot">
-      <section class="panel live-panel">
+      <section class="panel live-panel retired-feature">
         <div class="panel-head live-head">
           <div class="live-title">
             <label class="live-strategy-selector">
@@ -175,7 +175,7 @@
       <section class="main-grid">
         <div class="panel">
           <div class="panel-head">
-            <h2>实时市场</h2>
+            <h2>实时市场 · 原主账户</h2>
             <span id="last-tick">-</span>
           </div>
           <div id="markets" class="market-list"></div>
@@ -193,38 +193,36 @@
         </div>
       </section>
 
+      <section class="panel" id="optimized-main-panel" hidden>
+        <div class="panel-head"><div><h2>主账户 · 同期对照</h2><a class="report-link" href="/static/optimized-main.html" target="_blank" rel="noopener">优化版规则与对照口径</a><span id="main-comparison-period"></span></div><span id="main-comparison-status"></span></div>
+        <div id="main-comparison-summary" class="experiment-summary"></div>
+        <div class="table-wrap"><table class="trade-table"><thead><tr><th>版本</th><th>新增成交</th><th>官方已结算</th><th>区间净盈亏</th><th>胜率</th><th>未结算投入</th><th>已结算序列回撤</th><th>费用</th></tr></thead><tbody id="main-comparison-rows"></tbody></table></div>
+        <div id="optimized-reference-status" class="optimized-reference-status"></div>
+        <p class="optimized-comparison-note">只比较对照开始后的新增成交；原账户历史利润不计入提升幅度。分数和过滤规则仍需后续 Paper 验证。</p>
+      </section>
+
+      <section class="panel" id="main-exit-panel" hidden>
+        <div class="panel-head"><div><h2>主账户止盈止损 · 同单对照</h2><span id="main-exit-period"></span></div><span id="main-exit-status"></span></div>
+        <div id="main-exit-summary" class="experiment-summary"></div>
+        <p id="main-exit-policy" class="optimized-reference-status"></p>
+        <div class="table-wrap"><table class="trade-table"><thead><tr><th>主账户单号</th><th>方向</th><th>投入</th><th>状态</th><th>持有到官方结算</th><th>新策略净收益</th><th>同单收益差</th></tr></thead><tbody id="main-exit-pairs"></tbody></table></div>
+        <p class="optimized-comparison-note">沿用主账户新成交的成本和份额，仅独立模拟卖出；已结束的同单配对才计入收益差。止盈、止损百分比是试验参数，实际成交还取决于费用、延迟与买盘深度。原有账户继续保留。</p>
+      </section>
+
       <section class="panel experiment-panel">
         <div class="panel-head">
           <div>
-            <h2>策略实验</h2>
+            <h2>策略</h2>
             <span id="strategy-experiment-meta">0 组</span>
           </div>
           <div class="experiment-head-actions">
-            <a class="report-link" href="/strategy-experiments-retrospective.html" target="_blank" rel="noopener">复盘报告</a>
+            <a class="report-link" href="/strategy-review.html" target="_blank" rel="noopener">历史分析与新策略说明</a>
             <div id="strategy-experiment-summary" class="experiment-summary"></div>
           </div>
         </div>
         <div class="table-wrap experiment-table-wrap">
           <table class="trade-table experiment-table">
-            <thead>
-              <tr>
-                <th>排名</th>
-                <th>评分</th>
-                <th>样本</th>
-                <th>组合</th>
-                <th>定位</th>
-                <th>净盈亏</th>
-                <th>ROI</th>
-                <th>胜率</th>
-                <th>成交率</th>
-                <th>订单质量</th>
-                <th>结算</th>
-                <th>当前</th>
-                <th>目标契合</th>
-                <th>最后信号</th>
-                <th>详情</th>
-              </tr>
-            </thead>
+            <thead><tr><th>策略</th><th>定位</th><th>账面资产</th><th>已实现盈亏</th><th>已结算</th><th>胜率</th><th>持仓</th><th>当前判断</th><th>详情</th></tr></thead>
             <tbody id="strategy-experiments"></tbody>
           </table>
         </div>
@@ -655,6 +653,6 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=20260616-market-evidence-scout"></script>
+    <script src="/static/app.js?v=20261030-main-exit-v1"></script>
   </body>
 </html>

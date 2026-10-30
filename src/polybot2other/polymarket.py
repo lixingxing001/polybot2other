@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import ssl
 import time
@@ -249,6 +250,8 @@ class PolymarketClient:
         end_ts = _parse_ts(raw.get("endDate")) or (start_ts + BTC_5M_WINDOW_SECONDS)
         target_price = _target_from_market(raw)
         if target_price is None:
+            target_price = self._target_from_polymarket_api(slug)
+        if target_price is None:
             target_price = self._target_from_polymarket_page(slug)
         return MarketRound(
             round_id=slug,
@@ -263,6 +266,32 @@ class PolymarketClient:
             slug=slug,
             url=f"https://polymarket.com/event/{slug}",
         )
+
+    def _target_from_polymarket_api(self, slug: str) -> float | None:
+        cached = self._target_cache.get(slug)
+        if cached is not None:
+            return cached
+        start_ts = _slug_start_ts(slug)
+        # Current pages no longer embed the opening price in their HTML.
+        # Read the official price for this exact window, never a current spot price.
+        try:
+            payload = self._get_json(
+                "https://polymarket.com/api/crypto/crypto-price",
+                {
+                    "symbol": "BTC",
+                    "eventStartTime": _iso_z(start_ts),
+                    "variant": "fiveminute",
+                    "endDate": _iso_z(start_ts + BTC_5M_WINDOW_SECONDS),
+                },
+            )
+        except (OSError, ValueError):
+            return None
+        value = payload.get("openPrice") if isinstance(payload, dict) else None
+        target = _maybe_float(value) if not isinstance(value, bool) else None
+        if target is None or not math.isfinite(target) or target <= 0:
+            return None
+        self._target_cache[slug] = target
+        return target
 
     def _target_from_polymarket_page(self, slug: str) -> float | None:
         cached = self._target_cache.get(slug)

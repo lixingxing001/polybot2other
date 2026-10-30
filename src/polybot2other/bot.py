@@ -365,6 +365,9 @@ class PriceBasisTracker:
         return 4_500
 
 
+from .value_confirm import ValueConfirmGuard, VARIANT_ID as VALUE_CONFIRM_VARIANT_ID, stake_budget, entry_limit
+
+
 class PaperTradingBot:
     def __init__(self, settings: Settings, store: TradeStore) -> None:
         self.settings = settings
@@ -383,6 +386,7 @@ class PaperTradingBot:
         )
         self.market_data_price_fallback = PublicPriceClient(backend_market_data_timeout)
         self.strategy = RealBtcFiveMinuteStrategy(settings)
+        self.value_confirm_guard = None
         self._lock = threading.Lock()
         self._market_data_refresh_lock = threading.Lock()
         self._price_refresh_lock = threading.Lock()
@@ -426,7 +430,7 @@ class PaperTradingBot:
         self.market_scout_paper_db_path = _resolve_market_scout_paper_db_path(settings)
         self._market_scout_runtime_settings = self._load_market_scout_runtime_settings()
         self.market_paper_store = TradeStore(
-            self.market_scout_paper_db_path,
+            self.market_scout_paper_db_path if settings.market_scout_enabled else Path(":memory:"),
             float(self._market_scout_runtime_settings["paper_initial_balance"]),
         )
         self._market_scout_status: dict[str, Any] = {
@@ -517,7 +521,7 @@ class PaperTradingBot:
             "backend_binance_ws_at": None,
         }
         self.strategy_experiments = (
-            StrategyExperimentRunner(settings, self.polymarket, self.price_fallback)
+            StrategyExperimentRunner(settings, self.polymarket, self.price_fallback, baseline_store=self.store)
             if settings.strategy_experiments_enabled
             else None
         )
@@ -558,6 +562,8 @@ class PaperTradingBot:
         self.market_data_mode = variant.market_data_mode
         self.price_source_mode = variant.price_source_mode
         self.anti_bot_guard_mode = variant.anti_bot_guard_mode
+        if variant.variant_id == VALUE_CONFIRM_VARIANT_ID:
+            self.value_confirm_guard = ValueConfirmGuard(self.store, self.settings.paper_taker_fee_rate)
         if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES:
             replay_file = f"{variant.variant_id.lower()}.jsonl"
             self._aggressive_edge_loss_replay = AggressiveEdgeLossReplayRecorder(
@@ -571,6 +577,9 @@ class PaperTradingBot:
         if self.btc_runtime_is_paused():
             logger.info("BTC 数据业务处于暂停态，后台行情线程不启动")
             return
+        if self.strategy_experiments is not None:
+            self.strategy_experiments.market_data_provider = self._fresh_experiment_market_data
+            self.strategy_experiments.start_independent()
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
@@ -610,6 +619,8 @@ class PaperTradingBot:
     def stop(self) -> None:
         self._market_scout_stop.set()
         self._stop.set()
+        if self.strategy_experiments is not None:
+            self.strategy_experiments.stop_independent()
         self._join_btc_worker_threads()
         self._join_market_scout_thread()
 
@@ -700,6 +711,8 @@ class PaperTradingBot:
         if paused:
             # HTTP 按钮必须快速返回；线程会在各自循环里看到 _stop 和暂停态后退出。
             self._stop.set()
+            if self.strategy_experiments is not None:
+                self.strategy_experiments.pause_independent()
             self._set_btc_runtime_paused_runtime_state(now)
             logger.info("BTC 数据业务已暂停，已发送后台线程停止信号 settings_path=%s", self.btc_runtime_settings_path)
         else:
@@ -2679,6 +2692,17 @@ class PaperTradingBot:
             )
 
     def _run_strategy_from_state(self) -> None:
+        guard = self.value_confirm_guard
+        if guard is None:
+            return self._run_strategy_from_state_inner()
+        if not guard.execution_lock.acquire(blocking=False):
+            return
+        try:
+            return self._run_strategy_from_state_inner()
+        finally:
+            guard.execution_lock.release()
+
+    def _run_strategy_from_state_inner(self) -> None:
         if self._btc_runtime_stop_requested():
             return
         with self._lock:
@@ -2741,6 +2765,8 @@ class PaperTradingBot:
         if self._btc_runtime_stop_requested():
             return
         trade_ids = self._maybe_place_trade(market, signal, quotes)
+        if self.value_confirm_guard is not None and signal.side in {"Up", "Down"}:
+            self.value_confirm_guard.record_execution(market, trade_ids, (self.last_signal or {}).get("reason", ""))
         if self._btc_runtime_stop_requested():
             return
         replay_event = "entry_fill" if trade_ids else "strategy_tick"
@@ -2755,6 +2781,14 @@ class PaperTradingBot:
         )
         self._run_strategy_experiments(market, price, quotes)
         self._run_live_strategy(market, price, quotes)
+
+    def _fresh_experiment_market_data(self, round_id: str):
+        """Refresh copied inputs after settlement I/O; preserve original source timestamps."""
+        with self._lock:
+            if self.current_market is None or self.current_market.round_id != round_id:
+                return None
+            price, quotes, _source = self._paper_market_data_locked()
+            return price, quotes
 
     def _run_strategy_experiments(
         self,
@@ -3140,7 +3174,7 @@ class PaperTradingBot:
             self._append_last_signal_reason(f"{SINGLE_STOP_AND_FLIP_MARKER} 当前市场有活跃挂单，暂不止损反手")
             return []
         account = self.store.account()
-        stake = min(self.settings.stake_dollars, float(account["cash_balance"]))
+        stake = stake_budget(account, self.store.daily_realized_pnl()) if self.value_confirm_guard is not None else min(self.settings.stake_dollars, float(account["cash_balance"]))
         if stake < 0.1:
             return []
         if quotes is None:
@@ -3352,6 +3386,8 @@ class PaperTradingBot:
     ) -> Signal:
         """按实验组合过滤信号；默认 NONE 不改变旧策略行为。"""
 
+        if self.value_confirm_guard is not None:
+            return self.value_confirm_guard.evaluate(market, signal, price, quotes or {})
         if self.signal_filter_mode not in AGGRESSIVE_EDGE_FILTER_MODES:
             return signal
         shadow_report: dict[str, Any] | None = None
@@ -4660,10 +4696,12 @@ class PaperTradingBot:
     def _manage_resting_orders(self, market: MarketRound, quotes: dict[str, dict[str, Any]]) -> None:
         now = time.time()
         self.store.expire_resting_orders(now)
+        orders = [order for order in self.store.active_paper_orders("BTC")
+                  if str(order.get("round_id") or "") == market.round_id]
+        if not orders:
+            return
         quotes = self._quotes_with_depth(market, quotes)
-        for order in self.store.active_paper_orders("BTC"):
-            if str(order.get("round_id") or "") != market.round_id:
-                continue
+        for order in orders:
             side = str(order.get("side") or "")
             quote = quotes.get(side) if isinstance(quotes.get(side), dict) else {}
             fill = self._resting_order_fill(order, quote, now)
@@ -5445,6 +5483,8 @@ class PaperTradingBot:
         return merged
 
     def _entry_limit_price(self, signal: Signal) -> float:
+        if self.value_confirm_guard is not None:
+            return entry_limit(signal, self.settings.paper_taker_fee_rate)
         edge_preserving_limit = signal.confidence - self.settings.min_edge
         limit_price = max(signal.entry_price, edge_preserving_limit)
         return round(min(self.settings.max_entry_price, limit_price), 4)
@@ -6734,8 +6774,11 @@ class PaperTradingBot:
 
 
 class StrategyExperimentRunner:
-    def __init__(self, settings: Settings, polymarket: PolymarketClient, price_fallback: PublicPriceClient) -> None:
+    def __init__(self, settings: Settings, polymarket: PolymarketClient, price_fallback: PublicPriceClient, baseline_store=None) -> None:
+        self.baseline_store = baseline_store
+        self.comparison = None
         self.settings = settings
+        self.market_data_provider = None
         self.polymarket = polymarket
         self.variants = selected_strategy_variants(settings.strategy_experiments_variants)
         self._lock = threading.RLock()
@@ -6749,14 +6792,46 @@ class StrategyExperimentRunner:
         self._official_settlement_next_at: dict[str, float] = {}
         for variant in self.variants:
             variant_settings = self._settings_for_variant(settings, variant)
-            store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
-            bot = PaperTradingBot(variant_settings, store)
-            bot.polymarket = polymarket
-            bot.price_fallback = price_fallback
+            if variant.variant_id == "MAIN_TP_SL":
+                from .main_exit import MainExitBot
+                from .main_exit_store import MainExitStore
+                store = MainExitStore(variant_settings.db_path, variant_settings.initial_balance)
+                variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
+                bot = MainExitBot(variant_settings, store, baseline_store.db_path if baseline_store else settings.db_path)
+            elif variant.variant_id == "MAIN_OPTIMIZED":
+                from .optimized_main import OptimizedMainBot, OptimizedTradeStore
+                store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
+                bot = OptimizedMainBot(variant_settings, store)
+            else:
+                store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                bot = PaperTradingBot(variant_settings, store)
+                bot.polymarket = polymarket
+                bot.price_fallback = price_fallback
             bot.configure_strategy_experiment_variant(variant)
             self._bots[variant.variant_id] = bot
             self._errors[variant.variant_id] = None
             self._official_broadcast_errors[variant.variant_id] = None
+
+        if baseline_store is not None and "MAIN_OPTIMIZED" in self._bots:
+            from .optimized_comparison import MainComparison
+            optimized = self._bots["MAIN_OPTIMIZED"]
+            self.comparison = MainComparison(baseline_store, optimized.store, settings.strategy_experiments_db_dir / "main-comparison.json")
+
+    def start_independent(self):
+        for bot in self._bots.values():
+            if getattr(bot, "independent_runtime", False):
+                bot.start()
+
+    def pause_independent(self):
+        for bot in self._bots.values():
+            if getattr(bot, "independent_runtime", False):
+                bot.request_pause()
+
+    def stop_independent(self):
+        for bot in self._bots.values():
+            if getattr(bot, "independent_runtime", False):
+                bot.stop()
 
     def _settings_for_variant(self, settings: Settings, variant: StrategyVariant) -> Settings:
         db_path = settings.strategy_experiments_db_dir / f"{variant.variant_id.lower()}.sqlite3"
@@ -6765,6 +6840,19 @@ class StrategyExperimentRunner:
             if variant.strategy_family in {STRATEGY_FAMILY_PAIR, STRATEGY_FAMILY_LLM_SUPER_AGENT}
             else settings.max_open_trades
         )
+        if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_TP_SL"}:
+            seed = self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance
+            return replace(settings, db_path=db_path, initial_balance=round(seed, 2),
+                           strategy_experiments_enabled=False, strategy_experiments_variants="",
+                           live_trading_runtime_enabled=False, market_scout_enabled=False, llm_super_agent_enabled=False)
+        if variant.variant_id == VALUE_CONFIRM_VARIANT_ID:
+            return replace(settings, db_path=db_path, initial_balance=100.0, stake_dollars=2.0,
+                           max_open_trades=1, max_daily_loss=6.0, max_quote_age_ms=3000,
+                           min_time_left_seconds=30, max_time_left_seconds=270,
+                           max_entry_price=0.65, max_spread=0.02, min_edge=0.03,
+                           strategy_experiments_enabled=False, strategy_experiments_variants="",
+                           live_trading_runtime_enabled=False, market_scout_enabled=False,
+                           llm_super_agent_enabled=False)
         return replace(
             settings,
             db_path=db_path,
@@ -6821,8 +6909,16 @@ class StrategyExperimentRunner:
             self.last_run_at = now
             variants = tuple(self.variants)
         self._settle_pending_official_rounds(variants, now)
+        if self.market_data_provider is not None:
+            fresh = self.market_data_provider(market.round_id)
+            if fresh is None:
+                return
+            price, quotes = fresh
+            now = time.time()
         for variant in variants:
             bot = self._bots[variant.variant_id]
+            if getattr(bot, "independent_runtime", False):
+                continue
             try:
                 bot.store.upsert_round(market)
                 self._save_price_tick(bot.store, price, now)
@@ -6838,7 +6934,8 @@ class StrategyExperimentRunner:
                         "browser_feed_at": now,
                         "backend_rest_fallback_at": None,
                     }
-                self._settle_due_from_price(bot.store, price, now)
+                if variant.variant_id != VALUE_CONFIRM_VARIANT_ID:
+                    self._settle_due_from_price(bot.store, price, now)
                 bot._run_strategy_from_state()
                 bot.store.record_equity()
                 with self._lock:
@@ -6877,6 +6974,7 @@ class StrategyExperimentRunner:
             "decision_summary": _experiment_decision_summary(variants),
             "profit_summary": _experiment_profit_summary(variants),
             "variants": variants,
+            "main_comparison": self.comparison.snapshot() if self.comparison else None,
         }
 
     def detail(self, variant_id: str, trade_limit: int = 50, order_limit: int = 50) -> dict[str, Any]:
@@ -7194,7 +7292,8 @@ class StrategyExperimentRunner:
             "recent_llm_decisions": bot.store.recent_llm_decisions(3) if bot.llm_super_agent_enabled else [],
             "paper_trading_paused": bot.paper_trading_runtime().get("paused", False),
             "last_signal": dict(bot.last_signal or {}),
-            "last_error": last_error,
+            "last_error": bot.last_error if getattr(bot, "independent_runtime", False) else last_error,
+            "independent_runtime": bot.diagnostics() if getattr(bot, "independent_runtime", False) else None,
             "official_broadcast_error": official_broadcast_error,
             "loss_replay_path": str(bot._aggressive_edge_loss_replay.path)
             if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES
@@ -7278,6 +7377,8 @@ class StrategyExperimentRunner:
             self.last_official_broadcast_at = now
         for variant in variants:
             bot = self._bots[variant.variant_id]
+            if getattr(bot, "independent_runtime", False):
+                continue
             try:
                 bot.store.reconcile_round_official_outcome(
                     normalized_round_id,
@@ -7344,6 +7445,8 @@ class StrategyExperimentRunner:
         rounds: dict[str, float] = {}
         for variant in variants:
             bot = self._bots[variant.variant_id]
+            if getattr(bot, "independent_runtime", False):
+                continue
             try:
                 rows = bot.store.open_trades()
             except Exception as exc:  # noqa: BLE001 - keep other experiment stores progressing.

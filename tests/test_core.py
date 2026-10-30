@@ -1126,7 +1126,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK",
+                strategy_experiments_variants="VALUE_CONFIRM_V1",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
@@ -1144,7 +1144,7 @@ class TradingCoreTest(unittest.TestCase):
             store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
 
-            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
             variant_bot.store.upsert_round(market)
             variant_bot.store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
             variant_bot.store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
@@ -1160,7 +1160,7 @@ class TradingCoreTest(unittest.TestCase):
             main_recent = store.recent_trades(1)
             self.assertEqual(main_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
-            variant_detail = bot.strategy_experiment_detail("SINGLE_FAK", trade_limit=5, order_limit=5)
+            variant_detail = bot.strategy_experiment_detail("VALUE_CONFIRM_V1", trade_limit=5, order_limit=5)
             variant_recent = variant_detail["recent_trades_page"]["recent_trades"]
             self.assertEqual(variant_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(variant_bot.store.account()["cash_balance"], 95.0, places=6)
@@ -1168,13 +1168,14 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["chainlink_count"], 0)
             self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
 
+
     def test_strategy_experiments_settle_pending_open_trades_from_official_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK",
+                strategy_experiments_variants="VALUE_CONFIRM_V1",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
@@ -1193,7 +1194,7 @@ class TradingCoreTest(unittest.TestCase):
                 ends_at=now + 300,
                 target_price=101.0,
             )
-            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
             variant_bot.store.upsert_round(ended_market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "experiment official pending")
             variant_bot.store.place_trade(
@@ -1223,73 +1224,8 @@ class TradingCoreTest(unittest.TestCase):
             self.assertAlmostEqual(recent[0]["pnl"], -5.0, places=6)
             self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
 
-    def test_strategy_experiments_settle_shadow_only_round_from_official_resolution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = Settings(
-                db_path=Path(tmp) / "main.sqlite3",
-                strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC",
-            )
-            calls: list[str] = []
 
-            class FakePolymarket:
-                def get_resolution(self, slug: str) -> dict[str, Any] | None:
-                    calls.append(slug)
-                    if slug == ended_market.round_id:
-                        return {"outcome": "Up", "final_price": 101.0, "target_price": 100.0}
-                    return None
 
-            now = time.time()
-            ended_market = MarketRound(
-                round_id="btc-updown-5m-shadow-official-pending",
-                symbol="BTC",
-                started_at=now - 601,
-                ends_at=now - 301,
-                target_price=100.0,
-            )
-            runner = StrategyExperimentRunner(settings, FakePolymarket(), object())
-            variant_bot = runner._bots["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]
-            variant_bot.store.upsert_round(ended_market)
-            variant_bot.store.record_aggressive_edge_v2_shadow_sample(
-                round_id=ended_market.round_id,
-                symbol="BTC",
-                sample_key="m2:pass",
-                side="Up",
-                source_signal_side="Up",
-                base_would_trade=True,
-                v1_would_trade=True,
-                v2_would_trade=True,
-                v4_would_trade=True,
-                v5_would_trade=True,
-                entry_price=0.65,
-                confidence=0.78,
-                move_bps=6.5,
-                report={
-                    "risk_score": 0.1,
-                    "risk_level": "LOW",
-                    "risk_reasons": [],
-                    "features": {},
-                    "components": {},
-                },
-                base_block_reason=None,
-                v1_block_reason=None,
-                v4_block_reason=None,
-                v5_block_reason=None,
-                signal_reason="shadow only official pending",
-                created_at=now - 200,
-            )
-
-            runner._settle_pending_official_rounds(tuple(runner.variants), now)
-
-            self.assertEqual(calls, [ended_market.round_id])
-            round_row = variant_bot.store.get_round(ended_market.round_id)
-            self.assertEqual(round_row["outcome"], "Up")
-            self.assertEqual(round_row["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
-            summary = variant_bot.store.aggressive_edge_v2_shadow_summary("BTC")
-            self.assertEqual(summary["v5_would_trade_settled_count"], 1)
-            self.assertEqual(summary["v5_would_win_count"], 1)
-            self.assertEqual(summary["v5_would_loss_count"], 0)
-            self.assertEqual(runner.snapshot()["official_broadcast_count"], 1)
 
     def test_bot_records_official_resolution_final_and_target_prices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1562,11 +1498,11 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK",
+                strategy_experiments_variants="VALUE_CONFIRM_V1",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
-            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
             now = time.time()
             with variant_bot.store.conn:
                 variant_bot.store.conn.execute(
@@ -1580,7 +1516,7 @@ class TradingCoreTest(unittest.TestCase):
             main_curve = bot.equity_curve_window(account_scope="main", days=90, max_points=10)
             variant_curve = bot.equity_curve_window(
                 account_scope="strategy_experiment",
-                variant_id="SINGLE_FAK",
+                variant_id="VALUE_CONFIRM_V1",
                 days=90,
                 max_points=10,
             )
@@ -1588,13 +1524,15 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(main_curve["equity_curve_meta"]["account_scope"], "main")
             self.assertEqual(main_curve["equity_curve_meta"]["label"], "主账户")
             self.assertEqual(variant_curve["equity_curve_meta"]["account_scope"], "strategy_experiment")
-            self.assertEqual(variant_curve["equity_curve_meta"]["variant_id"], "SINGLE_FAK")
-            self.assertEqual(variant_curve["equity_curve_meta"]["combo"], "SINGLE + FAK")
+            self.assertEqual(variant_curve["equity_curve_meta"]["variant_id"], "VALUE_CONFIRM_V1")
+            self.assertEqual(variant_curve["equity_curve_meta"]["combo"], "价值确认 V1")
             self.assertTrue(any(row["total_equity"] == 105.0 for row in variant_curve["equity_curve"]))
             with self.assertRaises(ValueError):
                 bot.equity_curve_window(account_scope="strategy_experiment", variant_id="bad-variant")
             with self.assertRaises(ValueError):
                 bot.equity_curve_window(account_scope="bad-scope")
+
+
 
     def test_snapshot_keeps_unrealized_pnl_out_of_total_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4336,7 +4274,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK",
+                strategy_experiments_variants="VALUE_CONFIRM_V1",
                 stake_dollars=5.0,
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
@@ -4368,15 +4306,19 @@ class TradingCoreTest(unittest.TestCase):
                     "updated_at_ms": int(now * 1000),
                 },
             }
+            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+            variant_bot.price_basis_tracker._basis["okx"] = [9.900990099] * 5
+            variant_bot.value_confirm_guard.history.append((now*1000-25000,100.8))
+            price.update(okx=101.1,okx_updated_ms=now*1000)
             bot.strategy_experiments.run_from_state(market, price, quotes)
-            variant_bot = bot.strategy_experiments._bots["SINGLE_FAK"]
+            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
             self.assertEqual(variant_bot.store.open_trade_count("BTC"), 1)
 
             payload = bot.set_paper_trading_paused(True)
 
             self.assertTrue(payload["paper_trading"]["paused"])
             self.assertEqual(
-                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["SINGLE_FAK"]["canceled_count"],
+                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["VALUE_CONFIRM_V1"]["canceled_count"],
                 0,
             )
             self.assertTrue(variant_bot.paper_trading_runtime()["paused"])
@@ -4387,6 +4329,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(variant_bot.store.active_paper_orders("BTC"), [])
             self.assertEqual(variant_bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 1)
             self.assertIn("PAPER_PAUSED", variant_bot.snapshot()["runtime"]["last_signal"]["reason"])
+
 
     def test_btc_runtime_pause_blocks_live_snapshot_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6988,60 +6931,17 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(all("fee" in row["reason"] for row in recent))
             self.assertGreater(store.metrics()["realized_pnl"], 0)
 
-    def test_strategy_variants_cover_target_combinations_and_single_fak_modes(self) -> None:
-        combos = [variant.combo for variant in STRATEGY_VARIANTS]
+    def test_strategy_variants_cover_current_independent_accounts(self) -> None:
+        self.assertEqual([v.variant_id for v in STRATEGY_VARIANTS], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"])
+        self.assertEqual([v.combo for v in active_strategy_variants()], ["主账户止盈止损", "主账户（优化版）", "价值确认 V1"])
 
-        self.assertEqual(
-            combos,
-            [
-                "SINGLE + FAK",
-                "SINGLE + FAK Reverse",
-                "SINGLE + FAK Aggressive Edge",
-                "SINGLE + FAK Aggressive Edge V1",
-                "SINGLE + FAK Aggressive Edge V2",
-                "SINGLE + FAK Aggressive Edge V3",
-                "SINGLE + FAK Aggressive Edge Diagnostic",
-                "SINGLE + FAK Aggressive Edge V4 Diagnostic",
-                "SINGLE + FAK Aggressive Edge V5 Diagnostic",
-                "SINGLE + FAK Aggressive Edge V6 Diagnostic",
-                "SINGLE + FAK Aggressive Edge V7 Diagnostic",
-                "SINGLE + FAK Aggressive Edge V8 Learning Diagnostic",
-                "SINGLE + FAK Aggressive Edge V9 M1 Guard Diagnostic",
-                "SINGLE + FAK Aggressive Edge V10 Up Reversal Guard Diagnostic",
-                "SINGLE + FAK Aggressive Edge V11 Depth Momentum Diagnostic",
-                "SINGLE + FAK Aggressive Edge V12 Reversal Guard Diagnostic",
-                "SINGLE + FAK CHAINLINK_ONLY",
-                "SINGLE + FAK CHAINLINK_ONLY ANTI_BOT_GUARD",
-                "SINGLE + FAK FALLBACK_ONLY",
-                "SINGLE + FAK REVERSAL",
-                "SINGLE + FAK STOP_AND_FLIP",
-            ],
-        )
 
-    def test_selected_strategy_variants_ignore_deprecated_variants(self) -> None:
-        selected = selected_strategy_variants("PAIR_GTD,SINGLE_FAK,SINGLE_GTD,SINGLE_FAK_MULTI_LEAD")
-        self.assertEqual([variant.variant_id for variant in selected], ["SINGLE_FAK"])
+    def test_selected_strategy_variants_reject_retired_accounts(self) -> None:
+        self.assertEqual([v.variant_id for v in selected_strategy_variants("")], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"])
+        for retired in ("SINGLE_FAK", "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC", "PAIR_GTD"):
+            with self.subTest(retired=retired), self.assertRaises(ValueError):
+                selected_strategy_variants(retired)
 
-        selected_only_deprecated = selected_strategy_variants(
-            "PAIR_GTD,PAIR_POST_ONLY,SINGLE_GTC,SINGLE_FAK_STRICT,SINGLE_FAK_AGGRESSIVE_EDGE_V3"
-        )
-        self.assertEqual(selected_only_deprecated, tuple())
-
-        active_ids = {variant.variant_id for variant in active_strategy_variants()}
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC", active_ids)
-        self.assertIn("SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC", active_ids)
-        self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE", active_ids)
-        self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V1", active_ids)
-        self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V2", active_ids)
-        self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V3", active_ids)
 
     def test_pair_strategy_gtd_places_two_resting_pair_orders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7498,226 +7398,12 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
-            self.assertIn("review_score", variants["SINGLE_FAK"])
-            self.assertIn("score", variants["SINGLE_FAK"]["review_score"])
-            self.assertEqual(variants["SINGLE_FAK"]["review_score"]["sample_status"], "INSUFFICIENT")
-            self.assertIn("结算样本不足", variants["SINGLE_FAK"]["review_score"]["reasons"][0])
-            self.assertEqual(variants["SINGLE_FAK"]["metrics"]["open_trades"], 1)
-            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["signal_side_mode"], "REVERSE")
-            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["metrics"]["open_trades"], 1)
-            self.assertEqual(variants["SINGLE_FAK_REVERSE"]["last_signal"]["side"], "Down")
-            self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE", variants)
-            self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V1", variants)
-            self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V2", variants)
-            self.assertNotIn("SINGLE_FAK_AGGRESSIVE_EDGE_V3", variants)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V3_INTUITION",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            diagnostic_memory = variants["SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC"]["aggressive_edge_v3_memory_summary"]
-            self.assertIsNotNone(diagnostic_memory)
-            self.assertFalse(diagnostic_memory["ready"])
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V4_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V4_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v4_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v4_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V4_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v4_shadow_summary)
-            self.assertIn("v4_would_trade_count", v4_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V5_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V5_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v5_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v5_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V5_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v5_shadow_summary)
-            self.assertIn("v5_would_trade_count", v5_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V6_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V6_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v6_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v6_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V6_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v6_shadow_summary)
-            self.assertIn("v6_would_trade_count", v6_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V7_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V7_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v7_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v7_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V7_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v7_shadow_summary)
-            self.assertIn("v7_would_trade_count", v7_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V8_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V8_LEARNING_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v8_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v8_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V8_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v8_shadow_summary)
-            self.assertIn("v8_would_trade_count", v8_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V9_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V9_M1_GUARD_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v9_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v9_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V9_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v9_shadow_summary)
-            self.assertIn("v9_would_trade_count", v9_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V10_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V10_UP_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v10_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v10_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V10_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v10_shadow_summary)
-            self.assertIn("v10_would_trade_count", v10_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V11_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V11_DEPTH_MOMENTUM_GUARD_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v11_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v11_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V11_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v11_shadow_summary)
-            self.assertIn("v11_would_trade_count", v11_shadow_summary)
-            self.assertEqual(
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC"]["signal_filter_mode"],
-                "AGGRESSIVE_EDGE_V12_DIAGNOSTIC",
-            )
-            self.assertEqual(variants["SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC"]["metrics"]["open_trades"], 0)
-            self.assertIn(
-                "SINGLE_AGGRESSIVE_EDGE V12_REVERSAL_GUARD_DIAGNOSTIC_NO_TRADE",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC"]["last_signal"]["reason"],
-            )
-            self.assertIn(
-                "single_fak_aggressive_edge_v12_diagnostic.jsonl",
-                variants["SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC"]["loss_replay_path"],
-            )
-            v12_shadow_summary = variants["SINGLE_FAK_AGGRESSIVE_EDGE_V12_DIAGNOSTIC"]["aggressive_edge_v2_shadow_summary"]
-            self.assertIsNotNone(v12_shadow_summary)
-            self.assertIn("v12_would_trade_count", v12_shadow_summary)
-            self.assertEqual(variants["SINGLE_FAK_REVERSAL"]["single_entry_mode"], "REVERSAL")
-            self.assertEqual(variants["SINGLE_FAK_STOP_AND_FLIP"]["single_entry_mode"], "STOP_AND_FLIP")
-            self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["price_source_mode"], "CHAINLINK_ONLY")
-            self.assertEqual(variants["SINGLE_FAK_CHAINLINK_ONLY"]["metrics"]["open_trades"], 1)
-            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["price_source_mode"], "CHAINLINK_ONLY")
-            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["anti_bot_guard_mode"], "ANTI_BOT_GUARD")
-            self.assertEqual(variants["SINGLE_FAK_ANTI_BOT_GUARD"]["metrics"]["open_trades"], 1)
-            self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["price_source_mode"], "FALLBACK_ONLY")
-            self.assertEqual(variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["side"], "NO_TRADE")
-            self.assertIn("当前有新鲜 Chainlink", variants["SINGLE_FAK_FALLBACK_ONLY"]["last_signal"]["reason"])
-            self.assertNotIn("REALTIME_MAKER_POST_ONLY", variants)
-            self.assertNotIn("LLM_SUPER_AGENT_PAPER", variants)
-            self.assertNotIn("SINGLE_GTC", variants)
-            self.assertNotIn("SINGLE_GTD", variants)
-            self.assertNotIn("SINGLE_POST_ONLY", variants)
-            self.assertNotIn("SINGLE_FAK_STRICT", variants)
-            self.assertNotIn("SINGLE_FAK_MULTI_CONFIRM", variants)
-            self.assertNotIn("SINGLE_FAK_MULTI_LEAD", variants)
+            self.assertEqual(set(variants), {"MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"})
+            self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["open_trades"], 0)
+            self.assertEqual(variants["VALUE_CONFIRM_V1"]["last_signal"]["side"], "NO_TRADE")
+            self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["cash_balance"], 100)
+            self.assertNotEqual(bot.store.db_path, bot.strategy_experiments._bots["VALUE_CONFIRM_V1"].store.db_path)
 
-            detail = bot.strategy_experiment_detail("SINGLE_FAK", trade_limit=5, order_limit=5)
-            self.assertEqual(detail["variant"]["variant_id"], "SINGLE_FAK")
-            self.assertEqual(detail["variant"]["order_summary"]["total_count"], 1)
-            self.assertEqual(detail["recent_orders_page"]["recent_orders_meta"]["total"], 1)
-            self.assertEqual(detail["recent_trades_page"]["recent_trades_meta"]["total"], 1)
-
-            retrospective = bot.strategy_experiments_retrospective()
-            self.assertTrue(retrospective["enabled"])
-            self.assertEqual(len(retrospective["variants"]), len(active_variants))
-            self.assertEqual(len(retrospective["profit_summary"]["rankings"]), len(active_variants))
-            self.assertEqual(retrospective["window"], {"start_at": None, "end_at": None})
-
-            tables = bot.strategy_experiments_tables(trade_limit=20, order_limit=20)
-            self.assertTrue(tables["enabled"])
-            self.assertGreaterEqual(len(tables["open_trades"]), 3)
-            self.assertTrue(all("combo" in row for row in tables["open_trades"]))
-            self.assertTrue(any(row["variant_id"] == "SINGLE_FAK" for row in tables["open_trades"]))
-            self.assertTrue(all(not str(row["variant_id"]).startswith("PAIR_") for row in tables["open_trades"]))
-            self.assertGreaterEqual(tables["recent_orders_meta"]["total"], 5)
-            self.assertTrue(all("combo" in row for row in tables["recent_orders"]))
-            self.assertGreaterEqual(tables["recent_trades_meta"]["total"], 1)
-            self.assertEqual(tables["recent_trades_summary"]["total_count"], tables["recent_trades_meta"]["total"])
-
-            with self.assertRaises(ValueError):
-                bot.strategy_experiment_detail("bad-variant")
 
     def test_strategy_experiment_low_fill_variant_is_disqualified(self) -> None:
         review = _experiment_review_score(
@@ -7894,7 +7580,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="SINGLE_FAK",
+                strategy_experiments_variants="VALUE_CONFIRM_V1",
             )
             output = Path(tmp) / "docs" / "snapshot.html"
 
@@ -7909,8 +7595,9 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(output.exists())
             html = output.read_text(encoding="utf-8")
             self.assertIn("策略实验复盘报告", html)
-            self.assertIn("SINGLE + FAK", html)
+            self.assertIn("价值确认 V1", html)
             self.assertIn("数据源", html)
+
 
     def test_paper_order_summary_supports_time_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

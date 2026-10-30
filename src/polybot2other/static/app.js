@@ -191,7 +191,7 @@ const FIELD_STORAGE_KEYS = {
   recent: "polybot2other:recent-trade-fields",
   marketPaperOrder: "polybot2other:market-paper-order-fields:v2",
 };
-const APP_PAGE_KEYS = new Set(["bot", "market", "samples", "status"]);
+const APP_PAGE_KEYS = new Set(["bot", "status"]);
 const SAMPLE_VERSION_STORAGE_KEY = "polybot2other:sample-version:v12";
 const SAMPLE_DEFAULT_VERSION = "V12";
 const SAMPLE_VERSION_KEYS = ["V12", "V11", "V10", "V9", "V8", "V7", "V6", "V5", "V4"];
@@ -2491,7 +2491,7 @@ function renderAccountScope(data = latestStatus) {
   if (!options.some((option) => option.value === accountScope)) {
     const parsed = parseAccountScope(accountScope);
     const live = parsed.scope === "live" ? liveVariant(data) : null;
-    accountScope = live ? `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}` : "main";
+    accountScope = "main";
     equityCurveRows = [];
     equityCurveMeta = {};
     lastEquityCurveFetchMs = 0;
@@ -2546,40 +2546,13 @@ function renderDataScopeOptions(data = latestStatus) {
 }
 
 function accountScopeOptions(data = latestStatus) {
-  const variants = strategyExperimentVariants(data);
-  const live = liveVariant(data);
-  const livePapers = livePaperVariants(data);
-  return [
-    { value: "main", label: "主账户" },
-    ...variants.map((row) => ({
-      value: `experiment:${row.variant_id}`,
-      label: row.combo || row.variant_id,
-    })),
-    ...(live ? [{ value: `live:${live.variant_id || LIVE_REAL_DEFAULT_STRATEGY_ID}`, label: live.combo || LIVE_REAL_DEFAULT_STRATEGY_ID }] : []),
-    ...livePapers.map((row) => ({
-      value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
-      label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
-    })),
-  ];
+  return [{ value: "main", label: "主账户" }, ...strategyExperimentVariants(data).map(row => ({
+    value: `experiment:${row.variant_id}`, label: row.combo || row.variant_id,
+  }))];
 }
 
 function tableScopeOptions(data = latestStatus) {
-  const variants = strategyExperimentVariants(data);
-  const livePapers = livePaperVariants(data);
-  const liveOptions = liveStrategyTableOptions(data);
-  return [
-    { value: "main", label: "主账户" },
-    { value: "experiment", label: "策略实验全部" },
-    ...variants.map((row) => ({
-      value: `experiment:${row.variant_id}`,
-      label: row.combo || row.variant_id,
-    })),
-    ...liveOptions,
-    ...livePapers.map((row) => ({
-      value: `live_paper:${row.variant_id || "SINGLE_FAK_REAL_PAPER"}`,
-      label: row.combo || row.variant_id || "SINGLE_FAK_REAL_PAPER",
-    })),
-  ];
+  return accountScopeOptions(data);
 }
 
 function strategyExperimentVariants(data = latestStatus) {
@@ -3220,40 +3193,73 @@ function setLiveFallbackSourcesIfIdle(sources = [], { preserveDirty = false } = 
 function renderStrategyExperiments(runtime = {}) {
   if (!ids.strategyExperiments) return;
   const experiments = runtime.strategy_experiments || {};
-  const variants = Array.isArray(experiments.variants) ? experiments.variants : [];
-  const decision = experiments.decision_summary || {};
-  const profit = experiments.profit_summary || {};
-  const ranked = rankExperimentVariants(variants);
-  const settledTotal = variants.reduce((sum, row) => sum + (toNumber(row.recent_trades_summary?.settled_count) || 0), 0);
-  const activeTotal = variants.reduce((sum, row) => sum + (toNumber(row.active_orders) || 0), 0);
-  const openTotal = variants.reduce((sum, row) => sum + (toNumber(row.metrics?.open_trades) || 0), 0);
+  const variants = strategyExperimentVariants(latestStatus);
+  const main = { variant_id: "MAIN", combo: "主账户", role: "保留原策略与历史账本",
+    metrics: latestStatus?.metrics || {}, recent_trades_summary: latestStatus?.recent_trades_summary || {},
+    last_signal: runtime.last_signal || {}, last_error: runtime.last_error };
+  const rows = [main, ...variants];
+  ids.strategyExperimentMeta.textContent = `${rows.length} 个账户 · Paper 模拟交易`;
+  ids.strategyExperimentSummary.textContent = "各账户独立核算 · 止盈止损沿用主账户入场 · 原有策略与历史保留";
+  renderMainComparison(experiments);
+  renderMainExitComparison(experiments);
+  ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("");
+}
 
-  ids.strategyExperimentMeta.textContent = `${variants.length} 组 · tick ${experiments.run_count || 0}`;
-  const renderKey = experimentRenderKey(experiments, variants, decision, profit);
-  if (renderKey === lastExperimentRenderKey) return;
-  lastExperimentRenderKey = renderKey;
-  ids.strategyExperimentSummary.innerHTML = [
-    experimentSummaryItem("推荐", decision.recommended_combo || decision.current_leader_combo || "等待样本"),
-    experimentSummaryItem("盈利", profit.winner_combo || profit.current_profit_leader_combo || "等待样本"),
-    experimentSummaryItem("状态", decision.status_label || "继续观察"),
-    experimentSummaryItem("官方", fmtNumberCell(experiments.official_broadcast_count, 0)),
-    experimentSummaryItem("可比", `${fmtNumberCell(decision.ready_count, 0)} / ${fmtNumberCell(decision.total_count || variants.length, 0)}`),
-    experimentSummaryItem("淘汰", fmtNumberCell(decision.disqualified_count, 0)),
-    experimentSummaryItem("已结算", fmtNumberCell(settledTotal, 0)),
-    experimentSummaryItem("持仓", fmtNumberCell(openTotal, 0)),
-    experimentSummaryItem("挂单", fmtNumberCell(activeTotal, 0)),
+function renderMainComparison(experiments = {}) {
+  const panel = document.getElementById("optimized-main-panel");
+  if (!panel) return;
+  const comparison = experiments.main_comparison;
+  const optimized = (experiments.variants || []).find(row => row.variant_id === "MAIN_OPTIMIZED");
+  panel.hidden = !comparison;
+  if (!comparison) return;
+  document.getElementById("main-comparison-period").textContent = "起点：" + new Date(comparison.started_at * 1000).toLocaleString("zh-CN") + " · 初始模拟权益约 " + fmtMoneyCell(comparison.optimized_start_equity);
+  document.getElementById("main-comparison-status").textContent = comparison.status;
+  const note = panel.querySelector(".optimized-comparison-note");
+  if (note) note.textContent = "只比较对照起点之后的新成交，原有利润不计入提升幅度。" + (comparison.baseline_existing_positions_excluded ? "起点已有的 " + comparison.baseline_existing_positions_excluded + " 笔原版旧仓也不计入本段。" : "") + "新规则仍待 Paper 验证。";
+  document.getElementById("main-comparison-summary").innerHTML = [
+    experimentSummaryItem("净收益差", signedMoney(comparison.realized_pnl_difference)),
+    experimentSummaryItem("胜率差", comparison.win_rate_difference_pp == null ? "待样本" : comparison.win_rate_difference_pp.toFixed(2) + " 个百分点"),
+    experimentSummaryItem("共同已结算市场", comparison.common_settled_markets),
   ].join("");
+  document.getElementById("main-comparison-rows").innerHTML = [["主账户", comparison.baseline], ["主账户（优化版）", comparison.optimized]].map(([label, row]) =>
+    "<tr><td>" + safe(label) + "</td><td>" + fmtNumberCell(row.fills, 0) + "</td><td>" + fmtNumberCell(row.settled, 0) + "</td><td>" + fmtSignedMoneyCell(row.realized_pnl) + "</td><td>" + fmtPctCell(row.win_rate) + "</td><td>" + fmtMoneyCell(row.pending_stake) + "</td><td>" + fmtMoneyCell(row.settled_sequence_drawdown) + "</td><td>" + fmtMoneyCell(row.fees) + "</td></tr>"
+  ).join("");
+  const runtime = optimized?.independent_runtime || {};
+  const reference = runtime.reference || {};
+  const twap = reference.latest?.["price.crypto.twap"] || {};
+  const spot = reference.latest?.["price.crypto"] || {};
+  const freshness = reference.ready ? "参考价格就绪" : "等待新鲜参考价格";
+  const verified = reference.protocol_verified ? "TWAP 基准已与官方核对" : "等待 TWAP 基准核对";
+  document.getElementById("optimized-reference-status").textContent = "优化版独立行情：" + (runtime.market || "等待市场") + " · 开盘基准 " + fmtMoneyCell(runtime.target_price) + " · 当前 TWAP " + fmtMoneyCell(twap.price) + " · 现价 " + fmtMoneyCell(spot.price) + " · " + freshness + " · " + verified + " · " + (optimized?.last_signal?.reason || "等待判断");
+}
 
-  if (!experiments.enabled) {
-    ids.strategyExperiments.innerHTML = `<tr><td colspan="15" class="empty">实验未启用</td></tr>`;
-    return;
-  }
-  if (!ranked.length) {
-    ids.strategyExperiments.innerHTML = `<tr><td colspan="15" class="empty">暂无实验数据</td></tr>`;
-    return;
-  }
-
-  ids.strategyExperiments.innerHTML = ranked.map((row, index) => renderExperimentRow(row, index + 1)).join("");
+function renderMainExitComparison(experiments = {}) {
+  const panel = document.getElementById("main-exit-panel");
+  if (!panel) return;
+  const variant = (experiments.variants || []).find(row => row.variant_id === "MAIN_TP_SL");
+  panel.hidden = !variant;
+  if (!variant) return;
+  const state = variant.independent_runtime || {};
+  const rule = state.policy || {};
+  const stats = state.comparison || {};
+  document.getElementById("main-exit-period").textContent = (state.started_at ? "开始：" + new Date(state.started_at * 1000).toLocaleString("zh-CN") : "等待主账户连接") + " · 初始模拟资金 " + fmtMoneyCell(state.initial_balance);
+  document.getElementById("main-exit-status").textContent = variant.last_error || (variant.paper_trading_paused ? "Paper 已暂停" : state.running ? "独立运行中" : "等待启动");
+  document.getElementById("main-exit-summary").innerHTML = [
+    experimentSummaryItem("跟随入场", stats.matched_entries || 0),
+    experimentSummaryItem("已结算配对", stats.paired_settled || 0),
+    experimentSummaryItem("同单收益差", stats.paired_settled ? signedMoney(stats.difference) : "等待结算"),
+    experimentSummaryItem("止盈 / 止损单", `${stats.take_profit_trades || 0} / ${stats.stop_loss_trades || 0}`),
+    experimentSummaryItem("挽回亏损 / 赢家变亏", `${stats.saved_losses || 0} / ${stats.winners_stopped_out || 0}`),
+    experimentSummaryItem("卖出费用", fmtMoneyCell(stats.exit_fees)),
+    experimentSummaryItem("未跟随", stats.skipped_entries || 0),
+  ].join("");
+  document.getElementById("main-exit-policy").textContent = `试验规则：净盈利 ${(Number(rule.take_profit || 0) * 100).toFixed(0)}% 止盈，净亏损 ${(Number(rule.stop_loss || 0) * 100).toFixed(0)}% 止损。卖出按买盘深度与费用核算，${Number(rule.latency_seconds || 0) * 1000} 毫秒模拟延迟。` + (variant.last_signal?.reason || "");
+  const pairs = stats.recent_pairs || [];
+  document.getElementById("main-exit-pairs").innerHTML = pairs.length ? pairs.map(row => {
+    const complete = row.difference != null;
+    const status = row.remaining_parts ? "持仓中" : complete ? "对照已完成" : "已退出，等待官方结果";
+    return `<tr><td>#${safe(row.parent_id)}</td><td>${safe(row.side)}</td><td>${fmtMoneyCell(row.original_stake)}</td><td>${safe(status)}</td><td>${row.hold_pnl == null ? "待官方结算" : fmtSignedMoneyCell(row.hold_pnl)}</td><td>${row.remaining_parts ? "尚未完全退出" : fmtSignedMoneyCell(row.exit_pnl)}</td><td>${complete ? fmtSignedMoneyCell(row.difference) : "待配对"}</td></tr>`;
+  }).join("") : '<tr><td colspan="7">等待启用后的主账户新成交；不会补录旧仓或导入历史收益。</td></tr>';
 }
 
 function experimentSummaryItem(label, value) {
@@ -3777,46 +3783,23 @@ function rankExperimentVariants(variants) {
   });
 }
 
-function renderExperimentRow(row, rank) {
-  const summary = row.recent_trades_summary || {};
+function renderExperimentRow(row) {
   const metrics = row.metrics || {};
-  const orders = row.order_summary || {};
-  const review = row.review_score || {};
-  const settled = toNumber(summary.settled_count) || 0;
-  const total = toNumber(summary.total_count) || 0;
-  const open = toNumber(metrics.open_trades) || 0;
-  const active = toNumber(row.active_orders) || 0;
-  const orderQuality = `${fmtNumberCell(orders.filled_count, 0)} 成 · ${fmtNumberCell(orders.canceled_count, 0)} 取 · ${fmtNumberCell(orders.expired_count, 0)} 过 · ${fmtNumberCell(orders.rejected_count, 0)} 拒`;
-  const rowError = row.last_error || row.official_broadcast_error;
-  const signal = rowError || row.last_signal?.reason || row.last_signal?.side || "-";
-  const signalSide = rowError ? "异常" : row.last_signal?.side || "-";
+  const summary = row.recent_trades_summary || {};
+  const isMain = row.variant_id === "MAIN";
   const detailOpen = expandedExperimentId === row.variant_id;
-  return `
-    <tr>
-      <td class="mono-cell">${rank}</td>
-      <td>
-        <strong class="${scoreClass(review.score)}">${fmtNumberCell(review.score, 2)}</strong>
-        <span class="subtle">${safe(review.decision)}</span>
-      </td>
-      <td>${safe(review.sample_label || "-")}</td>
-      <td>
-        <strong>${safe(row.combo || row.variant_id)}</strong>
-        <span class="subtle mono-cell">${safe(row.variant_id)}</span>
-      </td>
-      <td>${safe(row.role)}</td>
-      <td>${fmtSignedMoneyCell(summary.total_pnl)}</td>
-      <td>${fmtSignedPctCell(summary.roi_pct)}</td>
-      <td>${fmtPctCell(summary.win_rate)}</td>
-      <td>${fmtPctCell(orders.fill_rate)}</td>
-      <td>${safe(orderQuality)}</td>
-      <td>${fmtNumberCell(settled, 0)} / ${fmtNumberCell(total, 0)}</td>
-      <td>${fmtNumberCell(open, 0)} 持仓 · ${fmtNumberCell(active, 0)} 挂单</td>
-      <td>${safe(row.target_report_alignment)}</td>
-      <td class="reason-cell"><span class="${rowError ? "negative" : ""}">${safe(signalSide)}</span> · ${safe(signal)}</td>
-      <td><button class="table-action" type="button" data-experiment-id="${safe(row.variant_id)}">${detailOpen ? "收起" : "详情"}</button></td>
-    </tr>
-    ${detailOpen ? renderExperimentDetailRow(row.variant_id, 15) : ""}
-  `;
+  return `<tr data-strategy-id="${safe(row.variant_id)}">
+    <td><strong>${safe(row.combo)}</strong></td>
+    <td>${safe(row.role)}</td>
+    <td>${fmtMoneyCell(metrics.total_equity)}</td>
+    <td>${fmtSignedMoneyCell(metrics.realized_pnl)}</td>
+    <td>${fmtNumberCell(row.variant_id === "MAIN_TP_SL" ? metrics.settled_trades : summary.settled_count, 0)}</td>
+    <td>${fmtPctCell(row.variant_id === "MAIN_TP_SL" ? metrics.win_rate : summary.win_rate)}</td>
+    <td>${fmtNumberCell(metrics.open_trades, 0)}</td>
+    <td class="reason-cell">${safe(row.last_error || row.last_signal?.reason || "等待新行情")}</td>
+    <td>${isMain ? '<button class="table-action" type="button" data-main-strategy>查看主账户</button>' :
+      `<button class="table-action" type="button" data-experiment-id="${safe(row.variant_id)}">${detailOpen ? "收起" : "详情"}</button>`}</td>
+    </tr>${!isMain && detailOpen ? renderExperimentDetailRow(row.variant_id, 9) : ""}`;
 }
 
 function renderExperimentDetailRow(variantId, colspan) {
@@ -3945,7 +3928,7 @@ function displayTargetState(market) {
 function renderMarket(data = latestStatus) {
   const runtime = data?.runtime || {};
   const market = activeMarket || runtime.current_market;
-  const signal = selectedAccountSignal(data);
+  const signal = ["MAIN_OPTIMIZED", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
   const pair = runtime.pair_strategy || {};
   const lastPairEvent = pair.last_event || {};
   const up = quotes.Up || runtime.latest_quotes?.Up || {};
@@ -6645,6 +6628,11 @@ document.addEventListener("keydown", (event) => {
 });
 ids.accountScopeSelect.addEventListener("change", handleAccountScopeChange);
 ids.strategyExperiments.addEventListener("click", (event) => {
+  if (event.target.closest("[data-main-strategy]")) {
+    ids.accountScopeSelect.value = "main";
+    ids.accountScopeSelect.dispatchEvent(new Event("change"));
+    return;
+  }
   const button = event.target.closest("[data-experiment-id]");
   if (!button) return;
   event.stopPropagation();

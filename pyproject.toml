@@ -23,3 +23,6 @@ polybot2other-sample-monitor = "polybot2other.sample_monitor:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
