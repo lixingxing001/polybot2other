@@ -525,13 +525,22 @@ class PaperTradingBot:
             if settings.strategy_experiments_enabled
             else None
         )
-        self.live_trading = LiveStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+        legacy_live = settings.live_trading_runtime_enabled and not settings.managed_live_enabled
+        self.live_trading = LiveStrategyRunner(settings, self.polymarket) if legacy_live else None
         self.live_paper_trading = (
-            LivePaperStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+            LivePaperStrategyRunner(settings, self.polymarket) if legacy_live else None
         )
         self.live_paper_stop_win_trading = (
-            LivePaperStopWinStrategyRunner(settings, self.polymarket) if settings.live_trading_runtime_enabled else None
+            LivePaperStopWinStrategyRunner(settings, self.polymarket) if legacy_live else None
         )
+        self.managed_live = None
+        self.managed_live_error = None
+        if settings.managed_live_enabled:
+            try:
+                from .managed_live import ManagedLiveAccounts
+                self.managed_live = ManagedLiveAccounts(settings, self)
+            except Exception as exc:
+                self.managed_live_error = f"实盘模块启动失败（{type(exc).__name__}），Paper 继续运行"
         self._append_market_llm_terminal_log(
             level="info",
             module="system",
@@ -574,6 +583,9 @@ class PaperTradingBot:
 
     def start(self) -> None:
         self._start_market_scout()
+        if self.managed_live is not None:
+            self.managed_live.set_market_paused(self.btc_runtime_is_paused())
+            self.managed_live.start()
         if self.btc_runtime_is_paused():
             logger.info("BTC 数据业务处于暂停态，后台行情线程不启动")
             return
@@ -619,6 +631,8 @@ class PaperTradingBot:
     def stop(self) -> None:
         self._market_scout_stop.set()
         self._stop.set()
+        if self.managed_live is not None:
+            self.managed_live.stop()
         if self.strategy_experiments is not None:
             self.strategy_experiments.stop_independent()
         self._join_btc_worker_threads()
@@ -711,6 +725,8 @@ class PaperTradingBot:
         if paused:
             # HTTP 按钮必须快速返回；线程会在各自循环里看到 _stop 和暂停态后退出。
             self._stop.set()
+            if self.managed_live is not None:
+                self.managed_live.set_market_paused(True)
             if self.strategy_experiments is not None:
                 self.strategy_experiments.pause_independent()
             self._set_btc_runtime_paused_runtime_state(now)
@@ -5662,6 +5678,8 @@ class PaperTradingBot:
                 ),
             )
         runtime["strategy_experiments"] = strategy_experiments_snapshot
+        runtime["managed_live"] = self.managed_live.snapshot() if self.managed_live is not None else {
+            "available": False, "enabled": False, "error": self.managed_live_error}
         runtime["live_trading"] = live_snapshot
         runtime["live_paper_trading"] = live_paper_snapshot
         runtime["live_paper_stop_win_trading"] = live_paper_stop_win_snapshot
@@ -6844,14 +6862,14 @@ class StrategyExperimentRunner:
             seed = self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance
             return replace(settings, db_path=db_path, initial_balance=round(seed, 2),
                            strategy_experiments_enabled=False, strategy_experiments_variants="",
-                           live_trading_runtime_enabled=False, market_scout_enabled=False, llm_super_agent_enabled=False)
+                           live_trading_runtime_enabled=False, managed_live_enabled=False, market_scout_enabled=False, llm_super_agent_enabled=False)
         if variant.variant_id == VALUE_CONFIRM_VARIANT_ID:
             return replace(settings, db_path=db_path, initial_balance=100.0, stake_dollars=2.0,
                            max_open_trades=1, max_daily_loss=6.0, max_quote_age_ms=3000,
                            min_time_left_seconds=30, max_time_left_seconds=270,
                            max_entry_price=0.65, max_spread=0.02, min_edge=0.03,
                            strategy_experiments_enabled=False, strategy_experiments_variants="",
-                           live_trading_runtime_enabled=False, market_scout_enabled=False,
+                           live_trading_runtime_enabled=False, managed_live_enabled=False, market_scout_enabled=False,
                            llm_super_agent_enabled=False)
         return replace(
             settings,
@@ -6861,6 +6879,7 @@ class StrategyExperimentRunner:
             strategy_experiments_enabled=False,
             strategy_experiments_variants="",
             live_trading_runtime_enabled=False,
+            managed_live_enabled=False,
         )
 
     def set_paper_trading_paused(

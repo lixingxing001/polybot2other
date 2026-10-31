@@ -32,8 +32,10 @@ log_path.parent.mkdir(exist_ok=True)
 env = dict(os.environ)
 env["PYTHONPATH"] = str(root / "src")
 env["PYTHONUNBUFFERED"] = "1"
-# Restoring the dashboard must never arm the imported real-money account.
-env["POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED"] = "false"
+# Enable the new live feature; its master/per-strategy switches default OFF.
+# Legacy live runners remain disabled when MANAGED_LIVE_ENABLED is true.
+env.setdefault("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", "true")
+env["POLYBOT2OTHER_MANAGED_LIVE_ENABLED"] = "true"
 env["POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED"] = "true"
 env["POLYBOT2OTHER_STRATEGY_EXPERIMENTS_VARIANTS"] = "MAIN_TP_SL,MAIN_OPTIMIZED,VALUE_CONFIRM_V1"
 env["POLYBOT2OTHER_MARKET_SCOUT_ENABLED"] = "false"
@@ -58,7 +60,7 @@ while time.monotonic() < deadline:
     try:
         with opener.open(f"{url}/api/status", timeout=3) as response:
             json.load(response)
-        print(f"Dashboard: {url}\nMode: Paper (real-money runtime disabled)\nPID: {process.pid}\nLog: {log_path}")
+        print(f"Dashboard: {url}\nMode: Paper / Live via independent dashboard switches\nPID: {process.pid}\nLog: {log_path}")
         break
     except (OSError, ValueError):
         time.sleep(1)

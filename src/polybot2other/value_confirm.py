@@ -44,10 +44,13 @@ def entry_limit(signal, fee_rate=.07):
 
 
 class ValueConfirmGuard:
-    def __init__(self, store, fee_rate=.07):
+    def __init__(self, store, fee_rate=.07, *, budget_calculator=None):
         self.store = store
         self.execution_lock = threading.Lock()
         self.fee_rate = fee_rate
+        self.budget_calculator = budget_calculator or stake_budget
+        self.daily_loss_limit = DAILY_LOSS_LIMIT
+        self.position_limit = 1
         self.history = deque(maxlen=180)
         self.last_decision = {}
         self._last_logged = None
@@ -58,7 +61,7 @@ class ValueConfirmGuard:
         now = time.time() if now is None else now
         account = self.store.account()
         daily_pnl = self.store.daily_realized_pnl()
-        budget = stake_budget(account, daily_pnl)
+        budget = self.budget_calculator(account, daily_pnl)
         reference = reference_probability(signal.confidence)
         features = {'version': VARIANT_ID, 'policy_version':POLICY_VERSION,
                     'round_id': market.round_id, 'observed_at': now,
@@ -117,12 +120,12 @@ class ValueConfirmGuard:
             return finish('FEE_EDGE', '扣除手续费和一美分滑点后参考优势不足 0.03')
         if self.store.trades_for_round(market.round_id):
             return finish('ONE_ENTRY', '本期已经成交过，不反手或重复开仓')
-        if daily_pnl <= -DAILY_LOSS_LIMIT:
-            return finish('DAILY_STOP', '滚动 24 小时已亏损达到 6 美元')
+        if self.daily_loss_limit > 0 and daily_pnl <= -self.daily_loss_limit:
+            return finish('DAILY_STOP', f'滚动 24 小时已亏损达到 {self.daily_loss_limit:g} 美元')
         if float(account['realized_pnl']) <= -TOTAL_LOSS_LIMIT:
             return finish('TOTAL_STOP', '累计已实现亏损达到 20 美元，保留账本等待复核')
-        if self.store.open_trade_count('BTC') >= 1:
-            return finish('POSITION_LIMIT', '已有一笔持仓，等待官方结算')
+        if self.store.open_trade_count('BTC') >= self.position_limit:
+            return finish('POSITION_LIMIT', '已有一笔持仓，等待官方结算' if self.position_limit == 1 else '持仓已达上限，等待官方结算')
         if budget < .1:
             return finish('CASH', '模拟资金不足')
         direction = 1 if signal.side == 'Up' else -1

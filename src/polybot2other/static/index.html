@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20261030-main-exit-v1">
+    <link rel="stylesheet" href="/static/styles.css?v=20261031-reconcile-v1">
   </head>
   <body>
     <main class="app-shell">
@@ -40,6 +40,15 @@
 
       <div class="page-stack">
       <section id="bot-page" class="app-page is-active" data-page="bot" aria-labelledby="nav-bot">
+      <section id="managed-wallet-panel" class="panel managed-wallet-panel" hidden>
+        <div class="managed-wallet-head"><div><div class="eyebrow">真实钱包 · 四个策略共享</div><div id="managed-wallet-address" class="subtle">正在连接</div></div><label class="managed-master"><span id="managed-mode-label">Paper 模式</span><input id="managed-master-enabled" type="checkbox" aria-label="实盘总开关"><span class="managed-switch-track"></span><b>实盘总开关</b></label></div>
+        <div class="managed-wallet-stats"><div><span>真实钱包余额</span><strong id="managed-wallet-balance">—</strong></div><div><span>钱包持仓估值</span><strong id="managed-wallet-positions">—</strong></div><div><span>真实钱包总资产</span><strong id="managed-wallet-total">—</strong></div><div><span>连接状态</span><strong id="managed-wallet-health">读取中</strong><small id="managed-wallet-updated"></small></div></div>
+        <p class="managed-wallet-note">总开关与对应策略开关同时开启，才会使用真实资金新开仓。关闭后停止新开仓，已有实盘持仓继续管理退出。Paper 对照继续保留。</p>
+        <div id="managed-strategy-controls" class="managed-strategy-controls"></div>
+        <div id="managed-execution-status" class="managed-execution-status" role="status" aria-live="polite"></div>
+        <details class="managed-event-history"><summary>实盘运行记录 · 暂停与恢复</summary><ul id="managed-execution-events"></ul></details>
+        <p id="managed-live-message" class="managed-live-message" role="status" aria-live="polite"></p>
+      </section>
       <section class="panel live-panel retired-feature">
         <div class="panel-head live-head">
           <div class="live-title">
@@ -137,6 +146,14 @@
               <option value="main">主账户</option>
             </select>
           </label>
+          <label class="scope-switch" id="managed-view-control" hidden>
+            数据
+            <select id="managed-data-view" aria-label="Paper与实盘数据展示">
+              <option value="auto">跟随当前策略开关</option>
+              <option value="paper">只查看 Paper</option>
+              <option value="live">只查看实盘</option>
+            </select>
+          </label>
         </div>
         <div class="metric">
           <span>总资产</span>
@@ -145,10 +162,12 @@
         <div class="metric">
           <span>总盈亏</span>
           <strong id="total-pnl">$0.00</strong>
+          <small class="managed-valuation-note" data-live-valuation-note="total" hidden></small>
         </div>
         <div class="metric">
           <span>未实现盈亏</span>
           <strong id="unrealized-pnl">$0.00</strong>
+          <small class="managed-valuation-note" data-live-valuation-note="unrealized" hidden></small>
         </div>
         <div class="metric">
           <span>可用资金</span>
@@ -175,7 +194,7 @@
       <section class="main-grid">
         <div class="panel">
           <div class="panel-head">
-            <h2>实时市场 · 原主账户</h2>
+            <h2 id="market-panel-title">实时市场 · 原主账户</h2>
             <span id="last-tick">-</span>
           </div>
           <div id="markets" class="market-list"></div>
@@ -183,11 +202,12 @@
 
         <div class="panel chart-panel">
           <div class="panel-head">
-            <h2>资金曲线</h2>
+            <h2 id="equity-chart-title">资金曲线</h2>
             <span id="paper-only">主账户 · Paper Only</span>
           </div>
           <div class="chart-body">
             <canvas id="equity-chart" width="680" height="190"></canvas>
+            <p id="managed-chart-empty" class="managed-empty" hidden>等待真实资产估值</p>
             <div id="equity-tooltip" class="chart-tooltip" hidden></div>
           </div>
         </div>
@@ -228,7 +248,12 @@
         </div>
       </section>
 
-      <section class="table-stack">
+      <section id="managed-live-tables" class="table-stack" hidden>
+        <div class="panel"><div class="panel-head"><h2>真实持仓 · <span id="managed-position-account"></span></h2><span id="managed-position-count"></span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>市场 / 方向</th><th>买入成本</th><th>剩余份额</th><th>退出估值</th><th>浮动盈亏</th><th>操作</th></tr></thead><tbody id="managed-positions"></tbody></table></div></div>
+        <div class="panel"><div class="panel-head"><h2>真实订单</h2><span>最近 50 条 · 只按官方确认记入成交</span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>时间</th><th>操作 / 方向</th><th>状态</th><th>含费预算 / 卖出份额</th><th>已确认份额</th><th>成交金额</th><th>手续费</th><th>官方订单</th></tr></thead><tbody id="managed-orders"></tbody></table></div></div>
+        <div class="panel"><div class="panel-head"><h2>实盘交易记录</h2><span>最近 50 笔</span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>开仓时间</th><th>市场 / 方向</th><th>状态</th><th>实际买入成本</th><th>已结算盈亏</th><th>待领取收益</th></tr></thead><tbody id="managed-history"></tbody></table></div><p class="managed-wallet-note">盈亏按官方已确认成交与市场费率核算。待领取收益属于已结算资产，不等同于可用现金；请在 Polymarket 完成领取。钱包余额与总资产为共享口径，持仓与盈亏按当前策略统计。</p></div>
+      </section>
+      <section class="table-stack" id="paper-table-stack">
         <div class="panel">
           <div class="panel-head">
             <div>
@@ -653,6 +678,7 @@
       </div>
     </main>
 
-    <script src="/static/app.js?v=20261030-main-exit-v1"></script>
+    <script src="/static/managed-live.js?v=20261031-reconcile-v1"></script>
+    <script src="/static/app.js?v=20261031-reconcile-v1"></script>
   </body>
 </html>

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import html
+import hmac
+import ipaddress
 import json
 import mimetypes
 import signal
@@ -162,6 +164,26 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _managed_live_runner(self, *, write: bool = False):
+        if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+            raise PermissionError("实盘控制仅允许本机访问")
+        host = self.headers.get("Host", "")
+        parsed_host = urllib.parse.urlparse("http://" + host)
+        if parsed_host.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise PermissionError("实盘控制请求来源无效")
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlparse(origin).netloc != host:
+            raise PermissionError("请在本机交易页面操作实盘设置")
+        runner = self.server.bot.managed_live
+        if runner is None:
+            raise ValueError("实盘模块尚未连接")
+        if write:
+            if self.headers.get_content_type() != "application/json":
+                raise PermissionError("实盘设置须使用 JSON 请求")
+            if not hmac.compare_digest(self.headers.get("X-Live-Control", ""), runner.control_token):
+                raise PermissionError("页面连接已更新，请刷新后重试")
+        return runner
+
     server: DashboardServer
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -251,6 +273,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if path == "/api/managed-live":
+            try:
+                runner = self._managed_live_runner()
+                self._send_json({**runner.snapshot(), "control_token": runner.control_token})
+            except PermissionError as exc:
+                self._send_error_json(HTTPStatus.FORBIDDEN, str(exc))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if path == "/strategy-review.html":
             self._send_static("strategy-review.html")
             return
@@ -516,6 +547,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self.server.bot.set_paper_trading_paused(paused))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/managed-live/settings":
+            try:
+                runner = self._managed_live_runner(write=True)
+                self._send_json(runner.update_settings(self._read_json_body()))
+            except PermissionError as exc:
+                self._send_error_json(HTTPStatus.FORBIDDEN, str(exc))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        if self.path == "/api/managed-live/sell":
+            try:
+                runner = self._managed_live_runner(write=True)
+                payload = self._read_json_body()
+                self._send_json(runner.close_position(str(payload.get("strategy_id", "")), int(payload.get("position_id", 0))))
+            except PermissionError as exc:
+                self._send_error_json(HTTPStatus.FORBIDDEN, str(exc))
+            except (ValueError, TypeError) as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            except Exception as exc:
+                self._send_error_json(HTTPStatus.CONFLICT, f"卖出暂未完成（{type(exc).__name__}），请查看订单确认状态")
             return
         if self.path == "/api/btc-runtime":
             try:

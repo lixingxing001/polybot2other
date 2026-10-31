@@ -2476,6 +2476,10 @@ function clamp01(value) {
 }
 
 function renderMetrics(metrics = {}) {
+  if (window.ManagedLiveUI?.active(latestStatus)) {
+    window.ManagedLiveUI.renderMetrics(metrics);
+    return;
+  }
   setMetric(ids.totalEquity, metrics.total_equity, money, null);
   setMetric(ids.totalPnl, metrics.total_pnl, signedMoney, cls);
   setMetric(ids.unrealizedPnl, metrics.unrealized_pnl, signedMoney, cls);
@@ -2507,7 +2511,7 @@ function renderAccountScope(data = latestStatus) {
   const current = accountScopeMeta(data);
   if (ids.accountScopeLabel) ids.accountScopeLabel.textContent = current.label;
   if (ids.accountScopeSource) ids.accountScopeSource.textContent = current.source;
-  if (ids.paperOnly) ids.paperOnly.textContent = parseAccountScope(accountScope).scope === "live" ? `${current.label} · Live` : `${current.label} · Paper`;
+  if (ids.paperOnly) ids.paperOnly.textContent = window.ManagedLiveUI?.active(data) ? "真实钱包资产 · 所有实盘策略共享" : parseAccountScope(accountScope).scope === "live" ? `${current.label} · Live` : `${current.label} · Paper`;
   renderDataScopeOptions(data);
 }
 
@@ -2617,18 +2621,21 @@ function selectedAccountVariant(data = latestStatus) {
 }
 
 function selectedAccountMetrics(data = latestStatus) {
+  if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.metrics(data);
   const variant = selectedAccountVariant(data);
   if (variant) return variant.metrics || {};
   return data?.metrics || {};
 }
 
 function selectedAccountSignal(data = latestStatus) {
+  if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.variant(data)?.last_signal || {};
   const variant = selectedAccountVariant(data);
   if (variant?.last_signal && typeof variant.last_signal === "object") return variant.last_signal;
   return data?.runtime?.last_signal || {};
 }
 
 function accountScopeMeta(data = latestStatus) {
+  if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.meta(data);
   const variant = selectedAccountVariant(data);
   if (variant) {
     if (variant.account_scope === "live_paper" || parseAccountScope(accountScope).scope === "live_paper") {
@@ -2718,6 +2725,18 @@ function appendScopeParams(params, value) {
 }
 
 function renderRuntime(runtime) {
+  if (window.ManagedLiveUI?.active(latestStatus)) {
+    const live = window.ManagedLiveUI.state(latestStatus);
+    const market = live.market_data || {};
+    const current = market.market && market.market.ends_at > Date.now() / 1000;
+    const execution = window.ManagedLiveUI.execution(latestStatus);
+    ids.runtime.textContent = execution?.disconnected ? "实盘状态失联" : execution ? ({blocked:"实盘暂停开仓",waiting:"实盘等待入场",confirming:"实盘确认订单",ready:"实盘处理入场",off:"实盘新开仓关闭"}[execution.state] || execution.label) : "实盘状态读取中";
+    ids.runtime.title = execution?.reason || live.error || "";
+    ids.runtime.classList.toggle("error", execution?.state === "blocked");
+    ids.runtime.classList.toggle("paused", execution?.state === "off");
+    ids.lastTick.textContent = !current ? "等待新的实盘市场" : market.reference_ready && market.reference_verified ? "独立实盘行情 · Chainlink 参考价已校验" : "独立实盘行情 · 等待参考价校验";
+    return;
+  }
   const hasError = Boolean(runtime.last_error);
   const stalePrice = priceState.chainlink_updated_ms ? Date.now() - priceState.chainlink_updated_ms > 5_000 : true;
   const paperPaused = Boolean(runtime.paper_trading?.paused);
@@ -3192,6 +3211,17 @@ function setLiveFallbackSourcesIfIdle(sources = [], { preserveDirty = false } = 
 
 function renderStrategyExperiments(runtime = {}) {
   if (!ids.strategyExperiments) return;
+  const managedMode = Boolean(window.ManagedLiveUI?.active(latestStatus));
+  const assetHeading = ids.strategyExperiments.closest("table")?.querySelectorAll("thead th")[2];
+  if (assetHeading) assetHeading.textContent = managedMode ? "本策略持仓市值" : "账面资产";
+  if (managedMode) {
+    ids.strategyExperimentMeta.textContent = "4 个策略 · 实盘独立核算";
+    ids.strategyExperimentSummary.textContent = "钱包余额共享 · 这里只展示当前程序确认的实盘记录";
+    document.getElementById("optimized-main-panel").hidden = true;
+    document.getElementById("main-exit-panel").hidden = true;
+    ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus);
+    return;
+  }
   const experiments = runtime.strategy_experiments || {};
   const variants = strategyExperimentVariants(latestStatus);
   const main = { variant_id: "MAIN", combo: "主账户", role: "保留原策略与历史账本",
@@ -3926,6 +3956,10 @@ function displayTargetState(market) {
 }
 
 function renderMarket(data = latestStatus) {
+  if (window.ManagedLiveUI?.active(data)) {
+    window.ManagedLiveUI.market(data);
+    return;
+  }
   const runtime = data?.runtime || {};
   const market = activeMarket || runtime.current_market;
   const signal = ["MAIN_OPTIMIZED", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
@@ -4884,6 +4918,10 @@ function drawChart(points) {
 }
 
 function chartInitialBalance() {
+  if (window.ManagedLiveUI?.active(latestStatus)) {
+    const rows = window.ManagedLiveUI.curve(latestStatus);
+    return Number(rows[0]?.total_equity ?? window.ManagedLiveUI.state(latestStatus).wallet?.balance ?? 0);
+  }
   const metrics = selectedAccountMetrics(latestStatus);
   return toNumber(metrics?.initial_balance)
     || toNumber(equityCurveMeta?.initial_balance)
@@ -4892,6 +4930,9 @@ function chartInitialBalance() {
 }
 
 function buildChartRows(statusRows = []) {
+  if (window.ManagedLiveUI?.active(latestStatus)) {
+    return window.ManagedLiveUI.curve(latestStatus).map(row => normalizeEquityPoint(row, chartInitialBalance())).filter(Boolean);
+  }
   const initialBalance = chartInitialBalance();
   const cutoff = Date.now() / 1000 - EQUITY_CURVE_DAYS * 24 * 60 * 60;
   const rowsByTime = new Map();
@@ -4905,6 +4946,7 @@ function buildChartRows(statusRows = []) {
 }
 
 function selectedAccountCurrentPoint(data = latestStatus) {
+  if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.currentPoint(data);
   const metrics = selectedAccountMetrics(data);
   const totalEquity = toNumber(metrics?.total_equity);
   if (totalEquity == null) return null;
@@ -5112,6 +5154,7 @@ function connectStatusStream() {
 }
 
 async function loadEquityCurve(force = false) {
+  if (window.ManagedLiveUI?.active(latestStatus)) return;
   const now = Date.now();
   if (equityCurveInFlight) {
     if (force) equityCurvePendingForce = true;
@@ -5141,7 +5184,7 @@ async function loadEquityCurve(force = false) {
     const res = await fetch(`/api/equity-curve?${params.toString()}`);
     if (!res.ok) throw new Error(`equity curve HTTP ${res.status}`);
     const payload = await res.json();
-    if (requestScope !== accountScope) return;
+    if (requestScope !== accountScope || window.ManagedLiveUI?.active(latestStatus)) return;
     const rows = Array.isArray(payload.equity_curve) ? payload.equity_curve : [];
     equityCurveRows = rows;
     equityCurveMeta = payload.equity_curve_meta || {};
@@ -6008,6 +6051,7 @@ function renderAll(data = latestStatus, options = {}) {
 
 function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
+  window.ManagedLiveUI?.render(data);
   renderRuntime(data.runtime);
   renderLivePanel(data);
   renderAccountScope(data);

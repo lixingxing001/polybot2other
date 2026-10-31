@@ -75,6 +75,8 @@ class Settings:
     live_trading_default_retry_count: int = 2
     live_trading_default_retry_delay_ms: int = 250
     live_trading_runtime_enabled: bool = True
+    managed_live_enabled: bool = False
+    managed_live_dir: Path = Path("data/live-accounts")
     llm_super_agent_enabled: bool = True
     llm_super_agent_api_key: str = ""
     llm_super_agent_base_url: str = "https://api.hao.ai/v1"
@@ -323,6 +325,8 @@ def load_settings() -> Settings:
         live_trading_default_retry_count=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_COUNT", 2, 0),
         live_trading_default_retry_delay_ms=_int_env("POLYBOT2OTHER_LIVE_DEFAULT_RETRY_DELAY_MS", 250, 0),
         live_trading_runtime_enabled=_bool_env("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", True),
+        managed_live_enabled=_bool_env("POLYBOT2OTHER_MANAGED_LIVE_ENABLED", False),
+        managed_live_dir=Path(os.environ.get("POLYBOT2OTHER_MANAGED_LIVE_DIR", "data/live-accounts")),
         llm_super_agent_enabled=_bool_env("POLYBOT2OTHER_LLM_SUPER_AGENT_ENABLED", True),
         llm_super_agent_api_key=os.environ.get("POLYBOT2OTHER_LLM_API_KEY", os.environ.get("HAOAI_API_KEY", "")),
         llm_super_agent_base_url=os.environ.get("POLYBOT2OTHER_LLM_BASE_URL", "https://api.hao.ai/v1"),
