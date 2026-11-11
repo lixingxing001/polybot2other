@@ -1,6 +1,6 @@
 # EdgePulse
 
-The dashboard has four isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. The optimized account has its own authenticated read-only PolyBolt spot/TWAP feed, CLOB feed, ledger, candidate journal and official-only settlement loop.
+The dashboard has four isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. In the default managed-live runtime, the Paper accounts share the verified PolyBolt spot/TWAP and CLOB collector used by live execution. The optimized account keeps its own model, ledger and journal while borrowing the same reference history; the exit account still mirrors original-main Paper entries and applies its existing exit policy.
 
 The dashboard also provides opt-in real execution for these four strategies. The global live switch and the corresponding strategy switch must both be enabled before new real BUY orders are allowed; all switches default off in a new live ledger. Each strategy has its own fee-inclusive order budget and accounting, while the actual wallet balance is shared. Turning either switch off stops new entries and continues managing existing positions, including the live take-profit/stop-loss strategy. Paper accounts continue as independent controls.
 
@@ -69,11 +69,23 @@ uv pip install --python .venv/macos/bin/python -e . 'py_clob_client_v2==1.0.1'
 ./stop-macos.sh
 ```
 
-The Mac launcher runs in the background at `http://127.0.0.1:8791` and reuses the existing `data/` databases and settings. It enables the managed-live feature while leaving its initial trading switches off; legacy live runners are not instantiated in managed mode. `POLYBOT2OTHER_MANAGED_LIVE_ENABLED=true` selects this interface, and `POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED=false` remains a process-level prohibition on real orders. Logs are written to `logs/polybot2other-macos-8791.log`. Existing BTC and Market Scout pause settings remain in effect. The original Paper control retains its legacy fallback to the five-minute window's `openPrice` when Gamma omits `priceToBeat`. That generic opening price is not a verified TWAP60 settlement reference; the optimized and managed-live feeds separately require a matching TWAP contract and verified opening value. Paper results do not establish future live profitability.
+The Mac launcher runs in the background at `http://127.0.0.1:8791` and reuses the existing `data/` databases and settings. It enables the managed-live feature while leaving its initial trading switches off; legacy live runners are not instantiated in managed mode. `POLYBOT2OTHER_MANAGED_LIVE_ENABLED=true` selects this interface, and `POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED=false` remains a process-level prohibition on real orders. Logs are written to `logs/polybot2other-macos-8791.log`. Existing BTC and Market Scout pause settings remain in effect.
+
+In managed mode, Paper and live inputs use `SharedMarketInputs`: the same verified market/opening, Chainlink spot, TWAP reference history, source timestamps, auxiliary basis data and directional books. Browser snapshots and legacy REST/RTDS Chainlink values cannot overwrite them. Turning live trading off does not turn this collector off; missing verified data produces a waiting state rather than a fallback to the legacy opening. A status response uses one captured frame for both Paper and live views. Pausing an independent Paper consumer does not reset or close the shared collector. Aligned Paper settlement also waits for the official outcome instead of provisionally using a later spot price. Explicitly disabling the managed feature retains the standalone legacy compatibility path.
+
+This is an input-layer change. Strategy formulas, per-account settings, fee models, Paper fill simulation, entry limits and exit-policy thresholds are retained. Account state, configured fees, real liquidity and submission checks can still produce different executions; identical market input does not guarantee identical fills or profits. Existing ledgers are not recalculated, and pre-alignment Paper results use the old data convention.
+
+On macOS the launcher also enables `POLYBOT2OTHER_KEEP_AWAKE=true`. A process-scoped `caffeinate -i -s -w <service PID>` guard prevents idle sleep while the service is running and is released on shutdown; display sleep remains allowed. Keep the laptop lid open, preferably on power: ordinary lid-close/manual sleep is not overridden or promised to keep trading alive. No permanent power settings or login auto-start are installed. To opt out, run `POLYBOT2OTHER_KEEP_AWAKE=false ./start-macos.sh`. A detected runtime interruption/clock discontinuity reconnects the live feeds and requires new wallet, region and open-order checks; a response begun before the interruption is not treated as a fresh balance. No order is resubmitted by recovery.
+
+Managed-live books use a buffered WebSocket transport that retains handshake-tail bytes and incomplete frames/messages across read timeouts. Complete depth is kept internally and ordered deltas are consumed before publishing bounded views. Stalled/backlogged connections resynchronize; a separate read-only worker repairs ageing sides using the official `/book` endpoint. REST repair preserves the server and receive timestamps and still requires the original 3-second source / 2.5-second receive freshness limits. An old response cannot overwrite a newer quote or another round. Aligned Paper consumers use these same books without a second authoritative subscription. The dashboard reports the power guard, quote ages, reconnections and repairs; these indicate data availability, not a guarantee that a trading signal will qualify.
 
 Managed-live P&L uses a separate, read-only valuation worker. It retains the last valid order book across brief outages, round changes and restarts, and recalculates remaining shares with depth and fees. The dashboard labels cached estimates with their age or pending settlement status; no quote is represented as zero profit. Display refresh may accept a dated book up to 30 seconds old; execution retains its strict 3-second source and 2.5-second streaming-receipt checks. Cached display values never trigger orders or credit the cash balance.
 
-Managed-live order reconciliation skips an in-flight POST and retries only reads when an order is not yet visible or a request fails. Unknown orders keep their budget reserved and block new entries until every such order is officially reconciled; confirmed fills or a confirmed no-fill result automatically remove the temporary block. Identity/accounting failures remain durable stops across restarts. The dashboard shows each strategy's entry state, reason, duration, retry policy and recent pause/recovery events. A missing dashboard heartbeat is shown as unknown live status, not a claim that the trading process has stopped.
+Managed-live order reconciliation skips an in-flight POST and retries reads without blindly resubmitting an uncertain order. If an order remains unresolved for 60 seconds and authenticated wallet/open-order snapshots are fresh, it enters `QUARANTINED`: its BUY budget stays reserved, its possible position and remaining cost count against the existing position/daily-loss limits, and the original market remains blocked across all strategies. Other markets may use the remaining limits. Partial fills do not double-count a position or its budget. Quarantined orders are checked every 15 seconds, survive restarts, and stay visible beyond the latest 50 orders. The adapter cross-checks trades, open orders and token holdings even when lookup by ID is empty; empty results or timeouts alone never release money. Only verified terminal evidence (including all final receipts identified by a saved successful FAK response) releases the uncertainty. Known explicit exchange rejections are recorded separately, with sanitized submission metadata retained. Identity/accounting failures remain durable stops across restarts. The dashboard shows each strategy's entry state, reason, duration, retry policy and pause/recovery/isolation events; a missing dashboard heartbeat is shown as unknown live status.
+
+For a quarantined order with no exchange acknowledgement and no confirmed fills, an additional `EXPIRED_UNFILLED` outcome closes long-lived missing records. It requires a market that ended at least 10 minutes ago and has an official resolution, a missing order lookup, successful complete trade/open-order queries with no matching activity, a fully paginated independent wallet-activity query with no relevant records, and verified token balances (zero for a BUY; all locally owned shares still present for a SELL). Wallet and open-order snapshots must remain fresh. Three consecutive clean checks spanning at least 30 seconds are required; any missing/conflicting check resets them. The final evidence is retained, no fill or cash is invented, and affected SELL holdings then settle using the official outcome. Finalized records continue low-frequency read-only audits (one due record per reconciliation pass, at least five minutes apart); contradictory late order/trade evidence restores the reservation and raises a durable review alert. Raw request/signature data is never stored; text, JSON and nested API errors retain a redacted error message for diagnosis.
+
+Wallet activity alone is not authenticated evidence that a specific order filled. Late activity without an order/trade match isolates only that order and retains its bounded budget; it does not create a wallet-wide integrity fault. For a finalized SELL, a later `REDEEM` is recognized as settlement only when the saved finalization proved those holdings intact, the token/timing/payout match, and the total burned shares do not exceed the proved holdings. Pagination continues after such rows so that a later-page trade cannot be missed. This exception does not apply to BUY orders or initial finalization checks. Earlier wallet-activity-only false alarms are automatically rechecked: normal settlement restores the prior final state, while ambiguous activity keeps the order isolated. Original fault evidence and the recovery proof are retained in `audit_recovery_json`; authenticated late fills, identity mismatches and budget faults remain subject to reconciliation review.
 
 The service automatically reads local `.env.live`, `.env.local`, and `.env` files for `POLYBOT2OTHER_*` keys. Existing process environment variables always win. To use a different file, set `POLYBOT2OTHER_ENV_FILE=/path/to/file`.
 Live readiness reports env file paths, geoblock status, and credential presence booleans only; it does not return private key, API secret, passphrase, or public IP values.
@@ -281,6 +293,91 @@ LLM routing is no longer part of strategy experiments. If enabled for the main b
 For the end-to-end live setup checklist, use `docs/live-trading-runbook.md`. Copy `.env.live.example` to `.env.live`, run `chmod 600 .env.live`, then fill the private values locally. `.env.live` is ignored and must hold the real private values only on the local machine.
 
 For safety, a saved `enabled=true` live switch is not preserved across process restarts. On startup the service rewrites live settings to `enabled=false` and shows that manual preflight/re-enable is required before any new real order can be submitted.
+
+## Paper execution aligned with managed live (2026-11-06)
+
+The Mac launcher enables `POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION=true`. The four
+Paper accounts reuse the existing `LiveSignals` functions, verified market inputs,
+and the saved per-strategy live budgets, position limits, daily-loss limits and
+TP/SL percentages. Live enable switches still control real orders only; the Paper
+pause button controls simulation. A settings change affects subsequent submissions,
+not the budget already reserved by an in-flight order. Each strategy tests a separate
+$100 virtual wallet; this is a standalone strategy comparison, not a simulation of
+four strategies competing for one shared live wallet.
+
+`paper_execution.py` accepts only read-only metadata/book/configuration callbacks.
+It cannot sign, post, cancel or redeem a real order. The entry limit, fee reserve,
+minimum size and V2 amount precision mirror the current managed-live adapter. It
+uses the market's current fee curve, not a fixed guessed fee. The TP/SL strategy
+uses its existing live signal and net-exit thresholds, and now executes its own
+budget independently rather than copying another account's fill. The old same-fill
+comparison is hidden in this mode because it would be misleading.
+
+Orders reserve the full all-in budget durably, then match against a fresh book
+observed after submission and arrival. The arrival delay is the larger of one
+second and the current read-only preflight duration: an explicitly conservative
+estimate, not a measured order-POST latency. Only 50% of displayed depth is treated
+as available. A FAK can partially fill; its remainder is canceled. Cash and shares
+remain occupied until the simulated confirmation. Confirmation delay uses the 90th
+percentile of up to 200 historical live submit-to-confirm samples (12 seconds if
+fewer than ten samples). This delay is separate from matching delay. When book
+connectivity is lost, saved matches keep their reserves and resume confirmation
+when data returns. The polling worker never performs network I/O, and does not
+wait for another strategy's REST preflight.
+
+Both arrivals and matches are journaled in the respective Paper SQLite ledger.
+After a restart, saved matches confirm exactly once; an arrival that was not
+observed is canceled with a data-gap reason, not filled retrospectively. Cancellation
+or ordinary order-expiry handling cannot prematurely release submitted reserves.
+Official resolution waits for pending simulated fills. Winning payouts become
+receivables first, with a modeled 60-second redemption delay before becoming
+spendable cash. Fees are charged per filled level. Partial exits preserve remaining
+shares and cost; a take-profit order cannot fill below its net-profit price floor.
+
+The dashboard shows the active assumptions, saved budgets, confirmation state,
+unfilled reasons and receivables. Open PnL uses net depth-based liquidation estimates;
+missing depth is not a zero PnL or a fictional best-bid fill. A cached estimate is
+labeled as such and is never executable. Historical runs are archived before a
+reset. These are conservative observable-market simulations, not a guarantee of
+real fills: hidden liquidity, queue priority, private API/chain failures, actual
+redemption timing and multi-strategy wallet contention cannot be fully reproduced.
+
+Protocol references: [Polymarket order types and price bounds](https://docs.polymarket.com/trading/place-orders),
+[market-specific taker fees](https://docs.polymarket.com/trading/fees).
+
+## 衡准 V1
+
+2026-11-08 按用户指示，启动脚本现在默认运行独立的“现有数据 Paper 试验”，已提取原数据中的价格、历史波动和均价误差。
+该试验没有通过原设计的模型训练验证，页面明确标为未校准；原严格实现与旧数据完整保留。
+本次调整、资金隔离与假设见 [提前 Paper 试验说明](doc/hengzhun-v1-pilot.md)。
+
+新增的 `HENGZHUN_TWAP_VALUE_V1` 按设计书 1.0.0 及配套机器附件用 Python 实现。
+显式设置 `POLYBOT2OTHER_HENGZHUN_PILOT_ENABLED=false` 后，`./start-macos.sh` 启动原严格 RECORD 采集，页面显示模型、合同、数据与时钟条件。
+该策略使用独立数据库，支持离线 REPLAY 和受资格约束的 PAPER；真实执行硬禁用。
+原有四个策略的资金与设置不接入新策略钱包。衡准固定 $5 含费预算、独立 $100 初始模拟本金。
+
+运行命令、训练发布和连续周回放见 [操作说明](doc/hengzhun-v1-operations.md)；
+对应设计及实际测试见 [实现矩阵](doc/hengzhun-v1-implementation-matrix.md) 和
+[验收执行索引](doc/hengzhun-v1-acceptance-execution.md)。
+当前真实市场适配尚有 [待核验项](doc/hengzhun-v1-adapter-audit.md)，初始模型为 UNFITTED；
+采集运行不代表正式 Paper 已获准开仓，也不代表已有样本外收益证据。
+
+## 双翼配对 V2（无需训练的独立 Paper）
+
+`./start-macos.sh` 默认运行 V2，V1 冻结为可展开的历史对照，不清空旧亏损。
+V2 将下单前的持仓、在途、未确认成交纳入风险预算，并提供独立退出核验通道。
+成交带与穿价压力两个情景各用独立 $100 账本，页面并列显示，收益不能相加。
+原四策略和实盘设置保持原样；双翼不具备真实交易接口。
+规则、模拟限制与运行验证见 [双翼 V2 说明](doc/paired-v2.md)。
+
+## 双翼配对 V1（已冻结的历史对照）
+
+页面保留 V1 的独立净值、配对账本、委托和模拟成交历史；默认停止新增报价，设置只读。
+独立 $100 初始本金，每组双边合计预算默认 $5；单边未配齐时仍有风险。
+它根据当前两个真实盘口报价，使用成交事件、队列和严格穿价模型模拟成交，无需等待模型训练。
+主动补齐/退出计入实际市场费率和深度限制，已确认配对或官方终局回款等待60秒后进入可用现金。
+该模块只允许 Paper，没有真实交易接口，原四策略和衡准均保留。
+详见 [策略规则、假设和操作说明](doc/paired-paper-v1.md)。
 
 ## Safety
 

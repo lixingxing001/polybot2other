@@ -59,6 +59,7 @@ class Settings:
     request_timeout_seconds: float = 4.0
     paper_entry_order_type: str = "FAK"
     paper_taker_fee_rate: float = 0.07
+    paper_realistic_execution: bool = False
     paper_gtd_seconds: float = 90.0
     strategy_experiments_enabled: bool = False
     strategy_experiments_db_dir: Path = Path("data/strategy-experiments")
@@ -77,6 +78,15 @@ class Settings:
     live_trading_runtime_enabled: bool = True
     managed_live_enabled: bool = False
     managed_live_dir: Path = Path("data/live-accounts")
+    hengzhun_enabled: bool = False
+    hengzhun_dir: Path = Path("data/hengzhun-v1")
+    hengzhun_pilot_enabled: bool = False
+    hengzhun_pilot_dir: Path = Path("data/hengzhun-v1-pilot")
+    paired_paper_enabled: bool = False
+    paired_paper_dir: Path = Path("data/paired-paper-v1")
+    paired_v1_frozen: bool = False
+    paired_v2_enabled: bool = False
+    paired_v2_dir: Path = Path("data/paired-paper-v2")
     llm_super_agent_enabled: bool = True
     llm_super_agent_api_key: str = ""
     llm_super_agent_base_url: str = "https://api.hao.ai/v1"
@@ -302,6 +312,7 @@ def load_settings() -> Settings:
         market_refresh_seconds=_float_env("POLYBOT2OTHER_MARKET_REFRESH_SECONDS", 2.0, 0.5),
         paper_entry_order_type=os.environ.get("POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE", "FAK"),
         paper_taker_fee_rate=_float_env("POLYBOT2OTHER_PAPER_TAKER_FEE_RATE", 0.07, 0.0),
+        paper_realistic_execution=_bool_env("POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION", False),
         paper_gtd_seconds=_float_env("POLYBOT2OTHER_PAPER_GTD_SECONDS", 90.0, 1.0),
         strategy_experiments_enabled=_bool_env("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED", True),
         strategy_experiments_db_dir=Path(
@@ -327,6 +338,15 @@ def load_settings() -> Settings:
         live_trading_runtime_enabled=_bool_env("POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED", True),
         managed_live_enabled=_bool_env("POLYBOT2OTHER_MANAGED_LIVE_ENABLED", False),
         managed_live_dir=Path(os.environ.get("POLYBOT2OTHER_MANAGED_LIVE_DIR", "data/live-accounts")),
+        hengzhun_enabled=_bool_env("POLYBOT2OTHER_HENGZHUN_ENABLED", False),
+        hengzhun_dir=Path(os.environ.get("POLYBOT2OTHER_HENGZHUN_DIR", "data/hengzhun-v1")),
+        hengzhun_pilot_enabled=_bool_env("POLYBOT2OTHER_HENGZHUN_PILOT_ENABLED", False),
+        hengzhun_pilot_dir=Path(os.environ.get("POLYBOT2OTHER_HENGZHUN_PILOT_DIR", "data/hengzhun-v1-pilot")),
+        paired_paper_enabled=_bool_env("POLYBOT2OTHER_PAIRED_PAPER_ENABLED", False),
+        paired_paper_dir=Path(os.environ.get("POLYBOT2OTHER_PAIRED_PAPER_DIR", "data/paired-paper-v1")),
+        paired_v1_frozen=_bool_env("POLYBOT2OTHER_PAIRED_V1_FROZEN", False),
+        paired_v2_enabled=_bool_env("POLYBOT2OTHER_PAIRED_V2_ENABLED", False),
+        paired_v2_dir=Path(os.environ.get("POLYBOT2OTHER_PAIRED_V2_DIR", "data/paired-paper-v2")),
         llm_super_agent_enabled=_bool_env("POLYBOT2OTHER_LLM_SUPER_AGENT_ENABLED", True),
         llm_super_agent_api_key=os.environ.get("POLYBOT2OTHER_LLM_API_KEY", os.environ.get("HAOAI_API_KEY", "")),
         llm_super_agent_base_url=os.environ.get("POLYBOT2OTHER_LLM_BASE_URL", "https://api.hao.ai/v1"),

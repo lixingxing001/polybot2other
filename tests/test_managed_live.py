@@ -253,7 +253,9 @@ class ManagedLiveTests(unittest.TestCase):
         initial=self.manager.snapshot()["variants"][0]["metrics"]
         self.assertEqual(initial["valuation"]["status"],"fresh")
         self.assertIsNotNone(initial["total_pnl"])
-        now=time.time();self.feed.age=10000
+        # Freeze on whole seconds so a millisecond round-trip cannot move a
+        # synthetic quote a floating-point fraction into the future.
+        now=int(time.time())+1;self.feed.age=10000
         self.exchange.valuation_book=Mock(side_effect=TimeoutError)
         for seconds,status in ((10,"cached"),(65,"stale")):
             with patch("time.time",return_value=now+seconds):
@@ -622,16 +624,22 @@ class ManagedLiveTests(unittest.TestCase):
         exchange=ManagedExchange(self.settings);self.addCleanup(exchange.http.close)
         sdk=exchange.legacy._sdk();client=Mock();ident="0x"+"d"*64
         order={"external_id":ident,"token_id":"up","created_at":time.time()}
+        client.get_trades.return_value=[];client.get_open_orders.return_value=[]
+        client.get_balance_allowance.return_value={"balance":"0","allowance":"0"}
         with patch.object(exchange,"client",return_value=(sdk,client)):
             for response in (None,{},[],{"id":ident},{"id":ident,"status":"MATCHED"}):
                 client.get_order.return_value=response
-                with self.subTest(response=response),self.assertRaises(OrderConfirmationPending):exchange.reconcile(order,self.market,exchange_info())
-            client.get_trades.assert_not_called()
+                with self.subTest(response=response):
+                    state=exchange.reconcile(order,self.market,exchange_info())
+                    self.assertFalse(state["terminal"]);self.assertFalse(state["no_fill"])
+                    self.assertEqual(state["evidence"]["trades"],"checked")
+            self.assertEqual(client.get_trades.call_count,5)
             client.get_order.return_value={"id":"0x"+"e"*64,"status":"MATCHED","size_matched":"0"}
             with self.assertRaisesRegex(ValueError,"编号"):exchange.reconcile(order,self.market,exchange_info())
             client.get_order.return_value={"id":ident,"status":"MATCHED","size_matched":"10"}
             client.get_trades.return_value=None
-            with self.assertRaises(OrderConfirmationPending):exchange.reconcile(order,self.market,exchange_info())
+            state=exchange.reconcile(order,self.market,exchange_info())
+            self.assertFalse(state["terminal"]);self.assertEqual(state["evidence"]["trades"],"unavailable")
 
     def test_managed_mode_does_not_construct_legacy_live_runners(self):
         from polybot2other.bot import PaperTradingBot

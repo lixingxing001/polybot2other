@@ -213,12 +213,12 @@ class RealBtcFiveMinuteStrategy:
         return max(0.01, min(0.99, confidence))
 
 
-def input_from_snapshot(market: MarketRound, payload: dict[str, Any]) -> RealMarketInput:
+def input_from_snapshot(market: MarketRound, payload: dict[str, Any], *, now_ts: float | None = None) -> RealMarketInput:
     price = payload.get("price") if isinstance(payload.get("price"), dict) else {}
     quotes = payload.get("quotes") if isinstance(payload.get("quotes"), dict) else {}
     up = quotes.get("Up") if isinstance(quotes.get("Up"), dict) else {}
     down = quotes.get("Down") if isinstance(quotes.get("Down"), dict) else {}
-    now_ms = int(time.time() * 1000)
+    now_ms = int((time.time() if now_ts is None else now_ts) * 1000)
     quote_updated_ms = max(_maybe_int(up.get("updated_at_ms")) or 0, _maybe_int(down.get("updated_at_ms")) or 0)
     price_updated_ms = max(
         _maybe_int(price.get("chainlink_updated_ms")) or 0,
@@ -233,6 +233,7 @@ def input_from_snapshot(market: MarketRound, payload: dict[str, Any]) -> RealMar
         or fallback
     )
     return RealMarketInput(
+        now_ts=now_ts,
         market=market,
         current_price=current,
         chainlink_price=_maybe_float(price.get("chainlink")),

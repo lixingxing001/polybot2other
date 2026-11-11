@@ -1,0 +1,188 @@
+{
+  "schema_version": "HENGZHUN_TWAP_VALUE_V1_OFFLINE_GOLDEN_CASES_1",
+  "data_status": "SCENARIO_ONLY_NOT_TRAINED",
+  "description": "人工构造的纯离线数学断言，不包含真实行情、实盘订单、历史回测或训练成果。",
+  "requires_network": false,
+  "contains_orders": false,
+  "scenario_defaults": {
+    "twap_window_seconds": 60,
+    "sigma_floor_bps_sqrt_s": 0.25,
+    "proxy_sd_floor_bps": 1.0,
+    "probability_clip_for_numerics": 0.000000000001,
+    "fee_rate_fixture": "0.07",
+    "price_tick_fixture": "0.01",
+    "quantity_step_fixture": "0.01",
+    "minimum_shares_fixture": "5"
+  },
+  "notes": [
+    "纯公式用例显式关闭两个研究 floor；SCENARIO floor 用例保留默认值。",
+    "sigma2 的单位为美元平方/秒；known_integral 的单位为美元乘秒。",
+    "手续费按现金另加费用计算；市场真实参数与舍入须由接入层核验。",
+    "示例 tick、份额步长和最小份额是测试输入，不能视为未来市场常量。",
+    "10/90 分位输入为人工数值，不代表已经训练或得到统计保证。"
+  ],
+  "cases": [
+    {
+      "id": "prior_tau_90",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 90, "source_price": 101, "reference_twap": 100, "sigma2_usd2_per_s": 4, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected": {"mean": 101, "variance_kernel_s": 50, "process_variance": 200, "total_variance": 200, "p_up": 0.5281859888985083}
+    },
+    {
+      "id": "prior_boundary_tau_60",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 60, "source_price": 101, "reference_twap": 100, "sigma2_usd2_per_s": 4, "known_integral": 0, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected": {"mean": 101, "variance_kernel_s": 20, "process_variance": 80, "p_up": 0.544510353744683}
+    },
+    {
+      "id": "partial_window_tau_30_opposes_spot_direction",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 99, "reference_twap": 100, "sigma2_usd2_per_s": 4, "known_integral": 3090, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected": {"mean": 101, "variance_kernel_s": 2.5, "process_variance": 10, "p_up": 0.6240851829770754}
+    },
+    {
+      "id": "irregular_ticks_previous_hold_integral",
+      "operation": "previous_tick_integral",
+      "inputs": {"ticks": [[0, 100], [7, 102], [19, 99], [30, 99]], "start_s": 0, "end_s": 30},
+      "expected": {"integral": 3013, "covered_seconds": 30, "max_source_hold_s": 12, "left_anchor_age_s": 0}
+    },
+    {
+      "id": "irregular_integral_to_probability",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 99, "reference_twap": 100, "sigma2_usd2_per_s": 4, "known_integral": 3013, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected": {"mean": 99.71666666666667, "process_variance": 10, "p_up": 0.46430338972394464}
+    },
+    {
+      "id": "volatility_units_fixed_five_second_returns",
+      "operation": "realized_variance",
+      "inputs": {"log_returns": [0.001, -0.001, 0.001, -0.001], "interval_s": 5, "source_price": 100000},
+      "expected": {"sample_count": 4, "log_variance_rate": 0.0000002, "dollar_variance_rate": 2000, "dollar_sigma": 44.721359549995796}
+    },
+    {
+      "id": "source_time_two_seconds_old_with_proxy_variance",
+      "operation": "forecast_from_timestamps",
+      "inputs": {"end_ts_ms": 300000, "wall_ts_ms": 270000, "source_ts_ms": 268000, "source_price": 101, "reference_twap": 100, "sigma2_usd2_per_s": 4, "known_integral": 2828, "proxy_error_variance_usd2": 16, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected": {"tau_wall_s": 30, "tau_model_s": 32, "source_age_s": 2, "mean": 101, "process_variance": 12.136296296296296, "proxy_variance": 16, "total_variance": 28.136296296296294, "p_up": 0.5747670294857203}
+    },
+    {
+      "id": "zero_observed_volatility_uses_scenario_floors",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 100000, "reference_twap": 100000, "sigma2_usd2_per_s": 0, "known_integral": 3000000},
+      "expected": {"mean": 100000, "sigma2_used_usd2_per_s": 6.25, "process_variance": 15.625, "proxy_variance": 100, "total_variance": 115.625, "p_up": 0.5, "probability_was_clipped": false}
+    },
+    {
+      "id": "extreme_scenario_probability_remains_below_one",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 101, "reference_twap": 100, "sigma2_usd2_per_s": 0, "known_integral": 3030},
+      "expected": {"mean": 101, "sigma2_used_usd2_per_s": 0.000006375625, "proxy_variance": 0.00010201, "total_variance": 0.0001179490625, "p_up": 0.999999999999, "probability_was_clipped": true}
+    },
+    {
+      "id": "fee_cash_cost_at_0_60",
+      "operation": "effective_cost_cash",
+      "inputs": {"price": "0.60", "fee_rate": "0.07"},
+      "expected": "0.6168"
+    },
+    {
+      "id": "guards_are_not_renormalized",
+      "operation": "conservative_guards",
+      "inputs": {"p_fit_up": "0.70", "p10_up": "0.68", "p90_up": "0.72", "buffer": "0.02"},
+      "expected": {"guard_up": "0.66", "guard_down": "0.26", "guard_sum": "0.92"}
+    },
+    {
+      "id": "guards_use_the_actual_fit_not_only_quantiles",
+      "operation": "conservative_guards",
+      "inputs": {"p_fit_up": "0.61", "p10_up": "0.64", "p90_up": "0.72", "buffer": "0.02"},
+      "expected": {"guard_up": "0.59", "guard_down": "0.26", "guard_sum": "0.85"}
+    },
+    {
+      "id": "dual_gate_effective_cost_cap",
+      "operation": "cost_cap_from_guard",
+      "inputs": {"guard": "0.66", "min_edge": "0.03", "min_roi": "0.05"},
+      "expected": 0.6285714285714286
+    },
+    {
+      "id": "stable_cash_price_cap_root",
+      "operation": "maximum_price_for_cash_cost",
+      "inputs": {"cost_cap": "0.62857142857142857142857142857142857142857142857143", "fee_rate": "0.07"},
+      "expected": 0.6119487044412538
+    },
+    {
+      "id": "price_tick_floor_is_never_rounded_up",
+      "operation": "floor_to_tick",
+      "inputs": {"value": "0.61194870444125383587070637555142412126578890574710", "tick": "0.01"},
+      "expected": "0.61"
+    },
+    {
+      "id": "edge_passes_but_roi_can_fail",
+      "operation": "value_gates",
+      "inputs": {"guard": "0.66", "effective_cost": "0.629", "min_edge": "0.03", "min_roi": "0.05"},
+      "expected": {"net_edge": "0.031", "passes_edge": true, "passes_roi": false, "passes_math_gates": false}
+    },
+    {
+      "id": "budget_five_includes_fee_and_respects_minimum",
+      "operation": "budget_to_shares",
+      "inputs": {"budget": "5", "price": "0.60", "quantity_step": "0.01", "min_shares": "5", "fee_rate": "0.07"},
+      "expected": {"quantity": "8.10", "nominal_cash": "4.86", "fee_cash": "0.13608", "total_cash": "4.99608", "unused_budget": "0.00392", "meets_minimum_shares": true, "within_budget": true}
+    },
+    {
+      "id": "budget_cannot_silently_bypass_minimum_shares",
+      "operation": "budget_to_shares",
+      "inputs": {"budget": "3", "price": "0.60", "quantity_step": "0.01", "min_shares": "5", "fee_rate": "0.07"},
+      "expected": {"quantity": "4.86", "meets_minimum_shares": false, "within_budget": true}
+    },
+    {
+      "id": "two_sides_at_0_60_lock_a_loss_with_cash_fees",
+      "operation": "equal_budget_pair_math",
+      "inputs": {"up_price": "0.60", "down_price": "0.60", "budget_each": "5", "fee_rate": "0.07"},
+      "expected": {"up_shares": 8.106355382619974, "down_shares": 8.106355382619974, "total_cash": "10", "pnl_if_up": -1.893644617380026, "pnl_if_down": -1.893644617380026, "outcome_independent": true}
+    },
+    {
+      "id": "tie_is_labeled_up",
+      "operation": "settlement_label",
+      "inputs": {"final_twap": "100000.00", "reference_twap": "100000.00"},
+      "expected": "UP"
+    },
+    {
+      "id": "strictly_lower_is_labeled_down",
+      "operation": "settlement_label",
+      "inputs": {"final_twap": "99999.99", "reference_twap": "100000.00"},
+      "expected": "DOWN"
+    },
+    {
+      "id": "requested_q_0_61_guard_fee_example",
+      "operation": "reference_trade_example",
+      "inputs": {"price": "0.61"},
+      "expected": {"status": "SCENARIO_ONLY_NOT_TRAINED", "guard_up": "0.66", "guard_down": "0.26", "effective_cost": "0.626653", "net_edge": "0.033347", "guard_roi": 0.05321445840042256, "cost_cap": 0.6285714285714286, "continuous_price_cap": 0.6119487044412538, "price_cap_at_tick_0_01": "0.61", "passes_math_gates": true, "budget_example": {"quantity": "7.97", "nominal_cash": "4.8617", "fee_cash": "0.13272441", "total_cash": "4.99442441", "unused_budget": "0.00557559", "meets_minimum_shares": true, "within_budget": true}}
+    },
+    {
+      "id": "one_cent_higher_limit_fails_same_guard",
+      "operation": "reference_trade_example",
+      "inputs": {"price": "0.62"},
+      "expected": {"effective_cost": "0.636492", "net_edge": "0.023508", "passes_edge": false, "passes_roi": false, "passes_math_gates": false, "price_cap_at_tick_0_01": "0.61"}
+    },
+    {
+      "id": "reject_future_source_timestamp",
+      "operation": "source_timing",
+      "inputs": {"end_ts_ms": 300000, "wall_ts_ms": 270000, "source_ts_ms": 270001},
+      "expected_error": "ValueError"
+    },
+    {
+      "id": "reject_missing_known_integral",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 100, "reference_twap": 100, "sigma2_usd2_per_s": 4},
+      "expected_error": "ValueError"
+    },
+    {
+      "id": "reject_zero_total_variance_without_floors",
+      "operation": "twap_prior",
+      "inputs": {"tau_model_s": 30, "source_price": 100, "reference_twap": 100, "sigma2_usd2_per_s": 0, "known_integral": 3000, "sigma_floor_bps_sqrt_s": 0, "proxy_sd_floor_bps": 0},
+      "expected_error": "ValueError"
+    },
+    {
+      "id": "reject_reversed_bootstrap_quantiles",
+      "operation": "conservative_guards",
+      "inputs": {"p_fit_up": "0.70", "p10_up": "0.72", "p90_up": "0.68"},
+      "expected_error": "ValueError"
+    }
+  ]
+}

@@ -891,13 +891,13 @@ function applyBtcRuntimeState(data = latestStatus) {
 function renderBtcRuntimeState(runtime = {}) {
   const paused = Boolean(runtime.paused);
   if (ids.btcRuntimeToggle) {
-    ids.btcRuntimeToggle.textContent = paused ? "恢复BTC" : "暂停BTC";
+    ids.btcRuntimeToggle.textContent = paused ? "恢复 BTC" : "暂停 BTC";
     ids.btcRuntimeToggle.setAttribute("aria-pressed", paused ? "true" : "false");
     ids.btcRuntimeToggle.classList.toggle("is-paused", paused);
     ids.btcRuntimeToggle.disabled = btcRuntimeSaving;
   }
   if (ids.btcRuntimeStatus) {
-    ids.btcRuntimeStatus.textContent = paused ? "BTC已暂停" : "BTC采集中";
+    ids.btcRuntimeStatus.textContent = paused ? "BTC 已暂停" : "BTC 采集中";
     ids.btcRuntimeStatus.classList.toggle("is-paused", paused);
     ids.btcRuntimeStatus.title = runtime.message || "";
   }
@@ -2483,6 +2483,7 @@ function renderMetrics(metrics = {}) {
   setMetric(ids.totalEquity, metrics.total_equity, money, null);
   setMetric(ids.totalPnl, metrics.total_pnl, signedMoney, cls);
   setMetric(ids.unrealizedPnl, metrics.unrealized_pnl, signedMoney, cls);
+  ids.unrealizedPnl.title = metrics.valuation_missing ? "等待完整盘口净估值" : metrics.valuation_cached ? "部分持仓沿用上次估值，等待新盘口或官方结算" : "";
   setMetric(ids.cashBalance, metrics.cash_balance, money, null);
   setMetric(ids.reservedCash, metrics.reserved_cash, money, null);
   setMetric(ids.openRisk, metrics.open_risk, money, null);
@@ -2730,23 +2731,28 @@ function renderRuntime(runtime) {
     const market = live.market_data || {};
     const current = market.market && market.market.ends_at > Date.now() / 1000;
     const execution = window.ManagedLiveUI.execution(latestStatus);
+    ids.runtime.dataset.state = execution?.disconnected ? "blocked" : execution?.state || "loading";
     ids.runtime.textContent = execution?.disconnected ? "实盘状态失联" : execution ? ({blocked:"实盘暂停开仓",waiting:"实盘等待入场",confirming:"实盘确认订单",ready:"实盘处理入场",off:"实盘新开仓关闭"}[execution.state] || execution.label) : "实盘状态读取中";
     ids.runtime.title = execution?.reason || live.error || "";
     ids.runtime.classList.toggle("error", execution?.state === "blocked");
     ids.runtime.classList.toggle("paused", execution?.state === "off");
-    ids.lastTick.textContent = !current ? "等待新的实盘市场" : market.reference_ready && market.reference_verified ? "独立实盘行情 · Chainlink 参考价已校验" : "独立实盘行情 · 等待参考价校验";
+    ids.lastTick.textContent = !current ? "等待新的实盘市场" : market.reference_ready && market.reference_verified ? "Paper / 实盘共用行情 · 参考价已校验" : "共用行情 · 等待参考价校验";
     return;
   }
   const hasError = Boolean(runtime.last_error);
-  const stalePrice = priceState.chainlink_updated_ms ? Date.now() - priceState.chainlink_updated_ms > 5_000 : true;
+  const displayedPrice = runtime.market_input_alignment?.enabled ? runtime.paper_price || {} : priceState;
+  const stalePrice = displayedPrice.chainlink_updated_ms ? Date.now() - displayedPrice.chainlink_updated_ms > 5_000 : true;
   const paperPaused = Boolean(runtime.paper_trading?.paused);
   const runtimeError = hasError || (!paperPaused && stalePrice);
+  ids.runtime.dataset.state = runtimeError ? "blocked" : paperPaused ? "off" : "running";
   ids.runtime.textContent = hasError ? "异常" : paperPaused ? "Paper已暂停" : stalePrice ? "等待实时价" : "实时运行";
   ids.runtime.classList.toggle("error", runtimeError);
   ids.runtime.classList.toggle("paused", paperPaused && !hasError);
-  ids.lastTick.textContent = runtime.last_error || `market ${marketWsStatus} · price ${priceWsStatus} · okx ${okxWsStatus} · binance ${binanceMarketWsStatus}`;
+  ids.lastTick.textContent = runtime.last_error || (runtime.market_input_alignment?.enabled
+    ? runtime.market_input_alignment.error || "Paper / 实盘共用行情 · 参考价已校验"
+    : `market ${marketWsStatus} · price ${priceWsStatus} · okx ${okxWsStatus} · binance ${binanceMarketWsStatus}`);
   if (ids.paperPauseToggle) {
-    ids.paperPauseToggle.textContent = paperPaused ? "恢复Paper" : "暂停Paper";
+    ids.paperPauseToggle.textContent = paperPaused ? "恢复 Paper" : "暂停 Paper";
     ids.paperPauseToggle.classList.toggle("is-paused", paperPaused);
     ids.paperPauseToggle.setAttribute("aria-pressed", paperPaused ? "true" : "false");
     ids.paperPauseToggle.title = paperPaused ? "恢复 Paper 自动下单" : "暂停 Paper 自动下单并取消活跃挂单";
@@ -3215,11 +3221,13 @@ function renderStrategyExperiments(runtime = {}) {
   const assetHeading = ids.strategyExperiments.closest("table")?.querySelectorAll("thead th")[2];
   if (assetHeading) assetHeading.textContent = managedMode ? "本策略持仓市值" : "账面资产";
   if (managedMode) {
-    ids.strategyExperimentMeta.textContent = "4 个策略 · 实盘独立核算";
+    ids.strategyExperimentMeta.textContent = runtime.hengzhun?.enabled ? "4 个实盘策略 + 1 个独立研究策略" : "4 个策略 · 实盘独立核算";
     ids.strategyExperimentSummary.textContent = "钱包余额共享 · 这里只展示当前程序确认的实盘记录";
     document.getElementById("optimized-main-panel").hidden = true;
     document.getElementById("main-exit-panel").hidden = true;
-    ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus);
+    ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus) + (window.PairedPaperV2UI?.row(runtime.paired_v2)||"") + (window.PairedPaperUI?.row(runtime.paired_paper)||"") + (window.HengzhunUI?.row(runtime.hengzhun)||"");
+    if(runtime.paired_paper?.enabled)ids.strategyExperimentMeta.textContent += " + 1 个独立 Paper";
+    if(runtime.paired_v2?.enabled)ids.strategyExperimentMeta.textContent = "4 个实盘策略 + V2 双情景 Paper + V1 历史 + 衡准研究";
     return;
   }
   const experiments = runtime.strategy_experiments || {};
@@ -3228,11 +3236,47 @@ function renderStrategyExperiments(runtime = {}) {
     metrics: latestStatus?.metrics || {}, recent_trades_summary: latestStatus?.recent_trades_summary || {},
     last_signal: runtime.last_signal || {}, last_error: runtime.last_error };
   const rows = [main, ...variants];
-  ids.strategyExperimentMeta.textContent = `${rows.length} 个账户 · Paper 模拟交易`;
-  ids.strategyExperimentSummary.textContent = "各账户独立核算 · 止盈止损沿用主账户入场 · 原有策略与历史保留";
+  ids.strategyExperimentMeta.textContent = `${rows.length} 个 Paper 账户` + (runtime.hengzhun?.enabled ? " + 1 个独立研究策略" : " · 模拟交易");
+  ids.strategyExperimentSummary.textContent = runtime.paper_execution?.enabled
+    ? "各账户独立 $100 模拟钱包 · 金额与风险设置跟随实盘 · 止盈止损账户独立成交"
+    : "各账户独立核算 · 止盈止损沿用主账户入场 · 原有策略与历史保留";
   renderMainComparison(experiments);
-  renderMainExitComparison(experiments);
-  ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("");
+  if (runtime.paper_execution?.enabled) document.getElementById("main-exit-panel").hidden = true;
+  else renderMainExitComparison(experiments);
+  ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("") + (window.PairedPaperV2UI?.row(runtime.paired_v2)||"") + (window.PairedPaperUI?.row(runtime.paired_paper)||"") + (window.HengzhunUI?.row(runtime.hengzhun)||"");
+  if(runtime.paired_paper?.enabled)ids.strategyExperimentMeta.textContent += " + 双翼配对";
+  if(runtime.paired_v2?.enabled)ids.strategyExperimentMeta.textContent = "4 个原策略 + 双翼 V2 双情景 + V1 历史对照 + 衡准研究";
+}
+
+function renderPaperExecution(runtime = {}) {
+  const panel = document.getElementById("paper-execution-panel");
+  if (!panel) return;
+  const data = runtime.paper_execution;
+  panel.hidden = !data?.enabled || Boolean(window.ManagedLiveUI?.active(latestStatus));
+  if (panel.hidden) return;
+  const accounts = data.accounts || [], policy = accounts[0]?.policy || {};
+  document.getElementById("paper-execution-version").textContent = "策略规则不变 · 模拟成交";
+  document.getElementById("paper-execution-policy").textContent =
+    `金额与上方保存的设置同步；每个策略独立测试。提交后至少 ${policy.arrival_floor_seconds || 1} 秒按新盘口撮合，只使用 ${Math.round((policy.depth_fraction || .5) * 100)}% 可见深度；确认等待约 ${Number(policy.confirmation_seconds || 12).toFixed(1)} 秒。资金确认前不可复用。`;
+  document.getElementById("paper-execution-accounts").innerHTML = accounts.map(a => {
+    const r = a.rules || {}, c = a.counts || {}, event = a.last_event || {};
+    const pending = (a.pending || []).length;
+    const state = pending ? "confirming" : /WAIT|LIMIT/.test(event.code || "") ? "waiting" : "ready";
+    return `<div class="managed-strategy-card paper-execution-account" data-state="${state}">
+      <div class="managed-strategy-title"><strong>${safe(a.name)}</strong><span>Paper</span></div>
+      <p>每笔 ${fmtMoneyCell(r.stake_dollars)} · 上限 ${safe(r.max_open_trades)} 笔 · 24h 亏损限额 ${Number(r.max_daily_loss) ? fmtMoneyCell(r.max_daily_loss) : "关闭"}</p>
+      <p class="paper-execution-reason">${safe(pending ? "模拟订单传输 / 确认中，资金和份额保持占用" : event.message || "等待检查")}</p>
+      <small>成交 ${Number(c.FILLED || 0) + Number(c.PARTIAL || 0)} 笔（部分 ${Number(c.PARTIAL || 0)}） · 未成交 ${Number(c.CANCELED || 0)} · 待确认 ${pending}</small>
+      <small>已结算待领取 ${fmtMoneyCell(a.pending_settlement_cash || 0)}</small>
+      <small>本轮开始 ${a.started_at ? new Date(a.started_at * 1000).toLocaleString("zh-CN") : "—"}</small>
+    </div>`;
+  }).join("");
+  document.getElementById("paper-execution-limitations").textContent =
+    `确认等待参考 ${policy.confirmation_samples || 0} 笔历史实盘的第 90 百分位；样本不足时采用 12 秒估计。传输延迟参考当前只读请求耗时、至少 1 秒，不是实测下单延迟。官方结算后另模拟 ${policy.redemption_seconds || 60} 秒领取等待。${data.limitations || ""}`;
+  const events = accounts.flatMap(a => (a.events || []).map(e => ({...e, name:a.name}))).sort((a,b) => b.at-a.at).slice(0,20);
+  document.getElementById("paper-execution-events").innerHTML = events.length
+    ? events.map(e => `<li><time>${new Date(e.at*1000).toLocaleTimeString("zh-CN")}</time> ${safe(e.name)} · ${safe(e.message)}</li>`).join("")
+    : "<li>等待首次执行检查</li>";
 }
 
 function renderMainComparison(experiments = {}) {
@@ -3245,7 +3289,7 @@ function renderMainComparison(experiments = {}) {
   document.getElementById("main-comparison-period").textContent = "起点：" + new Date(comparison.started_at * 1000).toLocaleString("zh-CN") + " · 初始模拟权益约 " + fmtMoneyCell(comparison.optimized_start_equity);
   document.getElementById("main-comparison-status").textContent = comparison.status;
   const note = panel.querySelector(".optimized-comparison-note");
-  if (note) note.textContent = "只比较对照起点之后的新成交，原有利润不计入提升幅度。" + (comparison.baseline_existing_positions_excluded ? "起点已有的 " + comparison.baseline_existing_positions_excluded + " 笔原版旧仓也不计入本段。" : "") + "新规则仍待 Paper 验证。";
+  if (note) note.textContent = "只比较对照起点之后的新成交，原有利润不计入提升幅度。" + (comparison.baseline_existing_positions_excluded ? "起点已有的 " + comparison.baseline_existing_positions_excluded + " 笔原版旧仓也不计入本段。" : "") + (latestStatus?.runtime?.paper_execution?.enabled ? "每笔金额分别跟随实盘设置，收益差也包含投入金额的差异。" : "新规则仍待 Paper 验证。");
   document.getElementById("main-comparison-summary").innerHTML = [
     experimentSummaryItem("净收益差", signedMoney(comparison.realized_pnl_difference)),
     experimentSummaryItem("胜率差", comparison.win_rate_difference_pp == null ? "待样本" : comparison.win_rate_difference_pp.toFixed(2) + " 个百分点"),
@@ -3961,14 +4005,15 @@ function renderMarket(data = latestStatus) {
     return;
   }
   const runtime = data?.runtime || {};
-  const market = activeMarket || runtime.current_market;
+  const aligned = Boolean(runtime.market_input_alignment?.enabled);
+  const market = aligned ? runtime.current_market : activeMarket || runtime.current_market;
   const signal = ["MAIN_OPTIMIZED", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
   const pair = runtime.pair_strategy || {};
   const lastPairEvent = pair.last_event || {};
-  const up = quotes.Up || runtime.latest_quotes?.Up || {};
-  const down = quotes.Down || runtime.latest_quotes?.Down || {};
-  const current = priceState.chainlink || runtime.latest_price?.chainlink || runtime.latest_price?.binance || null;
-  const targetState = displayTargetState(market);
+  const up = aligned ? runtime.paper_quotes?.Up || {} : quotes.Up || runtime.latest_quotes?.Up || {};
+  const down = aligned ? runtime.paper_quotes?.Down || {} : quotes.Down || runtime.latest_quotes?.Down || {};
+  const current = aligned ? runtime.paper_price?.chainlink ?? null : priceState.chainlink || runtime.latest_price?.chainlink || runtime.latest_price?.binance || null;
+  const targetState = aligned ? {value:marketTargetPrice(market),fallback:false,source:"shared_verified"} : displayTargetState(market);
   const target = targetState.value;
   const distance = current && target ? ((current - target) / target) * 10_000 : null;
   const marketQuestion = market?.question || "-";
@@ -3983,8 +4028,8 @@ function renderMarket(data = latestStatus) {
   const signalSide = signal.side || "-";
   const signalReason = signal.reason || "-";
   const pairEvent = lastPairEvent.message || "-";
-  const websocketText = `${marketWsStatus} / ${priceWsStatus}`;
-  const chainlinkTime = fmtMs(priceState.chainlink_updated_ms);
+  const websocketText = aligned ? "Paper / 实盘共用行情" : `${marketWsStatus} / ${priceWsStatus}`;
+  const chainlinkTime = fmtMs(aligned ? runtime.paper_price?.chainlink_updated_ms : priceState.chainlink_updated_ms);
   ids.markets.innerHTML = `
     <article class="market-row">
       <div class="market-top">
@@ -4836,7 +4881,8 @@ function drawChart(points) {
   const padX = 24;
   const padRight = 14;
   const padTop = 2;
-  const padBottom = 2;
+  const liveWalletChart = Boolean(window.ManagedLiveUI?.active(latestStatus));
+  const padBottom = liveWalletChart ? 25 : 2;
   const values = rows.map((p) => p.total_equity);
   const min = Math.min(...values, initialBalance);
   const max = Math.max(...values, initialBalance);
@@ -4906,7 +4952,19 @@ function drawChart(points) {
   ctx.fillStyle = "#9aa7b1";
   ctx.font = "12px system-ui";
   ctx.fillText(money.format(max), padX, 13);
-  ctx.fillText(money.format(min), padX, height - 5);
+  ctx.fillText(money.format(min), padX, liveWalletChart ? height - padBottom - 4 : height - 5);
+  if (liveWalletChart) {
+    const ticks = width >= 600 ? 4 : 2;
+    for (let i = 0; i <= ticks; i += 1) {
+      const stamp = minTs + (maxTs - minTs) * i / ticks;
+      const label = new Date(stamp * 1000).toLocaleString("zh-CN", {
+        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+      });
+      ctx.textAlign = i === 0 ? "left" : i === ticks ? "right" : "center";
+      ctx.fillText(label, padX + graphWidth * i / ticks, height - 5);
+    }
+    ctx.textAlign = "left";
+  }
 
   const hoverPoint = chartHoverX == null ? null : nearestChartPoint(chartPoints, chartHoverX);
   if (hoverPoint) {
@@ -5030,7 +5088,13 @@ function positionChartTooltip(point) {
   const row = point.data;
   const pnlClass = cls(row.total_pnl);
   const pnlLabel = row.total_pnl > 0 ? "盈利" : row.total_pnl < 0 ? "亏损" : "持平";
-  tooltip.innerHTML = `
+  const liveWalletChart = Boolean(window.ManagedLiveUI?.active(latestStatus));
+  tooltip.innerHTML = liveWalletChart ? `
+    <div class="chart-tooltip-time">${safe(formatChartTime(row.created_at))}</div>
+    <div class="chart-tooltip-row"><span>钱包总资产</span><strong>${money.format(row.total_equity)}</strong></div>
+    <div class="chart-tooltip-row"><span>较区间起点变化</span><strong class="${pnlClass}">${signedMoney(row.total_pnl)}</strong></div>
+    <div class="chart-tooltip-row"><span>钱包现金余额</span><strong>${money.format(row.cash_balance)}</strong></div>
+  ` : `
     <div class="chart-tooltip-time">${safe(formatChartTime(row.created_at))}</div>
     <div class="chart-tooltip-row"><span>总资产</span><strong>${money.format(row.total_equity)}</strong></div>
     <div class="chart-tooltip-row"><span>总盈亏</span><strong class="${pnlClass}">${signedMoney(row.total_pnl)}</strong></div>
@@ -5088,15 +5152,30 @@ async function runManualTick() {
   await loadStatus();
 }
 
+function usesSharedMarketInputs(data = latestStatus) {
+  return Boolean(data?.runtime?.market_input_alignment?.enabled);
+}
+
 function applyStatusPayload(data, options = {}) {
   const manual = Boolean(options.manual);
   const refreshAuxiliary = options.refreshAuxiliary !== false;
+  const wasShared = usesSharedMarketInputs();
   latestStatus = data;
   applyBtcRuntimeState(data);
   if (data.runtime.current_market) applyMarket(data.runtime.current_market);
-  if (data.runtime.latest_quotes && !Object.keys(quotes).length) quotes = data.runtime.latest_quotes;
-  if (data.runtime.latest_price && !priceState.chainlink && !priceState.binance) {
-    priceState = { ...priceState, ...data.runtime.latest_price };
+  if (usesSharedMarketInputs(data)) {
+    if (marketSocket || priceSocket || okxSocket || binanceMarketSocket) closeBtcSockets();
+    activeMarket = data.runtime.current_market || null;
+    quotes = { ...(data.runtime.paper_quotes || {}) };
+    priceState = { ...(data.runtime.paper_price || {}) };
+    marketWsStatus = "shared-live"; priceWsStatus = data.runtime.market_input_alignment.ready ? "shared-live" : "warming";
+    okxWsStatus = data.runtime.ws_status?.backend_okx_ws || "waiting";
+    binanceMarketWsStatus = data.runtime.ws_status?.backend_binance_ws || "waiting";
+    if (priceState.chainlink && priceState.chainlink_updated_ms) recordRealtimePriceEvent("chainlink",priceState.chainlink,priceState.chainlink_updated_ms);
+  } else {
+    if (data.runtime.latest_quotes && !Object.keys(quotes).length) quotes = data.runtime.latest_quotes;
+    if (data.runtime.latest_price && !priceState.chainlink && !priceState.binance) priceState = { ...priceState, ...data.runtime.latest_price };
+    if (wasShared && !btcRuntimePaused) { connectMarketSocket(); connectPriceSocket(); connectOkxSocket(); connectBinanceMarketSocket(); }
   }
   if (!isMainScope(recentDataScope)) {
     data.recent_trades = recentRows;
@@ -6053,6 +6132,11 @@ function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
   window.ManagedLiveUI?.render(data);
   renderRuntime(data.runtime);
+  renderPaperExecution(data.runtime);
+  window.HengzhunUI?.render(data.runtime?.hengzhun);
+  window.PairedPaperUI?.render(data.runtime?.paired_paper);
+  window.__pairedV1Snapshot=data.runtime?.paired_paper;
+  window.PairedPaperV2UI?.render(data.runtime?.paired_v2);
   renderLivePanel(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));
@@ -6159,7 +6243,7 @@ function applyMarket(market) {
 }
 
 function connectMarketSocket() {
-  if (btcRuntimePaused) return;
+  if (btcRuntimePaused || usesSharedMarketInputs()) return;
   if (!activeMarket?.up_token || !activeMarket?.down_token) return;
   if (marketSocket) marketSocket.close();
   if (marketPing) clearInterval(marketPing);
@@ -6243,7 +6327,7 @@ function connectMarketSocket() {
 }
 
 function connectPriceSocket() {
-  if (btcRuntimePaused) return;
+  if (btcRuntimePaused || usesSharedMarketInputs()) return;
   if (priceSocket && priceSocket.readyState <= 1) return;
   if (pricePing) clearInterval(pricePing);
   priceWsStatus = "connecting";
@@ -6287,7 +6371,7 @@ function connectPriceSocket() {
 }
 
 function connectOkxSocket() {
-  if (btcRuntimePaused) return;
+  if (btcRuntimePaused || usesSharedMarketInputs()) return;
   if (okxSocket && okxSocket.readyState <= 1) return;
   if (okxPing) clearInterval(okxPing);
   okxWsStatus = "connecting";
@@ -6327,7 +6411,7 @@ function connectOkxSocket() {
 }
 
 function connectBinanceMarketSocket() {
-  if (btcRuntimePaused) return;
+  if (btcRuntimePaused || usesSharedMarketInputs()) return;
   if (binanceMarketSocket && binanceMarketSocket.readyState <= 1) return;
   binanceMarketWsStatus = "connecting";
   const socket = new WebSocket(BINANCE_MARKET_WS);
@@ -6357,6 +6441,7 @@ function connectBinanceMarketSocket() {
 }
 
 function processPriceMessage(message) {
+  if (usesSharedMarketInputs()) return;
   const payload = message.payload || {};
   const topic = inferPriceTopic(message);
   const now = Date.now();
@@ -6388,6 +6473,7 @@ function processPriceMessage(message) {
 }
 
 function processOkxMessage(message) {
+  if (usesSharedMarketInputs()) return;
   const rows = Array.isArray(message.data) ? message.data : [];
   for (const row of rows) {
     const value = toNumber(row?.last);
@@ -6400,6 +6486,7 @@ function processOkxMessage(message) {
 }
 
 function processBinanceMarketMessage(message) {
+  if (usesSharedMarketInputs()) return;
   const value = toNumber(message.c || message.lastPrice);
   if (value == null) return;
   priceState.binance_market = value;
@@ -6417,6 +6504,7 @@ function inferPriceTopic(message) {
 }
 
 function updateQuote(side, row) {
+  if (usesSharedMarketInputs()) return;
   quotes[side] = {
     ...quotes[side],
     ...row,

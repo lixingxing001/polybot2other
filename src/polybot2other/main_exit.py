@@ -105,10 +105,12 @@ class MainExitBot(PaperTradingBot):
         with self._lock:
             self.paper_quotes = {}; self.latest_quotes = {}; self.execution_quotes = {}
         self._pending.clear()
-        self._book_thread = threading.Thread(target=self._book_loop, name="main-exit-clob", daemon=True)
+        self._book_thread = (None if self._shared_inputs_required else
+                             threading.Thread(target=self._book_loop, name="main-exit-clob", daemon=True))
         self._resolution_thread = threading.Thread(target=self._resolution_loop, name="main-exit-resolution", daemon=True)
         self._thread = threading.Thread(target=self._exit_loop, name="main-exit-paper", daemon=True)
-        self._book_thread.start(); self._resolution_thread.start(); self._thread.start()
+        if self._book_thread:self._book_thread.start()
+        self._resolution_thread.start(); self._thread.start()
 
     def request_pause(self):
         with self._lifecycle_lock:
@@ -146,6 +148,8 @@ class MainExitBot(PaperTradingBot):
             self._stop.wait(.25)
 
     def _sync_market(self, now):
+        if self._shared_inputs_required:
+            self._sync_shared_market_inputs();self.book_state="shared-live";return
         slug = "btc-updown-5m-" + str(int(now) // 300 * 300)
         with self._baseline_lock:
             row = self.baseline.execute("SELECT * FROM market_rounds WHERE round_id=?", (slug,)).fetchone()
@@ -209,6 +213,7 @@ class MainExitBot(PaperTradingBot):
                 return
             self._sync_market(now)
             self._sync_entries(now, live_clock=live_clock)
+            if self._shared_inputs_required:self._sync_shared_market_inputs()
             with self._lock:
                 market = self.current_market
                 quotes = {k: dict(v) for k, v in self.paper_quotes.items()}

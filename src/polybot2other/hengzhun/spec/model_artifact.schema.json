@@ -1,0 +1,1560 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hengzhun:v1:model-artifact:1.0.0",
+  "title": "衡准V1内部模型artifact合同",
+  "description": "内部标准化数据合同，不是Polymarket、Chainlink或其他场所官方接口。本交付只含UNFITTED占位，没有真实训练模型。统计系数和概率为JSON number；本schema不包含价格、金额或份额字段，若未来加入应使用十进制字符串。",
+  "$comment": "只检查形状与明确的局部约束。应用层必须校验真实数据和hash、有限数、窗口长度及先后、UTC日完整性、同市场分区隔离、标签真实available_at、行权重与计数一致性、样本清单、变换计算与退化标记、指标阈值、100次bootstrap索引唯一/不重不漏及数目相等、重采样真实性、规则匹配、发布边界、实际可读时刻和发布后最多7天有效期。标准JSON解析器应拒绝重复key、NaN和Infinity。不能把schema通过称为已训练、可交易或策略有效。 任一hash字段不得参与其自身摘要输入。实现必须统一锁定并版本化规范编码、键排序、数值序列化、UTF-8编码、排除字段及摘要范围；编码规则和摘要真实性由应用层校验，不能只凭64位形状接受产物。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/UnfittedArtifact"
+    },
+    {
+      "$ref": "#/$defs/FittedArtifact"
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "小写、无0x前缀的SHA-256十六进制摘要。形状校验不能证明来源或内容真实性。"
+    },
+    "EpochMillis": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "UTC Unix epoch毫秒，非秒数或本地时区字符串。"
+    },
+    "ManifestReference": {
+      "type": "object",
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "uri",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "description": "内部只读数据或报告清单引用。URI可指向受控本地/对象存储位置，不暗示任何官方API。"
+    },
+    "Window": {
+      "type": "object",
+      "properties": {
+        "start_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "end_at": {
+          "$ref": "#/$defs/EpochMillis"
+        }
+      },
+      "required": [
+        "start_at",
+        "end_at"
+      ],
+      "additionalProperties": false,
+      "description": "UTC半开区间[start_at,end_at)。长度、先后和市场归属由应用层及预登记的划分清单验证。"
+    },
+    "Transform": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "const": "MARKET_WEIGHTED_TRAIN_STANDARDIZATION"
+        },
+        "mean": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "scale": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "degenerate_features": {
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "scale_floor": {
+          "const": 1e-12
+        },
+        "degenerate_scale_replacement": {
+          "const": 1.0
+        }
+      },
+      "required": [
+        "method",
+        "mean",
+        "scale",
+        "degenerate_features",
+        "scale_floor",
+        "degenerate_scale_replacement"
+      ],
+      "additionalProperties": false,
+      "description": "与固定feature_order对应。训练市场总权重为一。原标准差小于1e-12时以一替代且记录退化；这些关系及加权计算由应用层检查。每个bootstrap子模型保存自己的训练变换。"
+    },
+    "Parameters": {
+      "type": "object",
+      "properties": {
+        "intercept": {
+          "type": "number"
+        },
+        "coefficients": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      },
+      "required": [
+        "intercept",
+        "coefficients"
+      ],
+      "additionalProperties": false,
+      "description": "四参数逻辑回归：一个截距及按feature_order排列的三个标准化特征系数。不得填入未训练的默认值。JSON解析器必须拒绝NaN和Infinity。"
+    },
+    "Fit": {
+      "type": "object",
+      "properties": {
+        "transform": {
+          "$ref": "#/$defs/Transform"
+        },
+        "parameters": {
+          "$ref": "#/$defs/Parameters"
+        },
+        "optimizer_result": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "const": "CONVERGED"
+            },
+            "iterations": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "weighted_training_log_loss": {
+              "type": "number",
+              "minimum": 0
+            },
+            "penalized_objective": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "status",
+            "iterations",
+            "weighted_training_log_loss",
+            "penalized_objective"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "transform",
+        "parameters",
+        "optimizer_result"
+      ],
+      "additionalProperties": false
+    },
+    "TrainingCounts": {
+      "type": "object",
+      "properties": {
+        "independent_markets": {
+          "type": "integer",
+          "minimum": 3000
+        },
+        "complete_utc_days": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 28
+        },
+        "up_markets": {
+          "type": "integer",
+          "minimum": 300
+        },
+        "down_markets": {
+          "type": "integer",
+          "minimum": 300
+        },
+        "landmark_rows": {
+          "type": "integer",
+          "minimum": 3000
+        },
+        "total_market_weight": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "每市场总权重为一；与独立市场数的一致性按锁定的浮点容差在应用层核验，schema不以整数样本下限约束浮点求和结果。"
+        }
+      },
+      "required": [
+        "independent_markets",
+        "complete_utc_days",
+        "up_markets",
+        "down_markets",
+        "landmark_rows",
+        "total_market_weight"
+      ],
+      "additionalProperties": false,
+      "description": "这里的独立市场按condition_id与规则版本去重，不能使用tick或landmark数量代替。Up+Down、行数、市场权重及清单一致性由应用层验证。"
+    },
+    "ValidationCounts": {
+      "type": "object",
+      "properties": {
+        "independent_markets": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "up_markets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "down_markets": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "landmark_rows": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "total_market_weight": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "每市场总权重为一；与独立市场数的一致性按锁定的浮点容差在应用层核验，schema不以整数样本下限约束浮点求和结果。"
+        }
+      },
+      "required": [
+        "independent_markets",
+        "up_markets",
+        "down_markets",
+        "landmark_rows",
+        "total_market_weight"
+      ],
+      "additionalProperties": false
+    },
+    "BootstrapCounts": {
+      "type": "object",
+      "properties": {
+        "day_draws": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 28
+        },
+        "unique_utc_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 28
+        },
+        "unique_markets": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "unique_up_markets": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "unique_down_markets": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "landmark_rows_with_multiplicity": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "total_market_weight_with_multiplicity": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "day_draws",
+        "unique_utc_days",
+        "unique_markets",
+        "unique_up_markets",
+        "unique_down_markets",
+        "landmark_rows_with_multiplicity",
+        "total_market_weight_with_multiplicity"
+      ],
+      "additionalProperties": false,
+      "description": "day_draws必须等于原训练集D个有效完整UTC日的数量。重复抽中日按重复次数保留权重。独立去重子样本不重复套用原训练集3000市场、20日、每类300门槛，但必须有两类标签。"
+    },
+    "BootstrapSuccess": {
+      "type": "object",
+      "properties": {
+        "attempt_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        },
+        "draw_manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        },
+        "sample_counts": {
+          "$ref": "#/$defs/BootstrapCounts"
+        },
+        "fit": {
+          "$ref": "#/$defs/Fit"
+        },
+        "fitted_parameters_hash": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "attempt_index",
+        "draw_manifest",
+        "sample_counts",
+        "fit",
+        "fitted_parameters_hash"
+      ],
+      "additionalProperties": false,
+      "description": "一项必须对应一次真实完成并成功收敛的日重采样拟合。不得复制主模型、补零或丢弃不利预测凑足数量。"
+    },
+    "BootstrapFailure": {
+      "type": "object",
+      "properties": {
+        "attempt_index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        },
+        "draw_manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        },
+        "reason_code": {
+          "enum": [
+            "SINGLE_CLASS",
+            "OPTIMIZER_NONCONVERGENCE",
+            "NONFINITE_PARAMETER",
+            "INVALID_TRANSFORM",
+            "DATA_INTEGRITY_ERROR",
+            "OTHER"
+          ]
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "attempt_index",
+        "draw_manifest",
+        "reason_code",
+        "detail"
+      ],
+      "additionalProperties": false
+    },
+    "Bootstrap": {
+      "type": "object",
+      "properties": {
+        "resampling_unit": {
+          "const": "COMPLETE_UTC_DAY"
+        },
+        "sampling": {
+          "const": "WITH_REPLACEMENT_D_FROM_D"
+        },
+        "seed": {
+          "const": 20261106
+        },
+        "total_attempts": {
+          "const": 100
+        },
+        "successful_count": {
+          "type": "integer",
+          "minimum": 90,
+          "maximum": 100
+        },
+        "failed_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "successful_models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BootstrapSuccess"
+          },
+          "minItems": 90,
+          "maxItems": 100
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BootstrapFailure"
+          },
+          "minItems": 0,
+          "maxItems": 10
+        },
+        "quantiles": {
+          "const": [
+            0.1,
+            0.9
+          ]
+        },
+        "quantile_method": {
+          "const": "numpy.quantile:method=linear"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        }
+      },
+      "required": [
+        "resampling_unit",
+        "sampling",
+        "seed",
+        "total_attempts",
+        "successful_count",
+        "failed_count",
+        "successful_models",
+        "failures",
+        "quantiles",
+        "quantile_method",
+        "manifest"
+      ],
+      "additionalProperties": false,
+      "description": "此处为完整可审查候选的拟合集合。少于90成功模型不能生成本schema的FITTED artifact，应保留独立训练失败报告。成功数、失败数、数组长度与100次尝试的对应关系、索引唯一性和真实重采样由应用层检查。"
+    },
+    "FitRecipe": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "const": "FOUR_PARAMETER_LOGISTIC"
+        },
+        "feature_order": {
+          "const": [
+            "u",
+            "v",
+            "u_times_h"
+          ],
+          "description": "固定顺序。u=logit(clip(p_raw_up,0.0001,0.9999))；v=logit(clip(p_market_up,0.0001,0.9999))；h=(tau_wall-60)/60；u_times_h=u*h。"
+        },
+        "landmarks_remaining_seconds": {
+          "const": [
+            90,
+            75,
+            60,
+            45,
+            30
+          ]
+        },
+        "landmark_max_lateness_ms": {
+          "const": 1000
+        },
+        "row_weighting": {
+          "const": "ONE_OVER_VALID_LANDMARKS_PER_MARKET"
+        },
+        "logit_clip": {
+          "const": 0.0001
+        },
+        "objective": {
+          "const": "WEIGHTED_MEAN_LOG_LOSS_PLUS_HALF_LAMBDA_L2"
+        },
+        "ridge_lambda": {
+          "const": 0.01
+        },
+        "intercept_penalized": {
+          "const": false
+        },
+        "seed": {
+          "const": 20261106
+        },
+        "optimizer_max_iterations": {
+          "const": 1000
+        },
+        "optimizer_tolerance": {
+          "const": 1e-08
+        },
+        "prior_parameters_fixed": {
+          "const": true
+        },
+        "secondary_calibrator": {
+          "const": "NONE"
+        }
+      },
+      "required": [
+        "family",
+        "feature_order",
+        "landmarks_remaining_seconds",
+        "landmark_max_lateness_ms",
+        "row_weighting",
+        "logit_clip",
+        "objective",
+        "ridge_lambda",
+        "intercept_penalized",
+        "seed",
+        "optimizer_max_iterations",
+        "optimizer_tolerance",
+        "prior_parameters_fixed",
+        "secondary_calibrator"
+      ],
+      "additionalProperties": false,
+      "description": "先验参数固定且特征按实际收到的事件因果构造。只在训练窗拟合这一个四参数模型；后移验证用于发布判定。"
+    },
+    "SplitPlan": {
+      "type": "object",
+      "properties": {
+        "train_window_days": {
+          "const": 28
+        },
+        "validation_window_days": {
+          "const": 7
+        },
+        "test_window_days": {
+          "const": 7
+        },
+        "roll_step_days": {
+          "const": 7
+        },
+        "training_window": {
+          "$ref": "#/$defs/Window"
+        },
+        "validation_window": {
+          "$ref": "#/$defs/Window"
+        },
+        "test_window": {
+          "$ref": "#/$defs/Window"
+        },
+        "partition_manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        }
+      },
+      "required": [
+        "train_window_days",
+        "validation_window_days",
+        "test_window_days",
+        "roll_step_days",
+        "training_window",
+        "validation_window",
+        "test_window",
+        "partition_manifest"
+      ],
+      "additionalProperties": false,
+      "description": "预登记28/7/7周滚动，测试周不重叠。同一condition_id及规则版本的全部方向、时点和派生行必须留在同一分区。训练与验证完整时间窗口不能用最低有效日数替代。"
+    },
+    "MetricPair": {
+      "type": "object",
+      "properties": {
+        "brier": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "log_loss": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "brier",
+        "log_loss"
+      ],
+      "additionalProperties": false
+    },
+    "Validation": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        },
+        "evaluated_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "label_available_cutoff_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "max_label_available_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "sample_counts": {
+          "$ref": "#/$defs/ValidationCounts"
+        },
+        "evaluation_scope": {
+          "const": "COMMON_VALID_LANDMARKS_MARKET_WEIGHT_ONE"
+        },
+        "model_metrics": {
+          "$ref": "#/$defs/MetricPair"
+        },
+        "market_probability_metrics": {
+          "$ref": "#/$defs/MetricPair"
+        },
+        "absolute_tolerance": {
+          "const": 0.01
+        },
+        "brier_passed": {
+          "type": "boolean"
+        },
+        "log_loss_passed": {
+          "type": "boolean"
+        },
+        "report": {
+          "$ref": "#/$defs/ManifestReference"
+        }
+      },
+      "required": [
+        "status",
+        "evaluated_at",
+        "label_available_cutoff_at",
+        "max_label_available_at",
+        "sample_counts",
+        "evaluation_scope",
+        "model_metrics",
+        "market_probability_metrics",
+        "absolute_tolerance",
+        "brier_passed",
+        "log_loss_passed",
+        "report"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "PASS"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "brier_passed": {
+                "const": true
+              },
+              "log_loss_passed": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "FAIL"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "anyOf": [
+              {
+                "properties": {
+                  "brier_passed": {
+                    "const": false
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "log_loss_passed": {
+                    "const": false
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "description": "验证只决定发布，不重新拟合。Brier和log loss都必须不劣于同期盘口概率基准超过0.01。数值比较、标签真实可见时间及状态一致性由应用层验证。"
+    },
+    "Release": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "CANDIDATE",
+            "REJECTED",
+            "RELEASED",
+            "REVOKED"
+          ]
+        },
+        "decision_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "published_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "publication_boundary_market_uid": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 0,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "status",
+        "decision_at",
+        "published_at",
+        "available_at",
+        "expires_at",
+        "revoked_at",
+        "publication_boundary_market_uid",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "CANDIDATE",
+                  "REJECTED"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "published_at": {
+                "type": "null"
+              },
+              "available_at": {
+                "type": "null"
+              },
+              "expires_at": {
+                "type": "null"
+              },
+              "revoked_at": {
+                "type": "null"
+              },
+              "publication_boundary_market_uid": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REJECTED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "reason_codes": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "RELEASED",
+                  "REVOKED"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "decision_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "published_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "available_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "expires_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "publication_boundary_market_uid": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "RELEASED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REVOKED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "reason_codes": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "发布与拟合状态分开。available_at不得早于验证完成、发布和实际可读时刻；expires_at不晚于published_at+7天；发布仅在新市场边界。时间关系、规则匹配与实时过期检查由应用层负责。"
+    },
+    "UnfittedRelease": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "NOT_RELEASED"
+        },
+        "published_at": {
+          "type": "null"
+        },
+        "available_at": {
+          "type": "null"
+        },
+        "expires_at": {
+          "type": "null"
+        },
+        "reason_codes": {
+          "const": [
+            "MODEL_UNFITTED"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "published_at",
+        "available_at",
+        "expires_at",
+        "reason_codes"
+      ],
+      "additionalProperties": false
+    },
+    "UnfittedValidation": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "NOT_RUN"
+        },
+        "evaluated_at": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "status",
+        "evaluated_at"
+      ],
+      "additionalProperties": false
+    },
+    "InternalOofDiagnostic": {
+      "type": "object",
+      "properties": {
+        "purpose": {
+          "const": "DIAGNOSTIC_ONLY"
+        },
+        "report": {
+          "$ref": "#/$defs/ManifestReference"
+        },
+        "changes_model_or_release_fit": {
+          "const": false
+        }
+      },
+      "required": [
+        "purpose",
+        "report",
+        "changes_model_or_release_fit"
+      ],
+      "additionalProperties": false,
+      "description": "可选时间OOF诊断，不是二次校准器，不得用其结果偷偷改变已登记模型或测试期参数。"
+    },
+    "Provenance": {
+      "type": "object",
+      "properties": {
+        "training_run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "feature_builder_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prior_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "training_code_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configuration_hash": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "rule_contract_hash": {
+          "$ref": "#/$defs/Sha256",
+          "description": "训练兼容规则的语义投影SHA-256；投影包括已核验的结算规则、权威feed和基准边界语义，须锁定字段白名单与版本。排除单个市场的时间窗口、基准数值和重复获取的审计时间，避免新一期正常滚动使模型规则匹配恒失败。每个实际市场仍须独立通过MarketContractSnapshot核验。"
+        },
+        "feature_definition_hash": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "prior_configuration_hash": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "training_code_hash": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "training_manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        },
+        "validation_manifest": {
+          "$ref": "#/$defs/ManifestReference"
+        },
+        "fitted_parameters_hash": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "required": [
+        "training_run_id",
+        "model_version",
+        "rule_version",
+        "feature_builder_version",
+        "prior_version",
+        "training_code_revision",
+        "configuration_hash",
+        "rule_contract_hash",
+        "feature_definition_hash",
+        "prior_configuration_hash",
+        "training_code_hash",
+        "training_manifest",
+        "validation_manifest",
+        "fitted_parameters_hash"
+      ],
+      "additionalProperties": false,
+      "description": "每个hash指向相应版本的真实源内容或规范化参数清单；规范化与摘要范围在引用清单记录，不对含自身hash字段的整份JSON作循环哈希。SHA形状不保证内容真实。"
+    },
+    "UnfittedProvenance": {
+      "type": "object",
+      "properties": {
+        "training_run_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rule_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "feature_builder_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prior_version": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "training_code_revision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configuration_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rule_contract_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "训练兼容规则的语义投影SHA-256；投影包括已核验的结算规则、权威feed和基准边界语义，须锁定字段白名单与版本。排除单个市场的时间窗口、基准数值和重复获取的审计时间，避免新一期正常滚动使模型规则匹配恒失败。每个实际市场仍须独立通过MarketContractSnapshot核验。"
+        },
+        "feature_definition_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prior_configuration_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "training_code_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "training_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManifestReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "validation_manifest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ManifestReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fitted_parameters_hash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "training_run_id",
+        "model_version",
+        "rule_version",
+        "feature_builder_version",
+        "prior_version",
+        "training_code_revision",
+        "configuration_hash",
+        "rule_contract_hash",
+        "feature_definition_hash",
+        "prior_configuration_hash",
+        "training_code_hash",
+        "training_manifest",
+        "validation_manifest",
+        "fitted_parameters_hash"
+      ],
+      "additionalProperties": false,
+      "description": "未取得的真实版本、训练运行和来源hash必须为null。不得使用全零hash或虚构路径占位。已知hash也必须有真实输入和可复算范围。"
+    },
+    "UnfittedArtifact": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "contract_kind": {
+          "const": "HENGZHUN_INTERNAL_MODEL_ARTIFACT"
+        },
+        "strategy_id": {
+          "const": "HENGZHUN_TWAP_VALUE_V1"
+        },
+        "spec_version": {
+          "const": "1.0.0"
+        },
+        "created_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "feature_order": {
+          "const": [
+            "u",
+            "v",
+            "u_times_h"
+          ],
+          "description": "固定顺序。u=logit(clip(p_raw_up,0.0001,0.9999))；v=logit(clip(p_market_up,0.0001,0.9999))；h=(tau_wall-60)/60；u_times_h=u*h。"
+        },
+        "inference_enabled": {
+          "const": false
+        },
+        "artifact_status": {
+          "const": "UNFITTED"
+        },
+        "training_executed": {
+          "const": false
+        },
+        "reason": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "const": "TRAINING_NOT_RUN"
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": false
+        },
+        "provenance": {
+          "$ref": "#/$defs/UnfittedProvenance"
+        },
+        "validation": {
+          "$ref": "#/$defs/UnfittedValidation"
+        },
+        "release": {
+          "$ref": "#/$defs/UnfittedRelease"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_kind",
+        "strategy_id",
+        "spec_version",
+        "created_at",
+        "feature_order",
+        "inference_enabled",
+        "artifact_status",
+        "training_executed",
+        "reason",
+        "provenance",
+        "validation",
+        "release"
+      ],
+      "additionalProperties": false,
+      "description": "明确的未训练交付占位。禁止出现fit、transform、parameters、bootstrap等拟合产物；推断入口必须返回MODEL_UNFITTED。训练失败日志单独保存，不能伪装为已拟合模型。"
+    },
+    "FittedArtifact": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "contract_kind": {
+          "const": "HENGZHUN_INTERNAL_MODEL_ARTIFACT"
+        },
+        "strategy_id": {
+          "const": "HENGZHUN_TWAP_VALUE_V1"
+        },
+        "spec_version": {
+          "const": "1.0.0"
+        },
+        "created_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "feature_order": {
+          "const": [
+            "u",
+            "v",
+            "u_times_h"
+          ],
+          "description": "固定顺序。u=logit(clip(p_raw_up,0.0001,0.9999))；v=logit(clip(p_market_up,0.0001,0.9999))；h=(tau_wall-60)/60；u_times_h=u*h。"
+        },
+        "inference_enabled": {
+          "type": "boolean"
+        },
+        "artifact_status": {
+          "const": "FITTED"
+        },
+        "training_executed": {
+          "const": true
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "split_plan": {
+          "$ref": "#/$defs/SplitPlan"
+        },
+        "fit_recipe": {
+          "$ref": "#/$defs/FitRecipe"
+        },
+        "training": {
+          "type": "object",
+          "properties": {
+            "cutoff_at": {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            "label_available_cutoff_at": {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            "max_label_available_at": {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            "fit_completed_at": {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            "sample_counts": {
+              "$ref": "#/$defs/TrainingCounts"
+            },
+            "data_quality_report": {
+              "$ref": "#/$defs/ManifestReference"
+            }
+          },
+          "required": [
+            "cutoff_at",
+            "label_available_cutoff_at",
+            "max_label_available_at",
+            "fit_completed_at",
+            "sample_counts",
+            "data_quality_report"
+          ],
+          "additionalProperties": false
+        },
+        "fit": {
+          "$ref": "#/$defs/Fit"
+        },
+        "bootstrap": {
+          "$ref": "#/$defs/Bootstrap"
+        },
+        "validation": {
+          "$ref": "#/$defs/Validation"
+        },
+        "release": {
+          "$ref": "#/$defs/Release"
+        },
+        "inference_contract": {
+          "type": "object",
+          "properties": {
+            "target": {
+              "const": "OFFICIAL_UP_BINARY_RESULT"
+            },
+            "max_abs_feature_z": {
+              "const": 5.0
+            },
+            "guard_error_buffer": {
+              "const": 0.02
+            },
+            "guard_quantiles": {
+              "const": [
+                0.1,
+                0.9
+              ]
+            },
+            "guard_normalization": {
+              "const": "NONE"
+            },
+            "missing_or_failed_bootstrap_inference": {
+              "const": "REJECT_DECISION"
+            },
+            "unavailable_model_behavior": {
+              "const": "REJECT_CALIBRATED_INFERENCE"
+            },
+            "runtime_rule_match_required": {
+              "const": true
+            },
+            "runtime_expiry_check_required": {
+              "const": true
+            }
+          },
+          "required": [
+            "target",
+            "max_abs_feature_z",
+            "guard_error_buffer",
+            "guard_quantiles",
+            "guard_normalization",
+            "missing_or_failed_bootstrap_inference",
+            "unavailable_model_behavior",
+            "runtime_rule_match_required",
+            "runtime_expiry_check_required"
+          ],
+          "additionalProperties": false
+        },
+        "internal_oof_diagnostic": {
+          "$ref": "#/$defs/InternalOofDiagnostic"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_kind",
+        "strategy_id",
+        "spec_version",
+        "created_at",
+        "feature_order",
+        "inference_enabled",
+        "artifact_status",
+        "training_executed",
+        "provenance",
+        "split_plan",
+        "fit_recipe",
+        "training",
+        "fit",
+        "bootstrap",
+        "validation",
+        "release",
+        "inference_contract"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "inference_enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "inference_enabled"
+            ]
+          },
+          "then": {
+            "properties": {
+              "validation": {
+                "properties": {
+                  "status": {
+                    "const": "PASS"
+                  }
+                }
+              },
+              "release": {
+                "properties": {
+                  "status": {
+                    "const": "RELEASED"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "release": {
+                "properties": {
+                  "status": {
+                    "not": {
+                      "const": "RELEASED"
+                    }
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inference_enabled": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "validation": {
+                "properties": {
+                  "status": {
+                    "const": "FAIL"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "validation"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inference_enabled": {
+                "const": false
+              },
+              "release": {
+                "properties": {
+                  "status": {
+                    "not": {
+                      "const": "RELEASED"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "description": "FITTED表示真实拟合及bootstrap集合已经形成，并且有可审查验证结果，不等于已发布。inference_enabled仅表示artifact的静态授权；运行时仍须检查时间、规则、领域范围、输入质量与全部成功子模型。"
+    }
+  }
+}

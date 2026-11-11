@@ -9,7 +9,12 @@ description = "Paper trading dashboard for real Polymarket BTC 5-minute predicti
 requires-python = ">=3.11"
 dependencies = [
   "py_clob_client_v2>=1.0.1",
+  "jsonschema==4.25.1",
+  "PyYAML==6.0.2",
 ]
+
+[tool.setuptools.package-data]
+"polybot2other.hengzhun" = ["spec/*.json", "spec/*.yaml", "spec/*.txt"]
 
 [project.scripts]
 polybot2other-dashboard = "polybot2other.web:main"

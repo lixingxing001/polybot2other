@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter, deque
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,7 @@ from .execution import (
     taker_fee,
 )
 from .evidence import MarketEvidenceScout
+from .shared_market_inputs import MarketInputs
 from .experiments import (
     ANTI_BOT_GUARD_MODE_NONE,
     MARKET_DATA_MODE_BASE,
@@ -372,6 +373,14 @@ class PaperTradingBot:
     def __init__(self, settings: Settings, store: TradeStore) -> None:
         self.settings = settings
         self.store = store
+        self.paper_execution = None
+        self.paper_execution_service = None
+        self.hengzhun = None
+        self.hengzhun_error = None
+        self.paired_paper = None
+        self.paired_paper_error = None
+        self.paired_v2 = None
+        self.paired_v2_error = None
         self.polymarket = PolymarketClient(settings.gamma_url, settings.clob_url, settings.request_timeout_seconds)
         self.actor_data = PolymarketDataClient(settings.data_api_url, settings.request_timeout_seconds)
         self.price_fallback = PublicPriceClient(settings.request_timeout_seconds)
@@ -411,6 +420,13 @@ class PaperTradingBot:
         self.paper_quotes: dict[str, dict[str, Any]] = {}
         self.execution_price: dict[str, Any] = {}
         self.execution_quotes: dict[str, dict[str, Any]] = {}
+        self._shared_inputs_required=bool(settings.managed_live_enabled)
+        self._shared_market_provider=None
+        self._shared_sync_lock=threading.Lock()
+        self._shared_saved_market=None
+        self._last_market_input=None
+        self._shared_input_error=None
+        self._auxiliary_prices={}
         # 保存最近一次后端 RTDS Chainlink 价格，避免市场切换或浏览器快照覆盖后丢失锚定价。
         self._latest_backend_chainlink_price: dict[str, Any] = {}
         self._last_live_snapshot_ingest_at = 0.0
@@ -539,8 +555,47 @@ class PaperTradingBot:
             try:
                 from .managed_live import ManagedLiveAccounts
                 self.managed_live = ManagedLiveAccounts(settings, self)
+                self.bind_market_inputs(self.managed_live.market_input_snapshot,
+                                        self.managed_live.feed.references,self.managed_live.feed.polymarket)
             except Exception as exc:
-                self.managed_live_error = f"实盘模块启动失败（{type(exc).__name__}），Paper 继续运行"
+                self.managed_live_error = f"实盘模块启动失败（{type(exc).__name__}），Paper 等待统一行情恢复"
+        if settings.managed_live_enabled and settings.paper_realistic_execution:
+            if self.managed_live is None:
+                raise RuntimeError("真实执行模拟需要统一行情与执行规则，不能回退到旧 Paper 成交")
+            from .paper_execution import PaperExecutionService
+            self.paper_execution_service = PaperExecutionService(self, self.managed_live)
+        if settings.hengzhun_enabled and settings.managed_live_enabled:
+            try:
+                if settings.hengzhun_pilot_enabled:
+                    from .hengzhun.pilot import HengzhunPilotService
+                    self.hengzhun = HengzhunPilotService(settings.hengzhun_pilot_dir,self.managed_live.feed,
+                        seed=settings.hengzhun_pilot_dir/'seed',gamma_url=settings.gamma_url,clob_url=settings.clob_url,
+                        entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused())
+                else:
+                    from .hengzhun.runtime import HengzhunRuntime
+                    import yaml
+                    configuration = settings.hengzhun_dir / "strategy_config.yaml"
+                    overrides = yaml.safe_load(configuration.read_text()) if configuration.exists() else None
+                    self.hengzhun = HengzhunRuntime(settings.hengzhun_dir, self.managed_live.feed, config=overrides)
+            except Exception as exc:
+                self.hengzhun_error = f"衡准 V1 初始化失败（{type(exc).__name__}）：{str(exc)[:180]}"
+        if settings.paired_paper_enabled and self.managed_live is not None:
+            try:
+                from .paired_paper_service import PairedPaperService
+                self.paired_paper = PairedPaperService(settings.paired_paper_dir, self.managed_live.feed,
+                    gamma_url=settings.gamma_url, clob_url=settings.clob_url,
+                    entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused(), frozen=settings.paired_v1_frozen)
+            except Exception as exc:
+                self.paired_paper_error = f"双翼配对初始化失败（{type(exc).__name__}）"
+        if settings.paired_v2_enabled and self.managed_live is not None:
+            try:
+                from .paired_v2_service import PairedV2Service
+                self.paired_v2 = PairedV2Service(settings.paired_v2_dir,self.managed_live.feed,
+                    gamma_url=settings.gamma_url,clob_url=settings.clob_url,
+                    entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused(),
+                    comparison_db=settings.strategy_experiments_db_dir/'main_optimized.sqlite3')
+            except Exception as exc:
+                self.paired_v2_error=f"双翼 V2 初始化失败（{type(exc).__name__}）"
         self._append_market_llm_terminal_log(
             level="info",
             module="system",
@@ -557,6 +612,81 @@ class PaperTradingBot:
                 f"Live 自动下注: 已锁定，{MARKET_SCOUT_LIVE_LOCKED_MESSAGE}",
             ],
         )
+
+    def bind_market_inputs(self,provider,references,market_client):
+        """Borrow the live collector, without borrowing its wallet or execution."""
+        self._shared_inputs_required=True;self._shared_market_provider=provider
+        self.polymarket=market_client
+        if hasattr(self,"references"):self.references=references
+        if self.strategy_experiments is not None:
+            self.strategy_experiments.bind_market_inputs(provider,references,market_client)
+
+    def _capture_shared_market_inputs(self):
+        try:
+            if self._shared_market_provider is not None:
+                frame = self._shared_market_provider()
+                research = getattr(self, 'hengzhun', None)
+                observed = int(frame.observed_at * 1000)
+                if research is not None and getattr(research,'capture_baseline',True) and observed - getattr(self, '_hengzhun_baseline_at', 0) >= 250:
+                    try:
+                        from .hengzhun.baseline import capture_main_frame
+                        baseline_frame = capture_main_frame(frame, self.settings)
+                        paper_engine = getattr(self, 'paper_execution', None)
+                        manager = getattr(self, 'managed_live', None)
+                        if paper_engine is not None:
+                            baseline_frame['execution_policy'] = asdict(paper_engine.policy)
+                            if frame.market is not None:
+                                info = paper_engine.info_cache.get(frame.market.round_id)
+                                if info is not None:
+                                    baseline_frame['market_info'] = dict(info)
+                        if manager is not None:
+                            baseline_frame['main_rule'] = manager.store.config()['strategies']['MAIN']
+                        research.capture('B1_FRAME', baseline_frame, int(time.time() * 1000))
+                        self._hengzhun_baseline_at = observed
+                    except Exception:
+                        # A research observer cannot change MAIN's signal inputs.
+                        pass
+                return frame
+            error=self.managed_live_error or "等待统一实盘行情"
+        except Exception as exc:error=f"统一行情暂不可用（{type(exc).__name__}），正在恢复"
+        return MarketInputs(None,{}, {},{},time.time(),"unavailable",error)
+
+    def _sync_shared_market_inputs(self):
+        # Never call the provider while holding this bot's lock: its auxiliary
+        # price callback reads the root collector under the same lock.
+        with self._shared_sync_lock:return self._sync_shared_market_inputs_locked()
+
+    def _sync_shared_market_inputs_locked(self):
+        frame=self._capture_shared_market_inputs();error=frame.error
+        with self._lock:
+            self._last_market_input=frame;self._shared_input_error=error
+            self.current_market=frame.market if frame else None
+            price=dict(frame.price) if frame else {};quotes=_copy_quotes(frame.quotes) if frame else {}
+            self.paper_price=dict(price);self.latest_price=dict(price);self.execution_price=dict(price)
+            self.paper_quotes=_copy_quotes(quotes);self.latest_quotes=_copy_quotes(quotes);self.execution_quotes=_copy_quotes(quotes)
+            self.ws_status.update(market="shared-live",price="shared-live" if not error else "warming",
+                                  backend_market_data_loop_at=time.time(),shared_input_error=error)
+            self._last_backend_market_data_refresh_at=time.time()
+            if frame and frame.market and all(frame.quote_error(side) is None for side in ("Up","Down")):
+                self._last_backend_quote_refresh_at=time.time()
+            if error:self.last_signal={"symbol":"BTC","side":"NO_TRADE","confidence":0.,"entry_price":0.,"move_bps":0.,"reason":error}
+        if frame and frame.market and frame.market!=self._shared_saved_market:
+            self.store.upsert_round(frame.market);self._shared_saved_market=frame.market
+        return frame
+
+    def _market_input_alignment(self,frame=None):
+        frame=frame or self._last_market_input
+        return {"enabled":self._shared_inputs_required,"source":"managed-live-verified" if self._shared_inputs_required else "legacy-paper",
+                "snapshot_id":frame.snapshot_id if frame else None,"observed_at":frame.observed_at if frame else None,
+                "ready":bool(frame and not frame.error),"error":frame.error if frame else self._shared_input_error}
+
+    def _overlay_shared_market_inputs(self,runtime,frame):
+        runtime["market_input_alignment"]=self._market_input_alignment(frame)
+        if frame is None:return
+        runtime.update(current_market=market_to_payload(frame.market),latest_price=dict(frame.price),paper_price=dict(frame.price),
+                       execution_price=dict(frame.price),latest_quotes=_copy_quotes(frame.quotes),paper_quotes=_copy_quotes(frame.quotes),
+                       execution_quotes=_copy_quotes(frame.quotes),
+                       market_data_scope={"display":"shared_verified","paper":"shared_verified","execution":"shared_verified"})
 
     def configure_strategy_experiment_variant(self, variant: StrategyVariant) -> None:
         """绑定实验组合元数据；版本化组合必须隔离过滤路径和复盘文件。"""
@@ -583,6 +713,15 @@ class PaperTradingBot:
 
     def start(self) -> None:
         self._start_market_scout()
+        self._start_hengzhun()
+        if self.paired_paper is not None:
+            try:self.paired_paper.start()
+            except Exception as exc:self.paired_paper_error = f"双翼配对启动失败（{type(exc).__name__}）"
+        if self.paired_v2 is not None:
+            try:self.paired_v2.start()
+            except Exception as exc:self.paired_v2_error=f"双翼 V2 启动失败（{type(exc).__name__}）"
+        if self.paper_execution_service is not None:
+            self.paper_execution_service.start()
         if self.managed_live is not None:
             self.managed_live.set_market_paused(self.btc_runtime_is_paused())
             self.managed_live.start()
@@ -606,7 +745,8 @@ class PaperTradingBot:
             name="polybot2other-clob-ws",
             daemon=True,
         )
-        self._clob_ws_thread.start()
+        if not self._shared_inputs_required:self._clob_ws_thread.start()
+        else:self._clob_ws_thread=None
         self._rtds_ws_thread = threading.Thread(
             target=self._run_rtds_chainlink_ws,
             name="polybot2other-rtds-chainlink-ws",
@@ -631,6 +771,15 @@ class PaperTradingBot:
     def stop(self) -> None:
         self._market_scout_stop.set()
         self._stop.set()
+        if self.paired_v2 is not None:
+            try:self.paired_v2.stop()
+            except Exception:pass
+        if self.paired_paper is not None:
+            try:self.paired_paper.stop()
+            except Exception:pass
+        self._stop_hengzhun()
+        if self.paper_execution_service is not None:
+            self.paper_execution_service.stop()
         if self.managed_live is not None:
             self.managed_live.stop()
         if self.strategy_experiments is not None:
@@ -1785,7 +1934,7 @@ class PaperTradingBot:
             self._stop.wait(BACKEND_MARKET_DATA_REFRESH_MIN_SECONDS)
 
     def _run_clob_ws(self) -> None:
-        if self.btc_runtime_is_paused():
+        if self.btc_runtime_is_paused() or self._shared_inputs_required:
             return
         self.clob_ws_feed.run(
             self._stop,
@@ -1831,6 +1980,13 @@ class PaperTradingBot:
         now = time.time()
         if self.btc_runtime_is_paused():
             self._set_btc_runtime_paused_runtime_state(now)
+            return
+        if self._shared_inputs_required:
+            try:
+                frame=self._sync_shared_market_inputs()
+                if frame and frame.market and self._backend_price_refresh_needed(now):self._start_backend_price_refresh(frame.market)
+            except Exception as exc:
+                with self._lock:self.ws_status['backend_market_data_error']=f'统一行情刷新暂不可用（{type(exc).__name__}）'
             return
         try:
             with self._lock:
@@ -1918,6 +2074,10 @@ class PaperTradingBot:
         now = time.time()
         if self.btc_runtime_is_paused():
             return self.btc_runtime_paused_snapshot_response()
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            return {"ok":True,"ignored_snapshot":"shared_verified_feed_authoritative",
+                    "market":market_to_payload(frame.market if frame else None),"updated_at":now}
         client_market = payload.get("market") if isinstance(payload.get("market"), dict) else {}
         with self._lock:
             cached_market = self.current_market
@@ -2015,6 +2175,9 @@ class PaperTradingBot:
             self._set_btc_runtime_paused_runtime_state(time.time())
             with self._lock:
                 return self.current_market
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            return frame.market if frame else None
         try:
             market = self.polymarket.find_current_btc_5m_market()
         except Exception:  # noqa: BLE001 - keep dashboard alive during short upstream failures.
@@ -2060,6 +2223,8 @@ class PaperTradingBot:
         self._refresh_backend_prices(market)
 
     def _refresh_backend_quotes(self, market: MarketRound) -> None:
+        if self._shared_inputs_required:
+            self._sync_shared_market_inputs();return
         if self.btc_runtime_is_paused():
             self._set_btc_runtime_paused_runtime_state(time.time())
             return
@@ -2082,6 +2247,13 @@ class PaperTradingBot:
             return
         now = time.time()
         ticks = self.market_data_price_fallback.fetch_sources("BTC", now)
+        if self._shared_inputs_required:
+            # Auxiliary sources still support the existing live model. They may
+            # not replace Chainlink, its clock, the opening, or the CLOB books.
+            if ticks.get("okx"):
+                self._ingest_backend_spot_price({"okx":ticks["okx"].price,"okx_updated_ms":int(time.time()*1000)})
+            with self._lock:self._last_backend_price_refresh_at=time.time()
+            return
         fallback_tick = ticks.get("coinbase") or ticks.get("binance") or ticks.get("okx")
         if fallback_tick is None:
             fallback_tick = self.market_data_price_fallback.fetch_symbol("BTC", now)
@@ -2123,6 +2295,7 @@ class PaperTradingBot:
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         payload = dict(price)
+        if self._shared_inputs_required:return payload
         if market is not None and market.target_price > 0:
             payload["target_price"] = market.target_price
             payload["target_price_source"] = "market.target_price"
@@ -2177,7 +2350,7 @@ class PaperTradingBot:
         price: dict[str, Any],
         status: dict[str, Any] | None = None,
     ) -> None:
-        if self.btc_runtime_is_paused():
+        if self.btc_runtime_is_paused() or self._shared_inputs_required:
             return
         chainlink = _maybe_float(price.get("chainlink"))
         updated_ms = _maybe_int(price.get("chainlink_updated_ms"))
@@ -2264,6 +2437,12 @@ class PaperTradingBot:
             merged_update["okx_updated_ms"] = now_ms
         if source == SPOT_WS_SOURCE_BINANCE and not _maybe_int(merged_update.get("binance_market_updated_ms")):
             merged_update["binance_market_updated_ms"] = now_ms
+        if self._shared_inputs_required:
+            allowed={key:value for key,value in merged_update.items() if key.startswith(("okx","binance_market"))}
+            with self._lock:
+                self._auxiliary_prices.update(allowed)
+                self._apply_backend_spot_ws_status_locked({"source":source,"state":"message",**(status or {})},now)
+            return
         with self._lock:
             market = self.current_market
             merged = dict(self.execution_price or self.paper_price or self.latest_price or {})
@@ -2335,7 +2514,7 @@ class PaperTradingBot:
         quotes: dict[str, dict[str, Any]],
         status: dict[str, Any] | None = None,
     ) -> None:
-        if self.btc_runtime_is_paused():
+        if self.btc_runtime_is_paused() or self._shared_inputs_required:
             return
         now = time.time()
         cleaned = _clean_quotes(quotes)
@@ -2366,6 +2545,9 @@ class PaperTradingBot:
             self.ws_status.pop("backend_clob_ws_error", None)
 
     def _backend_market_data_snapshot(self, market: MarketRound, *, blocking: bool = True) -> bool:
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            return bool(frame and frame.market and frame.market.round_id==market.round_id)
         acquired = self._market_data_refresh_lock.acquire(blocking=blocking)
         if not acquired:
             return False
@@ -2378,6 +2560,9 @@ class PaperTradingBot:
             self._market_data_refresh_lock.release()
 
     def _backend_quote_snapshot(self, market: MarketRound, *, blocking: bool = True) -> bool:
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            return bool(frame and frame.market and frame.market.round_id==market.round_id)
         acquired = self._market_data_refresh_lock.acquire(blocking=blocking)
         if not acquired:
             return False
@@ -2446,6 +2631,7 @@ class PaperTradingBot:
     def _paper_market_data_locked(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
         price = dict(self.paper_price)
         quotes = _copy_quotes(self.paper_quotes)
+        if self._shared_inputs_required:return price,quotes,"shared_verified"
         if not self.ws_status.get("browser_feed_at"):
             latest_price = dict(self.latest_price)
             latest_quotes = _copy_quotes(self.latest_quotes)
@@ -2462,6 +2648,7 @@ class PaperTradingBot:
     def _execution_market_data_locked(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
         price = dict(self.execution_price)
         quotes = _copy_quotes(self.execution_quotes)
+        if self._shared_inputs_required:return price,quotes,"shared_verified"
         if (price or quotes) or self.ws_status.get("browser_feed_at"):
             return price, quotes, "backend"
         return dict(self.latest_price), _copy_quotes(self.latest_quotes), "compat_latest_without_browser"
@@ -2555,6 +2742,7 @@ class PaperTradingBot:
                     with self._lock:
                         self._official_price_backfill_next_at[slug] = now + OFFICIAL_PRICE_BACKFILL_INTERVAL_SECONDS
                 continue
+        if self._shared_inputs_required:return
         with self._lock:
             price, _quotes, _source = self._paper_market_data_locked()
         chainlink_price = _maybe_float(price.get("chainlink"))
@@ -2721,6 +2909,12 @@ class PaperTradingBot:
     def _run_strategy_from_state_inner(self) -> None:
         if self._btc_runtime_stop_requested():
             return
+        if self.paper_execution is not None:
+            frame = self.paper_execution.decide()
+            if frame and frame.market:
+                self._run_strategy_experiments(frame.market, frame.price, frame.quotes)
+            return
+        frame=self._sync_shared_market_inputs() if self._shared_inputs_required else None
         with self._lock:
             market = self.current_market
             price, quotes, _source = self._paper_market_data_locked()
@@ -2744,9 +2938,13 @@ class PaperTradingBot:
             self._run_strategy_experiments(market, price, quotes)
             self._run_live_strategy(market, price, quotes)
             return
-        self._manage_resting_orders(market, quotes)
+        self._manage_resting_orders(market,frame.valid_quotes(time.time()) if frame else quotes)
         if self._btc_runtime_stop_requested():
             return
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            if frame.market is None:return
+            market,price,quotes=frame.market,dict(frame.price),_copy_quotes(frame.quotes)
         if self.realtime_maker_enabled:
             self._run_realtime_maker_strategy_from_state(market, price, quotes)
             return
@@ -2761,14 +2959,21 @@ class PaperTradingBot:
             self._run_live_strategy(market, price, quotes)
             return
         payload = {"price": price, "quotes": quotes}
-        signal = self.strategy.signal(
-            input_from_snapshot(market, payload),
-            self.market_data_mode,
-            self.price_source_mode,
-            self.anti_bot_guard_mode,
-        )
-        signal = self._apply_signal_side_mode(market, signal, quotes)
-        signal = self._apply_signal_filter_mode(market, signal, price, quotes)
+        if frame and frame.error:
+            signal=Signal("BTC","NO_TRADE",0.,0.,0.,frame.error)
+        else:
+            signal = self.strategy.signal(
+                frame.strategy_input() if frame else input_from_snapshot(market, payload),
+                self.market_data_mode,
+                self.price_source_mode,
+                self.anti_bot_guard_mode,
+            )
+            signal = self._apply_signal_side_mode(market, signal, quotes)
+            if frame and signal.side in ("Up","Down"):
+                error=frame.quote_error(signal.side)
+                if error:signal=Signal("BTC","NO_TRADE",0.,0.,0.,error)
+                else:signal = self._apply_signal_filter_mode(market, signal, price, quotes)
+            else:signal = self._apply_signal_filter_mode(market, signal, price, quotes)
         with self._lock:
             self.last_signal = {
                 "symbol": signal.symbol,
@@ -2780,6 +2985,11 @@ class PaperTradingBot:
             }
         if self._btc_runtime_stop_requested():
             return
+        if frame and signal.side in ("Up","Down"):
+            error=frame.quote_error(signal.side,time.time())
+            if error:
+                with self._lock:self.last_signal={"symbol":"BTC","side":"NO_TRADE","confidence":0.,"entry_price":0.,"move_bps":0.,"reason":error}
+                return
         trade_ids = self._maybe_place_trade(market, signal, quotes)
         if self.value_confirm_guard is not None and signal.side in {"Up", "Down"}:
             self.value_confirm_guard.record_execution(market, trade_ids, (self.last_signal or {}).get("reason", ""))
@@ -2800,6 +3010,10 @@ class PaperTradingBot:
 
     def _fresh_experiment_market_data(self, round_id: str):
         """Refresh copied inputs after settlement I/O; preserve original source timestamps."""
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            if frame is None or frame.market is None or frame.market.round_id!=round_id:return None
+            return dict(frame.price),_copy_quotes(frame.quotes)
         with self._lock:
             if self.current_market is None or self.current_market.round_id != round_id:
                 return None
@@ -4710,6 +4924,8 @@ class PaperTradingBot:
         ]
 
     def _manage_resting_orders(self, market: MarketRound, quotes: dict[str, dict[str, Any]]) -> None:
+        if self.paper_execution is not None:
+            return  # Delayed FAKs are only consumed by the durable simulator.
         now = time.time()
         self.store.expire_resting_orders(now)
         orders = [order for order in self.store.active_paper_orders("BTC")
@@ -5570,6 +5786,7 @@ class PaperTradingBot:
     def refresh_status_runtime_overlay(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         """用当前内存行情覆盖过期 status cache，避免界面展示上一拍价格源诊断。"""
 
+        frame=self._capture_shared_market_inputs() if self._shared_inputs_required else None
         payload = dict(snapshot)
         runtime = dict(payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {})
         live_snapshot = dict(
@@ -5609,10 +5826,65 @@ class PaperTradingBot:
                 ),
             )
             runtime["live_trading"] = live_snapshot
+        continuity=getattr(self,"service_continuity",None)
+        runtime["continuity"]=continuity.snapshot() if continuity is not None else None
+        self._overlay_shared_market_inputs(runtime,frame)
+        if self.paper_execution_service is not None:
+            runtime["paper_execution"] = self.paper_execution_service.snapshot()
+        if self.managed_live is not None and frame is not None:runtime["managed_live"]=self.managed_live.snapshot(market_input=frame)
         payload["runtime"] = runtime
+        runtime["hengzhun"] = self.hengzhun_snapshot()
+        runtime["paired_paper"] = self.paired_paper_snapshot()
+        runtime["paired_v2"] = self.paired_v2_snapshot()
         return payload
 
+    def paired_paper_snapshot(self):
+        service = getattr(self, 'paired_paper', None)
+        if service is not None:
+            try:return service.snapshot()
+            except Exception as exc:
+                return {"enabled":True,"name":"双翼配对 V1","mode":"PAPER","running":False,
+                        "error":f"模拟状态读取失败（{type(exc).__name__}）"}
+        return {"enabled":bool(getattr(self.settings,'paired_paper_enabled',False)),"mode":"PAPER","running":False,
+                "error":getattr(self,'paired_paper_error',None)}
+
+    def paired_v2_snapshot(self):
+        service=getattr(self,'paired_v2',None)
+        if service is not None:
+            try:return service.snapshot()
+            except Exception as exc:return {"enabled":True,"mode":"PAPER","error":f"V2 状态读取失败（{type(exc).__name__}）"}
+        return {"enabled":bool(getattr(self.settings,'paired_v2_enabled',False)),"mode":"PAPER","running":False,
+                "error":getattr(self,'paired_v2_error',None)}
+
+    def _start_hengzhun(self):
+        if self.hengzhun is None:
+            return
+        try:
+            self.hengzhun.start()
+        except Exception as exc:
+            self.hengzhun_error = f"衡准 V1 启动失败（{type(exc).__name__}）"
+            self._stop_hengzhun()
+            self.hengzhun = None
+
+    def _stop_hengzhun(self):
+        if self.hengzhun is None:
+            return
+        try:
+            self.hengzhun.stop()
+        except Exception as exc:
+            self.hengzhun_error = f"衡准 V1 停止异常（{type(exc).__name__}）"
+
+    def hengzhun_snapshot(self):
+        if self.hengzhun is not None:
+            try:return self.hengzhun.snapshot()
+            except Exception as exc:
+                return {"enabled":True,"name":"衡准 V1","mode":getattr(self.hengzhun,"mode","RECORD"),"live_execution_enabled":False,
+                        "error":f"研究状态读取失败（{type(exc).__name__}）"}
+        return {"enabled":bool(self.settings.hengzhun_enabled),"name":"衡准 V1","mode":"RECORD",
+                "live_execution_enabled":False,"error":self.hengzhun_error}
+
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        frame=self._capture_shared_market_inputs() if self._shared_inputs_required else None
         with self._lock:
             live_runner = self.live_trading
             live_paper_runner = self.live_paper_trading
@@ -5678,8 +5950,16 @@ class PaperTradingBot:
                 ),
             )
         runtime["strategy_experiments"] = strategy_experiments_snapshot
-        runtime["managed_live"] = self.managed_live.snapshot() if self.managed_live is not None else {
-            "available": False, "enabled": False, "error": self.managed_live_error}
+        runtime["hengzhun"] = self.hengzhun_snapshot()
+        runtime["paired_paper"] = self.paired_paper_snapshot()
+        runtime["paired_v2"] = self.paired_v2_snapshot()
+        if self.paper_execution_service is not None:
+            runtime["paper_execution"] = self.paper_execution_service.snapshot()
+        runtime["managed_live"] = ((self.managed_live.snapshot(market_input=frame) if frame is not None else self.managed_live.snapshot())
+                                   if self.managed_live is not None else {"available":False,"enabled":False,"error":self.managed_live_error})
+        continuity=getattr(self,"service_continuity",None)
+        runtime["continuity"]=continuity.snapshot() if continuity is not None else None
+        self._overlay_shared_market_inputs(runtime,frame)
         runtime["live_trading"] = live_snapshot
         runtime["live_paper_trading"] = live_paper_snapshot
         runtime["live_paper_stop_win_trading"] = live_paper_stop_win_snapshot
@@ -5814,7 +6094,8 @@ class PaperTradingBot:
                     "stop_streak_limit": PAIR_STOP_STREAK_LIMIT,
                 },
                 "paper_only": not (self.live_trading and self.live_trading.config.enabled),
-                "market_source": "Polymarket Gamma + CLOB market WebSocket + RTDS WebSocket",
+                "market_source": ("Paper / 实盘共用已校验行情" if self._shared_inputs_required else
+                                  "Polymarket Gamma + CLOB market WebSocket + RTDS WebSocket"),
             },
             "metrics": metrics,
             "open_trades": open_trades,
@@ -6580,6 +6861,8 @@ class PaperTradingBot:
                     item["exit_value"] = _round_money(exit_value)
                     item["unrealized_pnl"] = _round_money(unrealized_pnl)
                     item["unrealized_roi_pct"] = _roi_pct(unrealized_pnl, _maybe_float(row.get("stake")))
+            if self.paper_execution is not None:
+                item.update(self.paper_execution.mark(row, latest_quotes.get(str(row.get("side")), {}), current_market))
             decorated.append(item)
         return decorated
 
@@ -6781,9 +7064,14 @@ class PaperTradingBot:
             unrealized_pnl += exit_value - stake
         enriched["open_mark_value"] = _round_money(open_mark_value) or 0.0
         enriched["unrealized_pnl"] = _round_money(unrealized_pnl) or 0.0
+        if self.paper_execution is not None:
+            enriched["valuation_missing"] = sum(row.get("valuation_status") == "missing" for row in open_trades)
+            enriched["valuation_cached"] = sum(row.get("valuation_status") == "cached" for row in open_trades)
+            if enriched["valuation_missing"]:
+                enriched["unrealized_pnl"] = None
         cash_balance = _maybe_float(enriched.get("cash_balance")) or 0.0
         initial_balance = _maybe_float(enriched.get("initial_balance")) or self.settings.initial_balance
-        estimated_total_equity = cash_balance + open_mark_value
+        estimated_total_equity = cash_balance + open_mark_value + float(enriched.get("reserved_cash") or 0) + float(enriched.get("pending_settlement_cash") or 0)
         estimated_total_pnl = estimated_total_equity - initial_balance
         enriched["estimated_total_equity"] = _round_money(estimated_total_equity) or 0.0
         enriched["estimated_total_pnl"] = _round_money(estimated_total_pnl) or 0.0
@@ -6797,6 +7085,7 @@ class StrategyExperimentRunner:
         self.comparison = None
         self.settings = settings
         self.market_data_provider = None
+        self._shared_market_provider = None
         self.polymarket = polymarket
         self.variants = selected_strategy_variants(settings.strategy_experiments_variants)
         self._lock = threading.RLock()
@@ -6810,7 +7099,7 @@ class StrategyExperimentRunner:
         self._official_settlement_next_at: dict[str, float] = {}
         for variant in self.variants:
             variant_settings = self._settings_for_variant(settings, variant)
-            if variant.variant_id == "MAIN_TP_SL":
+            if variant.variant_id == "MAIN_TP_SL" and not settings.paper_realistic_execution:
                 from .main_exit import MainExitBot
                 from .main_exit_store import MainExitStore
                 store = MainExitStore(variant_settings.db_path, variant_settings.initial_balance)
@@ -6835,6 +7124,10 @@ class StrategyExperimentRunner:
             from .optimized_comparison import MainComparison
             optimized = self._bots["MAIN_OPTIMIZED"]
             self.comparison = MainComparison(baseline_store, optimized.store, settings.strategy_experiments_db_dir / "main-comparison.json")
+
+    def bind_market_inputs(self,provider,references,market_client):
+        self._shared_market_provider=provider;self.polymarket=market_client
+        for bot in self._bots.values():bot.bind_market_inputs(provider,references,market_client)
 
     def start_independent(self):
         for bot in self._bots.values():
@@ -6923,6 +7216,10 @@ class StrategyExperimentRunner:
         quotes: dict[str, dict[str, Any]],
     ) -> None:
         now = time.time()
+        if self._shared_market_provider is not None:
+            frame=self._shared_market_provider()
+            if frame.market is None:return
+            market,price,quotes,now=frame.market,dict(frame.price),_copy_quotes(frame.quotes),frame.observed_at
         with self._lock:
             self.run_count += 1
             self.last_run_at = now
@@ -6953,7 +7250,7 @@ class StrategyExperimentRunner:
                         "browser_feed_at": now,
                         "backend_rest_fallback_at": None,
                     }
-                if variant.variant_id != VALUE_CONFIRM_VARIANT_ID:
+                if variant.variant_id != VALUE_CONFIRM_VARIANT_ID and not bot._shared_inputs_required:
                     self._settle_due_from_price(bot.store, price, now)
                 bot._run_strategy_from_state()
                 bot.store.record_equity()
@@ -7310,6 +7607,7 @@ class StrategyExperimentRunner:
             "llm_super_agent_enabled": bot.llm_super_agent_enabled,
             "recent_llm_decisions": bot.store.recent_llm_decisions(3) if bot.llm_super_agent_enabled else [],
             "paper_trading_paused": bot.paper_trading_runtime().get("paused", False),
+            "paper_execution": bot.paper_execution.snapshot() if bot.paper_execution else None,
             "last_signal": dict(bot.last_signal or {}),
             "last_error": bot.last_error if getattr(bot, "independent_runtime", False) else last_error,
             "independent_runtime": bot.diagnostics() if getattr(bot, "independent_runtime", False) else None,

@@ -1,0 +1,3796 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hengzhun:v1:event-contracts:1.0.0",
+  "title": "衡准 V1 内部事件与经济账本合同",
+  "description": "本附件定义内部标准化记录，不是 Polymarket 或 Chainlink 的官方接口。外部字段到本合同的映射必须经实际响应、适用协议及官方说明核验。只验证形状和局部约束，不替代设计正文的时间、资金、因果、幂等和并发不变量。",
+  "$comment": "所有规范化对象 additionalProperties=false；唯一自由区为 RawEvent.payload。价格、金额、费用、份额为十进制字符串，概率/统计特征可以 number；时间为 UTC epoch 毫秒整数。schema 不证明 SHA256 内容、不强制跨字段时间比较、不进行十进制经济计算、不检查跨记录唯一性。不得通过 schema 通过来宣称集成验收或模型训练已经完成。 哈希计算必须排除被计算的 hash 字段自身；实现须统一锁定字段投影、键排序、UTF-8 编码、十进制规范形式、空值与数组顺序，附确定性样例，不能仅声称规范 JSON。RawEvent.payload_sha256 对保存的原始字节计算，不能先解析后重序列化冒充原字节。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/MarketContractSnapshot"
+    },
+    {
+      "$ref": "#/$defs/RawEvent"
+    },
+    {
+      "$ref": "#/$defs/FeatureFrame"
+    },
+    {
+      "$ref": "#/$defs/OrderIntent"
+    },
+    {
+      "$ref": "#/$defs/Fill"
+    },
+    {
+      "$ref": "#/$defs/OfficialResult"
+    },
+    {
+      "$ref": "#/$defs/LedgerEvent"
+    }
+  ],
+  "$defs": {
+    "Id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "内部或适配器保留的原始标识；本合同不假定官方标识格式。"
+    },
+    "Text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "64 位小写十六进制 SHA256，不带 0x；内容和规范化算法由应用核验。"
+    },
+    "EpochMillis": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "UTC Unix epoch 毫秒；不接受秒单位、字符串时间或浮点毫秒。"
+    },
+    "Decimal": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 80,
+      "description": "普通十进制字符串，禁止指数记法、千分位、NaN 与 Infinity。使用 Decimal/BigDecimal 运算。"
+    },
+    "NonNegativeDecimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+      "maxLength": 80
+    },
+    "PositiveDecimal": {
+      "type": "string",
+      "pattern": "^(?:[1-9][0-9]*(?:\\.[0-9]+)?|0\\.[0-9]*[1-9][0-9]*)$",
+      "maxLength": 80
+    },
+    "UnitIntervalDecimal": {
+      "type": "string",
+      "pattern": "^(?:0(?:\\.[0-9]+)?|1(?:\\.0+)?)$",
+      "maxLength": 80
+    },
+    "Probability": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "ReasonCodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Id"
+      },
+      "uniqueItems": true
+    },
+    "HashList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Sha256"
+      },
+      "uniqueItems": true
+    },
+    "Side": {
+      "enum": [
+        "UP",
+        "DOWN"
+      ]
+    },
+    "CalibrationStatus": {
+      "enum": [
+        "UNCALIBRATED",
+        "CALIBRATED"
+      ]
+    },
+    "EconomicSpace": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "RECORD",
+            "REPLAY",
+            "PAPER"
+          ]
+        },
+        "portfolio_run_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "scenario_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "ledger_scope": {
+          "enum": [
+            "SIGNAL_SHADOW",
+            "PAPER_PORTFOLIO"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "portfolio_run_id",
+        "scenario_id",
+        "ledger_scope"
+      ],
+      "additionalProperties": false,
+      "description": "经济空间四元组。整个组合内共用此空间，钱包级限制跨策略生效；不同场景的资金与收益不得合并。SHADOW_PRIOR 是通道标签，不是 mode。"
+    },
+    "EconomicIdentity": {
+      "type": "object",
+      "properties": {
+        "economic_space": {
+          "$ref": "#/$defs/EconomicSpace"
+        },
+        "wallet_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "strategy_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "economic_space",
+        "wallet_id",
+        "strategy_id"
+      ],
+      "additionalProperties": false
+    },
+    "MarketIdentity": {
+      "type": "object",
+      "properties": {
+        "market_uid": {
+          "$ref": "#/$defs/Id"
+        },
+        "condition_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "market_uid",
+        "condition_id"
+      ],
+      "additionalProperties": false
+    },
+    "Evidence": {
+      "type": "object",
+      "properties": {
+        "source_label": {
+          "$ref": "#/$defs/Text"
+        },
+        "source_locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "raw_payload_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "verification_method": {
+          "$ref": "#/$defs/Text"
+        },
+        "verified_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "source_label",
+        "source_locator",
+        "raw_payload_sha256",
+        "observed_at",
+        "verification_method",
+        "verified_at"
+      ],
+      "additionalProperties": false,
+      "description": "可指向已保存的原响应或官方说明。source_locator 为证据地址，绝不声明某个不存在的官方 API。"
+    },
+    "VersionSet": {
+      "type": "object",
+      "properties": {
+        "adapter_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "adapter_code_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "rest_schema_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "websocket_schema_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "sdk_locked_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "signature_domain_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "data_api_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "adapter_version",
+        "adapter_code_sha256",
+        "rest_schema_version",
+        "websocket_schema_version",
+        "sdk_locked_version",
+        "signature_domain_version",
+        "data_api_version"
+      ],
+      "additionalProperties": false,
+      "description": "市场协议、签名域、SDK、Data API 版本互不等价。应用核对适配组合。"
+    },
+    "StreamSequenceContract": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "enum": [
+            "CONTIGUOUS",
+            "MONOTONIC_ONLY",
+            "NONE",
+            "UNKNOWN"
+          ]
+        },
+        "scope_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream_seq": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_status": {
+          "enum": [
+            "NOT_APPLICABLE",
+            "NOT_CHECKED",
+            "OK",
+            "GAP",
+            "REGRESSION",
+            "MISSING"
+          ]
+        },
+        "dropped_count": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "capability",
+        "scope_id",
+        "stream_seq",
+        "check_status",
+        "dropped_count"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capability": {
+                "const": "NONE"
+              }
+            },
+            "required": [
+              "capability"
+            ]
+          },
+          "then": {
+            "properties": {
+              "stream_seq": {
+                "type": "null"
+              },
+              "check_status": {
+                "const": "NOT_APPLICABLE"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capability": {
+                "enum": [
+                  "CONTIGUOUS",
+                  "MONOTONIC_ONLY"
+                ]
+              },
+              "check_status": {
+                "const": "OK"
+              }
+            },
+            "required": [
+              "capability",
+              "check_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "stream_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "scope_id": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        }
+      ],
+      "description": "保留来源明确提供的序列能力。无序列源不得合成 stream_seq；本地 ingest_seq 单独保存。缺失真实序列可作为原始异常事件保存。"
+    },
+    "FeeContract": {
+      "type": "object",
+      "properties": {
+        "verification_status": {
+          "enum": [
+            "VERIFIED",
+            "UNVERIFIED",
+            "CONFLICT"
+          ]
+        },
+        "fee_model_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fee_formula_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coefficient": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collection_mode": {
+          "enum": [
+            "CASH_ADDED",
+            "SHARES_DEDUCTED",
+            "NONE",
+            "UNVERIFIED"
+          ]
+        },
+        "amount_semantics": {
+          "enum": [
+            "PRE_FEE_CASH",
+            "ALL_IN_CASH",
+            "GROSS_SHARES",
+            "UNVERIFIED"
+          ]
+        },
+        "rounding_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rounding_increment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "minimum_fee": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        }
+      },
+      "required": [
+        "verification_status",
+        "fee_model_id",
+        "fee_formula_id",
+        "coefficient",
+        "collection_mode",
+        "amount_semantics",
+        "rounding_mode",
+        "rounding_increment",
+        "minimum_fee",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verification_status": {
+                "const": "VERIFIED"
+              }
+            },
+            "required": [
+              "verification_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fee_model_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "fee_formula_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "collection_mode": {
+                "enum": [
+                  "CASH_ADDED",
+                  "SHARES_DEDUCTED",
+                  "NONE"
+                ]
+              },
+              "amount_semantics": {
+                "enum": [
+                  "PRE_FEE_CASH",
+                  "ALL_IN_CASH",
+                  "GROSS_SHARES"
+                ]
+              },
+              "rounding_mode": {
+                "$ref": "#/$defs/Id"
+              },
+              "rounding_increment": {
+                "$ref": "#/$defs/PositiveDecimal"
+              },
+              "minimum_fee": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Evidence"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "按协议、方向和逐档成交核验。不得把历史买入扣份额口径混用于现金加收口径。未知值保存 null 并阻断新增风险。"
+    },
+    "TradingContract": {
+      "type": "object",
+      "properties": {
+        "accepting_orders": {
+          "type": "boolean"
+        },
+        "book_state": {
+          "enum": [
+            "READY",
+            "CLOSED",
+            "RESYNCING",
+            "UNVERIFIED"
+          ]
+        },
+        "tick_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tick_size_unit": {
+          "const": "COLLATERAL_PER_SHARE"
+        },
+        "min_order_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_order_size_unit": {
+          "enum": [
+            "SHARES",
+            "PRE_FEE_COLLATERAL",
+            "ALL_IN_COLLATERAL",
+            "UNVERIFIED"
+          ]
+        },
+        "quantity_step": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "quantity_unit": {
+          "const": "SHARES"
+        },
+        "quantity_decimals": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 36
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supported_order_types": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "uniqueItems": true
+        },
+        "fee_contract": {
+          "$ref": "#/$defs/FeeContract"
+        },
+        "delay_status": {
+          "enum": [
+            "VERIFIED",
+            "UNKNOWN"
+          ]
+        },
+        "venue_min_arrival_delay_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "delay_included_in_scenario": {
+          "type": "boolean"
+        },
+        "delay_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        }
+      },
+      "required": [
+        "accepting_orders",
+        "book_state",
+        "tick_size",
+        "tick_size_unit",
+        "min_order_size",
+        "min_order_size_unit",
+        "quantity_step",
+        "quantity_unit",
+        "quantity_decimals",
+        "supported_order_types",
+        "fee_contract",
+        "delay_status",
+        "venue_min_arrival_delay_ms",
+        "delay_included_in_scenario",
+        "delay_evidence"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "delay_status": {
+                "const": "VERIFIED"
+              }
+            },
+            "required": [
+              "delay_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "venue_min_arrival_delay_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "delay_evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Evidence"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "原始字段单位经适配核验后才映射。最小量不能固定假设为 5 份。延迟含义未知时保留 UNKNOWN，不用 0 伪装已核验。"
+    },
+    "Baseline": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "received_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verified_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "VERIFIED",
+            "UNVERIFIED",
+            "CONFLICT"
+          ]
+        },
+        "resolution_feed_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boundary_rule_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verification_method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        }
+      },
+      "required": [
+        "value",
+        "source_at",
+        "received_at",
+        "verified_at",
+        "status",
+        "resolution_feed_id",
+        "boundary_rule_id",
+        "verification_method",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "VERIFIED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "$ref": "#/$defs/PositiveDecimal"
+              },
+              "source_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "received_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "verified_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "resolution_feed_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "boundary_rule_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "verification_method": {
+                "$ref": "#/$defs/Text"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Evidence"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "复用已核验开盘基准及其真实证据。时间边界与最终权威流匹配由适配器验证。本内部字段不暗示官方存在 price_at_open 接口。"
+    },
+    "SettlementRules": {
+      "type": "object",
+      "properties": {
+        "rule_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "rule_text_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "resolution_feed_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "price_kind": {
+          "enum": [
+            "CHAINLINK_TWAP",
+            "UNVERIFIED"
+          ]
+        },
+        "symbol": {
+          "const": "BTC/USD"
+        },
+        "twap_window_seconds": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "comparison": {
+          "enum": [
+            "END_GREATER_THAN_OR_EQUAL_TO_START_UP",
+            "UNVERIFIED"
+          ]
+        },
+        "tie_policy": {
+          "enum": [
+            "UP",
+            "UNVERIFIED"
+          ]
+        },
+        "result_verification_rule_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "rule_version",
+        "rule_text_sha256",
+        "resolution_feed_id",
+        "price_kind",
+        "symbol",
+        "twap_window_seconds",
+        "comparison",
+        "tie_policy",
+        "result_verification_rule_id"
+      ],
+      "additionalProperties": false
+    },
+    "MarketContractSnapshot": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "MarketContractSnapshot"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "captured_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "market": {
+          "$ref": "#/$defs/MarketIdentity"
+        },
+        "slug": {
+          "$ref": "#/$defs/Id"
+        },
+        "market_protocol_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "up_asset_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "down_asset_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collateral_asset_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "collateral_decimals": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 36
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "listed_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "window_open_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "window_close_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "window_duration_seconds": {
+          "const": 300
+        },
+        "rules": {
+          "$ref": "#/$defs/SettlementRules"
+        },
+        "baseline": {
+          "$ref": "#/$defs/Baseline"
+        },
+        "trading": {
+          "$ref": "#/$defs/TradingContract"
+        },
+        "versions": {
+          "$ref": "#/$defs/VersionSet"
+        },
+        "verification_status": {
+          "enum": [
+            "VERIFIED",
+            "UNVERIFIED",
+            "CONFLICT"
+          ]
+        },
+        "verification_reasons": {
+          "$ref": "#/$defs/ReasonCodes"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "snapshot_id",
+        "captured_at",
+        "contract_sha256",
+        "market",
+        "slug",
+        "market_protocol_version",
+        "up_asset_id",
+        "down_asset_id",
+        "collateral_asset_id",
+        "collateral_decimals",
+        "listed_at",
+        "window_open_at",
+        "window_close_at",
+        "window_duration_seconds",
+        "rules",
+        "baseline",
+        "trading",
+        "versions",
+        "verification_status",
+        "verification_reasons",
+        "evidence"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verification_status": {
+                "const": "VERIFIED"
+              }
+            },
+            "required": [
+              "verification_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "market_protocol_version": {
+                "$ref": "#/$defs/Id"
+              },
+              "up_asset_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "down_asset_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "collateral_asset_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "collateral_decimals": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 36
+              },
+              "rules": {
+                "properties": {
+                  "resolution_feed_id": {
+                    "$ref": "#/$defs/Id"
+                  },
+                  "price_kind": {
+                    "const": "CHAINLINK_TWAP"
+                  },
+                  "twap_window_seconds": {
+                    "const": 60
+                  },
+                  "comparison": {
+                    "const": "END_GREATER_THAN_OR_EQUAL_TO_START_UP"
+                  },
+                  "tie_policy": {
+                    "const": "UP"
+                  },
+                  "result_verification_rule_id": {
+                    "$ref": "#/$defs/Id"
+                  }
+                }
+              },
+              "baseline": {
+                "properties": {
+                  "status": {
+                    "const": "VERIFIED"
+                  }
+                }
+              },
+              "trading": {
+                "properties": {
+                  "tick_size": {
+                    "$ref": "#/$defs/PositiveDecimal"
+                  },
+                  "min_order_size": {
+                    "$ref": "#/$defs/PositiveDecimal"
+                  },
+                  "min_order_size_unit": {
+                    "enum": [
+                      "SHARES",
+                      "PRE_FEE_COLLATERAL",
+                      "ALL_IN_COLLATERAL"
+                    ]
+                  },
+                  "quantity_step": {
+                    "$ref": "#/$defs/PositiveDecimal"
+                  },
+                  "quantity_decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 36
+                  },
+                  "fee_contract": {
+                    "properties": {
+                      "verification_status": {
+                        "const": "VERIFIED"
+                      }
+                    }
+                  }
+                }
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Evidence"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ],
+      "description": "不可变的内部市场合同快照。时间差等于 300000 毫秒、两侧资产唯一性、基准和终值同源、合同 hash 及版本互相一致由应用检查。VERIFIED 不等于当前可交易。",
+      "$comment": "contract_sha256 仅覆盖已锁定的合同语义投影，不覆盖自身；snapshot_id、captured_at、重复请求 received/observed/verified 时间及本次抓取证据标识不应单独触发新合同版本。重复抓取语义相同的规则应复用相同合同版本和语义 hash。实际开盘窗口、权威流/边界规则、基准数值、资产/协议映射、交易精度/最小量/费用/延迟合同等语义变化才应重建并复查。审计时间和原响应仍完整保存。语义白名单及规范编码必须在适配器实现与测试中明确锁定。"
+    },
+    "RawEvent": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "RawEvent"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "event_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "capture_run_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "ingest_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "source_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "stream_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "source_kind": {
+          "enum": [
+            "OFFICIAL_SPOT",
+            "OFFICIAL_TWAP",
+            "ORDER_BOOK",
+            "ORDER_UPDATE",
+            "MARKET_METADATA",
+            "OFFICIAL_RESULT",
+            "WALLET",
+            "CLOCK",
+            "OTHER"
+          ]
+        },
+        "market": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarketIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "asset_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "received_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "source_time_status": {
+          "enum": [
+            "VALID",
+            "MISSING",
+            "MALFORMED",
+            "FUTURE",
+            "UNVERIFIED"
+          ]
+        },
+        "sequence": {
+          "$ref": "#/$defs/StreamSequenceContract"
+        },
+        "connection_epoch": {
+          "$ref": "#/$defs/Id"
+        },
+        "is_full_snapshot": {
+          "type": "boolean"
+        },
+        "quality_reasons": {
+          "$ref": "#/$defs/ReasonCodes"
+        },
+        "payload": {
+          "description": "外部原始 payload，显式允许任意 JSON。原字节的独立归档与 hash 必须保留；其他标准化对象均封闭字段。"
+        },
+        "payload_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "raw_archive_locator": {
+          "$ref": "#/$defs/Text"
+        },
+        "adapter_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "raw_schema_hint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "event_id",
+        "capture_run_id",
+        "boot_id",
+        "ingest_seq",
+        "source_id",
+        "stream_id",
+        "source_kind",
+        "market",
+        "asset_id",
+        "source_at",
+        "received_at",
+        "source_time_status",
+        "sequence",
+        "connection_epoch",
+        "is_full_snapshot",
+        "quality_reasons",
+        "payload",
+        "payload_sha256",
+        "raw_archive_locator",
+        "adapter_version",
+        "raw_schema_hint"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source_time_status": {
+                "const": "VALID"
+              }
+            },
+            "required": [
+              "source_time_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "source_at": {
+                "$ref": "#/$defs/EpochMillis"
+              }
+            }
+          }
+        }
+      ],
+      "description": "Append-only 采集记录；received_at 是第一次本地收到时间，不随回放或去重改写。重复、缺字段及格式异常也可落原始层，不因此成为有效模型输入。"
+    },
+    "BookLevel": {
+      "type": "object",
+      "properties": {
+        "price": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "quantity_shares": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        }
+      },
+      "required": [
+        "price",
+        "quantity_shares"
+      ],
+      "additionalProperties": false
+    },
+    "BookView": {
+      "type": "object",
+      "properties": {
+        "asset_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "source_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "received_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "snapshot_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "bids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BookLevel"
+          },
+          "minItems": 1
+        },
+        "asks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BookLevel"
+          },
+          "minItems": 1
+        },
+        "is_complete": {
+          "const": true
+        },
+        "observation_policy": {
+          "const": "LOCAL_OBSERVED_ASOF"
+        }
+      },
+      "required": [
+        "asset_id",
+        "source_at",
+        "received_at",
+        "snapshot_sha256",
+        "bids",
+        "asks",
+        "is_complete",
+        "observation_policy"
+      ],
+      "additionalProperties": false,
+      "description": "已验证且非空的盘口视图。排序、非交叉、时间、新鲜度与数量精度由应用验证。"
+    },
+    "PriorPrediction": {
+      "type": "object",
+      "properties": {
+        "spot": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "baseline": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "known_integral_usd_seconds": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "known_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 60
+        },
+        "mean_unadjusted_usd": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "mean_adjusted_usd": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "variance_rate_usd2_per_second": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "process_variance_usd2": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "total_variance_usd2": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "proxy_bias_bps": {
+          "type": "number"
+        },
+        "proxy_sd_bps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "proxy_sample_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "proxy_p95_abs_error_bps": {
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "proxy_status": {
+          "enum": [
+            "READY",
+            "WARMUP_FLOOR",
+            "INVALID"
+          ]
+        },
+        "fast_return_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "slow_return_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "volatility_span_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "p_raw_up": {
+          "$ref": "#/$defs/Probability"
+        },
+        "p_raw_down": {
+          "$ref": "#/$defs/Probability"
+        }
+      },
+      "required": [
+        "spot",
+        "baseline",
+        "known_integral_usd_seconds",
+        "known_seconds",
+        "mean_unadjusted_usd",
+        "mean_adjusted_usd",
+        "variance_rate_usd2_per_second",
+        "process_variance_usd2",
+        "total_variance_usd2",
+        "proxy_bias_bps",
+        "proxy_sd_bps",
+        "proxy_sample_count",
+        "proxy_p95_abs_error_bps",
+        "proxy_status",
+        "fast_return_count",
+        "slow_return_count",
+        "volatility_span_seconds",
+        "p_raw_up",
+        "p_raw_down"
+      ],
+      "additionalProperties": false,
+      "description": "统计概率与 bps 使用 number。美元价格、美元积分和美元方差使用十进制字符串。以普通 spot 作输入；官方 TWAP 不再作为 spot 求均价。"
+    },
+    "FittedPrediction": {
+      "type": "object",
+      "properties": {
+        "model_artifact_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "model_version": {
+          "$ref": "#/$defs/Id"
+        },
+        "feature_order": {
+          "const": [
+            "u",
+            "v",
+            "u_times_h"
+          ]
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "standardized_features": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -5,
+            "maximum": 5
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "p_fit_up": {
+          "$ref": "#/$defs/Probability"
+        },
+        "p10_up": {
+          "$ref": "#/$defs/Probability"
+        },
+        "p90_up": {
+          "$ref": "#/$defs/Probability"
+        },
+        "guard_up": {
+          "$ref": "#/$defs/Probability"
+        },
+        "guard_down": {
+          "$ref": "#/$defs/Probability"
+        },
+        "bootstrap_success_count": {
+          "type": "integer",
+          "minimum": 90,
+          "maximum": 100
+        },
+        "inference_success_count": {
+          "type": "integer",
+          "minimum": 90,
+          "maximum": 100
+        },
+        "model_available_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "model_expires_at": {
+          "$ref": "#/$defs/EpochMillis"
+        }
+      },
+      "required": [
+        "model_artifact_sha256",
+        "model_version",
+        "feature_order",
+        "features",
+        "standardized_features",
+        "p_fit_up",
+        "p10_up",
+        "p90_up",
+        "guard_up",
+        "guard_down",
+        "bootstrap_success_count",
+        "inference_success_count",
+        "model_available_at",
+        "model_expires_at"
+      ],
+      "additionalProperties": false,
+      "description": "按全部发布成功 bootstrap 子模型预测；分位数定义 linear。成功数相等、p10<=p90、feature_order 一致、时间可用性和保守公式由应用验证。"
+    },
+    "CostQuote": {
+      "type": "object",
+      "properties": {
+        "fee_model_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "fee_collection_mode": {
+          "enum": [
+            "CASH_ADDED",
+            "SHARES_DEDUCTED",
+            "NONE"
+          ]
+        },
+        "gross_shares": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "net_shares": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "cash_before_fees": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "fee_cash": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "fee_shares": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "all_in_cash": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "all_in_cost_per_net_share": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "levels_used": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "price": {
+                "$ref": "#/$defs/PositiveDecimal"
+              },
+              "gross_shares": {
+                "$ref": "#/$defs/PositiveDecimal"
+              },
+              "fee_cash": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "fee_shares": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              }
+            },
+            "required": [
+              "price",
+              "gross_shares",
+              "fee_cash",
+              "fee_shares"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "rounding_rule_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "fee_model_id",
+        "fee_collection_mode",
+        "gross_shares",
+        "net_shares",
+        "cash_before_fees",
+        "fee_cash",
+        "fee_shares",
+        "all_in_cash",
+        "all_in_cost_per_net_share",
+        "levels_used",
+        "rounding_rule_id"
+      ],
+      "additionalProperties": false,
+      "description": "两种收费方式统一输出总付现金和净到账份额。现金费与扣份额不得重复计入；求和、预算和逐档精度由应用核验。"
+    },
+    "CandidatePlan": {
+      "type": "object",
+      "properties": {
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "asset_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "best_bid": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "best_ask": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "limit_price": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "quantity_shares": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "probability_basis": {
+          "enum": [
+            "PRIOR_UNCALIBRATED",
+            "FITTED_CONSERVATIVE"
+          ]
+        },
+        "probability_used": {
+          "$ref": "#/$defs/Probability"
+        },
+        "cost_quote": {
+          "$ref": "#/$defs/CostQuote"
+        },
+        "net_edge": {
+          "type": "number"
+        },
+        "conservative_roi": {
+          "type": "number"
+        },
+        "passes_signal_gates": {
+          "type": "boolean"
+        },
+        "rejection_reasons": {
+          "$ref": "#/$defs/ReasonCodes"
+        }
+      },
+      "required": [
+        "side",
+        "asset_id",
+        "best_bid",
+        "best_ask",
+        "limit_price",
+        "quantity_shares",
+        "probability_basis",
+        "probability_used",
+        "cost_quote",
+        "net_edge",
+        "conservative_roi",
+        "passes_signal_gates",
+        "rejection_reasons"
+      ],
+      "additionalProperties": false
+    },
+    "FeatureFrame": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "FeatureFrame"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "frame_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "decision_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "identity": {
+          "$ref": "#/$defs/EconomicIdentity"
+        },
+        "market": {
+          "$ref": "#/$defs/MarketIdentity"
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "config_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "feature_code_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "input_event_hashes": {
+          "$ref": "#/$defs/HashList"
+        },
+        "decision_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "t_obs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tau_wall_seconds": {
+          "type": "number"
+        },
+        "tau_model_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ingest_cutoff": {
+          "type": "object",
+          "properties": {
+            "boot_id": {
+              "$ref": "#/$defs/Id"
+            },
+            "ingest_seq": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "boot_id",
+            "ingest_seq"
+          ],
+          "additionalProperties": false
+        },
+        "landmark_target_seconds": {
+          "anyOf": [
+            {
+              "enum": [
+                90,
+                75,
+                60,
+                45,
+                30
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "landmark_status": {
+          "enum": [
+            "NOT_A_LANDMARK",
+            "PRESENT",
+            "MISSING_OR_TOO_LATE"
+          ]
+        },
+        "data_status": {
+          "enum": [
+            "READY",
+            "BLOCKED"
+          ]
+        },
+        "data_reasons": {
+          "$ref": "#/$defs/ReasonCodes"
+        },
+        "calibration_status": {
+          "$ref": "#/$defs/CalibrationStatus"
+        },
+        "up_book": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BookView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "down_book": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BookView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prior": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PriorPrediction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fitted": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FittedPrediction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CandidatePlan"
+          },
+          "maxItems": 2
+        },
+        "decision": {
+          "enum": [
+            "RECORD_ONLY",
+            "BLOCKED",
+            "NO_SIGNAL",
+            "QUALIFIED_NO_INTENT",
+            "INTENT_CREATED"
+          ]
+        },
+        "intent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "decision_reasons": {
+          "$ref": "#/$defs/ReasonCodes"
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "frame_id",
+        "decision_id",
+        "identity",
+        "market",
+        "contract_sha256",
+        "config_sha256",
+        "feature_code_sha256",
+        "input_event_hashes",
+        "decision_at",
+        "t_obs",
+        "tau_wall_seconds",
+        "tau_model_seconds",
+        "ingest_cutoff",
+        "landmark_target_seconds",
+        "landmark_status",
+        "data_status",
+        "data_reasons",
+        "calibration_status",
+        "up_book",
+        "down_book",
+        "prior",
+        "fitted",
+        "candidates",
+        "decision",
+        "intent_id",
+        "decision_reasons"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "calibration_status": {
+                "const": "UNCALIBRATED"
+              }
+            },
+            "required": [
+              "calibration_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fitted": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "calibration_status": {
+                "const": "CALIBRATED"
+              }
+            },
+            "required": [
+              "calibration_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fitted": {
+                "$ref": "#/$defs/FittedPrediction"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "data_status": {
+                "const": "READY"
+              }
+            },
+            "required": [
+              "data_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "t_obs": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "tau_model_seconds": {
+                "type": "number"
+              },
+              "up_book": {
+                "$ref": "#/$defs/BookView"
+              },
+              "down_book": {
+                "$ref": "#/$defs/BookView"
+              },
+              "prior": {
+                "$ref": "#/$defs/PriorPrediction"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "const": "INTENT_CREATED"
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "intent_id": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        }
+      ],
+      "description": "包含拒绝和缺失样本，避免只保存成交信号。模型特征及输入双时间均不晚于 decision_at；缺失时保留 null 及原因，禁止造值。CALIBRATED 仅用于已通过可用性门槛且成功推理的帧。"
+    },
+    "WalletRiskState": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "const": "WALLET_GLOBAL_WITHIN_ECONOMIC_SPACE"
+        },
+        "open_risk_slot_limit": {
+          "const": 1
+        },
+        "open_risk_slots_used": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "cash_confirmed": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "cash_reserved": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "position_cost_unresolved": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "claim_receivable": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "claim_cost_committed": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "committed_cost_total": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "rolling_24h_gross_loss": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "unresolved_max_loss": {
+          "$ref": "#/$defs/NonNegativeDecimal"
+        },
+        "realized_pnl": {
+          "$ref": "#/$defs/Decimal"
+        },
+        "claim_pending_markets": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "claim_reserved_markets": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "claim_slot_limit": {
+          "const": 2
+        },
+        "unknown_exposure": {
+          "type": "boolean"
+        },
+        "valuation_status": {
+          "enum": [
+            "VERIFIED",
+            "UNCERTAIN"
+          ]
+        },
+        "drawdown_halt": {
+          "type": "boolean"
+        },
+        "snapshot_at": {
+          "$ref": "#/$defs/EpochMillis"
+        }
+      },
+      "required": [
+        "scope",
+        "open_risk_slot_limit",
+        "open_risk_slots_used",
+        "cash_confirmed",
+        "cash_reserved",
+        "position_cost_unresolved",
+        "claim_receivable",
+        "claim_cost_committed",
+        "committed_cost_total",
+        "rolling_24h_gross_loss",
+        "unresolved_max_loss",
+        "realized_pnl",
+        "claim_pending_markets",
+        "claim_reserved_markets",
+        "claim_slot_limit",
+        "unknown_exposure",
+        "valuation_status",
+        "drawdown_halt",
+        "snapshot_at"
+      ],
+      "additionalProperties": false,
+      "description": "同空间同钱包跨策略共享单风险槽。字段是经过聚合的账本快照；去重、claim 两类占用之和、成本不可重复计提、风险公式与额度由数据库事务验证。"
+    },
+    "IntentKey": {
+      "type": "object",
+      "properties": {
+        "wallet_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "strategy_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "condition_id": {
+          "$ref": "#/$defs/Id"
+        }
+      },
+      "required": [
+        "wallet_id",
+        "strategy_id",
+        "condition_id"
+      ],
+      "additionalProperties": false,
+      "description": "数据库唯一约束还须前置经济空间四元组。刻意不含方向、模型和配置版本。"
+    },
+    "OrderIntent": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "OrderIntent"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "intent_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "intent_key": {
+          "$ref": "#/$defs/IntentKey"
+        },
+        "identity": {
+          "$ref": "#/$defs/EconomicIdentity"
+        },
+        "market": {
+          "$ref": "#/$defs/MarketIdentity"
+        },
+        "market_owner_wallet_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "singleflight_wallet_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "created_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "reserved_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "submitted_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acknowledged_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "enum": [
+            "RESERVED",
+            "SUBMITTING",
+            "ACKNOWLEDGED",
+            "UNKNOWN",
+            "TERMINAL_NO_FILL",
+            "TERMINAL_WITH_FILL",
+            "ABORTED_BEFORE_SEND",
+            "REJECTED_CONFIRMED"
+          ]
+        },
+        "period_consumed": {
+          "const": true
+        },
+        "send_attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "venue": {
+          "const": "PAPER_VENUE"
+        },
+        "order_action": {
+          "const": "BUY"
+        },
+        "order_type": {
+          "const": "FAK"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "asset_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "limit_price": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "quantity_shares": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "budget_all_in": {
+          "type": "string",
+          "pattern": "^5(?:\\.0+)?$"
+        },
+        "cost_quote": {
+          "$ref": "#/$defs/CostQuote"
+        },
+        "calibration_status": {
+          "$ref": "#/$defs/CalibrationStatus"
+        },
+        "model_artifact_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "config_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "decision_frame_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "reservation_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "risk_before": {
+          "$ref": "#/$defs/WalletRiskState"
+        },
+        "risk_after": {
+          "$ref": "#/$defs/WalletRiskState"
+        },
+        "expected_arrival_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "venue_order_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_hashes": {
+          "$ref": "#/$defs/HashList"
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "intent_id",
+        "intent_key",
+        "identity",
+        "market",
+        "market_owner_wallet_id",
+        "singleflight_wallet_id",
+        "created_at",
+        "reserved_at",
+        "submitted_at",
+        "acknowledged_at",
+        "terminal_at",
+        "state",
+        "period_consumed",
+        "send_attempts",
+        "venue",
+        "order_action",
+        "order_type",
+        "side",
+        "asset_id",
+        "limit_price",
+        "quantity_shares",
+        "budget_all_in",
+        "cost_quote",
+        "calibration_status",
+        "model_artifact_sha256",
+        "contract_sha256",
+        "config_sha256",
+        "decision_frame_id",
+        "reservation_id",
+        "risk_before",
+        "risk_after",
+        "expected_arrival_at",
+        "venue_order_id",
+        "terminal_reason",
+        "evidence_hashes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "economic_space": {
+                  "properties": {
+                    "mode": {
+                      "enum": [
+                        "REPLAY",
+                        "PAPER"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "calibration_status": {
+                "const": "CALIBRATED"
+              }
+            },
+            "required": [
+              "calibration_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "model_artifact_sha256": {
+                "$ref": "#/$defs/Sha256"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "calibration_status": {
+                "const": "UNCALIBRATED"
+              }
+            },
+            "required": [
+              "calibration_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "model_artifact_sha256": {
+                "type": "null"
+              },
+              "identity": {
+                "properties": {
+                  "economic_space": {
+                    "properties": {
+                      "ledger_scope": {
+                        "const": "SIGNAL_SHADOW"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "SUBMITTING",
+                  "ACKNOWLEDGED",
+                  "UNKNOWN",
+                  "TERMINAL_NO_FILL",
+                  "TERMINAL_WITH_FILL",
+                  "REJECTED_CONFIRMED"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "send_attempts": {
+                "const": 1
+              },
+              "submitted_at": {
+                "$ref": "#/$defs/EpochMillis"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "TERMINAL_NO_FILL",
+                  "TERMINAL_WITH_FILL",
+                  "ABORTED_BEFORE_SEND",
+                  "REJECTED_CONFIRMED"
+                ]
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "terminal_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "terminal_reason": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "ABORTED_BEFORE_SEND"
+              }
+            },
+            "required": [
+              "state"
+            ]
+          },
+          "then": {
+            "properties": {
+              "send_attempts": {
+                "const": 0
+              },
+              "submitted_at": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "description": "此形状仅保存原子预占成功后的持久化提交意图；PREPARED 仅为内存候选，留在 CandidatePlan/FeatureFrame，不创建本记录、不消耗资格。原子预占和意图持久化成功即消耗本市场策略资格，后续发送前中止仍保留原 reserved_at 与 reservation_id。唯一键、钱包 singleflight、跨策略市场归属和全局单风险槽须在同一事务中检查。不存在 LIVE 或 SELL 分支。UNKNOWN 保留预算且不重发。"
+    },
+    "FillEconomics": {
+      "type": "object",
+      "properties": {
+        "gross_shares": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "net_shares": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cash_before_fees": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fee_cash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fee_shares": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "all_in_cash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonNegativeDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fee_collection_mode": {
+          "enum": [
+            "CASH_ADDED",
+            "SHARES_DEDUCTED",
+            "NONE",
+            "UNVERIFIED"
+          ]
+        },
+        "fee_model_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "economics_confirmed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "gross_shares",
+        "net_shares",
+        "cash_before_fees",
+        "fee_cash",
+        "fee_shares",
+        "all_in_cash",
+        "fee_collection_mode",
+        "fee_model_id",
+        "economics_confirmed"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "economics_confirmed": {
+                "const": true
+              }
+            },
+            "required": [
+              "economics_confirmed"
+            ]
+          },
+          "then": {
+            "properties": {
+              "net_shares": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "cash_before_fees": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "fee_cash": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "fee_shares": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "all_in_cash": {
+                "$ref": "#/$defs/NonNegativeDecimal"
+              },
+              "fee_collection_mode": {
+                "enum": [
+                  "CASH_ADDED",
+                  "SHARES_DEDUCTED",
+                  "NONE"
+                ]
+              },
+              "fee_model_id": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Fill": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "Fill"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "fill_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "venue_fill_key": {
+          "$ref": "#/$defs/Id"
+        },
+        "venue_order_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "intent_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "identity": {
+          "$ref": "#/$defs/EconomicIdentity"
+        },
+        "market": {
+          "$ref": "#/$defs/MarketIdentity"
+        },
+        "side": {
+          "$ref": "#/$defs/Side"
+        },
+        "asset_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "config_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "price": {
+          "$ref": "#/$defs/PositiveDecimal"
+        },
+        "status": {
+          "enum": [
+            "MATCHED",
+            "RETRYING",
+            "CONFIRMED",
+            "FAILED_FINAL",
+            "UNKNOWN"
+          ]
+        },
+        "source_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "received_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "matched_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "confirmed_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failure_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "economics": {
+          "$ref": "#/$defs/FillEconomics"
+        },
+        "evidence_hashes": {
+          "$ref": "#/$defs/HashList"
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "fill_id",
+        "venue_fill_key",
+        "venue_order_id",
+        "intent_id",
+        "identity",
+        "market",
+        "side",
+        "asset_id",
+        "contract_sha256",
+        "config_sha256",
+        "price",
+        "status",
+        "source_at",
+        "received_at",
+        "matched_at",
+        "confirmed_at",
+        "terminal_at",
+        "failure_reason",
+        "economics",
+        "evidence_hashes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "economic_space": {
+                  "properties": {
+                    "mode": {
+                      "enum": [
+                        "REPLAY",
+                        "PAPER"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "CONFIRMED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "confirmed_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "terminal_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "economics": {
+                "properties": {
+                  "economics_confirmed": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "FAILED_FINAL"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "terminal_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "failure_reason": {
+                "$ref": "#/$defs/Id"
+              }
+            }
+          }
+        }
+      ],
+      "description": "以稳定 venue_fill_key 幂等记账。部分成交合法，不以订单最小量删除成交。单个 fill 确认不代表整单终态；剩余预算要等整单及全部 child fills 对账。"
+    },
+    "PayoutVector": {
+      "type": "object",
+      "properties": {
+        "up": {
+          "$ref": "#/$defs/UnitIntervalDecimal"
+        },
+        "down": {
+          "$ref": "#/$defs/UnitIntervalDecimal"
+        }
+      },
+      "required": [
+        "up",
+        "down"
+      ],
+      "additionalProperties": false
+    },
+    "OfficialResult": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "OfficialResult"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "result_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "market": {
+          "$ref": "#/$defs/MarketIdentity"
+        },
+        "contract_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "supersedes_result_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "PENDING",
+            "VERIFIED_FINAL",
+            "SPECIAL_FINAL",
+            "CONFLICT"
+          ]
+        },
+        "source_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "received_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "verified_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "label_available_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "official_final_verified": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "enum": [
+            "UP",
+            "DOWN",
+            "SPECIAL",
+            "UNKNOWN"
+          ]
+        },
+        "payouts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayoutVector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "classification_label_up": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "baseline_value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "final_twap_value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PositiveDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolution_feed_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verification_rule_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/ReasonCodes"
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "result_id",
+        "market",
+        "contract_sha256",
+        "revision",
+        "supersedes_result_id",
+        "status",
+        "source_at",
+        "received_at",
+        "verified_at",
+        "label_available_at",
+        "official_final_verified",
+        "outcome",
+        "payouts",
+        "classification_label_up",
+        "baseline_value",
+        "final_twap_value",
+        "resolution_feed_id",
+        "verification_rule_id",
+        "evidence",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "VERIFIED_FINAL",
+                  "SPECIAL_FINAL"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "official_final_verified": {
+                "const": true
+              },
+              "verified_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "label_available_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "payouts": {
+                "$ref": "#/$defs/PayoutVector"
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Evidence"
+                },
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "VERIFIED_FINAL"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "UP",
+                  "DOWN"
+                ]
+              },
+              "classification_label_up": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "SPECIAL_FINAL"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "SPECIAL"
+              },
+              "classification_label_up": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "PENDING",
+                  "CONFLICT"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "official_final_verified": {
+                "const": false
+              },
+              "classification_label_up": {
+                "type": "null"
+              },
+              "label_available_at": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "UP"
+              },
+              "status": {
+                "const": "VERIFIED_FINAL"
+              }
+            },
+            "required": [
+              "outcome",
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "classification_label_up": {
+                "const": 1
+              },
+              "payouts": {
+                "properties": {
+                  "up": {
+                    "type": "string",
+                    "pattern": "^1(?:\\.0+)?$"
+                  },
+                  "down": {
+                    "type": "string",
+                    "pattern": "^0(?:\\.0+)?$"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "DOWN"
+              },
+              "status": {
+                "const": "VERIFIED_FINAL"
+              }
+            },
+            "required": [
+              "outcome",
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "classification_label_up": {
+                "const": 0
+              },
+              "payouts": {
+                "properties": {
+                  "up": {
+                    "type": "string",
+                    "pattern": "^0(?:\\.0+)?$"
+                  },
+                  "down": {
+                    "type": "string",
+                    "pattern": "^1(?:\\.0+)?$"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "description": "训练标签按真实官方最终支付向量确定，label_available_at 是第一次本地收到并验证最终结果的时间。单纯二元结果不得反推 final_twap_value；特殊支付进入账本但排除二元模型训练。结果修订新增记录，禁止回写已知时间。"
+    },
+    "SettlementGate": {
+      "type": "object",
+      "properties": {
+        "official_final_result_verified": {
+          "type": "boolean"
+        },
+        "whole_order_terminal_and_reconciled": {
+          "type": "boolean"
+        },
+        "all_child_fill_economics_confirmed": {
+          "type": "boolean"
+        },
+        "no_related_unknown_exposure": {
+          "type": "boolean"
+        },
+        "checked_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "settlement_recognized_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "official_result_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "uniqueItems": true
+        },
+        "fill_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "uniqueItems": true
+        },
+        "evidence_hashes": {
+          "$ref": "#/$defs/HashList"
+        }
+      },
+      "required": [
+        "official_final_result_verified",
+        "whole_order_terminal_and_reconciled",
+        "all_child_fill_economics_confirmed",
+        "no_related_unknown_exposure",
+        "checked_at",
+        "settlement_recognized_at",
+        "official_result_id",
+        "intent_ids",
+        "fill_ids",
+        "evidence_hashes"
+      ],
+      "additionalProperties": false,
+      "description": "四项首次同时满足时才能确认结算。settlement_recognized_at 不等同于标签可用时间。应用核验实际证据、全量 child fill 覆盖、时间和未知敞口。"
+    },
+    "ReadySettlementGate": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/SettlementGate"
+        },
+        {
+          "properties": {
+            "official_final_result_verified": {
+              "const": true
+            },
+            "whole_order_terminal_and_reconciled": {
+              "const": true
+            },
+            "all_child_fill_economics_confirmed": {
+              "const": true
+            },
+            "no_related_unknown_exposure": {
+              "const": true
+            },
+            "settlement_recognized_at": {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            "official_result_id": {
+              "$ref": "#/$defs/Id"
+            },
+            "intent_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Id"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "evidence_hashes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Sha256"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "LedgerDelta": {
+      "type": "object",
+      "properties": {
+        "account": {
+          "enum": [
+            "CASH_CONFIRMED",
+            "CASH_RESERVED",
+            "POSITION_COST_UNRESOLVED",
+            "CLAIM_RECEIVABLE",
+            "CLAIM_COST_COMMITTED",
+            "REALIZED_PNL",
+            "POSITION_NET_SHARES"
+          ]
+        },
+        "asset_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "unit": {
+          "enum": [
+            "COLLATERAL",
+            "SHARES"
+          ]
+        },
+        "delta": {
+          "$ref": "#/$defs/Decimal"
+        }
+      },
+      "required": [
+        "account",
+        "asset_id",
+        "unit",
+        "delta"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "account": {
+                "const": "POSITION_NET_SHARES"
+              }
+            },
+            "required": [
+              "account"
+            ]
+          },
+          "then": {
+            "properties": {
+              "unit": {
+                "const": "SHARES"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "account": {
+                "enum": [
+                  "CASH_CONFIRMED",
+                  "CASH_RESERVED",
+                  "POSITION_COST_UNRESOLVED",
+                  "CLAIM_RECEIVABLE",
+                  "CLAIM_COST_COMMITTED",
+                  "REALIZED_PNL"
+                ]
+              }
+            },
+            "required": [
+              "account"
+            ]
+          },
+          "then": {
+            "properties": {
+              "unit": {
+                "const": "COLLATERAL"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "LedgerEvent": {
+      "type": "object",
+      "properties": {
+        "record_type": {
+          "const": "LedgerEvent"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "ledger_event_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "origin_key": {
+          "$ref": "#/$defs/Id"
+        },
+        "economic_space": {
+          "$ref": "#/$defs/EconomicSpace"
+        },
+        "wallet_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "strategy_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "INITIAL_CASH",
+            "RESERVE_BUDGET",
+            "CONFIRM_FILL",
+            "RELEASE_UNUSED_RESERVATION",
+            "RECOGNIZE_UNKNOWN_EXPOSURE",
+            "RESOLVE_UNKNOWN_EXPOSURE",
+            "SETTLEMENT_RECOGNIZED_LOSS",
+            "SETTLEMENT_RECOGNIZED_CLAIM",
+            "SETTLEMENT_SPECIAL",
+            "CLAIM_RECEIVED",
+            "DRAWDOWN_HALT",
+            "VALUATION_PAUSE",
+            "REVERSAL"
+          ]
+        },
+        "effective_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/EpochMillis"
+        },
+        "market": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarketIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fill_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "official_result_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contract_sha256": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "config_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "deltas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LedgerDelta"
+          }
+        },
+        "wallet_before": {
+          "$ref": "#/$defs/WalletRiskState"
+        },
+        "wallet_after": {
+          "$ref": "#/$defs/WalletRiskState"
+        },
+        "settlement_gate": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SettlementGate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "claim_available_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cash_receipt_verified_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpochMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reverses_ledger_event_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_hashes": {
+          "$ref": "#/$defs/HashList"
+        },
+        "reason_codes": {
+          "$ref": "#/$defs/ReasonCodes"
+        }
+      },
+      "required": [
+        "record_type",
+        "schema_version",
+        "ledger_event_id",
+        "origin_key",
+        "economic_space",
+        "wallet_id",
+        "strategy_id",
+        "kind",
+        "effective_at",
+        "recorded_at",
+        "market",
+        "intent_id",
+        "fill_id",
+        "official_result_id",
+        "contract_sha256",
+        "config_sha256",
+        "deltas",
+        "wallet_before",
+        "wallet_after",
+        "settlement_gate",
+        "claim_available_at",
+        "cash_receipt_verified_at",
+        "reverses_ledger_event_id",
+        "evidence_hashes",
+        "reason_codes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "properties": {
+            "economic_space": {
+              "properties": {
+                "mode": {
+                  "enum": [
+                    "REPLAY",
+                    "PAPER"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "SETTLEMENT_RECOGNIZED_LOSS",
+                  "SETTLEMENT_RECOGNIZED_CLAIM",
+                  "SETTLEMENT_SPECIAL",
+                  "CLAIM_RECEIVED"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "settlement_gate": {
+                "$ref": "#/$defs/ReadySettlementGate"
+              },
+              "market": {
+                "$ref": "#/$defs/MarketIdentity"
+              },
+              "official_result_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "contract_sha256": {
+                "$ref": "#/$defs/Sha256"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "SETTLEMENT_RECOGNIZED_CLAIM",
+                  "CLAIM_RECEIVED"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "claim_available_at": {
+                "$ref": "#/$defs/EpochMillis"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "CLAIM_RECEIVED"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cash_receipt_verified_at": {
+                "$ref": "#/$defs/EpochMillis"
+              },
+              "deltas": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/LedgerDelta"
+                },
+                "minItems": 1
+              },
+              "evidence_hashes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Sha256"
+                },
+                "minItems": 1,
+                "uniqueItems": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "REVERSAL"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reverses_ledger_event_id": {
+                "$ref": "#/$defs/Id"
+              },
+              "reason_codes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/Id"
+                },
+                "minItems": 1,
+                "uniqueItems": true
+              }
+            }
+          }
+        }
+      ],
+      "description": "不可变分录。领取仅从应收转现金，不重复确认利润；亏损、胜利应收及领取分开。模拟 claim_available_at=settlement_recognized_at+60000。守恒、分录配平、单次确认、时间顺序、事件去重与并发事务由实现验证。"
+    }
+  }
+}

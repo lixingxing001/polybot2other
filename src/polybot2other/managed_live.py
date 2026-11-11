@@ -11,8 +11,13 @@ import secrets
 from .live import LiveProcessLock
 from .models import MarketRound
 from .managed_live_store import ManagedLiveStore, STRATEGIES, ACTIVE_ORDER_STATES
-from .managed_live_client import ManagedExchange, OrderConfirmationPending, fee_amount, maximum_fee_ratio
+from .managed_live_client import ManagedExchange, OrderConfirmationPending, OrderSubmissionUncertain, fee_amount, maximum_fee_ratio
 from .managed_live_signals import LiveMarketFeed, LiveSignals
+from .managed_live_recovery import (no_activity_candidate, FINALIZE_AFTER_END_SECONDS, LATE_AUDIT_FAULT,
+                                   wallet_only_audit_fault, direct_order_evidence)
+
+QUARANTINE_AFTER_SECONDS=60
+QUARANTINE_CHECK_SECONDS=15
 
 
 def sell_estimate(book, shares, info, limit=0):
@@ -33,7 +38,7 @@ class ManagedLiveAccounts:
         self.path=Path(settings.managed_live_dir)
         self.store=store or ManagedLiveStore(self.path/"accounts.sqlite3")
         self.exchange=exchange or ManagedExchange(settings)
-        self.feed=feed or LiveMarketFeed(settings,self.path)
+        self.feed=feed or LiveMarketFeed(settings,self.path,book_reader=self.exchange.rest_book)
         self._lock=threading.RLock();self._order_lock=threading.RLock();self._stop=threading.Event()
         self._reconcile_lock=threading.Lock();self._inflight_submissions=set()
         self._threads=[];self._market_paused=False
@@ -44,6 +49,8 @@ class ManagedLiveAccounts:
         self.last_signal={key:{"side":"NO_TRADE","reason":"实盘开仓未启用"} for key in STRATEGIES}
         self.last_error=None;self._retry_after={};self._exit_retry_after={};self._fault=None
         self._last_tick_at=0.;self._tick_wait="等待实盘策略首次检查";self._execution_statuses={}
+        self._reconcile_retry_after={}
+        self._wallet_wake=threading.Event();self._refresh_after=0.
         self.control_token=secrets.token_urlsafe(32)
         self.process_lock=LiveProcessLock(self.path/"wallet-orders.lock")
         self.signals=LiveSignals(settings,self.store,self.feed,self.available_cash,self._external_prices)
@@ -65,7 +72,12 @@ class ManagedLiveAccounts:
     def _external_prices(self):
         if self.owner is None:return {}
         with self.owner._lock:
-            return dict(self.owner.paper_price)
+            return dict(self.owner._auxiliary_prices if getattr(self.owner,"_shared_inputs_required",False) else self.owner.paper_price)
+
+    def market_input_snapshot(self,advance_basis=False):
+        # Only the existing live decision loop advances the auxiliary history.
+        # Paper/UI reads must not change sample density or model features.
+        return self.signals.market_inputs.capture(advance_basis=advance_basis)
 
     def start(self):
         if any(t.is_alive() for t in self._threads):return
@@ -80,7 +92,7 @@ class ManagedLiveAccounts:
         for worker in self._threads:worker.start()
 
     def stop(self):
-        self._stop.set();self.feed.stop()
+        self._stop.set();self._wallet_wake.set();self.feed.stop()
         for worker in self._threads:
             if worker is not threading.current_thread():worker.join(timeout=3)
         if not any(t.is_alive() and t.name=="live-strategies" for t in self._threads):
@@ -90,6 +102,19 @@ class ManagedLiveAccounts:
         self._market_paused=bool(paused)
         if paused:self.feed.request_pause()
         elif self._threads:self.feed.start()
+
+    def recover_after_interruption(self,gap):
+        with self._lock:
+            self._refresh_after=time.time()
+            self.wallet={**self.wallet,"ready":False,"stale":True,"error":"运行恢复后正在重新核对真实余额"}
+            self.geo={**self.geo,"ready":False};self.open_orders_at=0
+        self._wallet_wake.set()
+        if hasattr(self.feed,"recover_after_interruption"):self.feed.recover_after_interruption()
+        self.store.event("engine_resume",f"检测到约 {gap:.0f} 秒运行中断，重新同步行情和资金；未重复提交订单")
+
+    def _wallet_result_fresh(self,result):
+        start=result.get("read_started_at",0)
+        return bool(result.get("ready") and start>=self._refresh_after and 0<=time.time()-start<=25)
 
     def available_cash(self):
         with self._lock:
@@ -132,25 +157,33 @@ class ManagedLiveAccounts:
     def _wallet_loop(self):
         last_geo=0.
         while not self._stop.is_set():
+            force=self._wallet_wake.is_set();self._wallet_wake.clear()
             try:
                 fresh=self.exchange.read_wallet()
                 with self._lock:
-                    if fresh.get("ready"):self.wallet=fresh
-                    else:self.wallet={**self.wallet,"ready":False,"error":fresh.get("error"),"stale":True}
-                if fresh.get("ready"):
+                    valid=self._wallet_result_fresh(fresh)
+                    if valid:self.wallet=fresh
+                    else:self.wallet={**self.wallet,"ready":False,"error":fresh.get("error") or "余额查询跨越运行中断，正在重新读取","stale":True}
+                if valid:
                     self.store.record_wallet(fresh["balance"],fresh.get("total_equity"))
-                if time.time()-last_geo>=60:
+                if force or time.time()-last_geo>=60:
+                    began=time.time()
                     geo=self.exchange.read_geo()
-                    with self._lock:self.geo=geo
+                    with self._lock:
+                        if began<self._refresh_after or time.time()-began>25:geo={**geo,"ready":False}
+                        self.geo=geo
                     last_geo=time.time() if geo.get("ready") else time.time()-55
                 try:
+                    began=time.time()
                     orders=self.exchange.read_open_orders()
-                    with self._lock:self.open_orders=orders;self.open_orders_at=time.time()
+                    with self._lock:
+                        if began>=self._refresh_after and time.time()-began<=25:
+                            self.open_orders=orders;self.open_orders_at=time.time()
                 except Exception:
                     pass
             except Exception as exc:
                 self.last_error=f"钱包连接异常（{type(exc).__name__}）"
-            self._stop.wait(8)
+            self._wallet_wake.wait(8)
 
     def _trading_loop(self):
         while not self._stop.is_set():
@@ -228,7 +261,8 @@ class ManagedLiveAccounts:
     def tick(self):
         self._last_tick_at=time.time()
         if self._stop.is_set() or self._market_paused:return
-        market,reference,quotes,now=self.feed.observation()
+        frame=self.market_input_snapshot(advance_basis=True)
+        market,reference,quotes,now=frame.market,frame.reference,frame.quotes,frame.observed_at
         if market is None or market.ends_at<=now:
             self._tick_wait="等待本期实盘市场与行情";return
         self._tick_wait=None
@@ -265,7 +299,7 @@ class ManagedLiveAccounts:
             if block:
                 self._record_signal(key,{"side":"NO_TRADE","reason":block,"block_scope":"access"},"blocked");continue
             if time.time()<self._retry_after.get((key,market.round_id),0):continue
-            signal,limit=self.signals.evaluate(key,rule,market,reference,quotes,now,info)
+            signal,limit=self.signals.evaluate(key,rule,market,reference,quotes,now,info,market_input=frame)
             if signal.side in ("Up","Down"):
                 try:
                     result=self._open(key,rule,market,signal,limit,info,config["revision"])
@@ -297,18 +331,31 @@ class ManagedLiveAccounts:
         return (str(quote.get("token_id"))==str(token) and isinstance(source,(int,float)) and isinstance(received,(int,float))
                 and 0<=now*1000-source<=3000 and 0<=now*1000-received<=2500)
 
-    def _open(self,key,rule,market,signal,limit,info,revision):
-        if self.store.has_entry(key,market.round_id,None if key=="VALUE_CONFIRM_V1" else signal.side):return "本策略本期该方向已建仓，不重复开仓"
-        if self.store.active_orders(key):return "本策略已有订单等待官方确认"
-        if len(self.store.positions(key,open_only=True))>=rule["max_open_trades"]:return "达到本策略持仓数量上限"
+    def _entry_limits(self,key,rule):
+        risk=self.store.risk_usage(key)
+        if risk["slots"]>=rule["max_open_trades"]:return "持仓与待确认订单已达到本策略持仓数量上限"
         daily=self.store.daily_pnl(key)
-        if rule["max_daily_loss"] and daily<=-rule["max_daily_loss"]:raise ValueError("达到本策略每日亏损限额")
+        if rule["max_daily_loss"] and daily<=-rule["max_daily_loss"]:return "达到本策略每日亏损限额"
         amount=rule["stake_dollars"]
-        exposure=sum(p["remaining_cost"] for p in self.store.positions(key,open_only=True))
-        if rule["max_daily_loss"] and amount>rule["max_daily_loss"]+min(0,daily)-exposure+.000001:
-            raise ValueError("本策略剩余风控额度不足以覆盖本笔预算")
-        if amount>self.available_cash()+.000001:raise ValueError("真实可用余额不足本笔含费预算")
-        if self.wallet.get("allowance",0)<amount:raise ValueError("真实资金授权额度不足")
+        if rule["max_daily_loss"] and amount>rule["max_daily_loss"]+min(0,daily)-risk["loss_exposure"]+.000001:
+            return "本策略剩余风控额度不足以覆盖本笔预算（含待确认风险）"
+        if amount>self.available_cash()+.000001:return "真实可用余额不足本笔含费预算"
+        if self.wallet.get("allowance",0)<amount:return "真实资金授权额度不足"
+        return None
+
+    def _entry_restriction(self,key,rule,market,side):
+        if any(o["state"]=="QUARANTINED" for o in self.store.active_orders(round_id=market.round_id)):
+            raise ValueError("本市场存在隔离订单，禁止重复开仓；其他市场按剩余额度检查")
+        if self.store.has_entry(key,market.round_id,None if key=="VALUE_CONFIRM_V1" else side):return "本策略本期该方向已建仓，不重复开仓"
+        if any(o["state"]!="QUARANTINED" for o in self.store.active_orders(key)):return "本策略已有订单等待官方确认"
+        reason=self._entry_limits(key,rule)
+        if reason:raise ValueError(reason)
+        return None
+
+    def _open(self,key,rule,market,signal,limit,info,revision):
+        reason=self._entry_restriction(key,rule,market,signal.side)
+        if reason:return reason
+        amount=rule["stake_dollars"]
         token=market.up_token if signal.side=="Up" else market.down_token
         book=self.exchange.rest_book(token)
         if book.get("tick_size",info["tick_size"])!=info["tick_size"]:
@@ -328,10 +375,13 @@ class ManagedLiveAccounts:
                 return "开关或金额设置已变化，等待重新检查"
             reason=self._access_block(require_wallet=True)
             if reason:raise ValueError(reason)
+            reason=self._entry_restriction(key,rule,market,signal.side)
+            if reason:return reason
             if self._stop.is_set() or self._market_paused or amount>self.available_cash()+.000001:return "运行状态或可用余额已变化，等待重新检查"
-            current_market,ref,current_quotes,stamp=self.feed.observation()
+            current_input=self.market_input_snapshot(advance_basis=True)
+            current_market,ref,current_quotes,stamp=current_input.market,current_input.reference,current_input.quotes,current_input.observed_at
             if current_market is None or current_market.round_id!=market.round_id:return "市场已切换，等待新一期信号"
-            fresh,new_limit=self.signals.evaluate(key,rule,current_market,ref,current_quotes,stamp,info)
+            fresh,new_limit=self.signals.evaluate(key,rule,current_market,ref,current_quotes,stamp,info,market_input=current_input)
             if fresh.side!=signal.side or fresh.entry_price>limit or time.time()>=market.ends_at-self.settings.min_time_left_seconds:return "提交前复查已不满足入场条件，继续观察"
             if new_limit is None or limit>new_limit+.000001:return "提交前策略限价已变化，继续观察"
             order=self.store.prepare_order(prepared.external_id,key,market,token,signal.side,"BUY",limit,cash=amount,reason=signal.reason)
@@ -347,6 +397,7 @@ class ManagedLiveAccounts:
             self.store.set_order_state(order["id"],"SUBMITTING")
             try:
                 response=self.exchange.submit(prepared)
+                self.store.record_submission(order["id"],response)
                 if response.get("external_id"):
                     self.store.record_ack(order["id"],response["external_id"])
                 if response.get("identity_mismatch"):
@@ -354,9 +405,16 @@ class ManagedLiveAccounts:
                     return
                 if response.get("rejected"):
                     self.store.set_order_state(order["id"],"REJECTED",response.get("rejected_reason","官方拒绝订单，未记入成交"))
+                    self.store.event("reconcile_rejected",f"{STRATEGIES[order['strategy_id']]} {order['external_id']} {response.get('rejected_reason','官方拒绝订单')}")
                 else:
                     self.store.set_order_state(order["id"],"PENDING")
+            except OrderSubmissionUncertain as exc:
+                self.store.record_submission(order["id"],exc.details)
+                self.store.set_order_state(order["id"],"UNKNOWN",f"提交结果待核对：{exc.details.get('error_message','平台响应不完整')}")
             except Exception as exc:
+                status=getattr(exc,"status_code",None)
+                self.store.record_submission(order["id"],{"status":"UNKNOWN","error_type":type(exc).__name__,
+                                                           "http_status":status if isinstance(status,int) else None})
                 self.store.set_order_state(order["id"],"UNKNOWN",f"提交结果待官方确认（{type(exc).__name__}），不会重复提交")
             self.store.event("order",f"{STRATEGIES[order['strategy_id']]} {order['action']} {order['external_id']} 已进入官方对账")
         finally:
@@ -369,11 +427,25 @@ class ManagedLiveAccounts:
         self.store.set_order_state(order["id"],"UNKNOWN",message)
 
     def _wait_for_confirmation(self,order,message):
-        # The gate is derived from unresolved orders, so it disappears only when
-        # all such orders reach a verified terminal state. No sticky global fault.
-        if order["state"]!="UNKNOWN":
+        # Quarantined orders retain budget and ownership restrictions while allowing
+        # independent markets to use the remaining strategy and wallet limits.
+        if order["state"] not in ("UNKNOWN","QUARANTINED"):
             self.store.event("reconcile_wait",f"{STRATEGIES[order['strategy_id']]} {order['external_id']} {message}")
-        self.store.set_order_state(order["id"],"UNKNOWN",message)
+        self.store.set_order_state(order["id"],"QUARANTINED" if order["state"]=="QUARANTINED" else "UNKNOWN",message)
+
+    def _maybe_quarantine(self,order):
+        now=time.time()
+        if order["state"] not in ("UNKNOWN","SUBMITTING","PENDING"):return
+        if now-(order.get("submitted_at") or order["created_at"])<QUARANTINE_AFTER_SECONDS:return
+        if self._access_block() is not None:return
+        with self._lock:
+            wallet=dict(self.wallet);orders_at=self.open_orders_at
+            if order["id"] in self._inflight_submissions:return
+        if (not wallet.get("ready") or wallet.get("balance") is None or now-wallet.get("checked_at",0)>25
+                or now-orders_at>25):return
+        if self.store.quarantine_order(order["id"],now):
+            self.store.event("reconcile_quarantined",f"{STRATEGIES[order['strategy_id']]} {order['external_id']} 已隔离，继续只读核对；"
+                             f"预留 ${order['requested_cash']:.2f}，计入持仓与亏损限额，禁止本市场重复开仓")
 
     def close_position(self,strategy_id,position_id,reason="手动卖出"):
         block=self._access_block()
@@ -447,17 +519,57 @@ class ManagedLiveAccounts:
 
     def _reconcile_orders(self):
         faults=self.store.reconciliation_faults()
-        for pending in self.store.active_orders():
+        orders=sorted(self.store.active_orders(),key=lambda o:(o["state"]=="QUARANTINED",o["created_at"]))
+        audit=self.store.finalization_audit_candidate()
+        if audit:orders.append(audit)
+        for pending in orders:
             with self._lock:
                 if pending["id"] in self._inflight_submissions:continue
             order=self.store.order(pending["id"])
-            if not order or order["state"] not in ACTIVE_ORDER_STATES or order["state"]=="PREPARED":continue
-            if order["id"] in faults:continue
+            if not order or order["state"] not in (*ACTIVE_ORDER_STATES,"EXPIRED_UNFILLED") or order["state"]=="PREPARED":continue
+            reviewing_activity_fault=(faults.get(order["id"])==LATE_AUDIT_FAULT and wallet_only_audit_fault(order))
+            if order["id"] in faults and not reviewing_activity_fault:continue
             if order.get("ack_id") and order["ack_id"].lower()!=order["external_id"].lower():continue
+            if order["state"]=="QUARANTINED" or reviewing_activity_fault:
+                if time.time()<self._reconcile_retry_after.get(order["id"],0):continue
+                self._reconcile_retry_after[order["id"]]=time.time()+QUARANTINE_CHECK_SECONDS
             market=MarketRound(**self.store.market(order["round_id"]))
             try:
                 info=self.exchange.market_info(market)
-                state=self.exchange.reconcile(order,market,info)
+                query_order={**order,"state":"EXPIRED_UNFILLED"} if reviewing_activity_fault else order
+                state=self.exchange.reconcile(query_order,market,info)
+                checked=dict(state.get("evidence",{"order":"checked"}))
+                if state["fills"]:checked["confirmed_fills"]=state["fills"]
+                if self.store.recover_fak_no_match(order["id"],checked):
+                    self._reconcile_retry_after.pop(order["id"],None)
+                    self.store.event("reconcile_rejected",f"{STRATEGIES[order['strategy_id']]} FAK 无匹配成交，已释放 ${order['requested_cash']:.2f} 预留")
+                    self._wallet_wake.set()
+                    continue
+                if reviewing_activity_fault or (order["state"]=="QUARANTINED" and order.get("finalized_at")):
+                    recovered=self.store.recover_wallet_activity(order["id"],checked)
+                    if recovered:
+                        faults=self.store.reconciliation_faults()
+                        if self._fault==LATE_AUDIT_FAULT:self._fault=next(iter(faults.values()),None)
+                        self._reconcile_retry_after.pop(order["id"],None)
+                        self.store.event("reconcile_activity_recovered",f"{STRATEGIES[order['strategy_id']]} "
+                                         +self.store.order(order["id"])["error"])
+                        continue
+                    if reviewing_activity_fault:
+                        # Never overwrite proven trade evidence with a later empty
+                        # query, or turn an unavailable read into automatic recovery.
+                        if direct_order_evidence(checked):self.store.record_verification(order["id"],checked)
+                        continue
+                self.store.record_verification(order["id"],checked)
+                if order["state"]=="EXPIRED_UNFILLED":
+                    evidence=state.get("evidence",{})
+                    if state["terminal"] and state["no_fill"]:
+                        self.store.set_order_state(order["id"],"CANCELED","后续官方订单记录确认未成交")
+                    elif state["fills"] or direct_order_evidence(evidence):
+                        self._record_reconciliation_fault(order,LATE_AUDIT_FAULT)
+                    elif evidence.get("wallet_activity_count",0)>0:
+                        self.store.set_order_state(order["id"],"QUARANTINED","到期后发现钱包活动，尚未关联到该订单；仅隔离该订单核对")
+                        self.store.event("reconcile_activity_isolated",f"{STRATEGIES[order['strategy_id']]} 旧订单仅隔离核对，其他市场按剩余额度运行")
+                    continue
                 for fill in state["fills"]:
                     self.store.apply_confirmed_fill(order["id"],**fill)
                 if self.store.order(order["id"]).get("error")=="官方成交费用超出预算，需核对":
@@ -467,16 +579,31 @@ class ManagedLiveAccounts:
                     if message!="官方成交费用超出预算，需核对":message=None
                     self.store.set_order_state(order["id"],"CANCELED" if state["no_fill"] else "FILLED",message)
                     result="确认未成交" if state["no_fill"] else "确认成交"
-                    self.store.event("reconcile_recovered" if order["state"] in ("UNKNOWN","SUBMITTING") else "reconcile_confirmed",
+                    self._reconcile_retry_after.pop(order["id"],None)
+                    self.store.event("reconcile_recovered" if order["state"] in ("UNKNOWN","SUBMITTING","QUARANTINED") else "reconcile_confirmed",
                                      f"{STRATEGIES[order['strategy_id']]} {order['external_id']} 官方对账已完成：{result}")
+                elif state.get("pending_reason"):
+                    self._wait_for_confirmation(order,state["pending_reason"])
+                if not state["terminal"]:self._try_finalize_missing(self.store.order(order["id"]),market,state.get("evidence",{}))
             except OrderConfirmationPending as exc:
+                if reviewing_activity_fault:continue
+                if order["state"]=="EXPIRED_UNFILLED":
+                    self.store.record_verification(order["id"],{"order":"incomplete","message":str(exc)});continue
                 self._wait_for_confirmation(order,str(exc))
+                self.store.record_verification(order["id"],{"order":"incomplete","message":str(exc)})
+                self.store.record_closure_probe(order["id"],False,{})
             except ValueError as exc:
+                if reviewing_activity_fault:self.store.record_verification(order["id"],{"order":"integrity_conflict","message":str(exc)[:100]})
                 self._record_reconciliation_fault(order,f"实盘成交需核对：{str(exc)[:100]}")
             except Exception as exc:
+                if reviewing_activity_fault:continue
                 http_status=getattr(exc,"status_code",None)
                 detail=f"HTTP {http_status}" if isinstance(http_status,int) and 100<=http_status<=599 else type(exc).__name__
+                self.store.record_verification(order["id"],{"order":"unavailable","error":detail})
+                if order["state"]=="EXPIRED_UNFILLED":continue
                 self._wait_for_confirmation(order,f"官方对账暂不可用（{detail}），等待确认")
+                self.store.record_closure_probe(order["id"],False,{})
+            self._maybe_quarantine(self.store.order(order["id"]))
         rounds={p["round_id"] for p in self.store.positions(open_only=True)}
         for slug in rounds:
             market=self.store.market(slug)
@@ -485,6 +612,34 @@ class ManagedLiveAccounts:
             if resolution and resolution.get("outcome") in ("Up","Down"):
                 self.store.resolve(slug,resolution["outcome"])
 
+    def _try_finalize_missing(self,order,market,evidence):
+        if order["state"]!="QUARANTINED":return
+        now=time.time();proof=dict(evidence)
+        if now-market.ends_at>=FINALIZE_AFTER_END_SECONDS and evidence.get("wallet_activity")=="checked":
+            try:
+                resolution=self.feed.polymarket.get_resolution(market.round_id)
+                proof.update(market_resolved=bool(resolution and resolution.get("outcome") in ("Up","Down")),
+                             resolution_outcome=resolution.get("outcome") if resolution else None,market_ends_at=market.ends_at)
+            except Exception as exc:proof.update(market_resolved=False,resolution_error=type(exc).__name__)
+        with self._lock:wallet=dict(self.wallet);open_orders_at=self.open_orders_at
+        proof["wallet_verified"]=(not self._fault and self.process_lock.locked and wallet.get("ready") is True
+            and isinstance(wallet.get("balance"),(int,float)) and math.isfinite(wallet["balance"]) and wallet["balance"]>=0
+            and 0<=time.time()-wallet.get("checked_at",0)<=25 and 0<=time.time()-open_orders_at<=25)
+        if order["action"]=="SELL":
+            position=self.store.position(order["position_id"])
+            proof["owned_position_open"]=bool(position and position["remaining_shares"]>0 and position["token_id"]==order["token_id"])
+            proof["owned_token_shares"]=sum(p["remaining_shares"] for p in self.store.positions(open_only=True) if p["token_id"]==order["token_id"])
+        self.store.record_verification(order["id"],proof)
+        if self.store.record_closure_probe(order["id"],no_activity_candidate(order,market,proof,time.time()),proof):
+            self._reconcile_retry_after.pop(order["id"],None)
+            self.store.event("reconcile_finalized",f"{STRATEGIES[order['strategy_id']]} {order['external_id']} 市场已结算，三次多源核对无成交，释放资金与名额；继续低频复查")
+
+    def _fault_recovers_automatically(self):
+        if self._fault!=LATE_AUDIT_FAULT:return False
+        faults=self.store.reconciliation_faults()
+        return bool(faults) and all(message==LATE_AUDIT_FAULT and wallet_only_audit_fault(self.store.order(ident) or {})
+                                   for ident,message in faults.items())
+
     def _execution_status(self,row,config,market,block,now):
         key=row["variant_id"];signal=self.last_signal[key];rule=config["strategies"][key]
         state="waiting";reason=signal.get("reason") or "等待入场信号";recovery="auto"
@@ -492,7 +647,8 @@ class ManagedLiveAccounts:
         if not config["enabled"] or not rule["enabled"]:
             state="off";reason="实盘总开关已关闭" if not config["enabled"] else "该策略新开仓已关闭";recovery="manual"
         elif block:
-            state="blocked";reason=block;recovery="manual" if self._fault or not self.settings.live_trading_runtime_enabled or self._market_paused else "auto"
+            manual_fault=bool(self._fault) and not self._fault_recovers_automatically()
+            state="blocked";reason=block;recovery="manual" if manual_fault or not self.settings.live_trading_runtime_enabled or self._market_paused else "auto"
         elif self._threads and not any(t.is_alive() and t.name=="live-strategies" for t in self._threads):
             state="blocked";reason="实盘策略线程未运行，需要检查服务";recovery="manual"
         elif self.last_error:
@@ -501,12 +657,14 @@ class ManagedLiveAccounts:
             state="blocked";reason="实盘策略检查超过 15 秒未更新，等待连接恢复"
         elif self._tick_wait:
             reason=self._tick_wait
-        elif any(o["state"] in ACTIVE_ORDER_STATES for o in row["orders"]):
+        elif market and any(o["state"]=="QUARANTINED" for o in self.store.active_orders(round_id=market.round_id)):
+            state="blocked";reason="本市场存在隔离订单，禁止重复开仓；其他市场按剩余额度检查"
+        elif any(o["state"] in ACTIVE_ORDER_STATES and o["state"]!="QUARANTINED" for o in row["orders"]):
             state="confirming";reason="订单已提交，等待官方确认；不会重复提交"
+        elif self._entry_limits(key,rule):
+            state="blocked";reason=self._entry_limits(key,rule)
         elif signal.get("state")=="blocked" and signal.get("block_scope")!="access":
             state="blocked"
-        elif row["metrics"]["open_trades"]>=rule["max_open_trades"]:
-            reason="达到本策略持仓数量上限，等待持仓退出或结算"
         elif signal.get("side") in ("Up","Down"):
             state="ready";reason="入场检查已通过，等待提交结果"
         labels={"off":"新开仓已关闭","blocked":"暂停新开仓","waiting":"等待入场条件","confirming":"订单确认中","ready":"正在处理入场"}
@@ -514,10 +672,12 @@ class ManagedLiveAccounts:
         since=previous.get("since",now) if (previous.get("state"),previous.get("reason"))==(state,reason) else now
         result={"state":state,"label":labels[state],"reason":reason,"since":since,"checked_at":self._last_tick_at or None,
                 "recovery":recovery,"retry_at":self._retry_after.get((key,market.round_id),0) if market else None}
+        result["quarantined_count"]=row["risk"]["quarantined_count"]
+        result["quarantined_cash"]=row["risk"]["quarantined_cash"]
         self._execution_statuses[key]=result
         return result
 
-    def snapshot(self):
+    def snapshot(self,market_input=None):
         with self._lock:
             wallet=dict(self.wallet);geo=dict(self.geo)
         if wallet.get("checked_at") and time.time()-wallet["checked_at"]>25:
@@ -525,16 +685,19 @@ class ManagedLiveAccounts:
         wallet["available"]=self.available_cash() if wallet.get("ready") and not wallet.get("stale") else None
         wallet["reserved"]=round(max(0,wallet["balance"]-wallet["available"]),6) if wallet.get("available") is not None else None
         data=self.store.snapshot(self._valuation_marks())
-        market,reference,quotes,observed_at=self.feed.observation()
+        frame=market_input or self.market_input_snapshot()
+        market,reference,quotes,observed_at=frame.market,frame.reference,frame.quotes,frame.observed_at
         block=self._access_block(require_wallet=True)
         for row in data["variants"]:
             row["last_signal"]=self.last_signal[row["variant_id"]]
             row["execution"]=self._execution_status(row,data["settings"],market,block,time.time())
-        market_data={"market":asdict(market) if market else None,"observed_at":observed_at,
+        market_data={"market":asdict(market) if market else None,"observed_at":observed_at,"input_source":"managed-live-verified",
+                     "snapshot_id":frame.snapshot_id,
                      "reference_ready":reference.get("ready",False),"reference_verified":reference.get("protocol_verified",False),
                      "spot":reference.get("latest",{}).get("price.crypto",{}).get("price"),
                      "twap":reference.get("latest",{}).get("price.crypto.twap",{}).get("price"),
-                     "quotes":{k:{f:v.get(f) for f in ("best_bid","best_ask","source_ms","received_ms")} for k,v in quotes.items()}}
+                     "quotes":{k:{f:v.get(f) for f in ("best_bid","best_ask","source_ms","received_ms","source")} for k,v in quotes.items()},
+                     "feed_health":self.feed.health_snapshot() if hasattr(self.feed,"health_snapshot") else None}
         data.update(available=True,wallet=wallet,geo=geo,market_data=market_data,runtime_enabled=self.settings.live_trading_runtime_enabled,
                     running=any(t.is_alive() for t in self._threads),error=self._fault or self.last_error,
                     entry_block_reason=block,market_paused=self._market_paused,

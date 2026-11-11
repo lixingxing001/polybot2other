@@ -1,0 +1,243 @@
+{
+  "schema_version": "1.0",
+  "artifact_type": "source_register",
+  "strategy": "衡准 V1",
+  "verified_on": "2026-11-06",
+  "user_timezone": "Asia/Shanghai",
+  "status": "官方文档已核查，实际仓库、钱包和当期市场响应尚待接入核验",
+  "scope": "仅记录影响实现合同的一手规则。文档核查不代表实际系统已实现、已回测或能够盈利。",
+  "official_sources": [
+    {
+      "id": "S01",
+      "title": "Resolution",
+      "url": "https://docs.polymarket.com/concepts/resolution",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "Up/Down 的开盘基准与终局价格取自同一 Chainlink TWAP 流，分别对应合约窗口起点和终点。",
+        "终局价格大于等于开盘基准时判 Up，小于时判 Down。"
+      ],
+      "design_implication": "基准与终值必须匹配同一权威流和规则版本；可复用用户已有且已核验的基准读取链路。",
+      "limits": "本页没有给出专用 price-to-beat REST 端点，也没有明确缺少精确边界 tick 时应选前一条、后一条或插值。"
+    },
+    {
+      "id": "S02",
+      "title": "Predictions Changelog",
+      "url": "https://docs.polymarket.com/changelog/predictions",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "2026-08-14 起，5 分钟加密市场的 Chainlink TWAP 窗口改为 60 秒。",
+        "2026-11-02 起 Data API v1 退役。",
+        "更新记录包含加密市场 taker delay 的变更，延迟不能当作永久常量。"
+      ],
+      "design_implication": "记录结算、API 与延迟制度的生效时间，回放使用当时规则。"
+    },
+    {
+      "id": "S03",
+      "title": "Real-Time Data",
+      "url": "https://docs.polymarket.com/market-data/realtime-data",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "普通加密价格通道与 Chainlink TWAP 通道分开提供。",
+        "TWAP 的 60 秒字段表示回看窗口；返回值已经是 TWAP，应使用其源时间检查新鲜度。",
+        "参考价格流提供序列和丢包相关字段；盘口会发送 tick 变化，不能假定所有盘口消息也有连续序号。"
+      ],
+      "design_implication": "显式标注现价和 TWAP，禁止把 TWAP 再平均为另一个 60 秒结算量；订阅恢复后重新核对来源。"
+    },
+    {
+      "id": "S04",
+      "title": "Market Details",
+      "url": "https://docs.polymarket.com/market-data/market-details",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "市场协议版本决定使用 CTF token ID 或 Protocol V2 position ID，两种标识可能同时存在。",
+        "市场配置包含交易状态、费用表、最小精度和撮合延迟等信息。",
+        "文档要求把 v1、v2 以外的市场协议版本视为不支持。"
+      ],
+      "design_implication": "按实际协议和字段来源映射；未知版本或字段单位冲突时停止新开仓。"
+    },
+    {
+      "id": "S05",
+      "title": "Place Orders",
+      "url": "https://docs.polymarket.com/trading/place-orders",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "当前下单说明将 Market BUY amount 定义为费前金额，maxSpend 用于控制含费总支出。",
+        "CLOB book 的 min_order_size 以份额计；FAK 可部分成交并取消余量，FOK 要求全部成交。",
+        "市场协议版本与签名域版本不同，必须采用对应的标识和签名域。"
+      ],
+      "design_implication": "在实际签名金额层控制预算，保存逐档费用和净到账份额；不得把订单已接受当作已确认成交。"
+    },
+    {
+      "id": "S06",
+      "title": "Fees",
+      "url": "https://docs.polymarket.com/trading/fees",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "当前 Crypto taker 公式为份额乘以 0.07、价格及一减价格；maker 不收此费用。",
+        "费用应依据市场参数计算，并遵守官方费用精度。"
+      ],
+      "design_implication": "0.07 仅记录为本次核查的类别参数，实装动态读取 feeSchedule；预估成本按各成交档计算。"
+    },
+    {
+      "id": "S07",
+      "title": "Real-Time Order Updates",
+      "url": "https://docs.polymarket.com/trading/realtime-order-updates",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "成交从撮合到链上确认有多个状态，Confirmed 与永久 Failed 为终态。",
+        "断线恢复后应读取订单和近期成交重建账户状态，实时流不保证补发全部遗漏事件。"
+      ],
+      "design_implication": "重试或未知状态继续占用资金；恢复后对账完成才能再次开仓。"
+    },
+    {
+      "id": "S08",
+      "title": "Analytics",
+      "url": "https://docs.polymarket.com/market-data/public-analytics",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "结果接口区分结算状态和预计结算时间；预估时间不等于结果已生效。",
+        "token 引用的 final_price 表示结算支付额，结算数据可能延后更新。"
+      ],
+      "design_implication": "标签按首次收到并核验的结果时间生效；未结算和缺失结果不得填为失败。"
+    },
+    {
+      "id": "S09",
+      "title": "BTC 5 分钟历史市场实例",
+      "url": "https://polymarket.com/event/btc-updown-5m-1793807400",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面",
+      "facts": [
+        "实例的结算来源指向 BTC/USD 60 秒 TWAP 流。",
+        "页面市场上线时间与标题中的 5 分钟交易窗口不相同。"
+      ],
+      "design_implication": "listed_at 与 window_open_at 分开存储，不能拿市场创建或上线时间替代合约起点。",
+      "limits": "该页面仅作为规则与时间语义实例，不能替代用户实际当期市场的读取与核对。"
+    },
+    {
+      "id": "S10",
+      "title": "Maker Rebates Program，帮助中心说明",
+      "url": "https://help.polymarket.com/en/articles/13364471-maker-rebates-program",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取官方页面，部分费用收取说明与当前下单文档存在版本差异",
+      "facts": [
+        "该帮助页仍描述买入费按份额收取、卖出费按现金收取。"
+      ],
+      "design_implication": "不可把这段说明直接套到全部现行订单；须以已锁定协议、实际签名金额和成交净额核对费用单位。",
+      "authority_for_current_fee_collection": false
+    }
+  ],
+  "methodology_sources": [
+    {
+      "id": "R01",
+      "title": "A Reality Check for Data Snooping",
+      "url": "https://onlinelibrary.wiley.com/doi/abs/10.1111/1468-0262.00152",
+      "accessed_on": "2026-11-06",
+      "verification": "已读取原始研究的出版社页面",
+      "facts": [
+        "重复使用历史数据选策略会产生数据窥探偏差，研究提出相对基准的检验方法。"
+      ],
+      "design_implication": "完整登记看过的候选，样本外检验计入多重比较；本设计的具体窗口和阈值为工程提案。"
+    }
+  ],
+  "integration_verification": [
+    {
+      "id": "IV01",
+      "category": "基准边界与 API",
+      "status": "待接入核验",
+      "blocking_new_entries": true,
+      "known_facts": [
+        "开盘与终局值来自同一权威 TWAP 流，分别对应合约窗口边界。",
+        "用户已有已核验开盘基准，可在审计现有来源和时间语义后复用。"
+      ],
+      "not_verified": [
+        "本次未从官方文档核实一个专用开盘基准 REST 端点或固定 JSON 字段。",
+        "本次未核实边界精确 tick 缺失时的官方选择、修订及舍入约定。"
+      ],
+      "required_evidence": [
+        "现有基准读取代码的实际调用与脱敏原始响应，禁止为适配文档假造端点或字段。",
+        "一组包含窗口开始、结束、流标识、源时间、本地接收时间和官方结果的完整记录。",
+        "基准与终值的资产对、流类型、60 秒窗口、精度、边界选择规则及规则版本一致。",
+        "将既有已核验来源映射至内部 BaselineObservation 合同，并保存证据哈希。"
+      ],
+      "adapter_contract": {
+        "naming_scope": "以下均为内部标准化字段，不声明为官方 API 字段",
+        "required_internal_fields": [
+          "market_uid",
+          "window_open_at",
+          "window_close_at",
+          "reference_pair",
+          "authoritative_stream_id",
+          "twap_window_seconds",
+          "baseline_value",
+          "boundary_rule_id",
+          "source_event_at",
+          "received_at",
+          "verified_at",
+          "rule_snapshot_hash",
+          "raw_evidence_hash"
+        ]
+      },
+      "on_unverified_boundary": "停止新开仓。不得自行替换为最近即时价、首条到达价、前一条、后一条或插值；已有已核验边界实现可按其证据合同复用。",
+      "source_ids": [
+        "S01",
+        "S02",
+        "S03",
+        "S09"
+      ]
+    },
+    {
+      "id": "IV02",
+      "category": "费用与数量单位",
+      "status": "待接入核验",
+      "blocking_new_entries": true,
+      "required_evidence": [
+        "锁定当前协议和 SDK 版本，读取具体市场 feeSchedule 与 CLOB book。",
+        "逐一记录金额、份额、费用和最小量字段的来源路径及单位。",
+        "使用脱敏成交明细或已核验测试夹具比对现金总支出、净到账份额、逐档费用及取整。",
+        "证明含费预算约束作用于最终签名金额，证明没有重复扣费或遗漏 builder 费用。"
+      ],
+      "universal_cost_definition": "每份净成本等于实际总现金支出除以实际净到账份额。",
+      "on_conflict": "停止新开仓并记录冲突，不默认为零手续费或最小量单位。",
+      "source_ids": [
+        "S04",
+        "S05",
+        "S06",
+        "S10"
+      ]
+    },
+    {
+      "id": "IV03",
+      "category": "协议与版本映射",
+      "status": "待接入核验",
+      "blocking_new_entries": true,
+      "required_evidence": [
+        "分别记录市场协议、签名域、SDK、REST、WebSocket schema 和现金资产版本。",
+        "核对市场版本、Up/Down 标识、condition ID、book 版本、签名域和合约地址映射。",
+        "CTF book 缺少 version 时，仅在市场元数据已核实为 CTF 且其他标识一致后允许映射。",
+        "核查 Data API v2 的实际响应和分页语义，不复用退役接口假设。"
+      ],
+      "on_unknown_version": "禁止新增风险；已有订单通过仍受支持的路径撤单与对账。未知语义不得通过猜测继续签单。",
+      "source_ids": [
+        "S02",
+        "S04",
+        "S05",
+        "S07",
+        "S08"
+      ]
+    }
+  ],
+  "non_claims": [
+    "没有核实用户仓库的当前实现。",
+    "没有访问或操作真实交易钱包。",
+    "没有取得真实完整行情样本或执行盈利回测。",
+    "没有把文档缺失的远程端点、字段或边界选择规则当成已确认事实。"
+  ]
+}

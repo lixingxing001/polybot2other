@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
-    <link rel="stylesheet" href="/static/styles.css?v=20261031-reconcile-v1">
+    <link rel="stylesheet" href="/static/styles.css?v=20261106-hengzhun-v1">
+    <link rel="stylesheet" href="/static/paired-paper.css?v=20261108-pair-v2">
   </head>
   <body>
     <main class="app-shell">
@@ -23,18 +24,22 @@
           <button id="nav-samples" class="app-nav-item retired-feature" type="button" data-nav-page="samples">样本</button>
           <button id="nav-status" class="app-nav-item" type="button" data-nav-page="status">状态</button>
         </nav>
-        <div class="top-actions">
-          <button id="btc-runtime-toggle" class="btc-runtime-button btc-only-action" type="button" aria-pressed="false">暂停BTC</button>
-          <span id="btc-runtime-status" class="btc-runtime-status btc-only-action">BTC采集中</span>
-          <button id="paper-pause-toggle" class="paper-pause-button btc-only-action" type="button" aria-pressed="false">暂停Paper</button>
+        <div class="top-actions" role="group" aria-label="运行状态与操作">
+          <div class="header-health" role="group" aria-label="行情连接状态">
+            <span id="btc-runtime-status" class="btc-runtime-status btc-only-action">BTC 采集中</span>
+            <span id="polymarket-status-pill" class="polymarket-status-pill is-loading">Polymarket 读取中</span>
+          </div>
+          <span id="runtime-pill" class="pill" role="status">连接中</span>
+          <div class="header-controls" role="group" aria-label="运行操作">
+          <button id="btc-runtime-toggle" class="btc-runtime-button btc-only-action" type="button" aria-pressed="false">暂停 BTC</button>
+          <button id="paper-pause-toggle" class="paper-pause-button btc-only-action" type="button" aria-pressed="false">暂停 Paper</button>
           <label class="live-toggle btc-only-action retired-feature">
             <input id="live-enabled" type="checkbox">
             <span></span>
             实盘
           </label>
-          <span id="polymarket-status-pill" class="polymarket-status-pill is-loading">Polymarket 读取中</span>
-          <span id="runtime-pill" class="pill">连接中</span>
           <button id="tick-button" type="button" title="立即同步">同步</button>
+          </div>
         </div>
       </header>
 
@@ -43,9 +48,12 @@
       <section id="managed-wallet-panel" class="panel managed-wallet-panel" hidden>
         <div class="managed-wallet-head"><div><div class="eyebrow">真实钱包 · 四个策略共享</div><div id="managed-wallet-address" class="subtle">正在连接</div></div><label class="managed-master"><span id="managed-mode-label">Paper 模式</span><input id="managed-master-enabled" type="checkbox" aria-label="实盘总开关"><span class="managed-switch-track"></span><b>实盘总开关</b></label></div>
         <div class="managed-wallet-stats"><div><span>真实钱包余额</span><strong id="managed-wallet-balance">—</strong></div><div><span>钱包持仓估值</span><strong id="managed-wallet-positions">—</strong></div><div><span>真实钱包总资产</span><strong id="managed-wallet-total">—</strong></div><div><span>连接状态</span><strong id="managed-wallet-health">读取中</strong><small id="managed-wallet-updated"></small></div></div>
-        <p class="managed-wallet-note">总开关与对应策略开关同时开启，才会使用真实资金新开仓。关闭后停止新开仓，已有实盘持仓继续管理退出。Paper 对照继续保留。</p>
+        <p class="managed-wallet-note">保存的每笔金额、持仓上限和亏损限额供 Paper 与实盘共用。实盘总开关和策略开关只控制真实资金新开仓；关闭后继续管理已有实盘持仓。Paper 由顶部“暂停 Paper”单独控制。</p>
         <div id="managed-strategy-controls" class="managed-strategy-controls"></div>
-        <div id="managed-execution-status" class="managed-execution-status" role="status" aria-live="polite"></div>
+        <div id="managed-data-health" class="managed-data-health" hidden></div>
+        <div id="managed-quarantine-status" class="managed-quarantine-status" role="status" hidden></div>
+        <p id="managed-execution-scope" class="subtle"></p>
+        <div id="managed-execution-status" class="managed-execution-list" role="status" aria-live="polite"></div>
         <details class="managed-event-history"><summary>实盘运行记录 · 暂停与恢复</summary><ul id="managed-execution-events"></ul></details>
         <p id="managed-live-message" class="managed-live-message" role="status" aria-live="polite"></p>
       </section>
@@ -133,6 +141,13 @@
         <div id="live-once-result" class="live-once-result live-result-source" hidden></div>
       </section>
 
+      <section id="paper-execution-panel" class="panel paper-execution-panel" hidden aria-label="Paper 真实执行模拟">
+        <div class="panel-header"><h2>Paper · 真实执行模拟</h2><span id="paper-execution-version" class="subtle"></span></div>
+        <p id="paper-execution-policy" class="subtle"></p>
+        <div id="paper-execution-accounts" class="managed-strategy-controls"></div>
+        <details><summary>模拟假设与最近执行记录</summary><p id="paper-execution-limitations" class="subtle"></p><ul id="paper-execution-events"></ul></details>
+      </section>
+
       <section class="metric-grid" aria-label="账户指标">
         <div class="account-scope-card">
           <div>
@@ -209,6 +224,7 @@
             <canvas id="equity-chart" width="680" height="190"></canvas>
             <p id="managed-chart-empty" class="managed-empty" hidden>等待真实资产估值</p>
             <div id="equity-tooltip" class="chart-tooltip" hidden></div>
+            <p id="managed-chart-range" class="managed-wallet-note" hidden></p>
           </div>
         </div>
       </section>
@@ -248,10 +264,34 @@
         </div>
       </section>
 
+      <section id="paired-paper-panel" class="panel pp-panel" hidden>
+        <div class="pp-heading"><div class="pp-title"><div class="pp-icon" aria-hidden="true">⇄</div><div><h2>双翼配对 V1</h2><p>双边报价 · 配对合并 · 单边风险独立管理</p></div></div><span id="pp-state" class="pp-state">PAPER 连接中</span></div>
+        <div class="pp-content"><div class="pp-status-line"><i></i><strong id="pp-reason">正在读取当前市场</strong><span>无需前期训练</span></div>
+          <div id="pp-metrics" class="pp-metrics"></div><div id="pp-pair" class="pp-pair"></div>
+          <div class="pp-chart-head"><strong>独立账户净值</strong><span>从本次试验开始 · 缺失估值不填零</span></div><div id="pp-curve" class="pp-curve"></div>
+          <div id="pp-health" class="pp-health"></div><p id="pp-quality" class="pp-footnote"></p>
+          <details class="pp-settings-detail"><summary>Paper 参数与成交规则</summary><div id="pp-settings" class="pp-settings"><label class="pp-enable"><input id="pp-enabled" type="checkbox" checked>允许新增模拟报价</label><label>每组双边合计预算（$）<input id="pp-budget" type="number" min="1" max="100" step="0.1" value="5"></label><label>并行市场上限<input id="pp-max" type="number" min="1" max="10" step="1" value="5"></label><label>24小时净亏损额度（$）<input id="pp-loss" type="number" min="1" max="100" step="1" value="10"></label><button id="pp-save" type="button">保存 Paper 设置</button></div><p id="pp-save-message" aria-live="polite"></p>
+            <ul class="pp-rules"><li>开盘15秒后至剩余60秒挂新买单；每期最多一组成交，未成交报价12秒后撤单重排。</li><li>两侧独立按真实买盘报价，总目标成本不高于$0.98/份；极端价格和宽价差时等待。</li><li>提交及撤单各模拟2秒延迟；可见同价买单排在前面，盘口缩量可减少排队，实际卖出事件最多参与剩余量25%；同价触及不算成交。对严格穿过已生效买价的可成交卖盘，另按原买价和25%可见深度记保守假设成交，避免漏算不利成交。</li><li>撮合后12秒确认。单边持续12秒后进入配平管理：含费合适才补齐，否则尝试限价退出；不足最小份额的余量等待官方终局。</li><li>主动补齐/退出只使用到达时新盘口的25%可见深度并计费。成对份额模拟合并、终局兑付后，均等待60秒到账。</li><li>不计任何未收到的奖励或返佣。Paper独立$100初始本金；单边成交仍可能亏损，收益取决于成交与执行假设。</li></ul>
+          </details>
+          <div class="pp-section-head"><h3>市场账本</h3><span>最近100组 · 默认15行，可滚动</span></div><div class="table-wrap pp-scroll"><table class="trade-table"><thead><tr><th>时间 / 市场</th><th>阶段</th><th>累计买入</th><th>已配对份额</th><th>剩余持仓</th><th>手续费</th><th>已实现盈亏</th><th>待领取</th></tr></thead><tbody id="pp-groups"></tbody></table></div>
+          <div class="pp-section-head"><h3>模拟成交</h3><span>逐笔区分成交事件与保守穿价模型</span></div><div class="table-wrap pp-scroll"><table class="trade-table"><thead><tr><th>撮合时间</th><th>方向 / 类型</th><th>价格</th><th>份额</th><th>现金金额</th><th>手续费</th><th>确认状态</th></tr></thead><tbody id="pp-fills"></tbody></table></div>
+          <details><summary>委托及运行日志</summary><div class="table-wrap pp-scroll"><table class="trade-table"><thead><tr><th>提交时间</th><th>方向</th><th>限价</th><th>委托份额</th><th>成交份额</th><th>状态</th></tr></thead><tbody id="pp-orders"></tbody></table></div><ul id="pp-events" class="pp-events"></ul></details>
+        </div>
+      </section>
+      <section id="hengzhun-panel" class="panel hengzhun-panel" hidden>
+        <div class="panel-head"><div><h2>衡准 V1</h2><p class="subtle">BTC 五分钟均价价值策略 · 设计版本 1.0.0</p></div><span id="hengzhun-mode" class="hengzhun-mode">RECORD · 独立研究</span></div>
+        <div class="hengzhun-content"><p id="hengzhun-health"></p><div id="hengzhun-metrics" class="hengzhun-metrics"></div><div id="hengzhun-reasons" class="hengzhun-reasons"></div>
+        <p id="hengzhun-detail" class="subtle"></p><p id="hengzhun-note" class="subtle"></p>
+        <div id="hengzhun-account" hidden><div id="hengzhun-account-metrics" class="hengzhun-metrics"></div><p id="hengzhun-shadow" class="subtle"></p>
+          <div class="table-wrap hengzhun-trade-scroll"><table class="trade-table"><thead><tr><th>创建时间</th><th>市场</th><th>方向</th><th>状态</th><th>已确认投入</th><th>成交均价</th><th>净份额</th><th>结算单价</th><th>已实现盈亏</th></tr></thead><tbody id="hengzhun-trades"></tbody></table></div>
+        </div>
+        <details><summary>设计参数与采集诊断</summary><div class="table-wrap"><table class="hengzhun-rule-table"><tbody id="hengzhun-rules"></tbody></table></div><p class="subtle">条件独立失败次数；同一事件可能被多项拒绝，不代表独立市场数量。</p><table><thead><tr><th>原因</th><th>事件次数</th></tr></thead><tbody id="hengzhun-funnel"></tbody></table></details>
+        </div>
+      </section>
       <section id="managed-live-tables" class="table-stack" hidden>
-        <div class="panel"><div class="panel-head"><h2>真实持仓 · <span id="managed-position-account"></span></h2><span id="managed-position-count"></span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>市场 / 方向</th><th>买入成本</th><th>剩余份额</th><th>退出估值</th><th>浮动盈亏</th><th>操作</th></tr></thead><tbody id="managed-positions"></tbody></table></div></div>
-        <div class="panel"><div class="panel-head"><h2>真实订单</h2><span>最近 50 条 · 只按官方确认记入成交</span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>时间</th><th>操作 / 方向</th><th>状态</th><th>含费预算 / 卖出份额</th><th>已确认份额</th><th>成交金额</th><th>手续费</th><th>官方订单</th></tr></thead><tbody id="managed-orders"></tbody></table></div></div>
-        <div class="panel"><div class="panel-head"><h2>实盘交易记录</h2><span>最近 50 笔</span></div><div class="table-wrap"><table class="trade-table"><thead><tr><th>开仓时间</th><th>市场 / 方向</th><th>状态</th><th>实际买入成本</th><th>已结算盈亏</th><th>待领取收益</th></tr></thead><tbody id="managed-history"></tbody></table></div><p class="managed-wallet-note">盈亏按官方已确认成交与市场费率核算。待领取收益属于已结算资产，不等同于可用现金；请在 Polymarket 完成领取。钱包余额与总资产为共享口径，持仓与盈亏按当前策略统计。</p></div>
+        <div class="panel"><div class="panel-head"><h2>真实持仓 · <span id="managed-position-account"></span></h2><span id="managed-position-count"></span></div><div class="table-wrap managed-table-scroll" tabindex="0" aria-label="交易表格，默认显示 15 行，可滚动查看"><table class="trade-table"><thead><tr><th>市场 / 方向</th><th>买入均价</th><th>买入成本</th><th>剩余份额</th><th>退出估值</th><th>浮动盈亏</th><th>操作</th></tr></thead><tbody id="managed-positions"></tbody></table></div></div>
+        <div class="panel"><div class="panel-head"><h2>真实订单</h2><span>默认 15 行，表内滚动 · 最近 50 条及全部待核对订单</span></div><div class="table-wrap managed-table-scroll" tabindex="0" aria-label="交易表格，默认显示 15 行，可滚动查看"><table class="trade-table"><thead><tr><th>时间</th><th>操作 / 方向</th><th>状态</th><th>含费预算 / 卖出份额</th><th>已确认份额</th><th>成交均价</th><th>成交金额</th><th>手续费</th><th>官方订单</th></tr></thead><tbody id="managed-orders"></tbody></table></div></div>
+        <div class="panel"><div class="panel-head"><h2>实盘交易记录</h2><span>默认 15 行，表内滚动 · 最近 50 笔</span></div><div class="table-wrap managed-table-scroll" tabindex="0" aria-label="交易表格，默认显示 15 行，可滚动查看"><table class="trade-table"><thead><tr><th>开仓时间</th><th>市场 / 方向</th><th>状态</th><th>买入均价</th><th>卖出 / 结算价</th><th>实际买入成本</th><th>已结算盈亏</th><th>待领取收益</th></tr></thead><tbody id="managed-history"></tbody></table></div><p class="managed-wallet-note"><span class="managed-money--buy">蓝色：买入</span> · <span class="managed-money--sell">青色：卖出</span> · <span class="managed-money--fee">黄色：费用 / 待领取</span> · <span class="positive">绿色：盈利</span> · <span class="negative">红色：亏损</span>。均价不含手续费，买入成本含手续费；卖出均价与官方结算价分别展示。盈亏按官方已确认成交与市场费率核算。待领取收益属于已结算资产，不等同于可用现金；请在 Polymarket 完成领取。钱包余额与总资产为共享口径，持仓与盈亏按当前策略统计。</p></div>
       </section>
       <section class="table-stack" id="paper-table-stack">
         <div class="panel">
@@ -678,7 +718,10 @@
       </div>
     </main>
 
-    <script src="/static/managed-live.js?v=20261031-reconcile-v1"></script>
-    <script src="/static/app.js?v=20261031-reconcile-v1"></script>
+    <script src="/static/managed-live.js?v=20261109-live-monitor-scope"></script>
+    <script src="/static/hengzhun.js?v=20261108-hengzhun-pilot-2"></script>
+    <script src="/static/paired-paper.js?v=20261108-pair-v2-2"></script>
+    <script src="/static/paired-v2.js?v=20261108-pair-v2-2"></script>
+    <script src="/static/app.js?v=20261108-pair-v2"></script>
   </body>
 </html>

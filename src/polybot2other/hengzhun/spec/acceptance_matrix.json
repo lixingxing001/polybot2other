@@ -1,0 +1,1874 @@
+{
+  "schema_version": "1.0",
+  "title": "衡准 V1 执行、账本、风控与回放验收矩阵",
+  "created_date": "2026-11-06",
+  "document_status": "DESIGN_ONLY_NOT_EXECUTED",
+  "intended_modes": [
+    "RECORD",
+    "REPLAY",
+    "PAPER"
+  ],
+  "disclaimer": "本文件为待实现的验收规范。所有用例状态均为 NOT_RUN，不代表已实现、已通过测试或已验证真实盈利能力。费用、盘口与回款数值标注为 synthetic 的均为测试夹具。",
+  "defaults": {
+    "modes_allowed": [
+      "RECORD",
+      "REPLAY",
+      "PAPER"
+    ],
+    "live_enabled": false,
+    "signal_channels": [
+      "SIGNAL_SHADOW",
+      "PAPER_PORTFOLIO"
+    ],
+    "initial_paper_cash_usd": "100",
+    "entry_budget_usd_including_applicable_buy_fees": "5",
+    "submit_remaining_seconds_inclusive": [
+      30,
+      90
+    ],
+    "minimum_expected_arrival_remaining_seconds": 25,
+    "max_committed_cash_usd": "10",
+    "max_claim_pending_markets": 2,
+    "rolling_24h_gross_realized_loss_plus_risk_cap_usd": "10",
+    "conservative_nav_high_water_drawdown_stop_fraction": "0.15",
+    "default_scenario": {
+      "total_delay_ms": 1000,
+      "confirm_after_fill_ms": 12000,
+      "claim_after_final_ms": 60000,
+      "depth_haircut": "0.50",
+      "execution_evidence": "ASSUMED"
+    },
+    "preregistered_scenarios": [
+      {
+        "id": "S1",
+        "total_delay_ms": 1000,
+        "depth_haircut": "0.50"
+      },
+      {
+        "id": "S2",
+        "total_delay_ms": 2000,
+        "depth_haircut": "0.25"
+      },
+      {
+        "id": "S3",
+        "total_delay_ms": 5000,
+        "depth_haircut": "0.25"
+      }
+    ],
+    "same_market_retry_policy": "成功在原子预占事务中创建意图即消耗同一期资格；ABORTED_BEFORE_SEND、REJECTED_CONFIRMED、TERMINAL_NO_FILL 均不恢复资格。同一期不创建第二意图，不重新发送已终结意图；UNKNOWN 永不自动重发。PREPARED 仅为尚未创建持久化意图的候选规划。",
+    "effective_scenario_delay_rule": "若官方 hold 已知，total_delay_ms=max(配置的全链路总假设,hold_ms)；不得再次相加。未知 hold 保留 null/UNKNOWN。",
+    "loss_definition": "G24 按已最终确认的每笔或每市场完整净损益的负值累计，赢单不抵消其他亏损；费用不得在净损益之外再重复记一次亏损。",
+    "committed_definition": "待确认/UNKNOWN 剩余预占预算 + 已成交未最终结算成本 + CLAIM_PENDING 尚未回款成本。已知成交成本与剩余预占不得重复计算。",
+    "claim_definition": "仅在 settlement_recognized_at 建立最终应收或确认损失并释放方向风险槽。CLAIM_PENDING 计入保守净值，未到账前不计可用现金；原始成本继续占用 committed_cost。",
+    "max_open_risk_positions": 1,
+    "risk_scope": "同一经济空间内整个 wallet，覆盖全部策略；独立单策略账户自然也是一个 wallet。",
+    "economic_space_fields": [
+      "mode",
+      "portfolio_run_id",
+      "scenario_id",
+      "ledger_scope"
+    ],
+    "ledger_scope_values": [
+      "SIGNAL_SHADOW",
+      "PAPER_PORTFOLIO"
+    ],
+    "wallet_flight_key_fields": [
+      "mode",
+      "portfolio_run_id",
+      "scenario_id",
+      "ledger_scope",
+      "wallet_id"
+    ],
+    "wallet_market_owner_key_fields": [
+      "mode",
+      "portfolio_run_id",
+      "scenario_id",
+      "ledger_scope",
+      "wallet_id",
+      "condition_id"
+    ],
+    "intent_unique_key_fields": [
+      "mode",
+      "portfolio_run_id",
+      "scenario_id",
+      "ledger_scope",
+      "wallet_id",
+      "strategy_id",
+      "condition_id"
+    ],
+    "settlement_recognition_rule": "settlement_recognized_at 为官方最终结果已核验、整个订单已终态对账、全部子成交现金与净份额经济状态已确认且相关未知暴露为零，四项同时成立的首次时刻。",
+    "claim_timer_anchor": "claim_available_at = settlement_recognized_at + claim_after_final_ms；label_available_at 仍独立表示官方标签首次可得时刻。",
+    "claim_slots_rule": "在钱包原子预占事务中，按 condition_id 去重计算 claim_pending 市场 + reserved/unresolved 且可能形成正支付的市场 + 本次新增市场 <= 2。不同状态属于同一市场时只计一个槽；转为 CLAIM_PENDING 不重复加槽。",
+    "benchmark_space_policy": "旧策略原版完整对照使用独立经济空间并保留原风险参数；只有明确登记的统一风控对照采用衡准的新 cap，不把独立账户收益相加成共享钱包。"
+  },
+  "invariant_notes": [
+    "金钱、份额、价格与费用采用 Decimal 或各资产最小单位整数，禁止二进制浮点参与资金守恒。",
+    "只承诺通过持久化身份、幂等记账和对账实现一次经济效果；没有场所级保证时不能承诺网络报单严格 exactly-once。",
+    "未知订单的租约过期只允许接管对账，不允许重新报单或释放预算。",
+    "发送后订单按原方向、限价和数量撮合；只有场所可执行的规则才能使它拒绝，禁止后验免费撤单。",
+    "SCENARIO 允许显式未校准执行假设，EMPIRICAL 必须有已存在的可审计匿名日志；不得通过新真实交易取得证据。",
+    "仓位结算以官方最终结果证据为准，内部 TWAP 预测不能替代官方最终结算。",
+    "实际现金扣款与净到手份额是归一化成本真值；费用等值展示不得再次扣款。",
+    "G24、净实现损益、保守净值、可用现金、未决风险和成本占用是分别维护的字段。",
+    "root 负责整合并持久保存此文件；本文件不含任何真实凭证、钱包私钥或签名。",
+    "经济空间固定为 mode+portfolio_run_id+scenario_id+ledger_scope；影子与资金账户独立，组合策略共用同空间同 wallet。钱包单飞和市场所有权键不得包含 strategy_id。",
+    "意图键含 strategy_id 和 condition_id，但不含方向、模型或配置版本；钱包市场所有权阻止通过更换策略身份绕过同一期限制。创建意图即消耗资格，发送前中止和零成交均不恢复。",
+    "max_open_risk_positions=1 是同一经济空间整个钱包的上限，预占、待确认、UNKNOWN 与未确定结算按市场去重占槽。",
+    "官方结果核验仅提供结算条件之一；全部成交经济状态、订单终态与未知暴露也已核对后，才能在 settlement_recognized_at 释放风险并启动领取等待。",
+    "单个子成交 CONFIRMED 只将其实际支出从预占转成已确认成本；订单剩余预占必须等整个订单及全部子成交与取消余量核验完毕才释放。",
+    "claim_slots 在钱包事务内原子预留，包含现有应收与可能形成应收的未决市场；状态转换、领取、输单和确证零成交各按幂等规则转移或释放槽位。"
+  ],
+  "case_count": 50,
+  "cases": [
+    {
+      "id": "EX-001",
+      "area": "模式隔离",
+      "priority": "P0",
+      "title": "LIVE 必须硬禁用",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "mode": "LIVE",
+        "credentials_present": true,
+        "submit_requested": true
+      },
+      "trigger": "加载配置并尝试调用报单入口",
+      "expected_state": [
+        "启动拒绝 LIVE，或在创建任何交易客户端前失败",
+        "签名、报单、撤单、领取等交易副作用调用次数均为 0"
+      ],
+      "expected_ledger": [
+        "没有真实钱包预占、资金划转或成交账目"
+      ],
+      "available_test_method": [
+        "单元测试注入会在调用时失败的 signer 和 mutation transport",
+        "启动集成测试"
+      ],
+      "required_evidence": [
+        "启动错误码 LIVE_EXECUTION_DISABLED",
+        "副作用 spy 调用次数为 0"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-002",
+      "area": "模式隔离",
+      "priority": "P0",
+      "title": "RECORD 只记录行情与元数据",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "mode": "RECORD",
+        "valid_signal": true
+      },
+      "trigger": "推送一条完整有效信号并推进虚拟时间",
+      "expected_state": [
+        "允许保存原始消息和 SIGNAL_SHADOW 诊断",
+        "不创建 PAPER_PORTFOLIO 交易意图或订单"
+      ],
+      "expected_ledger": [
+        "Paper 账户现金及风险账本不变",
+        "真实钱包账本不变"
+      ],
+      "available_test_method": [
+        "模式路由单元测试",
+        "事件总线集成测试"
+      ],
+      "required_evidence": [
+        "原始记录存在",
+        "订单、预占和资金账本写入数为 0"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-003",
+      "area": "模式隔离",
+      "priority": "P0",
+      "title": "经济空间隔离且组合策略共用空间",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "economic_spaces": [
+          {
+            "mode": "PAPER",
+            "portfolio_run_id": "RUN_A",
+            "scenario_id": "S1",
+            "ledger_scope": "PAPER_PORTFOLIO",
+            "wallet_id": "W1"
+          },
+          {
+            "mode": "PAPER",
+            "portfolio_run_id": "RUN_A",
+            "scenario_id": "S1",
+            "ledger_scope": "SIGNAL_SHADOW",
+            "wallet_id": "W1"
+          },
+          {
+            "mode": "PAPER",
+            "portfolio_run_id": "RUN_B",
+            "scenario_id": "S1",
+            "ledger_scope": "PAPER_PORTFOLIO",
+            "wallet_id": "W1"
+          }
+        ],
+        "each_paper_portfolio_initial_cash_usd": "100",
+        "same_market_id": "M1",
+        "shared_portfolio_strategy_ids": [
+          "A",
+          "B"
+        ]
+      },
+      "trigger": "在不同经济空间评价同一市场，并在 RUN_A 的资金空间内让 A/B 竞争同一钱包",
+      "expected_state": [
+        "不同 ledger_scope、portfolio_run_id 或 scenario_id 的意图资格、市场所有权、单飞和账本相互隔离",
+        "RUN_A/PAPER_PORTFOLIO 内 A/B 必须复用同一个 wallet 状态，不能以 strategy_id 创建新的钱包锁或风险空间",
+        "钱包单飞键为 economic_space+wallet_id，市场所有权键为 economic_space+wallet_id+condition_id，均不含 strategy_id"
+      ],
+      "expected_ledger": [
+        "每条独立 PAPER_PORTFOLIO 轨迹分别从 100 开始，影子通道不冒充 100 账户",
+        "共享组合只有一套现金、预占、风险槽和 claim_slots",
+        "独立轨迹收益不相加成单一 100 钱包"
+      ],
+      "available_test_method": [
+        "数据库约束集成测试",
+        "双运行回放测试"
+      ],
+      "required_evidence": [
+        "经济空间键与 wallet 锁键",
+        "影子与资金账户独立 ledger root",
+        "共享组合的单一 wallet_state"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-004",
+      "area": "模型就绪",
+      "priority": "P0",
+      "title": "冷启动不得跳过模型准备门槛",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "model_ready": false,
+        "reference_data_available": true,
+        "book_valid": true,
+        "balance_usd": "100"
+      },
+      "trigger": "收到看似高优势的报价",
+      "expected_state": [
+        "PAPER_PORTFOLIO 拒绝新意图，原因 MODEL_NOT_READY",
+        "继续记录行情和模型准备进度"
+      ],
+      "expected_ledger": [
+        "不预占 5，不增加风险槽"
+      ],
+      "available_test_method": [
+        "模型状态 stub 单元测试",
+        "启动回放测试"
+      ],
+      "required_evidence": [
+        "拒绝原因",
+        "模型准备状态和所缺条件"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-005",
+      "area": "模型就绪",
+      "priority": "P0",
+      "title": "未支持的校准区间或无效预测必须弃权",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "calibration_support": false,
+        "prediction_variants": [
+          "NaN",
+          "Infinity",
+          "OUT_OF_RANGE",
+          "UNSUPPORTED_BUCKET"
+        ]
+      },
+      "trigger": "执行候选信号评价",
+      "expected_state": [
+        "不把缺失校准替换为原始分数、0.5 或固定胜率后交易",
+        "记录 ABSTAIN 或校准证据不足"
+      ],
+      "expected_ledger": [
+        "无预占、成交或虚构期望利润"
+      ],
+      "available_test_method": [
+        "参数化单元测试",
+        "属性测试：所有非有限或越界概率均拒绝"
+      ],
+      "required_evidence": [
+        "输入概率、校准版本与弃权原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-006",
+      "area": "未来信息隔离",
+      "priority": "P0",
+      "title": "未来行情不得改变过去决策",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "decision_time": "T",
+        "past_events_identical": true,
+        "future_tail_variants": [
+          "大涨",
+          "大跌",
+          "断流"
+        ]
+      },
+      "trigger": "保持 T 及之前接收记录不变，替换 T 之后数据，重新回放",
+      "expected_state": [
+        "T 时刻方向、分数、限价、数量与是否发送完全一致"
+      ],
+      "expected_ledger": [
+        "T 时刻及之前资金和风险账本哈希一致"
+      ],
+      "available_test_method": [
+        "变形测试",
+        "固定种子确定性回放"
+      ],
+      "required_evidence": [
+        "两次决策哈希",
+        "可见数据最大 received_at 不晚于 T"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-007",
+      "area": "未来信息隔离",
+      "priority": "P0",
+      "title": "未来结算标签不得进入当前训练或校准",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "decision_time": "T",
+        "training_row_label_available_at": "T+30s",
+        "market_end_at": "T-5s"
+      },
+      "trigger": "构建 T 时刻可用训练集与校准器",
+      "expected_state": [
+        "即便市场已结束，尚未可获得的官方标签仍被排除",
+        "模型训练 cutoff 按 label_available_at 校验"
+      ],
+      "expected_ledger": [
+        "不产生由泄漏标签导致的新增订单"
+      ],
+      "available_test_method": [
+        "数据过滤单元测试",
+        "带恶意未来标签的回放测试"
+      ],
+      "required_evidence": [
+        "训练样本清单",
+        "最大 label_available_at",
+        "模型版本哈希"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-008",
+      "area": "未来信息隔离",
+      "priority": "P1",
+      "title": "验证集不得用于选择同一验证期参数",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "frozen_parameter_hash": "H1",
+        "holdout_results_available": true,
+        "candidate_parameter_hash": "H2"
+      },
+      "trigger": "尝试按验证结果修改门槛并沿用同一次验证成绩",
+      "expected_state": [
+        "原验证报告保留 H1",
+        "H2 必须成为新实验，不能覆盖或冒充未见数据结果"
+      ],
+      "expected_ledger": [
+        "原运行账本不可被重写"
+      ],
+      "available_test_method": [
+        "实验注册表集成测试",
+        "配置不可变性测试"
+      ],
+      "required_evidence": [
+        "参数冻结记录",
+        "两个独立实验版本"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-009",
+      "area": "未来信息隔离",
+      "priority": "P0",
+      "title": "撮合不得借用到达后的有利盘口",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "arrival_time": "T",
+        "book_before_arrival": {
+          "ask": "0.70"
+        },
+        "book_after_arrival": {
+          "at": "T+100ms",
+          "ask": "0.50"
+        },
+        "limit": "0.60"
+      },
+      "trigger": "执行 FAK 模拟",
+      "expected_state": [
+        "不能用 T+100ms 的 0.50 报价为 T 时刻订单成交",
+        "按 T 时刻有效状态确认零成交，或数据不足时标记不可判定"
+      ],
+      "expected_ledger": [
+        "不出现事后低价持仓或盈利"
+      ],
+      "available_test_method": [
+        "撮合引擎单元测试",
+        "事件时间回放测试"
+      ],
+      "required_evidence": [
+        "用于撮合的 book sequence 和 source timestamp",
+        "零成交或不可判定原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-010",
+      "area": "数据时钟",
+      "priority": "P0",
+      "title": "接收新鲜无法掩盖源数据陈旧",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "received_age_ms": 10,
+        "source_age_ms": 10000,
+        "clock_bound_status": "VALID"
+      },
+      "trigger": "执行提交前新鲜度检查",
+      "expected_state": [
+        "拒绝过期行情",
+        "若核心行情无法恢复，暂停相关新开仓并继续记录"
+      ],
+      "expected_ledger": [
+        "已预占且确证未发送的意图可安全撤销预占",
+        "未知或已发送订单资金不得因此释放"
+      ],
+      "available_test_method": [
+        "双时间戳单元测试",
+        "数据断流故障注入"
+      ],
+      "required_evidence": [
+        "source_age 与 receive_age 分别记录",
+        "暂停原因与安全释放依据"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-011",
+      "area": "元数据验证",
+      "priority": "P0",
+      "title": "未知规则、费用或扣费单位在所有执行档阻断",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "execution_profile_variants": [
+          "SCENARIO",
+          "EMPIRICAL"
+        ],
+        "missing_field_variants": [
+          "rule_version",
+          "fee_formula",
+          "fee_charge_unit",
+          "fee_rounding"
+        ]
+      },
+      "trigger": "准备下单",
+      "expected_state": [
+        "拒绝发送并标记元数据不完整",
+        "不得以 0 手续费或历史参数替代缺失值"
+      ],
+      "expected_ledger": [
+        "不预占新预算，或仅安全释放确证未发送的预算"
+      ],
+      "available_test_method": [
+        "参数化适配器测试",
+        "元数据 API 错误注入"
+      ],
+      "required_evidence": [
+        "缺失字段清单",
+        "无报单副作用"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-012",
+      "area": "动态元数据",
+      "priority": "P0",
+      "title": "提交前 fee、tick 或规则版本变化须重新审核",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "reserved_budget_usd": "5",
+        "intent_state": "RESERVED",
+        "send_started": false,
+        "snapshot_version": "V1",
+        "current_version": "V2"
+      },
+      "trigger": "最终提交闸门检测到 fee、tick、规则或配置版本变化",
+      "expected_state": [
+        "当前意图中止发送并记录 VERSION_CHANGED",
+        "不得沿用旧限价精度、费用或净份额估计",
+        "进入 ABORTED_BEFORE_SEND；market_intent_consumed=true，同一期不能创建第二意图或换版本重试"
+      ],
+      "expected_ledger": [
+        "5 预算及其潜在 claim 槽安全释放",
+        "has_positive_fill=false，但 market_intent_consumed=true；两字段不得合并"
+      ],
+      "available_test_method": [
+        "提交闸门集成测试",
+        "元数据热更新故障注入"
+      ],
+      "required_evidence": [
+        "V1/V2 哈希",
+        "无发送记录",
+        "释放预占流水",
+        "期内资格未恢复的第二次申请拒绝记录"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-013",
+      "area": "动态元数据",
+      "priority": "P0",
+      "title": "发送后不能追溯修改原订单",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_state": "SUBMITTING",
+        "original_limit": "0.60",
+        "original_size": "8",
+        "new_metadata_version": "V2"
+      },
+      "trigger": "订单发送后 fee 或 tick 变化",
+      "expected_state": [
+        "保留原始请求字节和订单身份",
+        "按场所实际接受、拒绝、费用与成交结果对账",
+        "无法解释的费用差异暂停后续新单"
+      ],
+      "expected_ledger": [
+        "只记实际资金扣款和净到手份额",
+        "不得用新规则重写历史成本"
+      ],
+      "available_test_method": [
+        "适配器合约测试",
+        "发送后元数据变更故障注入"
+      ],
+      "required_evidence": [
+        "原始 payload hash",
+        "实际成交回执",
+        "差异告警"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-014",
+      "area": "预算",
+      "priority": "P0",
+      "title": "现金不足 5 不缩单、不加预算",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "entry_budget_usd": "5",
+        "available_cash_usd": "2",
+        "min_order_size": "5",
+        "price": "0.50"
+      },
+      "trigger": "产生有效信号",
+      "expected_state": [
+        "拒绝原因为 INSUFFICIENT_FULL_BUDGET",
+        "不得改成 2，也不得为满足最低份额扩大到其他预算"
+      ],
+      "expected_ledger": [
+        "现金仍为 2，预占为 0"
+      ],
+      "available_test_method": [
+        "资金闸门单元测试"
+      ],
+      "required_evidence": [
+        "配置预算、可用现金与拒绝原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-015",
+      "area": "数量精度",
+      "priority": "P0",
+      "title": "最低量和精度不得通过向上取整突破预算",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "entry_budget_usd": "5",
+        "synthetic_market": {
+          "min_order_size": "10",
+          "quantity_step": "1",
+          "price_tick": "0.01",
+          "limit": "0.60",
+          "explicit_fee": "0"
+        }
+      },
+      "trigger": "计算可提交数量",
+      "expected_state": [
+        "预算内最多 8 份，低于最低 10 份，因此跳过",
+        "不得把数量上调到 10 或预算上调到 6"
+      ],
+      "expected_ledger": [
+        "无预占或成交"
+      ],
+      "available_test_method": [
+        "数量计算单元测试",
+        "边界属性测试"
+      ],
+      "required_evidence": [
+        "未取整值、向下取整值、最低量和拒绝原因"
+      ],
+      "notes": [
+        "此最低量为合成测试元数据，用于证明实现读取动态最低量；不得硬编码现实市场最低量恒为 5。"
+      ]
+    },
+    {
+      "id": "EX-016",
+      "area": "费用归一化",
+      "priority": "P0",
+      "title": "现金扣费必须包含在 5 的现金预算内",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "synthetic_quote": {
+          "gross_shares": "10",
+          "price": "0.50",
+          "fee_cash": "0.175",
+          "fee_shares": "0"
+        },
+        "budget_usd": "5"
+      },
+      "trigger": "适配器报价并确定提交数量",
+      "expected_state": [
+        "原报价现金支出 5.175，不能原样发送",
+        "按数量步长向下减量后重新报价，或放弃"
+      ],
+      "expected_ledger": [
+        "任一允许订单的最大现金扣款不超过 5"
+      ],
+      "available_test_method": [
+        "费用适配器单元测试",
+        "数量与费用联动属性测试"
+      ],
+      "required_evidence": [
+        "归一化报价",
+        "预算不变量检查"
+      ],
+      "notes": [
+        "费用数值仅为合成测试输入。"
+      ]
+    },
+    {
+      "id": "EX-017",
+      "area": "费用归一化",
+      "priority": "P0",
+      "title": "份额扣费不得再次从现金扣除",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "synthetic_fill": {
+          "gross_shares": "10",
+          "price": "0.50",
+          "fee_shares": "0.35",
+          "fee_cash": "0",
+          "cash_debit": "5"
+        },
+        "initial_cash_usd": "100"
+      },
+      "trigger": "确认成交并入账",
+      "expected_state": [
+        "净份额为 9.65",
+        "净份额单位成本为 5/9.65"
+      ],
+      "expected_ledger": [
+        "现金为 95",
+        "持仓成本为 5",
+        "0.175 的费用等值仅作费用披露，不再额外扣现金"
+      ],
+      "available_test_method": [
+        "归一化填充单元测试",
+        "账本守恒测试"
+      ],
+      "required_evidence": [
+        "gross/net shares",
+        "现金流水",
+        "费用披露字段"
+      ],
+      "notes": [
+        "费用数值仅为合成测试输入。"
+      ]
+    },
+    {
+      "id": "EX-018",
+      "area": "原子预占",
+      "priority": "P0",
+      "title": "同钱包并发信号只有一个进入单飞",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "wallet_id": "W1",
+        "available_cash_usd": "100",
+        "concurrent_requests": 3,
+        "each_budget_usd": "5",
+        "economic_space": {
+          "mode": "PAPER",
+          "portfolio_run_id": "RUN_SHARED",
+          "scenario_id": "S1",
+          "ledger_scope": "PAPER_PORTFOLIO"
+        },
+        "strategy_ids": [
+          "A",
+          "B",
+          "C"
+        ],
+        "max_open_risk_positions_wallet": 1,
+        "initial_claim_slots": 0
+      },
+      "trigger": "三个工作线程同时申请预占并发送",
+      "expected_state": [
+        "全部资金和风险检查与意图创建、预占、钱包单飞、市场所有权及 claim 槽预留在同一钱包事务中完成",
+        "仅一个事务获得 wallet flight 和钱包风险槽；strategy_id 不得进入钱包锁键",
+        "未提交成功的竞争事务不创建持久化意图、不消耗其候选市场资格",
+        "不得靠进程内锁代替持久化约束"
+      ],
+      "expected_ledger": [
+        "预占仅 5，钱包风险槽仅 1，潜在 claim 槽仅 1",
+        "无重复意图、重复槽位或负现金"
+      ],
+      "available_test_method": [
+        "数据库 SERIALIZABLE/行锁并发集成测试",
+        "至少 100 轮竞争测试"
+      ],
+      "required_evidence": [
+        "事务结果",
+        "唯一键冲突处理",
+        "单一 reservation id",
+        "事务内全部风控前置条件及 wallet version",
+        "claim_slots 与市场所有权唯一键"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-019",
+      "area": "共享钱包",
+      "priority": "P0",
+      "title": "其他策略的 UNKNOWN 和已确认未结算仓位都占钱包总槽",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "wallet_id": "W1",
+        "same_economic_space": true,
+        "new_strategy_budget_usd": "5",
+        "max_open_risk_positions_wallet": 1,
+        "variants": [
+          {
+            "other_strategy_state": "UNKNOWN",
+            "other_strategy_unknown_budget_usd": "5",
+            "wallet_flight_active": true
+          },
+          {
+            "other_strategy_state": "OPEN_UNRESOLVED",
+            "other_strategy_confirmed_cost_usd": "2",
+            "wallet_flight_active": false
+          }
+        ]
+      },
+      "trigger": "衡准 V1 申请新单",
+      "expected_state": [
+        "UNKNOWN 变体由钱包单飞及未知暴露阻断",
+        "已确认未结算变体即使单飞已经释放，也因整个钱包风险槽已为 1 而阻断",
+        "不能因 strategy_id、方向或策略本地仓位为零而绕过钱包总上限"
+      ],
+      "expected_ledger": [
+        "两种变体的既有预占或持仓成本保持不变",
+        "无第二笔预占、风险槽或潜在 claim 槽"
+      ],
+      "available_test_method": [
+        "多策略共享账本集成测试"
+      ],
+      "required_evidence": [
+        "钱包级跨策略风险快照",
+        "UNKNOWN_ORDER_OR_WALLET_FLIGHT 与 WALLET_RISK_SLOT_FULL 的对应拒绝记录"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-020",
+      "area": "FAK",
+      "priority": "P0",
+      "title": "确认零成交才释放资金",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "reserved_usd": "5",
+        "venue_terminal_status": "CANCELLED",
+        "verified_total_fill": "0",
+        "intent_created_in_reservation_transaction": true
+      },
+      "trigger": "获得可信终态与零成交对账结果",
+      "expected_state": [
+        "进入 TERMINAL_NO_FILL",
+        "释放资金单飞与方向风险槽，释放无经济成交的潜在 claim 槽",
+        "market_intent_consumed=true，原市场所有权与期内资格保留；同一期不得创建第二意图或重发旧意图"
+      ],
+      "expected_ledger": [
+        "完整释放 5",
+        "无持仓、费用或盈亏"
+      ],
+      "available_test_method": [
+        "FAK 生命周期集成测试"
+      ],
+      "required_evidence": [
+        "终态与交易明细一致性证明",
+        "释放流水",
+        "再次申请同市场被拒绝"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-021",
+      "area": "FAK",
+      "priority": "P0",
+      "title": "部分成交小于最低提交量可保留，禁止补单",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "synthetic_market": {
+          "min_order_size": "5",
+          "quantity_step": "1",
+          "explicit_fee": "0"
+        },
+        "requested_size": "10",
+        "price": "0.50",
+        "filled_size": "4",
+        "reserved_usd": "5"
+      },
+      "trigger": "FAK 成交 4 份后确认剩余取消",
+      "expected_state": [
+        "4 份部分成交合法保留",
+        "期内资格在创建意图时已消耗；部分成交后继续保持，不能补单",
+        "不因持仓少于 5 份而撤销、补单或改写成交"
+      ],
+      "expected_ledger": [
+        "实际成本 2，净份额 4",
+        "单个子成交确认只转移其实际支付；整个订单、全部子成交及取消余量核验前剩余 3 继续预占，全部核验后释放",
+        "未结算风险为 2，风险槽为 1",
+        "同一市场的已确认持仓与待确认余量只占一个钱包风险槽和一个潜在 claim 槽"
+      ],
+      "available_test_method": [
+        "FAK 撮合与账本集成测试"
+      ],
+      "required_evidence": [
+        "提交数量通过最低量检查",
+        "部分成交回执",
+        "无追加报单"
+      ],
+      "notes": [
+        "最低量约束提交数量；实际适配器必须核对场所部分成交语义。"
+      ]
+    },
+    {
+      "id": "EX-022",
+      "area": "订单幂等",
+      "priority": "P0",
+      "title": "全额成交不得重复消耗入场资格或成本",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_id": "I1",
+        "synthetic_fill": {
+          "cash_debit": "5",
+          "net_shares": "8"
+        },
+        "duplicate_confirmations": 3
+      },
+      "trigger": "通过不同通道重复收到同一成交确认",
+      "expected_state": [
+        "单个经济成交仅应用一次",
+        "持仓和入场资格均只创建一次"
+      ],
+      "expected_ledger": [
+        "现金只减少 5",
+        "净份额只增加 8",
+        "成本只有一条有效记账组"
+      ],
+      "available_test_method": [
+        "REST/WebSocket 合并去重集成测试"
+      ],
+      "required_evidence": [
+        "canonical_execution_id",
+        "唯一账本键",
+        "守恒检查"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-023",
+      "area": "未知订单",
+      "priority": "P0",
+      "title": "发送超时且实际成交时禁止重发",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_state": "SUBMITTING",
+        "request_sent": true,
+        "response_lost": true,
+        "venue_actual_fill_cash_usd": "5"
+      },
+      "trigger": "HTTP 超时，然后触发定时器和重新启动",
+      "expected_state": [
+        "进入 UNKNOWN 并暂停钱包新单",
+        "无自动重发",
+        "对账找回订单后按真实成交恢复"
+      ],
+      "expected_ledger": [
+        "在确认前保留 5 的最坏风险和资金占用",
+        "对账后成本仅记一次"
+      ],
+      "available_test_method": [
+        "网络故障代理集成测试",
+        "崩溃恢复测试"
+      ],
+      "required_evidence": [
+        "发送次数严格为 1",
+        "UNKNOWN 日志",
+        "对账证据"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-024",
+      "area": "未知订单",
+      "priority": "P0",
+      "title": "暂时查不到订单不等于未成交",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_state": "UNKNOWN",
+        "venue_lookup_results": [
+          "NOT_FOUND",
+          "NOT_FOUND"
+        ],
+        "open_orders_empty": true
+      },
+      "trigger": "多次查询暂时无结果或租约超时",
+      "expected_state": [
+        "保持 UNKNOWN",
+        "不得基于 NOT_FOUND、空挂单列表或 TTL 自动重发、解锁"
+      ],
+      "expected_ledger": [
+        "5 预占和最坏风险继续保留"
+      ],
+      "available_test_method": [
+        "最终一致性故障注入",
+        "租约到期测试"
+      ],
+      "required_evidence": [
+        "零重发记录",
+        "未释放预占",
+        "暂停原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-025",
+      "area": "重启恢复",
+      "priority": "P0",
+      "title": "确认尚未发送的预占可安全撤销",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_state": "RESERVED",
+        "durable_send_started_marker": false,
+        "worker_crashed": true
+      },
+      "trigger": "重启恢复并验证未进入任何发送阶段",
+      "expected_state": [
+        "可进入 ABORTED_BEFORE_SEND",
+        "释放单飞，不创建成交",
+        "不能通过猜测进程日志来证明未发送",
+        "已持久化创建的意图仍消耗该期资格；ABORTED_BEFORE_SEND 不允许本期新建或重发"
+      ],
+      "expected_ledger": [
+        "完整释放 5、方向风险槽与该零暴露意图预留的潜在 claim 槽",
+        "市场资格及所有权记录保留，资金释放不等于资格恢复"
+      ],
+      "available_test_method": [
+        "预占提交后、SUBMITTING 标记前崩溃测试"
+      ],
+      "required_evidence": [
+        "持久化状态证据",
+        "安全撤销流水",
+        "重启后同一期第二次申请仍被拒绝"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-026",
+      "area": "重启恢复",
+      "priority": "P0",
+      "title": "进入 SUBMITTING 后崩溃须按 UNKNOWN 处理",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "intent_state": "SUBMITTING",
+        "durable_send_started_marker": true,
+        "response_persisted": false
+      },
+      "trigger": "进程在网络调用前后边界崩溃并重启",
+      "expected_state": [
+        "不能判断是否发送时一律 UNKNOWN",
+        "恢复工作只对账，不重新执行 outbox 报单"
+      ],
+      "expected_ledger": [
+        "预占、单飞和最坏风险不变"
+      ],
+      "available_test_method": [
+        "多个崩溃点故障注入",
+        "outbox 重放测试"
+      ],
+      "required_evidence": [
+        "恢复日志",
+        "发送次数上界为 1",
+        "无资金提前释放"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-027",
+      "area": "重启恢复",
+      "priority": "P0",
+      "title": "成交入账与确认消费必须具有一次效果",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "execution_id": "E1",
+        "ledger_transaction_committed": true,
+        "message_acknowledged": false
+      },
+      "trigger": "确认消费者崩溃，消息再次投递",
+      "expected_state": [
+        "识别已完成的账本事务",
+        "只补消费确认，不再累加成交"
+      ],
+      "expected_ledger": [
+        "现金、份额、成本和风险数值与崩溃前一致"
+      ],
+      "available_test_method": [
+        "事务提交后 ack 前崩溃测试"
+      ],
+      "required_evidence": [
+        "账本事务唯一键",
+        "恢复前后余额哈希"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-028",
+      "area": "事件乱序",
+      "priority": "P0",
+      "title": "重复和乱序状态不能把终态回退或重复记账",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "events": [
+          "CONFIRMED_FILL:E1",
+          "PENDING_FILL:E1",
+          "REST_CONFIRMED_FILL:E1",
+          "ORDER_CANCELLED_REMAINDER"
+        ]
+      },
+      "trigger": "按给定乱序消费事件",
+      "expected_state": [
+        "经济成交确认不回退到待确认",
+        "取消仅作用于未成交剩余量"
+      ],
+      "expected_ledger": [
+        "E1 只入账一次",
+        "剩余预占按已核验终态释放"
+      ],
+      "available_test_method": [
+        "事件排列属性测试",
+        "状态机模型测试"
+      ],
+      "required_evidence": [
+        "状态转移轨迹",
+        "幂等键命中记录"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-029",
+      "area": "未知部分成交",
+      "priority": "P0",
+      "title": "已知部分成交与未知余量合计风险不得重计或漏计",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "reserved_budget_usd": "5",
+        "confirmed_fill_cost_usd": "2",
+        "remainder_status": "UNKNOWN"
+      },
+      "trigger": "确认部分成交，但无法确认剩余是否取消",
+      "expected_state": [
+        "保留 UNKNOWN 和钱包暂停",
+        "风险槽为 1，不能拆成两个槽或释放槽",
+        "单个子成交 CONFIRMED 不触发订单剩余预算释放"
+      ],
+      "expected_ledger": [
+        "已知持仓风险 2 加未知剩余风险 3，合计 5",
+        "不得算成 2+5=7，也不得只算 2",
+        "可用现金仍保守扣住整个 5",
+        "按同一 condition_id 去重，只占一个钱包风险槽和一个潜在 claim 槽"
+      ],
+      "available_test_method": [
+        "部分成交超时集成测试",
+        "风险守恒属性测试"
+      ],
+      "required_evidence": [
+        "已知成本与剩余预占分项",
+        "总风险不变量"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-030",
+      "area": "入场时间",
+      "priority": "P0",
+      "title": "提交和预计到达时间双闸门",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "remaining_seconds_variants": [
+          "90",
+          "30",
+          "29.999"
+        ],
+        "known_total_delay_seconds_variants": [
+          "1",
+          "5",
+          "6"
+        ]
+      },
+      "trigger": "运行发送前最终时间检查",
+      "expected_state": [
+        "只允许提交剩余 30 至 90 秒",
+        "还需预计到达剩余至少 25 秒",
+        "例如剩余 30 秒、延迟 6 秒时拒绝"
+      ],
+      "expected_ledger": [
+        "拒绝发生在确证未发送前，可释放预占",
+        "若持久化意图已经创建，发送前时间闸门失败仍保持期内资格消耗；仅候选阶段失败且未创建意图时可继续后续评估"
+      ],
+      "available_test_method": [
+        "边界时间单元测试",
+        "虚拟时钟集成测试"
+      ],
+      "required_evidence": [
+        "检查时刻、预计到达时刻、拒绝原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-031",
+      "area": "因果执行",
+      "priority": "P0",
+      "title": "发送后延迟越界或信号反转不能免费取消",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "sent_remaining_seconds": "30",
+        "predicted_delay_seconds": "5",
+        "actual_delay_seconds": "7",
+        "limit_still_marketable": true,
+        "signal_reversed_after_send": true,
+        "venue_expiry_rejection_available": false
+      },
+      "trigger": "订单在剩余 23 秒时实际可撮合",
+      "expected_state": [
+        "按已发送 FAK 的实际场所规则成交",
+        "记录 ARRIVAL_GUARD_BREACH 并暂停后续新单",
+        "不根据到达后的模型分数反转而伪造零成交"
+      ],
+      "expected_ledger": [
+        "记入实际成交成本、份额和风险"
+      ],
+      "available_test_method": [
+        "延迟尾部故障注入",
+        "后验撤单偏差回放测试"
+      ],
+      "required_evidence": [
+        "原始订单不变",
+        "实际成交",
+        "违规告警与暂停记录"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-032",
+      "area": "延迟情景",
+      "priority": "P0",
+      "title": "全链路延迟包含已知平台 hold，不能重复相加",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "scenario_total_delay_ms": 1000,
+        "known_hold_variants_ms": [
+          250,
+          1500
+        ]
+      },
+      "trigger": "计算 SCENARIO 到达时间",
+      "expected_state": [
+        "hold 250 时有效 total 为 1000",
+        "hold 1500 时有效 total 至少为 1500",
+        "不得计算成 1250 或 2500"
+      ],
+      "expected_ledger": [
+        "仅时间推进，无额外虚构费用或资金变化"
+      ],
+      "available_test_method": [
+        "延迟适配器参数化单元测试"
+      ],
+      "required_evidence": [
+        "scenario_total、hold、effective_total 三字段"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-033",
+      "area": "延迟证据",
+      "priority": "P0",
+      "title": "未知 hold 不能被暗填为零，档位证据必须真实",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "profile_variants": [
+          "SCENARIO",
+          "EMPIRICAL"
+        ],
+        "venue_hold_ms": null,
+        "venue_hold_status": "UNKNOWN",
+        "scenario_total_delay_ms": 1000
+      },
+      "trigger": "构建执行配置",
+      "expected_state": [
+        "SCENARIO 可使用显式全链路假设，但保留 UNKNOWN 并标记 ASSUMED",
+        "EMPIRICAL 缺必要来源或适用性证据时不得宣称已校准，应暂停该档或显式改用新建 SCENARIO 实验",
+        "不通过新真实交易取得样本"
+      ],
+      "expected_ledger": [
+        "不得因档位切换静默混合账户结果"
+      ],
+      "available_test_method": [
+        "配置验证测试",
+        "报告证据标识测试"
+      ],
+      "required_evidence": [
+        "execution_evidence",
+        "缺失元数据字段",
+        "独立实验 manifest"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-034",
+      "area": "延迟证据",
+      "priority": "P0",
+      "title": "运行时连有效时间界限都未知时全局暂停",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "selected_delay_profile_valid": false,
+        "clock_bound_status": "UNKNOWN",
+        "existing_position": true
+      },
+      "trigger": "执行数据健康检查",
+      "expected_state": [
+        "钱包暂停所有新开仓",
+        "继续记录、订单对账、持仓监控与官方结果收集",
+        "不自动出售已有持仓"
+      ],
+      "expected_ledger": [
+        "已有预占和风险保持，不能用超时释放"
+      ],
+      "available_test_method": [
+        "时钟失锁与配置缺失故障注入"
+      ],
+      "required_evidence": [
+        "全局暂停原因",
+        "后续发送数为 0",
+        "既有状态继续更新"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-035",
+      "area": "确认等待",
+      "priority": "P0",
+      "title": "确认等待从撮合后起算，风险先于确认存在",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "send_ms": 0,
+        "total_delay_ms": 1000,
+        "confirm_after_fill_ms": 12000,
+        "full_fill": true
+      },
+      "trigger": "推进时间至 1000、12000、13000 毫秒",
+      "expected_state": [
+        "撮合发生在 1000",
+        "确认在 13000，不能误写为提交后 12000",
+        "确认前不得将未知成本释放或重复下单"
+      ],
+      "expected_ledger": [
+        "自预占起始终覆盖 5 的最坏风险",
+        "确认前资金不得循环使用"
+      ],
+      "available_test_method": [
+        "虚拟时钟生命周期测试"
+      ],
+      "required_evidence": [
+        "send、fill、confirm 三时间点",
+        "各时点风险快照"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-036",
+      "area": "结算",
+      "priority": "P0",
+      "title": "窗口关闭或只有官方结果均不能提前确认经济结算",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "market_end_passed": true,
+        "internal_twap_predicts_win": true,
+        "variants": [
+          {
+            "official_finality_status": "UNKNOWN",
+            "order_terminal_reconciled": true,
+            "all_fill_economics_confirmed": true,
+            "related_unknown_exposure": false
+          },
+          {
+            "official_finality_status": "VERIFIED_FINAL",
+            "order_terminal_reconciled": false,
+            "all_fill_economics_confirmed": false,
+            "related_unknown_exposure": true
+          }
+        ]
+      },
+      "trigger": "先后处理窗口关闭、官方结果和迟到订单确认",
+      "expected_state": [
+        "任一结算前置条件未满足时，不进入 RESOLVED_LOSS 或 CLAIM_PENDING",
+        "官方结果未知且已确认持仓继续 OPEN_UNRESOLVED；订单仍未知的变体保留 UNKNOWN/待确认状态",
+        "不能根据内部 TWAP 预测或单独官方结果释放尚未核验订单的风险"
+      ],
+      "expected_ledger": [
+        "方向风险、未核验预占和相关潜在 claim 槽继续保留",
+        "settlement_recognized_at 为空；不建立最终应收、不结转最终损益、不启动领取计时"
+      ],
+      "available_test_method": [
+        "官方结果延迟故障注入"
+      ],
+      "required_evidence": [
+        "四项结算前置条件的逐时状态",
+        "无提前释放及领取事件"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-037",
+      "area": "结算账本",
+      "priority": "P0",
+      "title": "输单确认后只核销成本，不能再次扣现金",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "initial_cash_usd": "100",
+        "confirmed_entry_cost_usd": "5",
+        "cash_after_buy_usd": "95",
+        "official_payout_usd": "0",
+        "settlement_preconditions": {
+          "official_result_final_verified": true,
+          "whole_order_terminal_reconciled": true,
+          "all_fill_economics_confirmed": true,
+          "related_unknown_exposure": false
+        }
+      },
+      "trigger": "四项结算前置条件首次同时满足，确认该持仓最终支付为零",
+      "expected_state": [
+        "记录 settlement_recognized_at，进入 RESOLVED_LOSS，释放整个钱包该市场的方向风险槽和潜在 claim 槽",
+        "市场入场资格仍永久消耗"
+      ],
+      "expected_ledger": [
+        "现金仍为 95",
+        "已实现净损益为 -5",
+        "G24 增加 5",
+        "成本占用和未结算风险归零",
+        "G24 的经济核实时刻采用 settlement_recognized_at；无领取计时"
+      ],
+      "available_test_method": [
+        "结算账本单元测试",
+        "现金守恒测试"
+      ],
+      "required_evidence": [
+        "买入与结算流水",
+        "损益、现金和风险分项"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-038",
+      "area": "结算账本",
+      "priority": "P0",
+      "title": "赢单待领取须区分应收、风险与现金",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "cash_after_buy_usd": "95",
+        "position_cost_usd": "5",
+        "confirmed_payout_receivable_usd": "8",
+        "official_final_verified_at_ms": 1000,
+        "whole_order_terminal_reconciled_at_ms": 1500,
+        "all_fill_economics_confirmed_at_ms": 2000,
+        "related_unknown_exposure_cleared_at_ms": 2500,
+        "claim_after_final_ms": 60000
+      },
+      "trigger": "按 1000、1500、2000、2500 毫秒依次满足结算证据，再推进到领取时点",
+      "expected_state": [
+        "2500 毫秒之前不进入 CLAIM_PENDING，不释放方向风险，也不启动领取计时",
+        "settlement_recognized_at=2500，为四项条件同时满足的首次时刻",
+        "此时进入 CLAIM_PENDING 并释放方向风险槽；潜在 claim 槽转为实际待领取槽，总 claim_slots 仍为 1",
+        "claim_available_at=62500，不能从市场结束、label_available_at 或更早的官方结果时间单独起算"
+      ],
+      "expected_ledger": [
+        "2500 毫秒后现金仍为 95，应收款为 8，保守净值为 103",
+        "已实现经济损益为 +3；成本占用仍为 5，G24 不因盈利减少",
+        "62500 毫秒前不增加可用现金；领取到账仍需独立回执",
+        "若无其他风险且 claim_slots=1、committed_cost=5，可申请下一笔预算 5，并原子预留第二个潜在 claim 槽"
+      ],
+      "available_test_method": [
+        "结算到应收账本测试"
+      ],
+      "required_evidence": [
+        "四项前置条件首次满足时间与 settlement_recognized_at",
+        "cash、receivable、NAV、committed_cost、claim_slots、G24 分项",
+        "领取计时未提前"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-039",
+      "area": "待领取上限",
+      "priority": "P0",
+      "title": "成本占用与潜在领取槽均在钱包事务内原子预留",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "max_claim_pending_markets": 2,
+        "variants": [
+          {
+            "claim_pending_markets": 2,
+            "potential_claim_markets_reserved_or_unresolved": 0,
+            "claim_cost_basis_usd": "10",
+            "open_risk_positions": 0,
+            "new_market_count": 1
+          },
+          {
+            "claim_pending_markets": 2,
+            "potential_claim_markets_reserved_or_unresolved": 0,
+            "claim_cost_basis_usd": "2",
+            "open_risk_positions": 0,
+            "new_market_count": 1
+          },
+          {
+            "claim_pending_markets": 1,
+            "potential_claim_markets_reserved_or_unresolved": 1,
+            "committed_cost_usd": "6",
+            "open_risk_positions": 1,
+            "new_market_count": 1
+          }
+        ],
+        "concurrent_variant": {
+          "claim_pending_markets": 1,
+          "potential_claim_markets_reserved_or_unresolved": 0,
+          "concurrent_new_markets": 2,
+          "same_economic_space_and_wallet": true
+        }
+      },
+      "trigger": "在三种快照及并发变体中申请新市场，并执行钱包原子预占",
+      "expected_state": [
+        "按 condition_id 去重校验 pending+reserved/unresolved可能正支付市场+新增市场<=2",
+        "三个已有快照均拒绝新增；小额部分成交不能绕过数量上限，空闲现金也不能替代 claim 槽",
+        "并发变体最多一个事务获得第二个潜在 claim 槽和唯一钱包风险槽",
+        "同一市场从 reserved 到 unresolved 再到 CLAIM_PENDING 时只转移槽状态，不重复计数"
+      ],
+      "expected_ledger": [
+        "拒绝时所有应收、成本占用和槽位保持不变",
+        "并发成功事务仅增加 5 预占、一个风险槽和一个潜在 claim 槽",
+        "领取完成、确认输单或确证零成交时幂等释放对应 claim 槽"
+      ],
+      "available_test_method": [
+        "组合风控集成测试",
+        "事务竞争测试",
+        "claim 槽状态转换属性测试"
+      ],
+      "required_evidence": [
+        "claim_slots 公式分项和去重市场清单",
+        "事务前后版本与唯一槽位记录",
+        "独立成本拒绝码与领取数量拒绝码"
+      ],
+      "notes": [
+        "max_open_risk_positions=1 作用于整个钱包；即使该上限也能阻断某个夹具，仍独立验证 claim 槽规则，禁止依靠其他限制替代。"
+      ]
+    },
+    {
+      "id": "EX-040",
+      "area": "领取账本",
+      "priority": "P0",
+      "title": "领取到账只转换资产，不能再记一次盈利",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "cash_usd": "95",
+        "claim_receivable_usd": "8",
+        "claim_cost_basis_usd": "5",
+        "realized_profit_already_booked_usd": "3",
+        "duplicate_receipts": 2,
+        "settlement_recognized_at_ms": 2500,
+        "claim_available_at_ms": 62500,
+        "receipt_at_ms": 62500,
+        "claim_slots_before": 1
+      },
+      "trigger": "确认领取 8 到账并重复投递回执",
+      "expected_state": [
+        "进入 CLOSED_CLAIMED",
+        "待领取数量减少 1",
+        "释放对应 claim 槽一次；历史市场所有权和期内意图资格不删除"
+      ],
+      "expected_ledger": [
+        "现金变为 103，应收归零，成本占用归零",
+        "净值仍为 103",
+        "已实现利润仍为 3",
+        "重复回执无第二次加款"
+      ],
+      "available_test_method": [
+        "领取状态机集成测试",
+        "回执幂等测试"
+      ],
+      "required_evidence": [
+        "领取交易唯一键",
+        "领取前后净值恒等",
+        "领取时刻不早于完整结算确认后的等待截止"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-041",
+      "area": "亏损额度",
+      "priority": "P0",
+      "title": "G24 使用亏损总额，盈利不能恢复额度",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "closed_trade_pnl_usd": [
+          "-5",
+          "+4",
+          "-5"
+        ],
+        "all_within_24h": true
+      },
+      "trigger": "累计风控损失并申请下一笔 5",
+      "expected_state": [
+        "G24 为 10",
+        "新开仓被阻断",
+        "不得计算为净亏损 6 或因 +4 获利减小前一笔损失"
+      ],
+      "expected_ledger": [
+        "净实现损益可单独为 -6，但不替代 G24",
+        "赢单费用不在其完整净损益之外另加一次亏损"
+      ],
+      "available_test_method": [
+        "风险函数单元测试"
+      ],
+      "required_evidence": [
+        "G24 与 net_realized_pnl 两个字段"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-042",
+      "area": "亏损额度",
+      "priority": "P0",
+      "title": "滚动亏损过期不能清除累计净值回撤停止",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "old_loss_ages_out_of_24h": true,
+        "drawdown_stop_latched": true
+      },
+      "trigger": "推进时间超过旧亏损 24 小时",
+      "expected_state": [
+        "G24 可按规则下降",
+        "回撤停止仍保留，不能自动恢复交易"
+      ],
+      "expected_ledger": [
+        "累计净值、峰值及账本历史不重置"
+      ],
+      "available_test_method": [
+        "时间窗口与锁存状态联合测试"
+      ],
+      "required_evidence": [
+        "窗口滚动结果",
+        "回撤锁存保持证据"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-043",
+      "area": "净值回撤",
+      "priority": "P0",
+      "title": "高水位回撤达到 15% 停止新开仓",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "cashflow_adjusted_high_water_nav_usd": "120",
+        "conservative_nav_usd": "102"
+      },
+      "trigger": "计算高水位回撤",
+      "expected_state": [
+        "回撤为 15%，锁存停止新开仓",
+        "不会自动平仓改变持有结算主线"
+      ],
+      "expected_ledger": [
+        "无新预占",
+        "已有持仓继续按真实状态计账"
+      ],
+      "available_test_method": [
+        "边界数值单元测试",
+        "风险状态机测试"
+      ],
+      "required_evidence": [
+        "峰值、当前净值、回撤比例与锁存原因"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-044",
+      "area": "净值质量",
+      "priority": "P0",
+      "title": "净值估值未知时不得虚构精确回撤",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "position_present": true,
+        "liquidation_book_missing": true,
+        "nav_status": "UNKNOWN"
+      },
+      "trigger": "计算账户风险和报告",
+      "expected_state": [
+        "暂停新开仓并标记净值未知",
+        "不得把未知持仓价值自动当成本价或精确市价",
+        "已有最坏损失风险仍保守计入"
+      ],
+      "expected_ledger": [
+        "NAV 可标记不可估计或另报明确的保守下界",
+        "不得将估值缺失混成已实现亏损"
+      ],
+      "available_test_method": [
+        "行情缺失故障注入",
+        "报告字段验证"
+      ],
+      "required_evidence": [
+        "估值状态",
+        "保守风险值",
+        "无虚构精确净值"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-045",
+      "area": "钱包对账",
+      "priority": "P0",
+      "title": "无法解释的钱包变动必须暂停",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "expected_confirmed_cash_usd": "100",
+        "observed_cash_usd": "96",
+        "known_pending_debits_usd": "0",
+        "registered_external_cashflow_usd": "0"
+      },
+      "trigger": "钱包快照对账",
+      "expected_state": [
+        "触发 WALLET_RECONCILIATION_MISMATCH",
+        "全钱包停止新预占与报单",
+        "先对账，不能把差额当其他策略免费占用或利润"
+      ],
+      "expected_ledger": [
+        "保留原账本并追加差异事件",
+        "不直接覆盖期望余额抹去差异"
+      ],
+      "available_test_method": [
+        "外部交易与人工操作故障注入"
+      ],
+      "required_evidence": [
+        "差异记录",
+        "暂停状态",
+        "无静默余额改写"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-046",
+      "area": "收益口径",
+      "priority": "P0",
+      "title": "SIGNAL_SHADOW 不得冒充 100 账户收益",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "signal_shadow_valid_candidates": 1000,
+        "paper_portfolio_filled_trades": 10,
+        "paper_initial_cash_usd": "100"
+      },
+      "trigger": "生成统计报告",
+      "expected_state": [
+        "明确分开样本采集指标与受资金约束的账户结果",
+        "shadow 不生成可被当成账户资金曲线的合并收益",
+        "影子与资金账户分别使用独立 ledger_scope；不能让影子意图消耗资金账户资格或钱包单飞"
+      ],
+      "expected_ledger": [
+        "PAPER_PORTFOLIO 收益只来自其真实模拟账本",
+        "不得加入未下单候选的假想利润"
+      ],
+      "available_test_method": [
+        "报告聚合单元测试",
+        "固定输入快照测试"
+      ],
+      "required_evidence": [
+        "两类指标分区",
+        "账本总损益与报告一致"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-047",
+      "area": "收益口径",
+      "priority": "P0",
+      "title": "未结算与未确认交易不能从风险报告消失",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "settled_wins": 10,
+        "unresolved_orders": 2,
+        "unknown_orders": 1,
+        "claim_pending_markets": 1
+      },
+      "trigger": "生成收益率、胜率、净值和风险摘要",
+      "expected_state": [
+        "已结算胜率注明分母",
+        "单独披露未确认、UNKNOWN、未结算与待领取数量",
+        "不以已结算赢单代表全部交易表现"
+      ],
+      "expected_ledger": [
+        "所有未决风险与应收仍纳入适用口径",
+        "现金收益和经济净值收益分开"
+      ],
+      "available_test_method": [
+        "报告完整性集成测试"
+      ],
+      "required_evidence": [
+        "状态分布与总订单数量对账",
+        "指标分母"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-048",
+      "area": "一次入场",
+      "priority": "P0",
+      "title": "创建意图即永久消耗本期资格，abort 与零成交也不恢复",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "market_id": "M1",
+        "intent_already_created": true,
+        "prior_state_variants": [
+          "ABORTED_BEFORE_SEND",
+          "REJECTED_CONFIRMED",
+          "TERMINAL_NO_FILL",
+          "TERMINAL_WITH_FILL",
+          "UNKNOWN"
+        ],
+        "retry_variants": [
+          "SAME_DIRECTION",
+          "OPPOSITE_DIRECTION",
+          "NEW_CONFIG_VERSION",
+          "NEW_MODEL_VERSION",
+          "PROCESS_RESTART",
+          "CHANGED_STRATEGY_ID_IN_SAME_WALLET"
+        ]
+      },
+      "trigger": "在每种已创建意图状态后，通过不同身份或版本再次申请同一期买入",
+      "expected_state": [
+        "所有变体均拒绝第二个持久化意图及旧意图重发；无需先有正成交",
+        "intent_key 不包含方向、模型或配置版本",
+        "wallet_market_owner_key 不含 strategy_id，更改策略身份不能绕过同一期钱包所有权",
+        "仅 PREPARED 候选尚未在钱包事务内创建意图时，拒绝后仍可在本期后续重新评估"
+      ],
+      "expected_ledger": [
+        "不新增预算、份额、风险或 claim 槽",
+        "原已终结意图的资金可已释放，但资格记录保留；原 UNKNOWN 的资金与风险继续保留"
+      ],
+      "available_test_method": [
+        "唯一约束数据库测试",
+        "跨版本恢复集成测试"
+      ],
+      "required_evidence": [
+        "经济空间、intent_key 与钱包市场所有权键",
+        "MARKET_INTENT_CONSUMED 或 WALLET_MARKET_OWNER_CONFLICT 拒绝记录",
+        "发送前 abort 和零成交后的重试拒绝结果"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-049",
+      "area": "撮合确认异常",
+      "priority": "P0",
+      "title": "成交后结算失败状态不得直接当零成交",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "order_status": "MATCHED",
+        "trade_settlement_status": "FAILED_OR_RETRYING",
+        "cash_or_token_movements_uncertain": true
+      },
+      "trigger": "适配器收到失败或重试状态",
+      "expected_state": [
+        "进入 RECONCILE_REQUIRED 或 UNKNOWN",
+        "不自动释放资金、重发买单或删除持仓"
+      ],
+      "expected_ledger": [
+        "保留可覆盖全部未知经济结果的风险和预占"
+      ],
+      "available_test_method": [
+        "适配器状态组合测试",
+        "链上与订单状态不一致故障注入"
+      ],
+      "required_evidence": [
+        "状态映射依据",
+        "对账计划",
+        "未提前释放"
+      ],
+      "notes": []
+    },
+    {
+      "id": "EX-050",
+      "area": "可复现性",
+      "priority": "P1",
+      "title": "三个预注册情景分别运行且不可择优隐藏",
+      "status": "NOT_RUN",
+      "input_fixture": {
+        "scenarios": [
+          "S1",
+          "S2",
+          "S3"
+        ],
+        "raw_data_hash": "D1",
+        "strategy_hash": "H1",
+        "fixed_seed": 7,
+        "economic_space_partition": "mode+portfolio_run_id+scenario_id+ledger_scope"
+      },
+      "trigger": "运行三组独立 PAPER_PORTFOLIO 回放并汇总",
+      "expected_state": [
+        "相同情景、数据和配置再次运行时结果一致",
+        "三个情景全部披露，不能仅展示盈利最佳者",
+        "发送前按各自预注册延迟进行时间检查，发送后不得免费重评拒单"
+      ],
+      "expected_ledger": [
+        "各情景独立从 100 开始",
+        "每组账本均可单独守恒和重放"
+      ],
+      "available_test_method": [
+        "确定性回放测试",
+        "实验 manifest 校验"
+      ],
+      "required_evidence": [
+        "各情景 manifest、种子、数据哈希、最终账本哈希",
+        "execution_evidence 均为 ASSUMED"
+      ],
+      "notes": [
+        "这些结果用于工程和模型验证，不能据此宣称真实交易可兑现。",
+        "旧策略原版完整对照保持独立经济空间与原风控参数；统一风控对照单独标记后才使用钱包 max_open_risk_positions=1 等新 cap。"
+      ]
+    }
+  ]
+}

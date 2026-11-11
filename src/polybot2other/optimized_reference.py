@@ -43,19 +43,28 @@ class ReferenceCache:
         self.state = "waiting"
         self.last_error = None
         self.frames = 0
+        self.observer = None
+
+    def _observe(self,kind,payload,received_ms,raw_text=None):
+        observer=getattr(self,'observer',None)
+        if observer is not None:
+            try:observer(kind,payload,int(received_ms),raw_text=raw_text)
+            except Exception:pass  # Observer maintains its own fault state; old strategies must continue.
 
     def reset_connection(self, state="connecting"):
+        self._observe('REFERENCE_HEALTH',{'state':state},time.time()*1000)
         with self.lock:
             self.latest.clear()
             self.sequences.clear()
             self.last_sources.clear()
             self.state = state
 
-    def ingest(self, frame, received_ms=None):
+    def ingest(self, frame, received_ms=None, *, observer_received_ms=None, raw_text=None):
         received_ms = time.time()*1000 if received_ms is None else received_ms
         channel = frame.get("channel")
         if channel not in CHANNELS:
             return False
+        self._observe('REFERENCE',frame,received_ms if observer_received_ms is None else observer_received_ms,raw_text)
         payload = frame.get("payload") or {}
         if payload.get("symbol") != "btcusd" or payload.get("source") != "chainlink":
             return False
@@ -175,9 +184,10 @@ class ReferenceCache:
 
 
 class PolyBoltReferenceFeed:
-    def __init__(self, cache: ReferenceCache):
+    def __init__(self, cache: ReferenceCache, socket_factory=None):
         self.cache = cache
         self.ws = None
+        self.socket_factory=socket_factory
 
     def close(self):
         if self.ws is not None:
@@ -200,7 +210,7 @@ class PolyBoltReferenceFeed:
         while not stop.is_set():
             self.cache.reset_connection()
             try:
-                self.ws = _StdlibWebSocket.connect("wss://ws-live-v2.polymarket.com/ws", 8)
+                self.ws = (self.socket_factory or _StdlibWebSocket.connect)("wss://ws-live-v2.polymarket.com/ws", 8)
                 self.ws.send_text(json.dumps({"op":"auth","auth":auth}))
                 authenticated = False
                 deadline = time.monotonic()+10
@@ -225,7 +235,7 @@ class PolyBoltReferenceFeed:
                     frame = json.loads(text)
                     if frame.get("op") == "error":
                         raise ValueError("REFERENCE_PROTOCOL_REJECTED")
-                    if self.cache.ingest(frame):
+                    if self.cache.ingest(frame,observer_received_ms=getattr(self.ws,'last_received_ms',None),raw_text=text):
                         last_advance[frame["channel"]] = time.monotonic()
                         backoff = .5
             except Exception as exc:

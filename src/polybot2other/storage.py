@@ -3589,6 +3589,9 @@ class TradeStore:
         now: float,
         settlement_source: str,
     ) -> list[dict[str, Any]]:
+        simulator = getattr(self, "paper_execution_ledger", None)
+        if simulator is not None and simulator.settlement_blocked(round_id):
+            return []  # Confirm matched buys/sells before resolving the position.
         normalized_outcome = _normalize_side(outcome)
         normalized_source = str(settlement_source or "").strip() or SETTLEMENT_SOURCE_CHAINLINK
         normalized_target_price = _positive_price_or_none(target_price)
@@ -3614,6 +3617,8 @@ class TradeStore:
                 win = _normalize_side(trade["side"]) == normalized_outcome
                 payout = round(float(trade["shares"]) if win else 0.0, 6)
                 pnl = round(payout - float(trade["stake"]), 6)
+                if simulator is not None:
+                    simulator.defer_payout(trade["id"], payout, now)
                 self.conn.execute(
                     """
                     UPDATE trades
@@ -3635,7 +3640,7 @@ class TradeStore:
                         updated_at = ?
                     WHERE id = 1
                     """,
-                    (payout, pnl, now),
+                    (0.0 if simulator is not None else payout, pnl, now),
                 )
                 item = dict(trade)
                 item.update(
@@ -4410,6 +4415,9 @@ class TradeStore:
         results: list[dict[str, Any]] = []
         with self.conn:
             for order in expired:
+                simulator = getattr(self, "paper_execution_ledger", None)
+                if simulator is not None and simulator.protects_order(order["id"]):
+                    continue
                 remaining_cash = max(0.0, round(float(order.get("remaining_cash") or 0.0), 6))
                 reason = _append_reason(str(order.get("reason") or ""), f"EXPIRED release {remaining_cash:.6f}")
                 self.conn.execute(
@@ -4437,6 +4445,9 @@ class TradeStore:
     @_locked
     def cancel_paper_order(self, order_id: int, reason: str = "manual cancel", now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
+        simulator = getattr(self, "paper_execution_ledger", None)
+        if simulator is not None and simulator.protects_order(order_id):
+            return {"canceled": [], "not_canceled": {str(order_id): "FAK 已模拟提交，等待撮合和确认后释放预算"}}
         row = self.conn.execute(
             "SELECT * FROM paper_orders WHERE id = ?",
             (int(order_id),),
@@ -4499,6 +4510,9 @@ class TradeStore:
         with self.conn:
             for order in orders:
                 order_id = int(order["id"])
+                simulator = getattr(self, "paper_execution_ledger", None)
+                if simulator is not None and simulator.protects_order(order_id):
+                    continue
                 remaining_cash = max(0.0, round(float(order.get("remaining_cash") or 0.0), 6))
                 cancel_reason = _append_reason(str(order.get("reason") or ""), f"CANCELED {reason} release {remaining_cash:.6f}")
                 self.conn.execute(
@@ -4783,13 +4797,16 @@ class TradeStore:
         wins = self.conn.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'SETTLED' AND pnl > 0").fetchone()["c"]
         losses = self.conn.execute("SELECT COUNT(*) AS c FROM trades WHERE status = 'SETTLED' AND pnl < 0").fetchone()["c"]
         row = self.conn.execute("SELECT COALESCE(MIN(total_equity), ?) AS min_equity FROM equity_curve", (account["initial_balance"],)).fetchone()
-        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash, 6)
+        simulator = getattr(self, "paper_execution_ledger", None)
+        pending_settlement_cash = simulator.pending_cash() if simulator else 0.0
+        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash + pending_settlement_cash, 6)
         total_pnl = round(total_equity - float(account["initial_balance"]), 6)
         max_drawdown = round(float(account["initial_balance"]) - float(row["min_equity"]), 6)
         return {
             "initial_balance": float(account["initial_balance"]),
             "cash_balance": round(float(account["cash_balance"]), 6),
             "reserved_cash": reserved_cash,
+            "pending_settlement_cash": pending_settlement_cash,
             "open_risk": open_risk,
             "realized_pnl": round(float(account["realized_pnl"]), 6),
             "unrealized_pnl": 0.0,
@@ -4810,7 +4827,9 @@ class TradeStore:
         account = self.account()
         open_risk = round(sum(float(row["stake"]) for row in self.open_trades()), 6)
         reserved_cash = self.reserved_cash()
-        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash, 6)
+        simulator = getattr(self, "paper_execution_ledger", None)
+        pending_settlement_cash = simulator.pending_cash() if simulator else 0.0
+        total_equity = round(float(account["cash_balance"]) + open_risk + reserved_cash + pending_settlement_cash, 6)
         self.conn.execute(
             """
             INSERT INTO equity_curve(cash_balance, open_risk, realized_pnl, total_equity, created_at)

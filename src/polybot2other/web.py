@@ -291,6 +291,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             self._send_json(self.server.status_snapshot())
             return
+        if path == "/api/hengzhun":
+            self._send_json(self.server.bot.hengzhun_snapshot())
+            return
+        if path == "/api/paired-paper":
+            self._send_json(self.server.bot.paired_paper_snapshot())
+            return
+        if path == "/api/paired-v2":
+            self._send_json(self.server.bot.paired_v2_snapshot())
+            return
         if path == "/api/polymarket-status":
             try:
                 refresh = _query_bool_optional(query, "refresh", False)
@@ -519,6 +528,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        if self.path in ("/api/paired-paper/settings", "/api/paired-v2/settings"):
+            try:
+                host=self.headers.get('Host','');origin=self.headers.get('Origin')
+                if (not ipaddress.ip_address(self.client_address[0]).is_loopback
+                    or urllib.parse.urlparse('http://'+host).hostname not in {'localhost','127.0.0.1','::1'}
+                    or (origin and urllib.parse.urlparse(origin).netloc!=host)
+                    or self.headers.get_content_type()!='application/json'):
+                    raise PermissionError('请在本机页面修改模拟设置')
+                service=self.server.bot.paired_v2 if self.path=="/api/paired-v2/settings" else self.server.bot.paired_paper
+                if service is None:raise ValueError('独立 Paper 服务尚未连接')
+                if not hmac.compare_digest(self.headers.get('X-Paired-Control',''),service.control_token):
+                    raise PermissionError('页面连接已更新，请刷新重试')
+                self._send_json(service.update_settings(self._read_json_body()))
+            except PermissionError as exc:self._send_error_json(HTTPStatus.FORBIDDEN,str(exc))
+            except ValueError as exc:self._send_error_json(HTTPStatus.BAD_REQUEST,str(exc))
+            return
         if self.path == "/api/tick":
             self.server.bot.tick()
             self._send_json(self.server.bot.snapshot())
@@ -1299,6 +1324,12 @@ def main(argv: list[str] | None = None) -> int:
     bot = PaperTradingBot(settings, store)
     server = DashboardServer((args.host, args.port), Handler, bot)
     stop_event = threading.Event()
+    from .service_continuity import ServiceContinuity
+    import os
+    def recover_runtime(gap):
+        if bot.managed_live is not None:bot.managed_live.recover_after_interruption(gap)
+    continuity=ServiceContinuity(os.environ.get("POLYBOT2OTHER_KEEP_AWAKE","").lower() in ("1","true","yes","on"),recover_runtime)
+    bot.service_continuity=continuity
 
     def _stop(_signum, _frame) -> None:
         if stop_event.is_set():
@@ -1309,12 +1340,14 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    bot.start()
-    print(f"polybot2other dashboard: http://{args.host}:{args.port}", flush=True)
+    continuity.start()
     try:
+        bot.start()
+        print(f"polybot2other dashboard: http://{args.host}:{args.port}", flush=True)
         server.serve_forever()
     finally:
         bot.stop()
+        continuity.stop()
         server.server_close()
     return 0
 

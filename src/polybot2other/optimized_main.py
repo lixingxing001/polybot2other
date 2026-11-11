@@ -230,6 +230,10 @@ class OptimizedMainBot(PaperTradingBot):
     def _start_workers(self):
         self._stop.clear()
         self.btc_runtime_paused=False
+        if self._shared_inputs_required:
+            self._reference_thread=None;self._book_thread=None
+            self._thread=threading.Thread(target=self._optimized_loop,name="optimized-shared-paper",daemon=True)
+            self._thread.start();return
         self.references.reset_connection()
         with self._lock:self.paper_quotes={};self.execution_quotes={};self.latest_quotes={}
         self._reference_thread=threading.Thread(target=self.reference_feed.run,args=(self._stop,),name="optimized-polybolt",daemon=True)
@@ -242,8 +246,9 @@ class OptimizedMainBot(PaperTradingBot):
             self._desired_running=False
             self.btc_runtime_paused=True
             self._stop.set()
-        self.references.reset_connection("paused")
-        self.reference_feed.close()
+        if not self._shared_inputs_required:
+            self.references.reset_connection("paused")
+            self.reference_feed.close()
         if self._book_ws:
             try:self._book_ws.close()
             except OSError:pass
@@ -266,6 +271,10 @@ class OptimizedMainBot(PaperTradingBot):
             self._stop.wait(self.settings.tick_seconds)
 
     def _market(self, now):
+        if self._shared_inputs_required:
+            frame=self._sync_shared_market_inputs()
+            self.book_state="shared-live"
+            return frame.market if frame else None
         start=int(now)//300*300
         with self._lock:
             market=self.current_market
@@ -316,18 +325,32 @@ class OptimizedMainBot(PaperTradingBot):
         if not self._decision_lock.acquire(blocking=False):
             return
         try:
+            if self.paper_execution is not None:
+                self._resolve(time.time())
+                self.paper_execution.decide()
+                self.store.record_equity()
+                return
             now=time.time()
             market=self._market(now)
             self._resolve(time.time())
             if self._stop.is_set():
                 return
+            frame=self._sync_shared_market_inputs() if self._shared_inputs_required else None
+            if self._shared_inputs_required:
+                market=frame.market if frame else None
             if market is None:
                 self._signal("MARKET_WAIT","等待当前五分钟市场")
                 return
             self.store.upsert_round(market)
-            reference=self.references.snapshot()
-            with self._lock:quotes={k:dict(v) for k,v in self.paper_quotes.items()}
-            signal,features=self.evaluate(market,reference,quotes,time.time())
+            if frame:
+                if frame.error:
+                    self._signal("SHARED_DATA",frame.error);return
+                reference=frame.reference;quotes=frame.quotes;now=frame.observed_at
+            else:
+                reference=self.references.snapshot()
+                with self._lock:quotes={k:dict(v) for k,v in self.paper_quotes.items()}
+                now=time.time()
+            signal,features=self.evaluate(market,reference,quotes,now)
             with self._lock:
                 self.last_signal={"symbol":"BTC","side":signal.side,"confidence":signal.confidence,
                                   "entry_price":signal.entry_price,"move_bps":signal.move_bps,"reason":signal.reason}

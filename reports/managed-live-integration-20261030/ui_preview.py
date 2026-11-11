@@ -33,6 +33,7 @@ def no_real_post(*args,**kwargs):
 exchange.submit=no_real_post
 store=ManagedLiveStore(TMP/"live/accounts.sqlite3")
 recovery_order=None
+quarantine_fixture=os.environ.get("POLYBOT2OTHER_UI_QUARANTINE_TEST")=="1"
 
 class PreviewAccounts(ManagedLiveAccounts):
     def snapshot(self):
@@ -40,7 +41,7 @@ class PreviewAccounts(ManagedLiveAccounts):
         self.wallet={"balance":42.771923,"allowance":1000,"portfolio_value":10,"total_equity":52.771923,
                      "ready":True,"checked_at":now,"read_started_at":now,"address_masked":"TEST…ONLY","currency":"测试单位"}
         self.geo={"ready":True,"blocked":False,"checked_at":now};self.open_orders_at=now
-        if recovery_order is not None:
+        if recovery_order is not None or quarantine_fixture:
             self._last_tick_at=now;self._tick_wait=None
             self.reconcile();self.refresh_valuations()
         return super().snapshot()
@@ -73,6 +74,16 @@ if os.environ.get("POLYBOT2OTHER_UI_RECOVERY_TEST")=="1":
             raise fakes.OrderConfirmationPending("官方订单暂未同步，等待确认（隔离验证）")
         return {"fills":[{"trade_id":"preview-confirmed","shares":10,"price":.4,"fee":.168,"fee_source":"test_fixture"}],"terminal":True,"no_fill":False}
     exchange.reconcile=delayed_read
+    managed.last_signal["MAIN"]={"side":"NO_TRADE","state":"waiting","reason":"等待下一次入场信号（隔离验证）"}
+if quarantine_fixture:
+    old=replace(market,round_id=f"btc-updown-5m-{start-300}",started_at=now-180,ends_at=now-60,up_token="old-up",down_token="old-down")
+    store.save_market(old);store.save_market(market)
+    isolated=store.prepare_order("0x"+"d"*64,"MAIN",old,old.up_token,"Up","BUY",.5,cash=5,now=now-120)
+    store.set_order_state(isolated["id"],"SUBMITTING",now=now-120)
+    store.set_order_state(isolated["id"],"UNKNOWN","官方订单尚未同步",now=now-120)
+    exchange.responses[isolated["external_id"]]={"fills":[],"terminal":False,"no_fill":False,"pending_reason":"官方订单暂无记录，继续交叉核对",
+        "evidence":{"order":"missing","trades":"checked","matching_trades":0,"open_orders":"checked","matching_open_order":False,"token_balance":0}}
+    store.update_config({"enabled":True,"strategies":{"MAIN":{"enabled":True}}})
     managed.last_signal["MAIN"]={"side":"NO_TRADE","state":"waiting","reason":"等待下一次入场信号（隔离验证）"}
 bot.managed_live=managed
 bot.current_market=market;bot.paper_price={"chainlink":100.2,"chainlink_updated_ms":now*1000}
