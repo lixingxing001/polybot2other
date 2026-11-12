@@ -345,39 +345,13 @@ redemption timing and multi-strategy wallet contention cannot be fully reproduce
 Protocol references: [Polymarket order types and price bounds](https://docs.polymarket.com/trading/place-orders),
 [market-specific taker fees](https://docs.polymarket.com/trading/fees).
 
-## 衡准 V1
+## 当前保留的四个策略
 
-2026-11-08 按用户指示，启动脚本现在默认运行独立的“现有数据 Paper 试验”，已提取原数据中的价格、历史波动和均价误差。
-该试验没有通过原设计的模型训练验证，页面明确标为未校准；原严格实现与旧数据完整保留。
-本次调整、资金隔离与假设见 [提前 Paper 试验说明](doc/hengzhun-v1-pilot.md)。
+主账户、主账户止盈止损、主账户（优化版）、价值确认 V1。
 
-新增的 `HENGZHUN_TWAP_VALUE_V1` 按设计书 1.0.0 及配套机器附件用 Python 实现。
-显式设置 `POLYBOT2OTHER_HENGZHUN_PILOT_ENABLED=false` 后，`./start-macos.sh` 启动原严格 RECORD 采集，页面显示模型、合同、数据与时钟条件。
-该策略使用独立数据库，支持离线 REPLAY 和受资格约束的 PAPER；真实执行硬禁用。
-原有四个策略的资金与设置不接入新策略钱包。衡准固定 $5 含费预算、独立 $100 初始模拟本金。
-
-运行命令、训练发布和连续周回放见 [操作说明](doc/hengzhun-v1-operations.md)；
-对应设计及实际测试见 [实现矩阵](doc/hengzhun-v1-implementation-matrix.md) 和
-[验收执行索引](doc/hengzhun-v1-acceptance-execution.md)。
-当前真实市场适配尚有 [待核验项](doc/hengzhun-v1-adapter-audit.md)，初始模型为 UNFITTED；
-采集运行不代表正式 Paper 已获准开仓，也不代表已有样本外收益证据。
-
-## 双翼配对 V2（无需训练的独立 Paper）
-
-`./start-macos.sh` 默认运行 V2，V1 冻结为可展开的历史对照，不清空旧亏损。
-V2 将下单前的持仓、在途、未确认成交纳入风险预算，并提供独立退出核验通道。
-成交带与穿价压力两个情景各用独立 $100 账本，页面并列显示，收益不能相加。
-原四策略和实盘设置保持原样；双翼不具备真实交易接口。
-规则、模拟限制与运行验证见 [双翼 V2 说明](doc/paired-v2.md)。
-
-## 双翼配对 V1（已冻结的历史对照）
-
-页面保留 V1 的独立净值、配对账本、委托和模拟成交历史；默认停止新增报价，设置只读。
-独立 $100 初始本金，每组双边合计预算默认 $5；单边未配齐时仍有风险。
-它根据当前两个真实盘口报价，使用成交事件、队列和严格穿价模型模拟成交，无需等待模型训练。
-主动补齐/退出计入实际市场费率和深度限制，已确认配对或官方终局回款等待60秒后进入可用现金。
-该模块只允许 Paper，没有真实交易接口，原四策略和衡准均保留。
-详见 [策略规则、假设和操作说明](doc/paired-paper-v1.md)。
+2026-11-11 按用户要求移除衡准与双翼的运行入口、页面和接口；已结束的实验保留精简历史归档。
+原四策略的 Paper / 实盘账本、开关、金额和风险设置不变。
+清理与归档清单见 `reports/data-cleanup-20261111-223500/`，历史数据位于 `data/archives/`。
 
 ## Safety
 

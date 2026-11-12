@@ -3221,13 +3221,10 @@ function renderStrategyExperiments(runtime = {}) {
   const assetHeading = ids.strategyExperiments.closest("table")?.querySelectorAll("thead th")[2];
   if (assetHeading) assetHeading.textContent = managedMode ? "本策略持仓市值" : "账面资产";
   if (managedMode) {
-    ids.strategyExperimentMeta.textContent = runtime.hengzhun?.enabled ? "4 个实盘策略 + 1 个独立研究策略" : "4 个策略 · 实盘独立核算";
+    ids.strategyExperimentMeta.textContent = "4 个策略 · 实盘独立核算";
     ids.strategyExperimentSummary.textContent = "钱包余额共享 · 这里只展示当前程序确认的实盘记录";
-    document.getElementById("optimized-main-panel").hidden = true;
     document.getElementById("main-exit-panel").hidden = true;
-    ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus) + (window.PairedPaperV2UI?.row(runtime.paired_v2)||"") + (window.PairedPaperUI?.row(runtime.paired_paper)||"") + (window.HengzhunUI?.row(runtime.hengzhun)||"");
-    if(runtime.paired_paper?.enabled)ids.strategyExperimentMeta.textContent += " + 1 个独立 Paper";
-    if(runtime.paired_v2?.enabled)ids.strategyExperimentMeta.textContent = "4 个实盘策略 + V2 双情景 Paper + V1 历史 + 衡准研究";
+    ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus);
     return;
   }
   const experiments = runtime.strategy_experiments || {};
@@ -3236,16 +3233,13 @@ function renderStrategyExperiments(runtime = {}) {
     metrics: latestStatus?.metrics || {}, recent_trades_summary: latestStatus?.recent_trades_summary || {},
     last_signal: runtime.last_signal || {}, last_error: runtime.last_error };
   const rows = [main, ...variants];
-  ids.strategyExperimentMeta.textContent = `${rows.length} 个 Paper 账户` + (runtime.hengzhun?.enabled ? " + 1 个独立研究策略" : " · 模拟交易");
+  ids.strategyExperimentMeta.textContent = `${rows.length} 个 Paper 账户 · 模拟交易`;
   ids.strategyExperimentSummary.textContent = runtime.paper_execution?.enabled
     ? "各账户独立 $100 模拟钱包 · 金额与风险设置跟随实盘 · 止盈止损账户独立成交"
     : "各账户独立核算 · 止盈止损沿用主账户入场 · 原有策略与历史保留";
-  renderMainComparison(experiments);
   if (runtime.paper_execution?.enabled) document.getElementById("main-exit-panel").hidden = true;
   else renderMainExitComparison(experiments);
-  ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("") + (window.PairedPaperV2UI?.row(runtime.paired_v2)||"") + (window.PairedPaperUI?.row(runtime.paired_paper)||"") + (window.HengzhunUI?.row(runtime.hengzhun)||"");
-  if(runtime.paired_paper?.enabled)ids.strategyExperimentMeta.textContent += " + 双翼配对";
-  if(runtime.paired_v2?.enabled)ids.strategyExperimentMeta.textContent = "4 个原策略 + 双翼 V2 双情景 + V1 历史对照 + 衡准研究";
+  ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("");
 }
 
 function renderPaperExecution(runtime = {}) {
@@ -3277,34 +3271,6 @@ function renderPaperExecution(runtime = {}) {
   document.getElementById("paper-execution-events").innerHTML = events.length
     ? events.map(e => `<li><time>${new Date(e.at*1000).toLocaleTimeString("zh-CN")}</time> ${safe(e.name)} · ${safe(e.message)}</li>`).join("")
     : "<li>等待首次执行检查</li>";
-}
-
-function renderMainComparison(experiments = {}) {
-  const panel = document.getElementById("optimized-main-panel");
-  if (!panel) return;
-  const comparison = experiments.main_comparison;
-  const optimized = (experiments.variants || []).find(row => row.variant_id === "MAIN_OPTIMIZED");
-  panel.hidden = !comparison;
-  if (!comparison) return;
-  document.getElementById("main-comparison-period").textContent = "起点：" + new Date(comparison.started_at * 1000).toLocaleString("zh-CN") + " · 初始模拟权益约 " + fmtMoneyCell(comparison.optimized_start_equity);
-  document.getElementById("main-comparison-status").textContent = comparison.status;
-  const note = panel.querySelector(".optimized-comparison-note");
-  if (note) note.textContent = "只比较对照起点之后的新成交，原有利润不计入提升幅度。" + (comparison.baseline_existing_positions_excluded ? "起点已有的 " + comparison.baseline_existing_positions_excluded + " 笔原版旧仓也不计入本段。" : "") + (latestStatus?.runtime?.paper_execution?.enabled ? "每笔金额分别跟随实盘设置，收益差也包含投入金额的差异。" : "新规则仍待 Paper 验证。");
-  document.getElementById("main-comparison-summary").innerHTML = [
-    experimentSummaryItem("净收益差", signedMoney(comparison.realized_pnl_difference)),
-    experimentSummaryItem("胜率差", comparison.win_rate_difference_pp == null ? "待样本" : comparison.win_rate_difference_pp.toFixed(2) + " 个百分点"),
-    experimentSummaryItem("共同已结算市场", comparison.common_settled_markets),
-  ].join("");
-  document.getElementById("main-comparison-rows").innerHTML = [["主账户", comparison.baseline], ["主账户（优化版）", comparison.optimized]].map(([label, row]) =>
-    "<tr><td>" + safe(label) + "</td><td>" + fmtNumberCell(row.fills, 0) + "</td><td>" + fmtNumberCell(row.settled, 0) + "</td><td>" + fmtSignedMoneyCell(row.realized_pnl) + "</td><td>" + fmtPctCell(row.win_rate) + "</td><td>" + fmtMoneyCell(row.pending_stake) + "</td><td>" + fmtMoneyCell(row.settled_sequence_drawdown) + "</td><td>" + fmtMoneyCell(row.fees) + "</td></tr>"
-  ).join("");
-  const runtime = optimized?.independent_runtime || {};
-  const reference = runtime.reference || {};
-  const twap = reference.latest?.["price.crypto.twap"] || {};
-  const spot = reference.latest?.["price.crypto"] || {};
-  const freshness = reference.ready ? "参考价格就绪" : "等待新鲜参考价格";
-  const verified = reference.protocol_verified ? "TWAP 基准已与官方核对" : "等待 TWAP 基准核对";
-  document.getElementById("optimized-reference-status").textContent = "优化版独立行情：" + (runtime.market || "等待市场") + " · 开盘基准 " + fmtMoneyCell(runtime.target_price) + " · 当前 TWAP " + fmtMoneyCell(twap.price) + " · 现价 " + fmtMoneyCell(spot.price) + " · " + freshness + " · " + verified + " · " + (optimized?.last_signal?.reason || "等待判断");
 }
 
 function renderMainExitComparison(experiments = {}) {
@@ -6133,10 +6099,6 @@ function renderAllNow(data = latestStatus, options = {}) {
   window.ManagedLiveUI?.render(data);
   renderRuntime(data.runtime);
   renderPaperExecution(data.runtime);
-  window.HengzhunUI?.render(data.runtime?.hengzhun);
-  window.PairedPaperUI?.render(data.runtime?.paired_paper);
-  window.__pairedV1Snapshot=data.runtime?.paired_paper;
-  window.PairedPaperV2UI?.render(data.runtime?.paired_v2);
   renderLivePanel(data);
   renderAccountScope(data);
   renderMetrics(selectedAccountMetrics(data));

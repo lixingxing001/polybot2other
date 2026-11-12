@@ -375,12 +375,6 @@ class PaperTradingBot:
         self.store = store
         self.paper_execution = None
         self.paper_execution_service = None
-        self.hengzhun = None
-        self.hengzhun_error = None
-        self.paired_paper = None
-        self.paired_paper_error = None
-        self.paired_v2 = None
-        self.paired_v2_error = None
         self.polymarket = PolymarketClient(settings.gamma_url, settings.clob_url, settings.request_timeout_seconds)
         self.actor_data = PolymarketDataClient(settings.data_api_url, settings.request_timeout_seconds)
         self.price_fallback = PublicPriceClient(settings.request_timeout_seconds)
@@ -564,38 +558,6 @@ class PaperTradingBot:
                 raise RuntimeError("真实执行模拟需要统一行情与执行规则，不能回退到旧 Paper 成交")
             from .paper_execution import PaperExecutionService
             self.paper_execution_service = PaperExecutionService(self, self.managed_live)
-        if settings.hengzhun_enabled and settings.managed_live_enabled:
-            try:
-                if settings.hengzhun_pilot_enabled:
-                    from .hengzhun.pilot import HengzhunPilotService
-                    self.hengzhun = HengzhunPilotService(settings.hengzhun_pilot_dir,self.managed_live.feed,
-                        seed=settings.hengzhun_pilot_dir/'seed',gamma_url=settings.gamma_url,clob_url=settings.clob_url,
-                        entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused())
-                else:
-                    from .hengzhun.runtime import HengzhunRuntime
-                    import yaml
-                    configuration = settings.hengzhun_dir / "strategy_config.yaml"
-                    overrides = yaml.safe_load(configuration.read_text()) if configuration.exists() else None
-                    self.hengzhun = HengzhunRuntime(settings.hengzhun_dir, self.managed_live.feed, config=overrides)
-            except Exception as exc:
-                self.hengzhun_error = f"衡准 V1 初始化失败（{type(exc).__name__}）：{str(exc)[:180]}"
-        if settings.paired_paper_enabled and self.managed_live is not None:
-            try:
-                from .paired_paper_service import PairedPaperService
-                self.paired_paper = PairedPaperService(settings.paired_paper_dir, self.managed_live.feed,
-                    gamma_url=settings.gamma_url, clob_url=settings.clob_url,
-                    entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused(), frozen=settings.paired_v1_frozen)
-            except Exception as exc:
-                self.paired_paper_error = f"双翼配对初始化失败（{type(exc).__name__}）"
-        if settings.paired_v2_enabled and self.managed_live is not None:
-            try:
-                from .paired_v2_service import PairedV2Service
-                self.paired_v2 = PairedV2Service(settings.paired_v2_dir,self.managed_live.feed,
-                    gamma_url=settings.gamma_url,clob_url=settings.clob_url,
-                    entries_paused=lambda:self.paper_trading_paused or self.btc_runtime_is_paused(),
-                    comparison_db=settings.strategy_experiments_db_dir/'main_optimized.sqlite3')
-            except Exception as exc:
-                self.paired_v2_error=f"双翼 V2 初始化失败（{type(exc).__name__}）"
         self._append_market_llm_terminal_log(
             level="info",
             module="system",
@@ -624,29 +586,7 @@ class PaperTradingBot:
     def _capture_shared_market_inputs(self):
         try:
             if self._shared_market_provider is not None:
-                frame = self._shared_market_provider()
-                research = getattr(self, 'hengzhun', None)
-                observed = int(frame.observed_at * 1000)
-                if research is not None and getattr(research,'capture_baseline',True) and observed - getattr(self, '_hengzhun_baseline_at', 0) >= 250:
-                    try:
-                        from .hengzhun.baseline import capture_main_frame
-                        baseline_frame = capture_main_frame(frame, self.settings)
-                        paper_engine = getattr(self, 'paper_execution', None)
-                        manager = getattr(self, 'managed_live', None)
-                        if paper_engine is not None:
-                            baseline_frame['execution_policy'] = asdict(paper_engine.policy)
-                            if frame.market is not None:
-                                info = paper_engine.info_cache.get(frame.market.round_id)
-                                if info is not None:
-                                    baseline_frame['market_info'] = dict(info)
-                        if manager is not None:
-                            baseline_frame['main_rule'] = manager.store.config()['strategies']['MAIN']
-                        research.capture('B1_FRAME', baseline_frame, int(time.time() * 1000))
-                        self._hengzhun_baseline_at = observed
-                    except Exception:
-                        # A research observer cannot change MAIN's signal inputs.
-                        pass
-                return frame
+                return self._shared_market_provider()
             error=self.managed_live_error or "等待统一实盘行情"
         except Exception as exc:error=f"统一行情暂不可用（{type(exc).__name__}），正在恢复"
         return MarketInputs(None,{}, {},{},time.time(),"unavailable",error)
@@ -713,13 +653,6 @@ class PaperTradingBot:
 
     def start(self) -> None:
         self._start_market_scout()
-        self._start_hengzhun()
-        if self.paired_paper is not None:
-            try:self.paired_paper.start()
-            except Exception as exc:self.paired_paper_error = f"双翼配对启动失败（{type(exc).__name__}）"
-        if self.paired_v2 is not None:
-            try:self.paired_v2.start()
-            except Exception as exc:self.paired_v2_error=f"双翼 V2 启动失败（{type(exc).__name__}）"
         if self.paper_execution_service is not None:
             self.paper_execution_service.start()
         if self.managed_live is not None:
@@ -771,13 +704,6 @@ class PaperTradingBot:
     def stop(self) -> None:
         self._market_scout_stop.set()
         self._stop.set()
-        if self.paired_v2 is not None:
-            try:self.paired_v2.stop()
-            except Exception:pass
-        if self.paired_paper is not None:
-            try:self.paired_paper.stop()
-            except Exception:pass
-        self._stop_hengzhun()
         if self.paper_execution_service is not None:
             self.paper_execution_service.stop()
         if self.managed_live is not None:
@@ -5833,55 +5759,7 @@ class PaperTradingBot:
             runtime["paper_execution"] = self.paper_execution_service.snapshot()
         if self.managed_live is not None and frame is not None:runtime["managed_live"]=self.managed_live.snapshot(market_input=frame)
         payload["runtime"] = runtime
-        runtime["hengzhun"] = self.hengzhun_snapshot()
-        runtime["paired_paper"] = self.paired_paper_snapshot()
-        runtime["paired_v2"] = self.paired_v2_snapshot()
         return payload
-
-    def paired_paper_snapshot(self):
-        service = getattr(self, 'paired_paper', None)
-        if service is not None:
-            try:return service.snapshot()
-            except Exception as exc:
-                return {"enabled":True,"name":"双翼配对 V1","mode":"PAPER","running":False,
-                        "error":f"模拟状态读取失败（{type(exc).__name__}）"}
-        return {"enabled":bool(getattr(self.settings,'paired_paper_enabled',False)),"mode":"PAPER","running":False,
-                "error":getattr(self,'paired_paper_error',None)}
-
-    def paired_v2_snapshot(self):
-        service=getattr(self,'paired_v2',None)
-        if service is not None:
-            try:return service.snapshot()
-            except Exception as exc:return {"enabled":True,"mode":"PAPER","error":f"V2 状态读取失败（{type(exc).__name__}）"}
-        return {"enabled":bool(getattr(self.settings,'paired_v2_enabled',False)),"mode":"PAPER","running":False,
-                "error":getattr(self,'paired_v2_error',None)}
-
-    def _start_hengzhun(self):
-        if self.hengzhun is None:
-            return
-        try:
-            self.hengzhun.start()
-        except Exception as exc:
-            self.hengzhun_error = f"衡准 V1 启动失败（{type(exc).__name__}）"
-            self._stop_hengzhun()
-            self.hengzhun = None
-
-    def _stop_hengzhun(self):
-        if self.hengzhun is None:
-            return
-        try:
-            self.hengzhun.stop()
-        except Exception as exc:
-            self.hengzhun_error = f"衡准 V1 停止异常（{type(exc).__name__}）"
-
-    def hengzhun_snapshot(self):
-        if self.hengzhun is not None:
-            try:return self.hengzhun.snapshot()
-            except Exception as exc:
-                return {"enabled":True,"name":"衡准 V1","mode":getattr(self.hengzhun,"mode","RECORD"),"live_execution_enabled":False,
-                        "error":f"研究状态读取失败（{type(exc).__name__}）"}
-        return {"enabled":bool(self.settings.hengzhun_enabled),"name":"衡准 V1","mode":"RECORD",
-                "live_execution_enabled":False,"error":self.hengzhun_error}
 
     def snapshot(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         frame=self._capture_shared_market_inputs() if self._shared_inputs_required else None
@@ -5950,9 +5828,6 @@ class PaperTradingBot:
                 ),
             )
         runtime["strategy_experiments"] = strategy_experiments_snapshot
-        runtime["hengzhun"] = self.hengzhun_snapshot()
-        runtime["paired_paper"] = self.paired_paper_snapshot()
-        runtime["paired_v2"] = self.paired_v2_snapshot()
         if self.paper_execution_service is not None:
             runtime["paper_execution"] = self.paper_execution_service.snapshot()
         runtime["managed_live"] = ((self.managed_live.snapshot(market_input=frame) if frame is not None else self.managed_live.snapshot())

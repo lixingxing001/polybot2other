@@ -102,26 +102,6 @@
 .managed-mode-live #paper-pause-toggle { display: none; }
 .managed-mode-live .account-scope-summary { color: var(--amber); }
 .managed-empty { color: var(--muted); padding: 30px 16px; text-align: center; }
-.hengzhun-panel { margin: 18px 0; border-color: #354d66; }
-.hengzhun-content { padding: 0 18px 18px; }
-.hengzhun-mode { padding: 7px 11px; color: #9ec8ef; background: #1c2a37; border: 1px solid #3b566e; border-radius: 7px; font-size: 12px; }
-.hengzhun-metrics { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 10px; margin: 14px 0; }
-.hengzhun-metrics > div { padding: 13px; background: #1c2329; border: 1px solid var(--line); border-radius: 8px; }
-.hengzhun-metrics span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
-.hengzhun-metrics strong { font-size: 18px; font-variant-numeric: tabular-nums; }
-.hengzhun-reasons { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0; }
-.hengzhun-reason { border: 1px solid #574c35; background: #29251e; color: #d9b976; padding: 5px 8px; border-radius: 5px; font-size: 12px; }
-.hengzhun-content p { line-height: 1.65; }
-.hengzhun-content details { margin-top: 15px; }
-.hengzhun-rule-table th { width: 150px; }
-.hengzhun-rule-table td { white-space: normal; line-height: 1.6; }
-.hengzhun-strategy-row { background: rgba(99,179,255,.035); }
-.hengzhun-trade-scroll { max-height: 700px; overflow: auto; }
-.hengzhun-trade-scroll th { position: sticky; top: 0; z-index: 1; background: #1c2329; }
-.hengzhun-trade-scroll td { height: 42px; }
-.hengzhun-buy-price { color: #80b9f2; font-variant-numeric: tabular-nums; }
-.hengzhun-cash { color: #e2bc75; font-variant-numeric: tabular-nums; }
-@media(max-width:680px) { .hengzhun-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 .table-wrap.managed-table-scroll { max-height: 850px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #64717e #161c20; scrollbar-gutter: stable; }
 .table-wrap.managed-table-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
 .table-wrap.managed-table-scroll::-webkit-scrollbar-thumb { background: #64717e; border-radius: 5px; }
