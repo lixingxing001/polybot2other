@@ -16,7 +16,8 @@ from .managed_live_recovery import (FINALIZE_MIN_CHECKS, FINALIZE_MIN_SPAN_SECON
                                    finalization_evidence, direct_order_evidence)
 
 STRATEGIES = {"MAIN": "主账户", "MAIN_OPTIMIZED": "主账户（优化版）",
-              "VALUE_CONFIRM_V1": "价值确认 V1", "MAIN_TP_SL": "主账户止盈止损"}
+              "MAIN_ADAPTIVE": "主账户自适应成长版", "VALUE_CONFIRM_V1": "价值确认 V1",
+              "MAIN_TP_SL": "主账户止盈止损"}
 ACTIVE_ORDER_STATES = ("PREPARED", "SUBMITTING", "PENDING", "UNKNOWN", "QUARANTINED")
 
 
@@ -89,6 +90,48 @@ class ManagedLiveStore:
             if name not in columns:self.conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {kind}")
         with self.conn:
             self.conn.execute("INSERT OR IGNORE INTO live_config VALUES(1,?)", (json.dumps(defaults()),))
+        self._migrate_config()
+
+    def _migrate_config(self):
+        """Add newly supported strategies without resetting live choices.
+
+        The live ledger predates MAIN_ADAPTIVE, so an existing database may
+        still contain only the original four strategy rows.  Merge each known
+        row with the current defaults and keep all saved values.  Unknown
+        retired rows are omitted from the active config so the execution loop
+        cannot try to evaluate a strategy that no longer exists.
+        """
+        with self.lock:
+            row = self.conn.execute("SELECT json FROM live_config WHERE id=1").fetchone()
+            if not row:
+                return
+            try:
+                stored = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError):
+                stored = {}
+            base = defaults()
+            if isinstance(stored, dict):
+                for field in ("enabled", "manage_existing_when_off", "revision"):
+                    if field in stored:
+                        base[field] = stored[field]
+                old_strategies = stored.get("strategies")
+                if isinstance(old_strategies, dict):
+                    for key in STRATEGIES:
+                        values = old_strategies.get(key)
+                        if isinstance(values, dict):
+                            base["strategies"][key].update(values)
+            # A malformed legacy value must never turn the startup migration
+            # into an enabled live switch or an invalid risk configuration.
+            base["enabled"] = bool(base.get("enabled", False))
+            base["manage_existing_when_off"] = bool(base.get("manage_existing_when_off", True))
+            try:
+                base["revision"] = int(base.get("revision", 0))
+            except (TypeError, ValueError):
+                base["revision"] = 0
+            payload = json.dumps(base, ensure_ascii=False, separators=(",", ":"))
+            if payload != row[0]:
+                with self.conn:
+                    self.conn.execute("UPDATE live_config SET json=? WHERE id=1", (payload,))
 
     def config(self):
         with self.lock:

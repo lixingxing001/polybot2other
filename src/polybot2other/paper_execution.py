@@ -610,9 +610,8 @@ class PaperExecutionService:
                 config = manager.store.config()
                 if strategy_id in config.get("strategies", {}):
                     return config
-                # MAIN_ADAPTIVE is Paper-only.  Keep its amount and risk rules
-                # on the isolated strategy settings instead of adding a live
-                # wallet switch or a live-account row for it.
+                # Keep isolated Paper settings available even when a strategy
+                # is not present in an older live-ledger configuration.
                 strategy_settings = strategy_bot.settings
                 strategies = dict(config.get("strategies", {}))
                 strategies[strategy_id] = {

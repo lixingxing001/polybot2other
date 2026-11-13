@@ -31,7 +31,7 @@
 .managed-wallet-stats strong { font-size: 25px; font-variant-numeric: tabular-nums; }
 .managed-wallet-stats > div:last-child strong { font-size: 18px; }
 .managed-wallet-note { font-size: 12px; line-height: 1.7; color: var(--muted); margin: 12px 0; }
-.managed-strategy-controls { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; }
+.managed-strategy-controls { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
 .managed-strategy-card { padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #151b20; min-width: 0; }
 .managed-strategy-card.is-live { border-color: var(--amber); background: #282217; }
 .managed-strategy-title { display: flex; flex-direction: column; gap: 10px; font-size: 14px; }

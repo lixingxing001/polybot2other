@@ -1,8 +1,8 @@
 # EdgePulse
 
-The dashboard has five isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), **主账户自适应成长版** (`MAIN_ADAPTIVE`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. The adaptive account starts from settled samples in the optimized account's ledger, keeps its own balance and ledger, and applies only bounded score calibration after enough samples. It is Paper-only and is never added to the real-wallet strategy set. In the default managed-live runtime, the Paper accounts share the verified PolyBolt spot/TWAP and CLOB collector used by live execution. The optimized account keeps its own model, ledger and journal while borrowing the same reference history; the exit account still mirrors original-main Paper entries and applies its existing exit policy.
+The dashboard has five isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), **主账户自适应成长版** (`MAIN_ADAPTIVE`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. The adaptive account starts from settled samples in the optimized account's ledger, keeps its own balance and ledger, and applies only bounded score calibration after enough samples. It is also available as an opt-in live strategy with its own switch, risk limits and live accounting; the live switch is off by default. In the default managed-live runtime, the Paper accounts share the verified PolyBolt spot/TWAP and CLOB collector used by live execution. The optimized account keeps its own model, ledger and journal while borrowing the same reference history; the exit account still mirrors original-main Paper entries and applies its existing exit policy.
 
-The dashboard also provides opt-in real execution for these four strategies. The global live switch and the corresponding strategy switch must both be enabled before new real BUY orders are allowed; all switches default off in a new live ledger. Each strategy has its own fee-inclusive order budget and accounting, while the actual wallet balance is shared. Turning either switch off stops new entries and continues managing existing positions, including the live take-profit/stop-loss strategy. Paper accounts continue as independent controls.
+The dashboard also provides opt-in real execution for these five strategies. The global live switch and the corresponding strategy switch must both be enabled before new real BUY orders are allowed; all switches default off in a new live ledger. Each strategy has its own fee-inclusive order budget and accounting, while the actual wallet balance is shared. Turning either switch off stops new entries and continues managing existing positions, including the live take-profit/stop-loss strategy. The adaptive live strategy uses the bounded calibration model built from the optimized and adaptive Paper ledgers; if that model cannot be opened, its entry state is shown as unavailable and it cannot silently fall back to the optimized strategy.
 
 The top metrics and tables follow the selected strategy's effective Paper/live mode by default. A separate data-view selector can inspect either ledger without enabling trading. Wallet cash comes from authenticated CLOB balance queries, and portfolio value comes from the official Data API; failed reads are shown as unavailable or stale rather than a fabricated zero. Live strategy P&L is based on confirmed official fills and the market's fee schedule. Resolved winning shares are shown as pending redemption and are never credited to the displayed cash balance before the wallet API reports the cash.
 
@@ -296,7 +296,7 @@ For safety, a saved `enabled=true` live switch is not preserved across process r
 
 ## Paper execution aligned with managed live (2026-11-06)
 
-The Mac launcher enables `POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION=true`. The four
+The Mac launcher enables `POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION=true`. The five
 Paper accounts reuse the existing `LiveSignals` functions, verified market inputs,
 and the saved per-strategy live budgets, position limits, daily-loss limits and
 TP/SL percentages. Live enable switches still control real orders only; the Paper
@@ -345,12 +345,12 @@ redemption timing and multi-strategy wallet contention cannot be fully reproduce
 Protocol references: [Polymarket order types and price bounds](https://docs.polymarket.com/trading/place-orders),
 [market-specific taker fees](https://docs.polymarket.com/trading/fees).
 
-## 当前保留的四个策略
+## 当前保留的五个策略
 
-主账户、主账户止盈止损、主账户（优化版）、价值确认 V1。
+主账户、主账户止盈止损、主账户（优化版）、主账户自适应成长版、价值确认 V1。
 
 2026-11-11 按用户要求移除衡准与双翼的运行入口、页面和接口；已结束的实验保留精简历史归档。
-原四策略的 Paper / 实盘账本、开关、金额和风险设置不变。
+原四策略的 Paper / 实盘账本、开关、金额和风险设置不变；自适应成长版新增实盘入口，默认关闭。
 清理与归档清单见 `reports/data-cleanup-20261111-223500/`，历史数据位于 `data/archives/`。
 
 ## Safety

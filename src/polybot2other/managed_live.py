@@ -1,4 +1,4 @@
-"""Four independent live strategies sharing one real wallet and one order coordinator."""
+"""Five independent live strategies sharing one real wallet and one order coordinator."""
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -15,6 +15,7 @@ from .managed_live_client import ManagedExchange, OrderConfirmationPending, Orde
 from .managed_live_signals import LiveMarketFeed, LiveSignals
 from .managed_live_recovery import (no_activity_candidate, FINALIZE_AFTER_END_SECONDS, LATE_AUDIT_FAULT,
                                    wallet_only_audit_fault, direct_order_evidence)
+from .adaptive_model import AdaptiveModel
 
 QUARANTINE_AFTER_SECONDS=60
 QUARANTINE_CHECK_SECONDS=15
@@ -53,7 +54,20 @@ class ManagedLiveAccounts:
         self._wallet_wake=threading.Event();self._refresh_after=0.
         self.control_token=secrets.token_urlsafe(32)
         self.process_lock=LiveProcessLock(self.path/"wallet-orders.lock")
-        self.signals=LiveSignals(settings,self.store,self.feed,self.available_cash,self._external_prices)
+        self.adaptive_model=None;self.adaptive_model_error=None
+        try:
+            experiments_dir=Path(settings.strategy_experiments_db_dir)
+            self.adaptive_model=AdaptiveModel(
+                experiments_dir/"main_adaptive.model.sqlite3",
+                experiments_dir/"main_optimized.sqlite3",
+                experiments_dir/"main_adaptive.sqlite3",
+            )
+        except Exception as exc:
+            self.adaptive_model_error=f"{type(exc).__name__}: {str(exc)[:120]}"
+            self.store.event("adaptive_model_unavailable",f"主账户自适应成长版模型未就绪：{self.adaptive_model_error}")
+        self.signals=LiveSignals(settings,self.store,self.feed,self.available_cash,self._external_prices,
+                                 adaptive_model=self.adaptive_model,
+                                 adaptive_model_error=self.adaptive_model_error)
         try:
             self.store.bind_wallet(self.exchange.identity)
         except Exception:
@@ -97,6 +111,9 @@ class ManagedLiveAccounts:
             if worker is not threading.current_thread():worker.join(timeout=3)
         if not any(t.is_alive() and t.name=="live-strategies" for t in self._threads):
             self.process_lock.release()
+        if self.adaptive_model is not None:
+            try:self.adaptive_model.close()
+            except Exception:pass
 
     def set_market_paused(self, paused):
         self._market_paused=bool(paused)
@@ -698,10 +715,16 @@ class ManagedLiveAccounts:
                      "twap":reference.get("latest",{}).get("price.crypto.twap",{}).get("price"),
                      "quotes":{k:{f:v.get(f) for f in ("best_bid","best_ask","source_ms","received_ms","source")} for k,v in quotes.items()},
                      "feed_health":self.feed.health_snapshot() if hasattr(self.feed,"health_snapshot") else None}
+        if self.adaptive_model is not None:
+            try:adaptive_model=self.adaptive_model.snapshot()
+            except Exception as exc:adaptive_model={"state":"UNAVAILABLE","error":f"{type(exc).__name__}: {str(exc)[:120]}"}
+        else:
+            adaptive_model={"state":"UNAVAILABLE","error":self.adaptive_model_error or "模型未初始化"}
         data.update(available=True,wallet=wallet,geo=geo,market_data=market_data,runtime_enabled=self.settings.live_trading_runtime_enabled,
                     running=any(t.is_alive() for t in self._threads),error=self._fault or self.last_error,
                     entry_block_reason=block,market_paused=self._market_paused,
-                    balance_scope="钱包余额和总资产由四个实盘策略共享；策略盈亏与持仓单独统计。",
+                    adaptive_model=adaptive_model,
+                    balance_scope="钱包余额和总资产由五个实盘策略共享；策略盈亏与持仓单独统计。",
                     off_policy="关闭开关只停止新开仓，已有实盘持仓继续管理退出。",
                     fee_note="策略盈亏依据官方已确认成交和官方市场费率计算；待领取收益不是现金余额。")
         return data

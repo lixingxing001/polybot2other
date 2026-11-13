@@ -72,7 +72,8 @@ class ManagedLiveTests(unittest.TestCase):
         self.root=Path(self.temp.name)
         self.settings=Settings(db_path=self.root/"paper.sqlite3",strategy_experiments_enabled=False,
             market_scout_enabled=False,llm_super_agent_enabled=False,managed_live_enabled=True,
-            managed_live_dir=self.root/"live",live_trading_runtime_enabled=True)
+            managed_live_dir=self.root/"live",strategy_experiments_db_dir=self.root/"experiments",
+            live_trading_runtime_enabled=True)
         now=time.time();start=int(now)//300*300
         self.market=MarketRound(f"btc-updown-5m-{start}","BTC",start,now+240,100,
                                condition_id="condition",up_token="up",down_token="down")
@@ -108,6 +109,56 @@ class ManagedLiveTests(unittest.TestCase):
         self.assertTrue(all(r["metrics"]["realized_pnl"]==0 for r in s["variants"]))
         self.assertNotIn("control_token",s)
         self.manager.tick();self.assertEqual(self.exchange.submitted,[])
+
+    def test_existing_live_config_migrates_adaptive_without_resetting_saved_rules(self):
+        path=self.root/"migration.sqlite3"
+        first=ManagedLiveStore(path)
+        old=first.config()
+        old["enabled"]=True
+        old["strategies"].pop("MAIN_ADAPTIVE",None)
+        old["strategies"]["MAIN_OPTIMIZED"].update(enabled=True,stake_dollars=3.5,max_open_trades=4)
+        with first.conn:
+            first.conn.execute("UPDATE live_config SET json=? WHERE id=1",(json.dumps(old),))
+        first.conn.close()
+        migrated=ManagedLiveStore(path);self.addCleanup(migrated.conn.close)
+        config=migrated.config()
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["strategies"]["MAIN_OPTIMIZED"]["stake_dollars"],3.5)
+        self.assertEqual(config["strategies"]["MAIN_OPTIMIZED"]["max_open_trades"],4)
+        self.assertIn("MAIN_ADAPTIVE",config["strategies"])
+        self.assertFalse(config["strategies"]["MAIN_ADAPTIVE"]["enabled"])
+
+    def test_adaptive_live_signal_blocks_when_model_is_unavailable(self):
+        from types import SimpleNamespace
+        from polybot2other.managed_live_signals import LiveSignals
+        self.manager.signals.evaluate=LiveSignals.evaluate.__get__(self.manager.signals,LiveSignals)
+        self.manager.signals.adaptive_model=None
+        self.manager.signals.adaptive_model_error="测试模型不可用"
+        reference={"ready":True,"protocol_verified":True,"latest":{}}
+        frame=SimpleNamespace(error=None,market=self.market,reference=reference,quotes={},observed_at=time.time())
+        signal,_=self.manager.signals.evaluate("MAIN_ADAPTIVE",self.store.config()["strategies"]["MAIN_ADAPTIVE"],
+                                                self.market,reference,{},time.time(),exchange_info(),market_input=frame)
+        self.assertEqual(signal.side,"NO_TRADE")
+        self.assertIn("自适应模型未就绪",signal.reason)
+
+    def test_adaptive_live_signal_injects_bounded_model_adjustment(self):
+        from types import SimpleNamespace
+        from polybot2other.managed_live_signals import LiveSignals
+        self.manager.signals.evaluate=LiveSignals.evaluate.__get__(self.manager.signals,LiveSignals)
+        model=Mock()
+        model.adjust_prediction.side_effect=lambda prediction,market,now:{**prediction,"up_score":.8}
+        self.manager.signals.adaptive_model=model
+        reference={"ready":True,"protocol_verified":True,"latest":{}}
+        frame=SimpleNamespace(error=None,market=self.market,reference=reference,quotes={},observed_at=time.time())
+        candidate=Signal("BTC","Up",.8,.5,10,"test")
+        def evaluate(context,market,reference,quotes,now):
+            prediction=context.adjust_prediction({"up_score":.6,"projected_final_twap":101.0},market,now)
+            return candidate,{"limit_price":.5,"adaptive_score":prediction["up_score"]}
+        with patch("polybot2other.managed_live_signals.OptimizedMainBot.evaluate",side_effect=evaluate):
+            signal,_=self.manager.signals.evaluate("MAIN_ADAPTIVE",self.store.config()["strategies"]["MAIN_ADAPTIVE"],
+                                                    self.market,reference,{},time.time(),exchange_info(),market_input=frame)
+        self.assertEqual(signal.side,"Up")
+        model.adjust_prediction.assert_called_once()
 
     def test_master_and_strategy_switches_both_required(self):
         self.manager.update_settings({"strategies":{"MAIN":{"enabled":True}}})

@@ -116,14 +116,11 @@ class LiveRiskView:
 
 
 class LiveSignals:
-    def __init__(self, settings, store, feed, cash, external_prices, adaptive_model=None):
+    def __init__(self, settings, store, feed, cash, external_prices, adaptive_model=None, adaptive_model_error=None):
         self.settings=settings;self.store=store;self.feed=feed;self.cash=cash;self.external_prices=external_prices
         self.views={key:LiveRiskView(store,key,cash) for key in ("MAIN","MAIN_OPTIMIZED","MAIN_ADAPTIVE","VALUE_CONFIRM_V1","MAIN_TP_SL")}
-        # The adaptive Paper strategy is intentionally outside the live-wallet
-        # strategy set.  Its model is injected by the isolated Paper executor;
-        # the live manager therefore keeps the original four strategies and
-        # cannot accidentally place or calibrate a live adaptive order.
         self.adaptive_model=adaptive_model
+        self.adaptive_model_error=adaptive_model_error
         self.last_features={}
         self.value_settings={"stake_dollars":2.0}
         self.value=ValueConfirmGuard(self.views["VALUE_CONFIRM_V1"],settings.paper_taker_fee_rate,
@@ -139,6 +136,9 @@ class LiveSignals:
         settings=replace(self.settings,stake_dollars=config["stake_dollars"],max_open_trades=config["max_open_trades"],
                          max_daily_loss=config["max_daily_loss"] or 1e100,paper_taker_fee_rate=info["fee_rate"])
         if strategy_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE"}:
+            if strategy_id == "MAIN_ADAPTIVE" and self.adaptive_model is None:
+                detail=self.adaptive_model_error or "模型文件不可用"
+                return blocked(f"主账户自适应成长版：自适应模型未就绪（{detail}）")
             adjust_prediction = None
             if strategy_id == "MAIN_ADAPTIVE" and self.adaptive_model is not None:
                 adjust_prediction = self.adaptive_model.adjust_prediction

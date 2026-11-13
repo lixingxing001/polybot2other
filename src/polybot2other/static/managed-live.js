@@ -1,6 +1,6 @@
 /* Real wallet and live execution controls; credentials never enter this UI. */
 (() => {
-  const names={MAIN:"主账户",MAIN_TP_SL:"主账户止盈止损",MAIN_OPTIMIZED:"主账户（优化版）",VALUE_CONFIRM_V1:"价值确认 V1"};
+  const names={MAIN:"主账户",MAIN_TP_SL:"主账户止盈止损",MAIN_OPTIMIZED:"主账户（优化版）",MAIN_ADAPTIVE:"主账户自适应成长版",VALUE_CONFIRM_V1:"价值确认 V1"};
   let previousMode=null,busy=false,token="",latest=null,acknowledged=null;
   let dataView="auto",runtimeMessage="";
   const el=id=>document.getElementById(id);
