@@ -6985,6 +6985,12 @@ class StrategyExperimentRunner:
                 store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
                 bot = OptimizedMainBot(variant_settings, store)
+            elif variant.variant_id == "MAIN_ADAPTIVE":
+                from .adaptive_main import AdaptiveMainBot
+                from .optimized_main import OptimizedTradeStore
+                store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
+                bot = AdaptiveMainBot(variant_settings, store)
             else:
                 store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 bot = PaperTradingBot(variant_settings, store)
@@ -7026,9 +7032,11 @@ class StrategyExperimentRunner:
             if variant.strategy_family in {STRATEGY_FAMILY_PAIR, STRATEGY_FAMILY_LLM_SUPER_AGENT}
             else settings.max_open_trades
         )
-        if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_TP_SL"}:
-            seed = self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance
-            return replace(settings, db_path=db_path, initial_balance=round(seed, 2),
+        if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_TP_SL"}:
+            initial_balance = 100.0 if variant.variant_id == "MAIN_ADAPTIVE" else (
+                self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance
+            )
+            return replace(settings, db_path=db_path, initial_balance=round(initial_balance, 2),
                            strategy_experiments_enabled=False, strategy_experiments_variants="",
                            live_trading_runtime_enabled=False, managed_live_enabled=False, market_scout_enabled=False, llm_super_agent_enabled=False)
         if variant.variant_id == VALUE_CONFIRM_VARIANT_ID:
@@ -7463,6 +7471,10 @@ class StrategyExperimentRunner:
         open_trades = self._variant_open_trades(bot, _variant_tags(variant))
         metrics = bot._metrics_with_open_marks(bot.store.metrics(), open_trades)
         trade_summary = bot.store.recent_trade_summary("BTC", start_at, end_at)
+        learning_snapshot = None
+        learning_snapshot_fn = getattr(bot, "learning_snapshot", None)
+        if variant.variant_id == "MAIN_ADAPTIVE" and callable(learning_snapshot_fn):
+            learning_snapshot = learning_snapshot_fn()
         return {
             "variant_id": variant.variant_id,
             "combo": variant.combo,
@@ -7486,6 +7498,7 @@ class StrategyExperimentRunner:
             "last_signal": dict(bot.last_signal or {}),
             "last_error": bot.last_error if getattr(bot, "independent_runtime", False) else last_error,
             "independent_runtime": bot.diagnostics() if getattr(bot, "independent_runtime", False) else None,
+            "adaptive_learning": learning_snapshot,
             "official_broadcast_error": official_broadcast_error,
             "loss_replay_path": str(bot._aggressive_edge_loss_replay.path)
             if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES

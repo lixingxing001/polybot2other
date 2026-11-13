@@ -6932,12 +6932,12 @@ class TradingCoreTest(unittest.TestCase):
             self.assertGreater(store.metrics()["realized_pnl"], 0)
 
     def test_strategy_variants_cover_current_independent_accounts(self) -> None:
-        self.assertEqual([v.variant_id for v in STRATEGY_VARIANTS], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"])
-        self.assertEqual([v.combo for v in active_strategy_variants()], ["主账户止盈止损", "主账户（优化版）", "价值确认 V1"])
+        self.assertEqual([v.variant_id for v in STRATEGY_VARIANTS], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"])
+        self.assertEqual([v.combo for v in active_strategy_variants()], ["主账户止盈止损", "主账户（优化版）", "主账户自适应成长版", "价值确认 V1"])
 
 
     def test_selected_strategy_variants_reject_retired_accounts(self) -> None:
-        self.assertEqual([v.variant_id for v in selected_strategy_variants("")], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"])
+        self.assertEqual([v.variant_id for v in selected_strategy_variants("")], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"])
         for retired in ("SINGLE_FAK", "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC", "PAIR_GTD"):
             with self.subTest(retired=retired), self.assertRaises(ValueError):
                 selected_strategy_variants(retired)
@@ -7398,7 +7398,12 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
-            self.assertEqual(set(variants), {"MAIN_TP_SL", "MAIN_OPTIMIZED", "VALUE_CONFIRM_V1"})
+            self.assertEqual(set(variants), {"MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"})
+            adaptive = variants["MAIN_ADAPTIVE"]
+            self.assertEqual(adaptive["adaptive_learning"]["seed_samples"], 0)
+            self.assertEqual(adaptive["adaptive_learning"]["adaptive_samples"], 0)
+            self.assertEqual(adaptive["metrics"]["cash_balance"], 100)
+            self.assertNotEqual(bot.store.db_path, bot.strategy_experiments._bots["MAIN_ADAPTIVE"].store.db_path)
             self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["open_trades"], 0)
             self.assertEqual(variants["VALUE_CONFIRM_V1"]["last_signal"]["side"], "NO_TRADE")
             self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["cash_balance"], 100)

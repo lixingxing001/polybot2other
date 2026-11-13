@@ -116,9 +116,15 @@ class LiveRiskView:
 
 
 class LiveSignals:
-    def __init__(self, settings, store, feed, cash, external_prices):
+    def __init__(self, settings, store, feed, cash, external_prices, adaptive_model=None):
         self.settings=settings;self.store=store;self.feed=feed;self.cash=cash;self.external_prices=external_prices
-        self.views={key:LiveRiskView(store,key,cash) for key in ("MAIN","MAIN_OPTIMIZED","VALUE_CONFIRM_V1","MAIN_TP_SL")}
+        self.views={key:LiveRiskView(store,key,cash) for key in ("MAIN","MAIN_OPTIMIZED","MAIN_ADAPTIVE","VALUE_CONFIRM_V1","MAIN_TP_SL")}
+        # The adaptive Paper strategy is intentionally outside the live-wallet
+        # strategy set.  Its model is injected by the isolated Paper executor;
+        # the live manager therefore keeps the original four strategies and
+        # cannot accidentally place or calibrate a live adaptive order.
+        self.adaptive_model=adaptive_model
+        self.last_features={}
         self.value_settings={"stake_dollars":2.0}
         self.value=ValueConfirmGuard(self.views["VALUE_CONFIRM_V1"],settings.paper_taker_fee_rate,
                                     budget_calculator=lambda account,daily:min(self.value_settings["stake_dollars"],account["cash_balance"]))
@@ -132,15 +138,23 @@ class LiveSignals:
         market,reference,quotes,now=frame.market,frame.reference,frame.quotes,frame.observed_at
         settings=replace(self.settings,stake_dollars=config["stake_dollars"],max_open_trades=config["max_open_trades"],
                          max_daily_loss=config["max_daily_loss"] or 1e100,paper_taker_fee_rate=info["fee_rate"])
-        if strategy_id=="MAIN_OPTIMIZED":
+        if strategy_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE"}:
+            adjust_prediction = None
+            if strategy_id == "MAIN_ADAPTIVE" and self.adaptive_model is not None:
+                adjust_prediction = self.adaptive_model.adjust_prediction
             context=SimpleNamespace(settings=replace(settings,paper_taker_fee_rate=0),references=self.feed.references,
-                                    paper_trading_paused=False,store=self.views[strategy_id])
+                                    paper_trading_paused=False,
+                                    store=self.views.get(strategy_id, self.views["MAIN_OPTIMIZED"]),
+                                    strategy_label=("主账户自适应成长版" if strategy_id == "MAIN_ADAPTIVE" else "主账户优化版"),
+                                    adjust_prediction=adjust_prediction or (lambda prediction, _market, _now: prediction))
             signal,features=OptimizedMainBot.evaluate(context,market,reference,quotes,now)
+            self.last_features=dict(features)
             limit=features.get("limit_price")
             if signal.side in ("Up","Down") and limit is not None:
                 edge=signal.confidence-limit-fee_amount(1,limit,info["fee_rate"],info["fee_exponent"])
                 if edge<max(.02,settings.min_edge):return blocked("按官方费用曲线计算后的模型优势不足")
-                signal=replace(signal,reason=f"主账户优化版：实时 TWAP 模型，官方费用后优势 {edge:.4f}")
+                label = "主账户自适应成长版" if strategy_id == "MAIN_ADAPTIVE" else "主账户优化版"
+                signal=replace(signal,reason=f"{label}：实时 TWAP 模型，官方费用后优势 {edge:.4f}")
             return signal,limit
         price=frame.price
         data=frame.strategy_input()

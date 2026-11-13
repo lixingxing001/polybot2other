@@ -428,24 +428,45 @@ class ManagedExchange:
         from .managed_live_recovery import expected_redemption
         funder=os.environ.get("POLYBOT2OTHER_LIVE_FUNDER_ADDRESS","").strip().lower()
         if not funder:raise ValueError("缺少钱包身份")
-        start=int(order["created_at"])-2;end=int(time.time());count=0;pages=0;offset=0;previous=None
+        start=int(order["created_at"])-2;end=int(time.time());count=0;pages=0;offset=0;cursor=None;previous=None;seen_cursors=set()
         settlements=0;burned=0.;settlement_rows=[];seen_redemptions={};activity_types={}
-        while offset<5000:
-            response=self.http.get(self.settings.data_api_url.rstrip('/')+'/activity',params={
-                "user":funder,"market":market.condition_id,"start":start,"end":end,"limit":100,"offset":offset,
-                "sortBy":"TIMESTAMP","sortDirection":"DESC"})
-            response.raise_for_status();rows=response.json();pages+=1
-            if not isinstance(rows,list):raise ValueError("钱包活动响应不完整")
+        while pages<50:
+            params={"user":funder,"condition":market.condition_id,"start":start,"end":end,"limit":100,
+                    "sort_by":"TIMESTAMP","sort_direction":"DESC"}
+            if cursor:params["cursor"]=cursor
+            elif pages and offset:params["offset"]=offset
+            response=self.http.get(self.settings.data_api_url.rstrip('/')+'/v2/activity',params=params)
+            response.raise_for_status();payload=response.json();pages+=1
+            legacy_page=isinstance(payload,list)
+            if legacy_page:
+                rows=payload;has_more=bool(rows);next_cursor=None
+            elif isinstance(payload,dict) and isinstance(payload.get("data"),list):
+                rows=payload["data"];pagination=payload.get("pagination")
+                if not isinstance(pagination,dict):raise ValueError("钱包活动分页响应不完整")
+                has_more=bool(pagination.get("has_more"));next_cursor=pagination.get("next_cursor")
+                if has_more and (not isinstance(next_cursor,str) or not next_cursor):
+                    raise ValueError("钱包活动分页游标缺失")
+            else:raise ValueError("钱包活动响应不完整")
             fingerprint=json.dumps(rows,sort_keys=True)
             if rows and fingerprint==previous:raise ValueError("钱包活动分页未前进")
             previous=fingerprint
-            for row in rows:
-                if (not isinstance(row,dict) or str(row.get("proxyWallet","")).lower()!=funder
+            normalized=[]
+            for raw_row in rows:
+                if not isinstance(raw_row,dict):raise ValueError("钱包活动记录格式无效")
+                row=dict(raw_row)
+                row.update(proxyWallet=raw_row.get("proxyWallet",raw_row.get("proxy_wallet")),
+                           conditionId=raw_row.get("conditionId",raw_row.get("condition_id")),
+                           asset=raw_row.get("asset",raw_row.get("token_id")),
+                           usdcSize=raw_row.get("usdcSize",raw_row.get("usdc_size")),
+                           transactionHash=raw_row.get("transactionHash",raw_row.get("transaction_hash")))
+                if (str(row.get("proxyWallet","")).lower()!=funder
                         or str(row.get("conditionId","")).lower()!=market.condition_id.lower()
                         or not isinstance(row.get("timestamp"),(int,float)) or isinstance(row.get("timestamp"),bool)
                         or not math.isfinite(row["timestamp"]) or not isinstance(row.get("type"),str) or not row["type"]
                         or (row.get("asset") is not None and not isinstance(row["asset"],str))):
                     raise ValueError("钱包活动身份或市场字段不匹配")
+                normalized.append(row)
+            for row in normalized:
                 if row["timestamp"]>=start and (not row.get("asset") or str(row["asset"])==order["token_id"]):
                     ident=(row.get("transactionHash"),row.get("asset"))
                     settlement={k:row.get(k) for k in ("type","timestamp","asset","size","usdcSize","transactionHash")}
@@ -463,7 +484,17 @@ class ManagedExchange:
                         "wallet_activity_complete":not rows,"wallet_activity_types":activity_types,
                         "wallet_settlement_count":settlements,"wallet_settlement_shares":round(burned,6),
                         "wallet_settlements":settlement_rows}
-            offset+=len(rows)
+            if not has_more:
+                return {"wallet_activity":"checked","wallet_activity_count":count,"wallet_activity_pages":pages,
+                        "wallet_activity_since":start,"wallet_activity_until":end,"wallet_activity_checked_at":time.time(),
+                        "wallet_activity_complete":True,"wallet_activity_types":activity_types,
+                        "wallet_settlement_count":settlements,"wallet_settlement_shares":round(burned,6),
+                        "wallet_settlements":settlement_rows}
+            if legacy_page:
+                offset+=len(rows)
+            else:
+                if next_cursor in seen_cursors:raise ValueError("钱包活动分页游标未前进")
+                seen_cursors.add(next_cursor);cursor=next_cursor
         raise ValueError("钱包活动分页尚未完成")
 
     def token_balance(self, token_id):

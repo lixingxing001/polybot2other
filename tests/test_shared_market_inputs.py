@@ -46,7 +46,7 @@ class SharedInputsTests(unittest.TestCase):
         self.feed.observation=observation
         self.manager.signals=LiveSignals(self.settings,self.store,self.feed,self.manager.available_cash,self.manager._external_prices)
         settings=replace(self.settings,strategy_experiments_enabled=experiments,
-                         strategy_experiments_variants='MAIN_OPTIMIZED,MAIN_TP_SL,VALUE_CONFIRM_V1',
+                         strategy_experiments_variants='MAIN_OPTIMIZED,MAIN_ADAPTIVE,MAIN_TP_SL,VALUE_CONFIRM_V1',
                          strategy_experiments_db_dir=self.root/'experiments')
         self.paper_store=TradeStore(self.root/'original-paper.sqlite3',100);self.addCleanup(self.paper_store.conn.close)
         with patch('polybot2other.managed_live.ManagedLiveAccounts',return_value=self.manager):
@@ -136,7 +136,7 @@ class SharedInputsTests(unittest.TestCase):
 
     def test_all_retained_experiments_borrow_feed_without_duplicate_collectors(self):
         self.aligned(experiments=True);runner=self.paper.strategy_experiments
-        self.assertEqual(set(runner._bots),{'MAIN_OPTIMIZED','MAIN_TP_SL','VALUE_CONFIRM_V1'})
+        self.assertEqual(set(runner._bots),{'MAIN_OPTIMIZED','MAIN_ADAPTIVE','MAIN_TP_SL','VALUE_CONFIRM_V1'})
         for bot in runner._bots.values():
             config=asdict(bot.settings);frame=bot._sync_shared_market_inputs()
             self.assertEqual(frame.snapshot_id,self.manager.market_input_snapshot().snapshot_id)

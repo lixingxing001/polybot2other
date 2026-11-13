@@ -30,6 +30,7 @@ SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V9_DIAGNOSTIC = "AGGRESSIVE_EDGE_V9_DIAGNOSTI
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V10_DIAGNOSTIC = "AGGRESSIVE_EDGE_V10_DIAGNOSTIC"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V11_DIAGNOSTIC = "AGGRESSIVE_EDGE_V11_DIAGNOSTIC"
 SIGNAL_FILTER_MODE_AGGRESSIVE_EDGE_V12_DIAGNOSTIC = "AGGRESSIVE_EDGE_V12_DIAGNOSTIC"
+SIGNAL_FILTER_MODE_MAIN_ADAPTIVE = "MAIN_ADAPTIVE"
 MARKET_DATA_MODE_BASE = "BASE"
 MARKET_DATA_MODE_MULTI_CONFIRM = "MULTI_CONFIRM"
 MARKET_DATA_MODE_MULTI_LEAD = "MULTI_LEAD"
@@ -63,6 +64,8 @@ class StrategyVariant:
             return "主账户止盈止损"
         if self.variant_id == "MAIN_OPTIMIZED":
             return "主账户（优化版）"
+        if self.variant_id == "MAIN_ADAPTIVE":
+            return "主账户自适应成长版"
         if self.variant_id == "VALUE_CONFIRM_V1":
             return "价值确认 V1"
         suffixes: list[str] = []
@@ -125,6 +128,9 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
     StrategyVariant("MAIN_OPTIMIZED", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
                     "已实现", "待前向验证", "独立 Paper：同源 TWAP、费用与波动约束",
                     signal_filter_mode="MAIN_OPTIMIZED"),
+    StrategyVariant("MAIN_ADAPTIVE", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
+                    "已实现", "待前向验证", "独立 Paper：以主账户（优化版）历史样本为种子，持续校准分数并成长",
+                    signal_filter_mode=SIGNAL_FILTER_MODE_MAIN_ADAPTIVE),
     StrategyVariant(VALUE_CONFIRM_VARIANT_ID, STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
                     "已实现", "待前向验证", "独立 Paper：价值价带、方向确认、限额风控",
                     single_entry_mode=SINGLE_ENTRY_MODE_STRICT,

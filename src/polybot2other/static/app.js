@@ -3864,6 +3864,23 @@ function experimentDetailHtml(detail) {
   const summary = variant.recent_trades_summary || {};
   const orderSummary = variant.order_summary || {};
   const review = variant.review_score || {};
+  const learning = variant.adaptive_learning || {};
+  const learningPanel = variant.variant_id === "MAIN_ADAPTIVE"
+    ? `<div class="experiment-learning-panel">
+        <h3>自适应学习状态</h3>
+        <div class="experiment-detail-metrics">
+          ${experimentMetric("模型状态", safe(learning.state || "WARMING"))}
+          ${experimentMetric("种子样本", fmtNumberCell(learning.seed_samples, 0))}
+          ${experimentMetric("新策略样本", fmtNumberCell(learning.adaptive_samples, 0))}
+          ${experimentMetric("总样本", fmtNumberCell(learning.total_samples, 0))}
+          ${experimentMetric("当前调整", learning.last_adjustment == null ? "基线" : `${Number(learning.last_adjustment) >= 0 ? "+" : ""}${(Number(learning.last_adjustment) * 100).toFixed(2)}%`)}
+          ${experimentMetric("当前状态", safe(learning.last_adaptive_state || "等待新信号"))}
+          ${experimentMetric("最小调整样本", fmtNumberCell(learning.min_adjustment_samples, 0))}
+          ${experimentMetric("单次最大调整", learning.max_adjustment == null ? "—" : `${(Number(learning.max_adjustment) * 100).toFixed(1)}%`)}
+        </div>
+        <p class="experiment-detail-empty">历史样本只用于小幅校准评分，余额、持仓和交易记录仍保持独立。</p>
+      </div>`
+    : "";
   return `
     <div class="experiment-detail">
       <div class="experiment-detail-metrics">
@@ -3876,6 +3893,7 @@ function experimentDetailHtml(detail) {
         ${experimentMetric("订单", `${fmtNumberCell(orderSummary.total_count, 0)} 总 · ${fmtNumberCell(orderSummary.active_count, 0)} 活跃`)}
       </div>
       <div class="experiment-score-reasons">${experimentScoreReasons(review)}</div>
+      ${learningPanel}
       <div class="experiment-detail-grid">
         <div class="experiment-detail-section">
           <h3>最近交易</h3>
@@ -3973,7 +3991,7 @@ function renderMarket(data = latestStatus) {
   const runtime = data?.runtime || {};
   const aligned = Boolean(runtime.market_input_alignment?.enabled);
   const market = aligned ? runtime.current_market : activeMarket || runtime.current_market;
-  const signal = ["MAIN_OPTIMIZED", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
+  const signal = ["MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
   const pair = runtime.pair_strategy || {};
   const lastPairEvent = pair.last_event || {};
   const up = aligned ? runtime.paper_quotes?.Up || {} : quotes.Up || runtime.latest_quotes?.Up || {};

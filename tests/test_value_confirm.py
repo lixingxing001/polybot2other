@@ -132,7 +132,7 @@ class ValueConfirmTests(unittest.TestCase):
         self.addCleanup(main_store.conn.close)
         main=PaperTradingBot(settings,main_store)
         runner=main.strategy_experiments
-        self.assertEqual(list(runner._bots),['MAIN_TP_SL','MAIN_OPTIMIZED','VALUE_CONFIRM_V1'])
+        self.assertEqual(list(runner._bots),['MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'])
         new=runner._bots['VALUE_CONFIRM_V1']
         self.addCleanup(new.store.conn.close)
         self.assertEqual(main.settings.stake_dollars,5)
@@ -224,7 +224,7 @@ class ValueConfirmTests(unittest.TestCase):
                 worker.join(3)
 
     def test_retired_accounts_cannot_be_selected(self):
-        self.assertEqual([x.variant_id for x in selected_strategy_variants('')],['MAIN_TP_SL','MAIN_OPTIMIZED','VALUE_CONFIRM_V1'])
+        self.assertEqual([x.variant_id for x in selected_strategy_variants('')],['MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'])
         with self.assertRaises(ValueError):
             selected_strategy_variants('SINGLE_FAK')
 

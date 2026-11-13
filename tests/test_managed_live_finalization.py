@@ -228,6 +228,33 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual(result["wallet_activity_count"],1);self.assertFalse(result["wallet_activity_complete"])
         self.assertEqual(get.call_args_list[1].kwargs["params"]["offset"],1)
 
+    def test_v2_activity_uses_condition_cursor_and_snake_case_fields(self):
+        e=ManagedExchange(self.settings);self.addCleanup(e.http.close)
+        funder="0x"+"a"*40;now=time.time();order={"created_at":now,"token_id":"up"}
+        page1=Mock();page1.json.return_value={"data":[
+            {"proxy_wallet":funder,"condition_id":self.market.condition_id,"timestamp":now,
+             "type":"TRADE","token_id":"other","transaction_hash":"0xother","size":1,"usdc_size":.5}
+        ],"pagination":{"has_more":True,"next_cursor":"cursor-1"}}
+        page2=Mock();page2.json.return_value={"data":[],"pagination":{"has_more":False,"next_cursor":None}}
+        with patch.dict("os.environ",{"POLYBOT2OTHER_LIVE_FUNDER_ADDRESS":funder}),patch.object(e.http,"get",side_effect=[page1,page2]) as get:
+            result=e.wallet_activity_evidence(order,self.market)
+        self.assertEqual(result["wallet_activity_count"],0);self.assertTrue(result["wallet_activity_complete"])
+        self.assertEqual(get.call_args_list[0].kwargs["params"]["condition"],self.market.condition_id)
+        self.assertNotIn("market",get.call_args_list[0].kwargs["params"])
+        self.assertEqual(get.call_args_list[1].kwargs["params"]["cursor"],"cursor-1")
+
+    def test_v2_activity_matching_trade_is_counted(self):
+        e=ManagedExchange(self.settings);self.addCleanup(e.http.close)
+        funder="0x"+"a"*40;now=time.time();order={"created_at":now,"token_id":"up"}
+        page=Mock();page.json.return_value={"data":[
+            {"proxy_wallet":funder,"condition_id":self.market.condition_id,"timestamp":now,
+             "type":"TRADE","token_id":"up","transaction_hash":"0xtrade","size":1,"usdc_size":.5}
+        ],"pagination":{"has_more":False,"next_cursor":None}}
+        with patch.dict("os.environ",{"POLYBOT2OTHER_LIVE_FUNDER_ADDRESS":funder}),patch.object(e.http,"get",return_value=page):
+            result=e.wallet_activity_evidence(order,self.market)
+        self.assertEqual(result["wallet_activity_count"],1)
+        self.assertFalse(result["wallet_activity_complete"])
+
     def test_activity_error_wrong_wallet_and_nonadvancing_pages_fail_closed(self):
         e=ManagedExchange(self.settings);self.addCleanup(e.http.close)
         funder="0x"+"a"*40;order={"created_at":time.time(),"token_id":"up"}

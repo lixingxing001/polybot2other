@@ -23,7 +23,8 @@ from .shared_market_inputs import quote_error
 VERSION = "realistic-paper-v1"
 ACTIVE_PHASES = ("IN_FLIGHT", "CONFIRMING")
 NAMES = {"MAIN": "主账户", "MAIN_TP_SL": "主账户止盈止损",
-         "MAIN_OPTIMIZED": "主账户（优化版）", "VALUE_CONFIRM_V1": "价值确认 V1"}
+         "MAIN_OPTIMIZED": "主账户（优化版）", "MAIN_ADAPTIVE": "主账户自适应成长版",
+         "VALUE_CONFIRM_V1": "价值确认 V1"}
 
 
 @dataclass(frozen=True)
@@ -168,8 +169,14 @@ class PaperExecution:
         self.store.paper_execution_ledger = self
         from .managed_live_signals import LiveSignals
         self.risk = PaperRiskView(self)
-        self.signals = LiveSignals(base_settings, self.risk, feed,
-                                   lambda: self.store.account()["cash_balance"], lambda: {})
+        self.signals = LiveSignals(
+            base_settings,
+            self.risk,
+            feed,
+            lambda: self.store.account()["cash_balance"],
+            lambda: {},
+            adaptive_model=getattr(bot, "adaptive_model", None),
+        )
         self.recover()
 
     def _create_schema(self):
@@ -236,6 +243,9 @@ class PaperExecution:
     def _record_signal(self, signal):
         with self.bot._lock:
             self.bot.last_signal = asdict(signal)
+            features = getattr(self.signals, "last_features", None)
+            if isinstance(features, dict):
+                self.bot.last_decision = dict(features)
 
     def _entry_block(self, market, side, rule):
         if self.pending():
@@ -596,9 +606,27 @@ class PaperExecutionService:
         self.engines = {}
         for key, bot in bots.items():
             if key not in NAMES: continue
+            def config_reader(strategy_id=key, strategy_bot=bot):
+                config = manager.store.config()
+                if strategy_id in config.get("strategies", {}):
+                    return config
+                # MAIN_ADAPTIVE is Paper-only.  Keep its amount and risk rules
+                # on the isolated strategy settings instead of adding a live
+                # wallet switch or a live-account row for it.
+                strategy_settings = strategy_bot.settings
+                strategies = dict(config.get("strategies", {}))
+                strategies[strategy_id] = {
+                    "enabled": True,
+                    "stake_dollars": strategy_settings.stake_dollars,
+                    "max_open_trades": strategy_settings.max_open_trades,
+                    "max_daily_loss": strategy_settings.max_daily_loss,
+                    "take_profit_pct": 20.0,
+                    "stop_loss_pct": 40.0,
+                }
+                return {**config, "strategies": strategies}
             engine = PaperExecution(bot, key, owner.settings, frame_reader=manager.market_input_snapshot,
                 info_reader=manager.exchange.market_info, book_reader=manager.exchange.rest_book,
-                config_reader=manager.store.config, feed=manager.feed, policy=policy)
+                config_reader=config_reader, feed=manager.feed, policy=policy)
             bot.paper_execution = engine
             self.engines[key] = engine
 

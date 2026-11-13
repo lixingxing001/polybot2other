@@ -181,6 +181,7 @@ def forecast_twap(references, market, current):
 
 class OptimizedMainBot(PaperTradingBot):
     independent_runtime = True
+    policy_version = POLICY_VERSION
 
     def __init__(self, settings, store):
         super().__init__(settings, store)
@@ -376,9 +377,10 @@ class OptimizedMainBot(PaperTradingBot):
     def evaluate(self, market, reference, quotes, now):
         features={"round_id":market.round_id,"target_price":market.target_price,
                   "time_left_seconds":market.ends_at-now,"reference":reference}
+        label=getattr(self,"strategy_label","主账户优化版")
         def block(code,message):
             features["code"]=code
-            return Signal("BTC","NO_TRADE",0,0,0,"主账户优化版 ["+code+"] "+message),features
+            return Signal("BTC","NO_TRADE",0,0,0,label+" ["+code+"] "+message),features
         if self.paper_trading_paused:
             return block("PAPER_PAUSED","模拟交易已暂停")
         if not reference.get("ready"):
@@ -393,6 +395,9 @@ class OptimizedMainBot(PaperTradingBot):
         prediction=forecast_twap(self.references,market,reference["latest"])
         if prediction is None:
             return block("WARMUP","等待足够连续的同源波动样本")
+        adjuster=getattr(self,"adjust_prediction",None)
+        if callable(adjuster):
+            prediction=adjuster(prediction,market,now)
         features.update(prediction)
         side="Up" if prediction["up_score"]>=.5 else "Down"
         score=prediction["up_score"] if side=="Up" else 1-prediction["up_score"]
@@ -439,21 +444,26 @@ class OptimizedMainBot(PaperTradingBot):
             return block("DEPTH","限价范围内深度不足")
         features.update(code="ALLOW",stake=stake)
         return Signal("BTC",side,round(score,6),ask,move,
-                      "主账户优化版 [ALLOW] 同源 TWAP，滚动波动分数 "+format(score,".3f")+
+                      label+" [ALLOW] 同源 TWAP，滚动波动分数 "+format(score,".3f")+
                       "，净费用优势 "+format(score-cost,".3f")),features
+
+    def adjust_prediction(self, prediction, market, now):
+        """Hook for isolated research variants; the optimized strategy is unchanged."""
+        return prediction
 
     def _entry_limit_price(self, signal):
         return min(self.settings.max_entry_price,signal.entry_price+.01)
 
     def _signal(self,code,message):
-        with self._lock:self.last_signal={"side":"NO_TRADE","reason":"主账户优化版 ["+code+"] "+message}
+        label=getattr(self,"strategy_label","主账户优化版")
+        with self._lock:self.last_signal={"side":"NO_TRADE","reason":label+" ["+code+"] "+message}
         key=("state",code)
         if key!=self._last_audit_key or time.time()-self._last_audit_at>=10:
             self._audit({"event":"state","code":code,"reason":message})
             self._last_audit_key=key;self._last_audit_at=time.time()
 
     def _audit(self,record):
-        row={"policy_version":POLICY_VERSION,"observed_at":time.time(),**record}
+        row={"policy_version":getattr(self,"policy_version",POLICY_VERSION),"observed_at":time.time(),**record}
         with self.journal.open("a",encoding="utf-8") as stream:
             stream.write(json.dumps(row,ensure_ascii=False,allow_nan=False)+"\n")
 
@@ -461,7 +471,7 @@ class OptimizedMainBot(PaperTradingBot):
         with self._lock:
             market=self.current_market
             quotes={side:{key:row.get(key) for key in ("best_bid","best_ask","source_ms","received_ms")} for side,row in self.paper_quotes.items()}
-        return {"policy_version":POLICY_VERSION,"running":bool(self._thread and self._thread.is_alive()),
+        return {"policy_version":getattr(self,"policy_version",POLICY_VERSION),"running":bool(self._thread and self._thread.is_alive()),
                 "market":market.round_id if market else None,"target_price":market.target_price if market else None,
                 "target_source":self.polymarket.market_details.get(market.round_id,{}) if market else {},
                 "reference":self.references.snapshot(),"last_decision":dict(self.last_decision),

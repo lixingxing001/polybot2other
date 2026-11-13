@@ -29,7 +29,7 @@ class PaperExecutionTests(unittest.TestCase):
         self.store.upsert_round(self.market)
         self.info = {'fee_rate':.07, 'fee_exponent':1, 'tick_size':'0.01', 'neg_risk':False}
         rule = {'enabled':False,'stake_dollars':3.,'max_open_trades':5,'max_daily_loss':21.,'take_profit_pct':20.,'stop_loss_pct':40.}
-        self.config = {'enabled':False,'revision':4,'strategies':{key:dict(rule) for key in ('MAIN','MAIN_OPTIMIZED','MAIN_TP_SL','VALUE_CONFIRM_V1')}}
+        self.config = {'enabled':False,'revision':4,'strategies':{key:dict(rule) for key in ('MAIN','MAIN_OPTIMIZED','MAIN_ADAPTIVE','MAIN_TP_SL','VALUE_CONFIRM_V1')}}
         self.quote_changes = {}; self.book_age = 0.; self.frame_error = None
         self.signal = Signal('BTC','Up',.8,.4,15.,'unchanged signal')
         self.settings = Settings(db_path=self.store.db_path,market_scout_enabled=False,llm_super_agent_enabled=False,live_trading_runtime_enabled=False)
@@ -277,7 +277,7 @@ class PaperExecutionWiringTests(unittest.TestCase):
             root=Path(directory)
             settings=Settings(db_path=root/'main.sqlite3',managed_live_enabled=True,paper_realistic_execution=True,
                 managed_live_dir=root/'live',strategy_experiments_enabled=True,
-                strategy_experiments_variants='MAIN_TP_SL,MAIN_OPTIMIZED,VALUE_CONFIRM_V1',
+                strategy_experiments_variants='MAIN_TP_SL,MAIN_OPTIMIZED,MAIN_ADAPTIVE,VALUE_CONFIRM_V1',
                 strategy_experiments_db_dir=root/'experiments',btc_runtime_settings_path=root/'btc.json',
                 market_scout_enabled=False,llm_super_agent_enabled=False,live_trading_runtime_enabled=False)
             store=TradeStore(settings.db_path,100);live=ManagedLiveStore(root/'live/accounts.sqlite3')
@@ -294,11 +294,12 @@ class PaperExecutionWiringTests(unittest.TestCase):
                 bot=PaperTradingBot(settings,store)
             try:
                 engines=bot.paper_execution_service.engines
-                self.assertEqual(set(engines),{'MAIN','MAIN_TP_SL','MAIN_OPTIMIZED','VALUE_CONFIRM_V1'})
+                self.assertEqual(set(engines),{'MAIN','MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'})
                 self.assertFalse(getattr(bot.strategy_experiments._bots['MAIN_TP_SL'],'independent_runtime',False))
                 for engine in engines.values():
                     self.assertIs(engine.bot.paper_execution,engine)
                     engine.decide();engine.poll()
+                    self.assertEqual(engine.snapshot()['strategy_id'],engine.strategy_id)
                     self.assertEqual(engine.store.account()['initial_balance'],100)
                 bot._run_strategy_from_state()
                 self.assertEqual(live.config(),before)
