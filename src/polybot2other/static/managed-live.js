@@ -1,6 +1,6 @@
 /* Real wallet and live execution controls; credentials never enter this UI. */
 (() => {
-  const names={MAIN:"主账户",MAIN_TP_SL:"主账户止盈止损",MAIN_OPTIMIZED:"主账户（优化版）",MAIN_ADAPTIVE:"主账户自适应成长版",VALUE_CONFIRM_V1:"价值确认 V1"};
+  const names={MAIN:"主账户",MAIN_OPTIMIZED:"主账户（优化版）",MAIN_ADAPTIVE:"主账户自适应成长版",MAIN_OPTIMIZED_FAST:"主账户（优化极速赚钱版）",MAIN_OPTIMIZED_PLUS:"主账户（优化进阶版）"};
   let previousMode=null,busy=false,token="",latest=null,acknowledged=null;
   let dataView="auto",runtimeMessage="";
   const el=id=>document.getElementById(id);
@@ -66,17 +66,30 @@
       el("managed-live-message").textContent="设置已保存。单笔预算用于后续新开仓，原有持仓份额保持不变。";renderAll(latestStatus,{force:true,forceChart:true});
     }catch(error){el("managed-live-message").textContent=error.message;}finally{busy=false;if(latestStatus)render(latestStatus);}
   }
+  async function resetLossLimit(id){
+    if(busy)return;busy=true;controls(latestStatus);
+    el("managed-live-message").textContent="正在重置亏损限额…";
+    try{const d=await post("/api/managed-live/reset-loss-limit",{strategy_id:id});acknowledged=d;latestStatus.runtime.managed_live=d;
+      const row=(d.variants||[]).find(r=>r.variant_id===id);
+      el("managed-live-message").textContent=`${names[id]}已重置：实盘亏损从 ${at(row.loss_limit.reset_at)} 重新统计，限额为 ${amount(row.settings.max_daily_loss)}。`;
+      renderAll(latestStatus,{force:true,forceChart:true});
+    }catch(error){el("managed-live-message").textContent=error.message;}finally{busy=false;if(latestStatus)render(latestStatus);}
+  }
   function controls(data){
     const container=el("managed-strategy-controls");
     if(!container.children.length)container.innerHTML=Object.entries(names).map(([id,name])=>`<div class="managed-strategy-card" data-live-card="${id}">
       <div class="managed-strategy-title"><strong>${esc(name)}</strong><label class="managed-small-switch"><input type="checkbox" data-live-toggle="${id}" aria-label="${esc(name)}实盘开关"><span>允许实盘开仓</span></label></div>
       <div class="managed-inputs"><label>每笔金额（Paper / 实盘共用，含费）<div><span>$</span><input type="number" min="0.1" step="0.1" data-setting="stake_dollars" aria-label="${esc(name)}每笔金额"></div></label><button type="button" data-live-save="${id}">保存</button></div>
       <details><summary>风险设置（Paper / 实盘共用）</summary><label>最多持仓（含待确认）<input type="number" min="1" max="10" step="1" data-setting="max_open_trades" aria-label="${esc(name)}最多持仓"></label><label>24 小时亏损限额（$）<input type="number" min="0" step="1" data-setting="max_daily_loss" aria-label="${esc(name)}每日亏损限额"></label>
-      ${id==="MAIN_TP_SL"?'<label>净盈利止盈（%）<input type="number" min="1" max="1000" step="1" data-setting="take_profit_pct" aria-label="实盘止盈百分比"></label><label>净亏损止损（%）<input type="number" min="1" max="99" step="1" data-setting="stop_loss_pct" aria-label="实盘止损百分比"></label><small>止盈止损参数也用于当前已有实盘持仓。</small>':''}</details><small class="managed-card-state"></small></div>`).join("");
+      <button type="button" data-live-reset-loss="${id}" aria-label="${esc(name)}重置亏损限额" title="按已保存的限额，从现在重新统计本策略实盘亏损；历史盈亏和持仓保留。">重置亏损限额</button><small class="managed-loss-reset-note" data-live-loss-reset-note></small>
+      </details><small class="managed-card-state"></small></div>`).join("");
     const root=state(data);
     for(const [id,c] of Object.entries(root.settings?.strategies||{})){const card=container.querySelector(`[data-live-card="${id}"]`);if(!card)continue;
       const toggle=card.querySelector("input[data-live-toggle]");toggle.checked=c.enabled;toggle.disabled=busy;card.classList.toggle("is-live",root.enabled&&c.enabled);
-      card.querySelectorAll("input[data-setting]").forEach(input=>{if(document.activeElement!==input&&!input.dataset.dirty)input.value=c[input.dataset.setting];});card.querySelector("button").disabled=busy;
+      card.querySelectorAll("input[data-setting]").forEach(input=>{if(document.activeElement!==input&&!input.dataset.dirty)input.value=c[input.dataset.setting];});card.querySelectorAll("button").forEach(button=>{button.disabled=busy;});
+      const reset=(root.variants||[]).find(r=>r.variant_id===id)?.loss_limit;
+      const resetButton=card.querySelector("[data-live-reset-loss]");resetButton.disabled=busy||!reset;
+      card.querySelector("[data-live-loss-reset-note]").textContent=!reset?"等待服务支持重置":reset.reset_at?`上次重置：${at(reset.reset_at)} · 仅本策略实盘`:"从点击时重新统计实盘亏损，保留历史盈亏及持仓风险。";
       const execution=(root.variants||[]).find(r=>r.variant_id===id)?.execution,caption=card.querySelector(".managed-card-state");
       caption.textContent=execution?`${execution.label} · ${execution.reason}`:root.enabled&&c.enabled?"正在读取开仓状态":c.enabled?"等待实盘总开关开启":"新开仓关闭";caption.dataset.state=execution?.state||"off";}
   }
@@ -94,7 +107,7 @@
       if(container.children[index]!==box)container.insertBefore(box,container.children[index]||null);
       renderExecutionCard(data,r,box);
     });
-    const events=(state(data).events||[]).filter(e=>/^(reconcile_|entry_|engine_)/.test(e.kind));
+    const events=(state(data).events||[]).filter(e=>/^(reconcile_|entry_|engine_|loss_limit_reset$)/.test(e.kind));
     el("managed-execution-events").innerHTML=events.length?events.map(e=>`<li><time>${at(e.at)}</time><span>${esc(e.message.replace(/0x[a-fA-F0-9]{64}/g,id=>id.slice(0,12)+"…"))}</span></li>`).join(""):'<li>暂无暂停或恢复记录</li>';
   }
   function renderExecutionCard(data,r,box){
@@ -240,6 +253,7 @@
   });
   document.addEventListener("click",async e=>{
     const save=e.target.closest("[data-live-save]");if(save){try{update({strategies:{[save.dataset.liveSave]:cardValues(save.dataset.liveSave)}});}catch(error){el("managed-live-message").textContent=error.message;}}
+    const reset=e.target.closest("[data-live-reset-loss]");if(reset){await resetLossLimit(reset.dataset.liveResetLoss);return;}
     const select=e.target.closest("[data-live-select]");if(select){ids.accountScopeSelect.value=select.dataset.liveSelect==="MAIN"?"main":"experiment:"+select.dataset.liveSelect;ids.accountScopeSelect.dispatchEvent(new Event("change",{bubbles:true}));}
     const sell=e.target.closest("[data-live-sell]");if(sell){sell.disabled=true;try{await post("/api/managed-live/sell",{strategy_id:sell.dataset.liveOwner,position_id:Number(sell.dataset.liveSell)});el("managed-live-message").textContent="卖出请求已处理，请以官方确认后的成交为准。";}catch(error){el("managed-live-message").textContent=error.message;}finally{sell.disabled=false;}}
   });

@@ -16,8 +16,10 @@ from .managed_live_recovery import (FINALIZE_MIN_CHECKS, FINALIZE_MIN_SPAN_SECON
                                    finalization_evidence, direct_order_evidence)
 
 STRATEGIES = {"MAIN": "主账户", "MAIN_OPTIMIZED": "主账户（优化版）",
-              "MAIN_ADAPTIVE": "主账户自适应成长版", "VALUE_CONFIRM_V1": "价值确认 V1",
-              "MAIN_TP_SL": "主账户止盈止损"}
+              "MAIN_ADAPTIVE": "主账户自适应成长版", "MAIN_OPTIMIZED_FAST": "主账户（优化极速赚钱版）",
+              "MAIN_OPTIMIZED_PLUS": "主账户（优化进阶版）"}
+RETIRED_STRATEGIES = {"VALUE_CONFIRM_V1": "价值确认 V1", "MAIN_TP_SL": "主账户止盈止损"}
+STRATEGY_LABELS = {**STRATEGIES, **RETIRED_STRATEGIES}
 ACTIVE_ORDER_STATES = ("PREPARED", "SUBMITTING", "PENDING", "UNKNOWN", "QUARANTINED")
 
 
@@ -25,7 +27,7 @@ def defaults():
     return {"enabled": False, "manage_existing_when_off": True, "revision": 0,
             "strategies": {key: {"enabled": False, "stake_dollars": 2.0 if key == "VALUE_CONFIRM_V1" else 5.0,
                                 "max_open_trades": 1 if key == "VALUE_CONFIRM_V1" else 2,
-                                "max_daily_loss": 6.0 if key == "VALUE_CONFIRM_V1" else 21.0,
+                                "max_daily_loss": 6.0 if key == "VALUE_CONFIRM_V1" else 30.0 if key == "MAIN_OPTIMIZED_PLUS" else 21.0,
                                 "take_profit_pct": 20.0, "stop_loss_pct": 40.0}
                            for key in STRATEGIES}}
 
@@ -49,6 +51,8 @@ class ManagedLiveStore:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript("""
           CREATE TABLE IF NOT EXISTS live_config(id INTEGER PRIMARY KEY CHECK(id=1),json TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS loss_limit_resets(
+            strategy_id TEXT PRIMARY KEY,reset_at REAL NOT NULL,position_pnl_json TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS wallet_identity(id INTEGER PRIMARY KEY CHECK(id=1),identity TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS rounds(round_id TEXT PRIMARY KEY,json TEXT NOT NULL,ends_at REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS positions(
@@ -86,7 +90,7 @@ class ManagedLiveStore:
         for name,kind in {"ack_id":"TEXT","quarantined_at":"REAL","verification_at":"REAL",
                           "verification_json":"TEXT","submission_json":"TEXT","closure_checks":"INTEGER NOT NULL DEFAULT 0",
                           "closure_since":"REAL","closure_checked_at":"REAL","finalized_at":"REAL","finalization_json":"TEXT",
-                          "audit_recovery_json":"TEXT"}.items():
+                          "audit_recovery_json":"TEXT","adaptive_decision_json":"TEXT","fast_decision_json":"TEXT","plus_decision_json":"TEXT"}.items():
             if name not in columns:self.conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {kind}")
         with self.conn:
             self.conn.execute("INSERT OR IGNORE INTO live_config VALUES(1,?)", (json.dumps(defaults()),))
@@ -111,11 +115,17 @@ class ManagedLiveStore:
                 stored = {}
             base = defaults()
             if isinstance(stored, dict):
+                retired = stored.get("retired_strategies", {})
+                base["retired_strategies"] = dict(retired) if isinstance(retired, dict) else {}
                 for field in ("enabled", "manage_existing_when_off", "revision"):
                     if field in stored:
                         base[field] = stored[field]
                 old_strategies = stored.get("strategies")
                 if isinstance(old_strategies, dict):
+                    for key in RETIRED_STRATEGIES:
+                        values = old_strategies.get(key)
+                        if isinstance(values, dict):
+                            base["retired_strategies"][key] = {**values, "enabled": False}
                     for key in STRATEGIES:
                         values = old_strategies.get(key)
                         if isinstance(values, dict):
@@ -136,6 +146,13 @@ class ManagedLiveStore:
     def config(self):
         with self.lock:
             return json.loads(self.conn.execute("SELECT json FROM live_config WHERE id=1").fetchone()[0])
+
+    def exit_rules(self, strategy_id):
+        """Keep managing historical positions without allowing retired entries."""
+        config = self.config()
+        return (config["strategies"].get(strategy_id)
+                or config.get("retired_strategies", {}).get(strategy_id)
+                or {"enabled": False, "take_profit_pct": 20.0, "stop_loss_pct": 40.0})
 
     def update_config(self, payload):
         with self.lock:
@@ -194,11 +211,14 @@ class ManagedLiveStore:
             return json.loads(row[0]) if row else None
 
     def prepare_order(self, external_id, strategy_id, market, token_id, outcome, action,
-                      limit_price, cash=0, shares=0, position_id=None, reason="", now=None):
+                      limit_price, cash=0, shares=0, position_id=None, reason="", now=None, adaptive_decision=None,
+                      fast_decision=None, plus_decision=None):
         now = time.time() if now is None else now
         with self.lock, self.conn:
-            if strategy_id not in STRATEGIES or action not in ("BUY", "SELL"):
+            if strategy_id not in STRATEGY_LABELS or action not in ("BUY", "SELL"):
                 raise ValueError("未知策略或订单方向")
+            if action == "BUY" and strategy_id not in STRATEGIES:
+                raise ValueError("该策略已移除，禁止新开仓")
             if not external_id or now >= market.ends_at:
                 raise ValueError("缺少订单哈希或市场已结束")
             if self.active_orders(strategy_id, market.round_id):
@@ -209,12 +229,53 @@ class ManagedLiveStore:
                 p = self.position(position_id)
                 if not p or p["strategy_id"] != strategy_id or p["token_id"] != token_id or not 0 < shares <= p["remaining_shares"]+.000001:
                     raise ValueError("卖出份额不属于当前策略")
+            if action == "BUY" and strategy_id == "MAIN_ADAPTIVE" and self.has_entry(strategy_id, market.round_id):
+                raise ValueError("成长版本期已有成交，禁止同一期反手或重复开仓")
+            if action == "BUY" and strategy_id == "MAIN_OPTIMIZED_FAST" and self.has_entry(strategy_id, market.round_id):
+                raise ValueError("极速版本期已有成交，禁止同一期反手或重复开仓")
+            if action == "BUY" and strategy_id == "MAIN_OPTIMIZED_PLUS" and self.has_entry(strategy_id, market.round_id):
+                raise ValueError("进阶版本期已有成交，禁止同一期反手或重复开仓")
+            adaptive_json = None
+            if adaptive_decision is not None:
+                if strategy_id != "MAIN_ADAPTIVE" or action != "BUY":
+                    raise ValueError("自适应决策只能绑定成长版买入订单")
+                from .adaptive_main import compact_adaptive_decision
+                evidence = compact_adaptive_decision(adaptive_decision, mode="live")
+                if evidence.get("round_id") != market.round_id or evidence.get("candidate_side") != outcome:
+                    raise ValueError("自适应决策与订单市场或方向不一致")
+                adaptive_json = json.dumps(evidence, ensure_ascii=False, allow_nan=False)
+            fast_json = None
+            if strategy_id == "MAIN_OPTIMIZED_FAST" and action == "BUY" and fast_decision is None:
+                raise ValueError("极速版买入缺少最终入场决策快照")
+            if fast_decision is not None:
+                if strategy_id != "MAIN_OPTIMIZED_FAST" or action != "BUY":
+                    raise ValueError("极速版决策只能绑定极速版买入订单")
+                from .optimized_fast import compact_fast_decision
+                evidence = compact_fast_decision(fast_decision, mode="live")
+                if evidence.get("round_id") != market.round_id or evidence.get("candidate_side") != outcome:
+                    raise ValueError("极速版决策与订单市场或方向不一致")
+                if not evidence.get("fast_allowed"):
+                    raise ValueError("极速版决策未通过最终入场检查")
+                fast_json = json.dumps(evidence, ensure_ascii=False, allow_nan=False)
+            plus_json = None
+            if strategy_id == "MAIN_OPTIMIZED_PLUS" and action == "BUY" and plus_decision is None:
+                raise ValueError("进阶版买入缺少最终入场决策快照")
+            if plus_decision is not None:
+                if strategy_id != "MAIN_OPTIMIZED_PLUS" or action != "BUY":
+                    raise ValueError("进阶版决策只能绑定进阶版买入订单")
+                from .optimized_plus import compact_plus_decision
+                evidence = compact_plus_decision(plus_decision, mode="live")
+                if evidence.get("round_id") != market.round_id or evidence.get("candidate_side") != outcome:
+                    raise ValueError("进阶版决策与订单市场或方向不一致")
+                if not evidence.get("plus_allowed"):
+                    raise ValueError("进阶版决策未通过最终入场检查")
+                plus_json = json.dumps(evidence, ensure_ascii=False, allow_nan=False)
             ident = uuid.uuid4().hex
             self.conn.execute("""INSERT INTO orders(id,external_id,strategy_id,round_id,token_id,outcome,action,
-                position_id,requested_cash,requested_shares,limit_price,state,created_at,updated_at,reason)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,'PREPARED',?,?,?)""",
+                position_id,requested_cash,requested_shares,limit_price,state,created_at,updated_at,reason,adaptive_decision_json,fast_decision_json,plus_decision_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,'PREPARED',?,?,?,?,?,?)""",
                 (ident, external_id, strategy_id, market.round_id, token_id, outcome, action,
-                 position_id, cash, shares, limit_price, now, now, reason))
+                 position_id, cash, shares, limit_price, now, now, reason, adaptive_json,fast_json,plus_json))
             return self.order(ident)
 
     def order(self, ident):
@@ -459,11 +520,37 @@ class ManagedLiveStore:
             if side:sql+=" AND outcome=?";args.append(side)
             return self.conn.execute(sql,args).fetchone() is not None
 
-    def daily_pnl(self, strategy_id, now=None):
+    def reset_loss_limit(self, strategy_id, now=None):
+        if not isinstance(strategy_id,str) or strategy_id not in STRATEGIES:
+            raise ValueError("未知实盘策略")
+        with self.lock,self.conn:
+            now=time.time() if now is None else now
+            # Keep each realized baseline, including partial exits. A later close
+            # must not bring pre-reset profit/loss back into the risk window.
+            baseline={str(p["id"]):p["realized_pnl"] for p in self.positions(strategy_id) if p["realized_pnl"]}
+            self.conn.execute("INSERT OR REPLACE INTO loss_limit_resets VALUES(?,?,?)",
+                              (strategy_id,now,json.dumps(baseline)))
+            config=self.config();config["revision"]+=1
+            self.conn.execute("UPDATE live_config SET json=? WHERE id=1",(json.dumps(config),))
+            self.conn.execute("INSERT INTO events(at,kind,message) VALUES(?,?,?)",
+                              (now,"loss_limit_reset",f"{STRATEGIES[strategy_id]} 已重置实盘亏损限额，从此刻重新统计；历史盈亏和持仓保留"))
+        return self.loss_limit_status(strategy_id,now)
+
+    def loss_limit_status(self, strategy_id, now=None):
         now=time.time() if now is None else now
         with self.lock:
-            # Conservative on partially exited positions: count their realized loss too.
-            return sum(p["realized_pnl"] for p in self.positions(strategy_id) if (p["closed_at"] or now)>=now-86400)
+            reset=self.conn.execute("SELECT * FROM loss_limit_resets WHERE strategy_id=?",(strategy_id,)).fetchone()
+            reset_at=reset["reset_at"] if reset else None
+            baseline=json.loads(reset["position_pnl_json"]) if reset else {}
+            start=max(now-86400,reset_at) if reset_at is not None else now-86400
+            # Preserve the existing conservative treatment of partial exits,
+            # counting only changes after the manual reset when one exists.
+            realized=sum(p["realized_pnl"]-baseline.get(str(p["id"]),0) for p in self.positions(strategy_id)
+                         if (p["closed_at"] if p["closed_at"] is not None else now)>=start)
+            return {"reset_at":reset_at,"window_start":start,"realized_pnl":round(realized,6)}
+
+    def daily_pnl(self, strategy_id, now=None):
+        return self.loss_limit_status(strategy_id,now)["realized_pnl"]
 
     def record_wallet(self, balance, total_equity, now=None):
         with self.lock,self.conn:
@@ -573,6 +660,7 @@ class ManagedLiveStore:
                 orders.extend(o for o in self.active_orders(key) if o["id"] not in known)
                 variants.append({"variant_id":key,"combo":label,"settings":config["strategies"][key],
                     "risk":self.risk_usage(key),
+                    "loss_limit":self.loss_limit_status(key,now),
                     "metrics":{"realized_pnl":realized,"unrealized_pnl":round(unrealized,6) if complete else None,
                     "total_pnl":round(realized+unrealized,6) if complete else None,"position_value":round(value,6) if complete else None,
                     "valuation":valuation,
@@ -581,7 +669,7 @@ class ManagedLiveStore:
                     "max_drawdown":round(drawdown,6),"claim_due":round(sum(p["claim_due"] for p in positions),6),
                     "reserved_cash":round(sum(o["requested_cash"] for o in self.active_orders(key) if o["action"]=="BUY"),6)},
                     "open_trades":open_rows,"recent_trades":list(reversed(positions[-50:])),"orders":orders})
-            return {"enabled":config["enabled"],"settings":config,"variants":variants,"wallet_curve":history['rows'],
+            return {"enabled":config["enabled"],"settings":{k:v for k,v in config.items() if k!="retired_strategies"},"variants":variants,"wallet_curve":history['rows'],
                     "wallet_curve_meta":history['meta'],
                     "quarantined_orders":[o for o in self.active_orders() if o["state"]=="QUARANTINED"],
                     "events":[dict(r) for r in self.conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 10")]}

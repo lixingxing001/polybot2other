@@ -45,6 +45,8 @@
 .managed-strategy-card details { font-size: 12px; color: var(--muted); }
 .managed-strategy-card details > label { display: block; margin: 10px 0; }
 .managed-strategy-card details input { margin-top: 5px; }
+.managed-strategy-card [data-live-reset-loss] { padding: 7px 10px; font-size: 12px; }
+.managed-loss-reset-note { display: block; margin-top: 8px; line-height: 1.6; }
 .managed-card-state { display: block; margin-top: 12px; color: var(--muted); font-size: 11px; }
 .managed-strategy-card.is-live .managed-card-state { color: var(--amber); }
 .managed-live-message { min-height: 18px; font-size: 12px; color: var(--amber); line-height: 1.6; margin: 12px 0 0; }
@@ -2917,6 +2919,151 @@ button.danger-button:hover:not(:disabled) {
 .experiment-detail-metrics b {
   color: var(--muted);
   font-weight: 600;
+}
+
+.experiment-learning-panel {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: min(100%, calc(100vw - 80px));
+  max-width: 1120px;
+  overflow-wrap: anywhere;
+}
+
+.experiment-learning-panel .experiment-detail-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+}
+
+.experiment-learning-panel .experiment-detail-metrics > span {
+  min-width: 0;
+}
+
+.experiment-learning-v3 .adaptive-v3-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.experiment-learning-v3 .adaptive-v3-heading h3 {
+  margin: 0;
+}
+
+.experiment-learning-v3 .adaptive-v3-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.experiment-learning-v3 .adaptive-v3-status::before {
+  content: "";
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e6b867;
+}
+
+.experiment-learning-v3 .adaptive-v3-status.is-active::before {
+  background: #57c995;
+}
+
+.experiment-learning-v3 .adaptive-v3-comparison,
+.experiment-learning-v3 .adaptive-v3-features {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.experiment-learning-v3 h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.experiment-fast-panel {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: min(100%, calc(100vw - 80px));
+  max-width: 1120px;
+  overflow-wrap: anywhere;
+}
+
+.experiment-fast-panel .experiment-detail-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.experiment-fast-panel .experiment-detail-metrics > span {
+  min-width: 0;
+}
+
+.experiment-plus-panel {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: min(100%, calc(100vw - 80px));
+  max-width: 1120px;
+  overflow-wrap: anywhere;
+}
+
+.experiment-plus-panel .experiment-detail-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+}
+
+.experiment-plus-panel .experiment-detail-metrics > span {
+  min-width: 0;
+}
+
+.optimized-plus-comparison {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.optimized-plus-comparison h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.optimized-plus-comparison-table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.optimized-plus-comparison-table th,
+.optimized-plus-comparison-table td {
+  padding: 9px 10px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.optimized-plus-comparison-table th:first-child {
+  width: 40%;
+  text-align: left;
+}
+
+.optimized-plus-comparison-table tbody th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.experiment-plus-panel .optimized-plus-comparison-table thead th {
+  position: static;
 }
 
 .experiment-score-reasons {

@@ -136,17 +136,17 @@ class SharedInputsTests(unittest.TestCase):
 
     def test_all_retained_experiments_borrow_feed_without_duplicate_collectors(self):
         self.aligned(experiments=True);runner=self.paper.strategy_experiments
-        self.assertEqual(set(runner._bots),{'MAIN_OPTIMIZED','MAIN_ADAPTIVE','MAIN_TP_SL','VALUE_CONFIRM_V1'})
+        self.assertEqual(set(runner._bots),{'MAIN_OPTIMIZED','MAIN_ADAPTIVE'})
         for bot in runner._bots.values():
             config=asdict(bot.settings);frame=bot._sync_shared_market_inputs()
             self.assertEqual(frame.snapshot_id,self.manager.market_input_snapshot().snapshot_id)
             self.assertIs(bot.polymarket,self.feed.polymarket);self.assertEqual(asdict(bot.settings),config)
-        optimized=runner._bots['MAIN_OPTIMIZED'];exit_bot=runner._bots['MAIN_TP_SL']
+        optimized=runner._bots['MAIN_OPTIMIZED'];adaptive=runner._bots['MAIN_ADAPTIVE']
         self.assertIs(optimized.references,self.feed.references)
         with patch('threading.Thread') as thread:
             optimized._start_workers();self.assertEqual(thread.call_count,1)
             self.assertIsNone(optimized._reference_thread);self.assertIsNone(optimized._book_thread)
-            thread.reset_mock();exit_bot._start_workers();self.assertEqual(thread.call_count,2);self.assertIsNone(exit_bot._book_thread)
+            thread.reset_mock();adaptive._start_workers();self.assertEqual(thread.call_count,1);self.assertIsNone(adaptive._book_thread)
         with patch.object(optimized.reference_feed,'close') as close:
             optimized.request_pause();close.assert_not_called()
         self.feed.references.reset_connection.assert_not_called()

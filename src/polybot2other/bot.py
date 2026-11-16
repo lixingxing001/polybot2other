@@ -6991,6 +6991,18 @@ class StrategyExperimentRunner:
                 store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
                 bot = AdaptiveMainBot(variant_settings, store)
+            elif variant.variant_id == "MAIN_OPTIMIZED_FAST":
+                from .optimized_fast import FastMainBot
+                from .optimized_main import OptimizedTradeStore
+                store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
+                bot = FastMainBot(variant_settings, store)
+            elif variant.variant_id == "MAIN_OPTIMIZED_PLUS":
+                from .optimized_plus import PlusMainBot
+                from .optimized_main import OptimizedTradeStore
+                store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
+                bot = PlusMainBot(variant_settings, store)
             else:
                 store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 bot = PaperTradingBot(variant_settings, store)
@@ -7032,8 +7044,8 @@ class StrategyExperimentRunner:
             if variant.strategy_family in {STRATEGY_FAMILY_PAIR, STRATEGY_FAMILY_LLM_SUPER_AGENT}
             else settings.max_open_trades
         )
-        if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_TP_SL"}:
-            initial_balance = 100.0 if variant.variant_id == "MAIN_ADAPTIVE" else (
+        if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS", "MAIN_TP_SL"}:
+            initial_balance = 100.0 if variant.variant_id in {"MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"} else (
                 self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance
             )
             return replace(settings, db_path=db_path, initial_balance=round(initial_balance, 2),
@@ -7499,6 +7511,8 @@ class StrategyExperimentRunner:
             "last_error": bot.last_error if getattr(bot, "independent_runtime", False) else last_error,
             "independent_runtime": bot.diagnostics() if getattr(bot, "independent_runtime", False) else None,
             "adaptive_learning": learning_snapshot,
+            "fast_policy": bot.fast_policy_snapshot() if variant.variant_id == "MAIN_OPTIMIZED_FAST" else None,
+            "plus_policy": bot.plus_policy_snapshot() if variant.variant_id == "MAIN_OPTIMIZED_PLUS" else None,
             "official_broadcast_error": official_broadcast_error,
             "loss_replay_path": str(bot._aggressive_edge_loss_replay.path)
             if variant.signal_filter_mode in AGGRESSIVE_EDGE_FILTER_MODES

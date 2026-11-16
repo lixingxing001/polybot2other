@@ -270,7 +270,7 @@ class PaperExecutionTests(unittest.TestCase):
 
 
 class PaperExecutionWiringTests(unittest.TestCase):
-    def test_all_four_real_bots_share_saved_rules_and_cannot_call_private_exchange(self):
+    def test_all_three_real_bots_share_saved_rules_and_cannot_call_private_exchange(self):
         from polybot2other.bot import PaperTradingBot
         from polybot2other.managed_live_store import ManagedLiveStore
         with tempfile.TemporaryDirectory() as directory:
@@ -294,8 +294,7 @@ class PaperExecutionWiringTests(unittest.TestCase):
                 bot=PaperTradingBot(settings,store)
             try:
                 engines=bot.paper_execution_service.engines
-                self.assertEqual(set(engines),{'MAIN','MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'})
-                self.assertFalse(getattr(bot.strategy_experiments._bots['MAIN_TP_SL'],'independent_runtime',False))
+                self.assertEqual(set(engines),{'MAIN','MAIN_OPTIMIZED','MAIN_ADAPTIVE'})
                 for engine in engines.values():
                     self.assertIs(engine.bot.paper_execution,engine)
                     engine.decide();engine.poll()

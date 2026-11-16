@@ -91,6 +91,14 @@ class ManagedLiveTests(unittest.TestCase):
         self.manager.update_settings({"enabled":True,"strategies":{k:{"enabled":True} for k in ids or ("MAIN",)}})
 
     def buy(self, key="MAIN", shares=10, price=.4):
+        if key == "MAIN_TP_SL":
+            # Seed a historical holding; retired strategies cannot buy anymore.
+            position = self.buy("MAIN", shares, price)
+            with self.store.conn:
+                self.store.conn.execute("UPDATE positions SET strategy_id=? WHERE id=?", (key, position["id"]))
+                self.store.conn.execute("UPDATE orders SET strategy_id=? WHERE id=?", (key, position["entry_order"]))
+            self.manager.update_settings({"enabled": False})
+            return self.store.position(position["id"])
         self.enable(key);self.manager.tick()
         order=next(o for o in self.store.active_orders() if o["strategy_id"]==key)
         self.confirm(order,shares,price)
@@ -109,6 +117,23 @@ class ManagedLiveTests(unittest.TestCase):
         self.assertTrue(all(r["metrics"]["realized_pnl"]==0 for r in s["variants"]))
         self.assertNotIn("control_token",s)
         self.manager.tick();self.assertEqual(self.exchange.submitted,[])
+
+    def test_retired_config_cannot_reenable_entries_and_preserves_exit_rules(self):
+        saved = self.store.config()
+        saved["strategies"]["MAIN_TP_SL"] = {"enabled": True, "take_profit_pct": 31.0, "stop_loss_pct": 22.0}
+        saved["strategies"]["VALUE_CONFIRM_V1"] = {"enabled": True, "stake_dollars": 4.0}
+        with self.store.conn:
+            self.store.conn.execute("UPDATE live_config SET json=? WHERE id=1", (json.dumps(saved),))
+        self.store._migrate_config()
+        self.assertEqual(set(self.store.config()["strategies"]), {"MAIN", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"})
+        self.assertEqual(self.store.exit_rules("MAIN_TP_SL")["take_profit_pct"], 31.0)
+        self.assertFalse(self.store.exit_rules("MAIN_TP_SL")["enabled"])
+        self.assertNotIn("retired_strategies", self.manager.snapshot()["settings"])
+        for key in ("MAIN_TP_SL", "VALUE_CONFIRM_V1"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.store.update_config({"strategies": {key: {"enabled": True}}})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.store.prepare_order("retired-order", key, self.market, "up", "Up", "BUY", .5, cash=5)
 
     def test_existing_live_config_migrates_adaptive_without_resetting_saved_rules(self):
         path=self.root/"migration.sqlite3"
@@ -147,6 +172,8 @@ class ManagedLiveTests(unittest.TestCase):
         self.manager.signals.evaluate=LiveSignals.evaluate.__get__(self.manager.signals,LiveSignals)
         model=Mock()
         model.adjust_prediction.side_effect=lambda prediction,market,now:{**prediction,"up_score":.8}
+        model.assess_entry.return_value={"adaptive_allowed":True,"adaptive_score":.76,
+                                        "candidate_side":"Up","adaptive_reason":"cost calibrated"}
         self.manager.signals.adaptive_model=model
         reference={"ready":True,"protocol_verified":True,"latest":{}}
         frame=SimpleNamespace(error=None,market=self.market,reference=reference,quotes={},observed_at=time.time())
@@ -159,6 +186,9 @@ class ManagedLiveTests(unittest.TestCase):
                                                     self.market,reference,{},time.time(),exchange_info(),market_input=frame)
         self.assertEqual(signal.side,"Up")
         model.adjust_prediction.assert_called_once()
+        model.assess_entry.assert_called_once()
+        self.assertAlmostEqual(model.assess_entry.call_args.kwargs["all_in_cost"], .5175)
+        self.assertEqual(signal.confidence, .76)
 
     def test_master_and_strategy_switches_both_required(self):
         self.manager.update_settings({"strategies":{"MAIN":{"enabled":True}}})
@@ -264,7 +294,7 @@ class ManagedLiveTests(unittest.TestCase):
         p=self.buy("MAIN_TP_SL")
         self.feed.bid=.79;self.feed.ask=.8
         self.exchange.bid=.79;self.exchange.ask=.8
-        self.manager.update_settings({"enabled":False,"strategies":{"MAIN_TP_SL":{"enabled":False}}})
+        self.manager.update_settings({"enabled":False})
         self.manager.tick()
         self.assertEqual(self.exchange.submitted[-1].action,"SELL")
         self.assertEqual(self.store.active_orders()[0]["position_id"],p["id"])
@@ -328,8 +358,8 @@ class ManagedLiveTests(unittest.TestCase):
         self.feed.age=10000;self.exchange.bid=.79;self.exchange.ask=.8
         self.exchange.valuation_book=Mock(wraps=self.exchange.valuation_book)
         self.manager.refresh_valuations()
-        row=next(r for r in self.manager.snapshot()["variants"] if r["variant_id"]=="MAIN_TP_SL")
-        self.assertGreater(row["metrics"]["unrealized_pnl"],0)
+        self.assertNotIn("MAIN_TP_SL", {r["variant_id"] for r in self.manager.snapshot()["variants"]})
+        self.assertGreater(self.manager._valuation_marks()[p["id"]]["value"], p["remaining_cost"])
         self.exchange.valuation_book.assert_called_once_with(p["token_id"])
         self.manager.tick()
         self.assertEqual(len(self.exchange.submitted),1)

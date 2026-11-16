@@ -1,18 +1,20 @@
 # EdgePulse
 
-The dashboard has five isolated Paper accounts: the original **主账户**, **主账户止盈止损** (`MAIN_TP_SL`), **主账户（优化版）** (`MAIN_OPTIMIZED`), **主账户自适应成长版** (`MAIN_ADAPTIVE`), and **价值确认 V1** (`VALUE_CONFIRM_V1`). Existing strategy rules and histories remain intact. The adaptive account starts from settled samples in the optimized account's ledger, keeps its own balance and ledger, and applies only bounded score calibration after enough samples. It is also available as an opt-in live strategy with its own switch, risk limits and live accounting; the live switch is off by default. In the default managed-live runtime, the Paper accounts share the verified PolyBolt spot/TWAP and CLOB collector used by live execution. The optimized account keeps its own model, ledger and journal while borrowing the same reference history; the exit account still mirrors original-main Paper entries and applies its existing exit policy.
+The dashboard has five isolated Paper accounts: **主账户** (`MAIN`), **主账户（优化版）** (`MAIN_OPTIMIZED`), **主账户自适应成长版** (`MAIN_ADAPTIVE`), **主账户（优化极速赚钱版）** (`MAIN_OPTIMIZED_FAST`), and **主账户（优化进阶版）** (`MAIN_OPTIMIZED_PLUS`). The adaptive account starts from settled samples in the optimized ledger and keeps its own balance and bounded score calibration. FAST and PLUS each start with a separate $100 Paper account and do not copy historical profits. In the default managed-live runtime, all five share the verified PolyBolt spot/TWAP and CLOB collector used by live execution. Existing strategies' entry rules and retained ledgers are unchanged.
 
-The dashboard also provides opt-in real execution for these five strategies. The global live switch and the corresponding strategy switch must both be enabled before new real BUY orders are allowed; all switches default off in a new live ledger. Each strategy has its own fee-inclusive order budget and accounting, while the actual wallet balance is shared. Turning either switch off stops new entries and continues managing existing positions, including the live take-profit/stop-loss strategy. The adaptive live strategy uses the bounded calibration model built from the optimized and adaptive Paper ledgers; if that model cannot be opened, its entry state is shown as unavailable and it cannot silently fall back to the optimized strategy.
+The dashboard also provides opt-in real execution for these five strategies. The global live switch and the corresponding strategy switch must both be enabled before new real BUY orders are allowed; all switches default off in a new live ledger. Adding FAST or PLUS leaves saved switches intact and adds the new live switch as OFF. Each strategy has its own fee-inclusive order budget and accounting, while the actual wallet balance is shared. Turning either switch off stops new entries and continues managing existing positions, including historical positions from retired strategies. The adaptive live strategy uses the bounded calibration model built from the optimized and adaptive Paper ledgers; if that model cannot be opened, its entry state is shown as unavailable and it cannot silently fall back to the optimized strategy.
+
+Each strategy's risk settings include **重置亏损限额** for its live account. Clicking it keeps the saved limit and starts its loss accounting from that moment, within the existing rolling 24-hour window. The reset survives restarts, preserves historical P&L and Paper accounting, and retains the risk of existing holdings and uncertain orders. Later settlements count from the saved realized-P&L baseline, including positions partially sold before the reset.
 
 The top metrics and tables follow the selected strategy's effective Paper/live mode by default. A separate data-view selector can inspect either ledger without enabling trading. Wallet cash comes from authenticated CLOB balance queries, and portfolio value comes from the official Data API; failed reads are shown as unavailable or stale rather than a fabricated zero. Live strategy P&L is based on confirmed official fills and the market's fee schedule. Resolved winning shares are shown as pending redemption and are never credited to the displayed cash balance before the wallet API reports the cash.
 
 Live execution uses its own validated TWAP reference and fresh order books. It does not copy Paper fills. Signed order hashes are saved before a single POST; uncertain results retain reservations and are reconciled rather than blindly resubmitted. Partial fills retain remaining shares. Settings and manual exits are restricted to same-origin loopback requests with a per-process control token. The live ledger and public reference cache are under `data/live-accounts/`; credentials remain only in the existing owner-readable environment file. No blockchain approvals, funding transfers, or redemptions are performed automatically.
 
-The exit experiment reads the original main ledger in SQLite read-only mode and mirrors only new Paper FAK entries, retaining their actual cost, buy fees and shares for a matched-entry comparison. It does not retroactively copy old positions or re-enter after an early sale. Its initial test thresholds are +20% net profit and −40% net loss, with a 500 ms simulated sell delay, half of displayed bid depth and a one-cent adverse price haircut. Thresholds are experimental; stop loss is a trigger, not a guaranteed maximum loss. Partial exits preserve unsold shares, and unfilled exits do not receive invented proceeds. The account stores its own sales, entry links and policy in `data/strategy-experiments/main_tp_sl.sqlite3`; observations continue after early sales until expiry in `main_tp_sl.observations.jsonl`. The dashboard compares only officially resolved matched entries and reports both saved losses and forgone winner profits. Late observations, insufficient funds and paused entries are recorded as skipped instead of backfilled. The original main account supplies entry decisions and its existing entry risk controls; this exit experiment only adds its own cash constraint. It never enables live orders.
+**主账户止盈止损** (`MAIN_TP_SL`) and **价值确认 V1** (`VALUE_CONFIRM_V1`) were retired on 2026-11-14. They have no active Paper registration or live entry controls. Old launcher selections are ignored, saved retirement settings are kept only for historical exits, and direct new BUY requests are rejected. Their historical databases are retained without being started. Existing confirmed positions and uncertain orders remain eligible for reconciliation and settlement.
 
 Read the optimized-account specification at `http://127.0.0.1:8791/static/optimized-main.html`. Its initial virtual equity is aligned with the original main account at creation; subsequent restarts neither re-fund it nor reset comparison history. The dashboard's same-period comparison excludes original historical profit and carryover positions, distinguishes pending exposure, and reports actual P&L/percentage-point differences only after trades exist. Model changes and the early mid-price filter are forward-testing hypotheses, not proven profit improvements.
 
-The packaged [historical review](src/polybot2other/static/strategy-review.html) remains available. Detailed loss, exit and trading-hour analyses are generated locally under `reports/`. Their Python analysis/rendering scripts are versioned; database snapshots, generated reports, audit manifests and local configuration are excluded from Git. These research scripts require the corresponding local snapshots and backup metadata. Retired strategy sources and ledgers are archived under `data/backups/strategy-retirement-20261026-225605/`. Value Confirm retains its own Paper history and original Paper sizing controls. Live operation remains opt-in through the new dashboard switches.
+The packaged [historical review](src/polybot2other/static/strategy-review.html) remains available. Detailed loss, exit and trading-hour analyses are generated locally under `reports/`. Their Python analysis/rendering scripts are versioned; database snapshots, generated reports, audit manifests and local configuration are excluded from Git. These research scripts require the corresponding local snapshots and backup metadata. Retired strategy sources and ledgers are archived under `data/backups/strategy-retirement-20261026-225605/`. Live operation remains opt-in through the new dashboard switches.
 
 The reference notes below also document legacy features retained for historical compatibility; they do not re-enable retired strategies.
 
@@ -296,7 +298,7 @@ For safety, a saved `enabled=true` live switch is not preserved across process r
 
 ## Paper execution aligned with managed live (2026-11-06)
 
-The Mac launcher enables `POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION=true`. The five
+The Mac launcher enables `POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION=true`. The retained
 Paper accounts reuse the existing `LiveSignals` functions, verified market inputs,
 and the saved per-strategy live budgets, position limits, daily-loss limits and
 TP/SL percentages. Live enable switches still control real orders only; the Paper
@@ -347,11 +349,106 @@ Protocol references: [Polymarket order types and price bounds](https://docs.poly
 
 ## 当前保留的五个策略
 
-主账户、主账户止盈止损、主账户（优化版）、主账户自适应成长版、价值确认 V1。
+主账户、主账户（优化版）、主账户自适应成长版、主账户（优化极速赚钱版）、主账户（优化进阶版）。止盈止损和价值确认 V1 已退役，历史账本保留。
 
 2026-11-11 按用户要求移除衡准与双翼的运行入口、页面和接口；已结束的实验保留精简历史归档。
 原四策略的 Paper / 实盘账本、开关、金额和风险设置不变；自适应成长版新增实盘入口，默认关闭。
 清理与归档清单见 `reports/data-cleanup-20261111-223500/`，历史数据位于 `data/archives/`。
+
+## 自适应成长 V3（2026-11-16，当前版本）
+
+仅升级 `MAIN_ADAPTIVE`；账户名、余额和历史不重置，其他三个策略的方向算法与设置保留，成长版实盘开关不自动打开。
+
+- 用原始预测的 log-odds 作固定起点，以带固定 L2 正则的逻辑回归学习条件误差。连续特征包括原分数、方向、提交时买价、剩余时间，以及方向对齐的 10/30/60 秒动量、滚动波动、现价相对过去 60 秒均价偏离和盘口价差。单次分数修正限制为上下各 0.06，参数没有按历史利润寻优。
+- 仍采用 72 小时样本半衰期、30 天窗口，每个市场最多一票，仅使用决策之前已经取得官方结算的标签。当前市场与未来结果不参与训练；基本有效样本或单项行情特征有效样本少于 40 时，分别保留基线或禁用该特征系数。
+- 本机可从原同源行情缓存恢复历史特征，必须同时满足 `source_ms <= decision_at` 和 `received_ms <= decision_at`。优化版历史使用已保存的提交时间，不能用稍后的成交确认时间；V2 使用原始决策时间。缺失或过期特征保持缺失，不补造平盘和盘口。
+- 旧 V2 表原样保留，V3 使用独立的 `context_training_samples_v3` 和 `context_observations_v3` 表。历史回补只用于训练与探索诊断。**旧记录重算的 V3 分数不能当作前向验证结果。** 每个新市场首次候选在结束前持久化模型版本、训练截止、训练指纹、行情特征、原分数、候选分数和官方含费成本。
+- 正常 Paper 继续运行。只有 V3 新观察达到至少 40 个独立已结市场、跨度至少 24 小时，成对预测误差改善达到政策要求且近似 90% 下界为正，扣费报价理论收益为正并严格优于基线、理论回撤不劣于基线，才采用候选修正；滚动效果退化则继续基线。这个对照不模拟成交深度、资金占用、延迟与实际滑点，不能当作实盘收益证明。
+- 页面区分“候选学习/修正已用于开仓”，显示 V3 已结成交实际采用修正的笔数、最近完整行情评估、覆盖数量，以及误杀赢家、避免输家、新增赢家/输家。`READY` 表示模型可计算，不表示修正已生效或已经更赚钱。
+
+固定首版历史诊断使用 263 个已有机会：基线、V2、V3 的 Brier 分别为 0.21746、0.21759、0.21947（越低越好）；按每次机会单位预算计算的报价理论收益合计分别为 +6.4541、−0.2582、−2.1276。**V3 首版尚未优于基线，未据此启用修正。** 这些已经看过的历史仅作诊断，不能称作未接触测试集。后续真实前向结果决定是否值得采用，不能保证数据越多收益越高。
+
+复现本机固定备份诊断（不写生产账本）：
+
+```bash
+.venv/macos/bin/python scripts/evaluate_adaptive_v3.py \
+  --backup data/backups/adaptive-v3-20261116-183049 --evaluate
+```
+
+报告：`reports/adaptive-v3-20261116/feature-audit.json`、`chronological-diagnostic.json`。新环境没有本机历史时从其可用数据开始，原始基线仍可继续开仓。
+
+## 自适应成长 V2（2026-11-15，历史版本）
+
+以下保留 V2 的实现与诊断说明；当前运行版本为上文 V3。V2 仅作用于 `MAIN_ADAPTIVE`，原主账户和优化版方向模型不变。
+
+- 原始分数与校准分数分开保存；旧成长版缺少原始分数的记录保留供复盘，不再作为原始概率样本重复学习。
+- 决策只使用当时已经结算的历史，排除当前市场。同一五分钟市场最多贡献一票，防止不同策略的相同结算重复增加置信度。
+- 历史权重采用 72 小时半衰期，最多使用 30 天；按方向、原始分数、价格和剩余时间逐级回退。少于最低有效样本时按原始分数继续评估，不为凑样本暂停交易。
+- 用近期预测残差、20 票基准先验和不确定性折扣调整分数，上调最多 0.04、下调最多 0.08；比较校准分数与限价、手续费后的成本。参数为固定研究政策，未按旧利润搜索最优组合，分数也不是保证胜率。
+- 新校准先作候选观察，当前采用原始基线分数继续运行。只有最近 7 天的新候选取得至少 40 个独立官方结算、观察跨度至少 24 小时，且成对预测误差改善的近似 90% 下界大于零、候选报价含费单位预算结果为正且不低于基线，才参与决策；滚动验证退化时自动退回基线。仅采用官方费率的新观察可以支持该激活门，旧式配置费率观察不能激活它。候选方向的报价理论结果不等于实际成交收益，这些阈值也不保证未来盈利。
+- 成长版同一期不反向重复建仓。金额和持仓上限继续按现有界面设置执行，不加杠杆、不追亏加注。
+- 新候选观察只在取得官方结算结果后进入学习；未成交的观察不是虚拟成交或利润。有效候选有不可变的模型版本、原始/校准分、成本、样本截止与报价时间快照。紧凑决策日志按模式限量轮换。
+- 页面显示独立市场数、有效权重、旧分数隔离数量和本次费用后优势，避免把累计样本数当作效果证明。
+
+真实成交模拟路径与实盘读取官方费率；兼容的旧式即时 Paper 仅使用配置中的模拟费率，不能将其结果当作实盘成交验证。现存策略历史不重置，V2 新成交可按模型版本和决策时间区分。
+
+可复现的只读时序诊断：
+
+```bash
+.venv/macos/bin/python scripts/evaluate_adaptive_v2.py \
+  --optimized-db data/strategy-experiments/main_optimized.sqlite3 \
+  --adaptive-db data/strategy-experiments/main_adaptive.sqlite3 \
+  --evaluation-start '2026-11-13T00:03:19+08:00' \
+  --cutoff '2026-11-15T01:36:22+08:00' \
+  --output reports/adaptive-v2-20261115/chronological-diagnostic.json
+```
+
+首轮固定政策的历史候选诊断未优于原始基线，因此未直接启用候选校准；运行时前向验证门与历史候选筛选诊断分开。
+
+诊断严格使用先前结算数据，但历史成交价格只是事后执行成本代理；无法还原所有未提交信号、盘口深度、重试与资金约束，因此是已有成交的探索性筛选评估，不是完整策略回测，也没有未经查看的独立验证集。未来真实 Paper 记录才用于继续判断收益和回撤是否改善。验证方法参考 [时间顺序交叉验证](https://scikit-learn.org/stable/modules/cross_validation.html#time-series-split) 与 [概率校准](https://scikit-learn.org/stable/modules/calibration.html)。
+
+## 主账户（优化极速赚钱版）（2026-11-16）
+
+独立实验标识 `MAIN_OPTIMIZED_FAST`，政策版本 `main-optimized-fast-20261116-v1`。名称按用户要求保留，不代表保证更快盈利。优化目标是相同预算下减少低效入场，实际效果需要上线后的 Paper 对照；没有增加下注金额、放宽仓位或改动其他策略。
+
+复盘扫描本机 33 份现存/备份账本，去重后为 565 条 Paper、466 条实盘记录；旧撮合与当前真实模拟分开。固定截止 `2026-11-16 01:37:02 +08:00`。当前真实模拟有 337 笔已结算，实盘有 465 笔已结算、1 笔待结。报告位于 `reports/optimized-fast-20261116/review.json` 和 `review.txt`，可用 `scripts/review_optimized_fast.py --help` 查看复现入口。
+
+证据支持先测试每期一次成交和弱分数过滤：实盘 26 笔同一期反手按每笔 $5 归一合计亏损 $23.69；Paper 原始分数低于 0.66 的 24 笔等额亏损 $34.46。相同市场和方向的 209 组 Paper/实盘，等额收益分别为 $9.16/$8.77，主要累计差异来自不同机会选择。提高模型优势阈值或固定只做后半段没有一致支持，因此没有采用这两种做法。
+
+| 项目 | 新策略规则 |
+| --- | --- |
+| 方向与结算模型 | 沿用优化版同源现价、60 秒 TWAP 和滚动波动预测；不使用新模型训练或未来标签 |
+| 原始分数 | 至少 0.66；分数不是校准胜率 |
+| 连续确认 | 在已有行情历史中检查 3 个源时间预测，跨度至少 6 秒，同向且均达到分数门槛；重复推送不能充数 |
+| 入场时间与价格 | 剩余 20–285 秒，买价不超过 0.72，价差不超过 0.03，额外限价空间最多 0.01 |
+| 成本 | 官方费用后分数减每份成本至少 0.02，分数/每份成本−1 至少 3%；提交前再次复核 |
+| 深度和重复入场 | 完整新鲜盘口深度覆盖预算；每期最多一次成功入场，不反手；拒单仍可重试，待确认继续对账 |
+| 初始账户 | 独立 Paper $100，不复制历史收益；真实模拟默认每笔 $5、最多 2 笔、亏损额度 $21，按界面设置执行 |
+| 实盘 | 默认关闭，启用必须由用户明确操作；原有实盘设置不变 |
+
+用户已有更严格的时间、分数、价格、价差和优势配置会继续生效。兼容的简化 Paper 路径继承全局金额/风险设置，并明确标记配置费率；默认 Mac 启动走官方费率与真实成交模拟。日志限量轮换，每笔新成交保留政策版本、原始分数、确认跨度、成本和提交前判断快照，便于后续同口径复盘。
+
+历史仅可观察的“原记录每期首笔＋分数≥0.66”子集，按每笔 $5 归一后，累计收益从 $93.34 变成 $119.59，最大已实现回撤从 $44.85 变成 $33.72。但较早阶段收益下降，11 月 15 日筛选后仍亏损 $4.58。历史记录不能完整重放新增连续确认、拒单后的后续候选、盘口变化或资金限制，实盘也缺少原始分数；这些数字不是完整新策略回测或收益提升承诺。
+
+## 主账户（优化进阶版）（2026-11-16）
+
+独立实验 `MAIN_OPTIMIZED_PLUS`，政策版本 `main-optimized-plus-20261116-v1`。复用原优化版的 TWAP 预测、原始分数、时间、价格、价差、深度和费用规则；不叠加 FAST 的 0.66 分数或六秒确认，不修改既有四个账户的算法、账本和保存设置。
+
+| 项目 | 规则 |
+| --- | --- |
+| 同期入场 | 每个五分钟市场最多一次成功入场，不反手、不重复；待确认继续核实，失败/拒单仍可重试。跨市场持仓上限仍按界面设置 |
+| Up 短线动量 | 过去 30 秒 BTC 对数涨幅超过 2 bps（约 0.02%）时暂不买 Up，动量回落后重新评估；Down 不增加此门槛 |
+| 行情因果性 | 使用同源 `price.crypto`，源时间不超过本次预测且接收时间不超过本次决策；Up 缺失、过期或断档时显示等待原因，不永久禁入该期 |
+| 晚入场 | 开始 120 秒后只记录诊断，不作为禁入条件 |
+| 成本 | 沿用原始费用后优势门槛（至少 0.02）；提交前按官方费率重新验证，并把最终决策绑定订单 |
+| 初始账户 | 独立 Paper $100；真实模拟默认每笔 $5、最多 2 笔、亏损额度 $30，Paper / 实盘均按界面保存值执行 |
+| 实盘入口 | 独立卡片和勾选项，默认关闭；其他策略已有开关保持原值 |
+
+2 bps 阈值来自对原优化版实盘历史的探索性分析，不是未经查看的测试集结果。固定复盘截至 `2026-11-16 21:31:28 +08:00`，报告位于 `reports/optimized-live-review-20261116-213128/`。不能把历史筛掉的亏损直接算作新策略可获得的利润；后续信号、资金占用和成交机会会变化，实际收益与胜率需要前向验证。
+
+新策略详情提供**从新账户创建起的同期 Paper 对照**：原优化版与进阶版各自实际已结成交的净收益、胜率、最大已实现回撤、未结笔数及每笔 $5 成本归一收益。按开仓时间纳入，排除新策略启动前已开的旧仓；未结仓不计入已实现盈亏。它比较真实发生的两组模拟成交，不是同一机会的反事实回放，也不含未实现回撤。无已结样本时胜率显示为空。
+
+每笔新订单保留政策版本、决策时间、原始分数、30 秒动量、官方含费成本和最终提交快照；诊断日志限量轮换。共享钱包资金仍会影响启用多个实盘策略后的成交机会。默认 Mac 启动使用真实成交模拟，兼容简化 Paper 则继承全局金额/风险设置并标记配置费率。
 
 ## Safety
 

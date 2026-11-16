@@ -1120,13 +1120,13 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
 
-    def test_bot_broadcasts_official_resolution_to_strategy_experiments(self) -> None:
+    def test_official_broadcast_preserves_independent_optimized_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="VALUE_CONFIRM_V1",
+                strategy_experiments_variants="MAIN_OPTIMIZED",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
@@ -1144,7 +1144,7 @@ class TradingCoreTest(unittest.TestCase):
             store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
             store.settle_due_rounds({"BTC": 99.5}, now)
 
-            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+            variant_bot = bot.strategy_experiments._bots["MAIN_OPTIMIZED"]
             variant_bot.store.upsert_round(market)
             variant_bot.store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
             variant_bot.store.save_price_tick("BTC", 99.5, "test-chainlink", market.ends_at)
@@ -1160,22 +1160,22 @@ class TradingCoreTest(unittest.TestCase):
             main_recent = store.recent_trades(1)
             self.assertEqual(main_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
             self.assertAlmostEqual(store.account()["cash_balance"], 95.0, places=6)
-            variant_detail = bot.strategy_experiment_detail("VALUE_CONFIRM_V1", trade_limit=5, order_limit=5)
+            variant_detail = bot.strategy_experiment_detail("MAIN_OPTIMIZED", trade_limit=5, order_limit=5)
             variant_recent = variant_detail["recent_trades_page"]["recent_trades"]
-            self.assertEqual(variant_recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
-            self.assertAlmostEqual(variant_bot.store.account()["cash_balance"], 95.0, places=6)
-            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["official_count"], 1)
-            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["chainlink_count"], 0)
+            self.assertEqual(variant_recent[0]["settlement_source"], "chainlink_fallback")
+            self.assertAlmostEqual(variant_bot.store.account()["cash_balance"], 105.0, places=6)
+            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["official_count"], 0)
+            self.assertEqual(variant_detail["variant"]["recent_trades_summary"]["chainlink_count"], 1)
             self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
 
 
-    def test_strategy_experiments_settle_pending_open_trades_from_official_resolution(self) -> None:
+    def test_strategy_experiments_leave_independent_settlement_to_optimized_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = Settings(
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="VALUE_CONFIRM_V1",
+                strategy_experiments_variants="MAIN_OPTIMIZED",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
@@ -1194,7 +1194,7 @@ class TradingCoreTest(unittest.TestCase):
                 ends_at=now + 300,
                 target_price=101.0,
             )
-            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+            variant_bot = bot.strategy_experiments._bots["MAIN_OPTIMIZED"]
             variant_bot.store.upsert_round(ended_market)
             signal = Signal("BTC", "Down", 0.7, 0.5, -10.0, "experiment official pending")
             variant_bot.store.place_trade(
@@ -1213,18 +1213,9 @@ class TradingCoreTest(unittest.TestCase):
 
             bot.strategy_experiments.run_from_state(current_market, {"chainlink": 101.0}, {})
 
-            self.assertEqual(calls, [ended_market.round_id])
-            self.assertEqual(variant_bot.store.open_trades(), [])
-            recent = variant_bot.store.recent_trades(1)
-            self.assertEqual(recent[0]["round_id"], ended_market.round_id)
-            self.assertEqual(recent[0]["status"], "SETTLED")
-            self.assertEqual(recent[0]["outcome"], "Up")
-            self.assertEqual(recent[0]["settlement_source"], SETTLEMENT_SOURCE_POLYMARKET)
-            self.assertAlmostEqual(recent[0]["payout"], 0.0, places=6)
-            self.assertAlmostEqual(recent[0]["pnl"], -5.0, places=6)
-            self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 1)
-
-
+            self.assertEqual(calls, [])
+            self.assertEqual(len(variant_bot.store.open_trades()), 1)
+            self.assertEqual(bot.strategy_experiments.snapshot()["official_broadcast_count"], 0)
 
 
     def test_bot_records_official_resolution_final_and_target_prices(self) -> None:
@@ -1498,11 +1489,11 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="VALUE_CONFIRM_V1",
+                strategy_experiments_variants="MAIN_OPTIMIZED",
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
             bot = PaperTradingBot(settings, store)
-            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+            variant_bot = bot.strategy_experiments._bots["MAIN_OPTIMIZED"]
             now = time.time()
             with variant_bot.store.conn:
                 variant_bot.store.conn.execute(
@@ -1516,7 +1507,7 @@ class TradingCoreTest(unittest.TestCase):
             main_curve = bot.equity_curve_window(account_scope="main", days=90, max_points=10)
             variant_curve = bot.equity_curve_window(
                 account_scope="strategy_experiment",
-                variant_id="VALUE_CONFIRM_V1",
+                variant_id="MAIN_OPTIMIZED",
                 days=90,
                 max_points=10,
             )
@@ -1524,8 +1515,8 @@ class TradingCoreTest(unittest.TestCase):
             self.assertEqual(main_curve["equity_curve_meta"]["account_scope"], "main")
             self.assertEqual(main_curve["equity_curve_meta"]["label"], "主账户")
             self.assertEqual(variant_curve["equity_curve_meta"]["account_scope"], "strategy_experiment")
-            self.assertEqual(variant_curve["equity_curve_meta"]["variant_id"], "VALUE_CONFIRM_V1")
-            self.assertEqual(variant_curve["equity_curve_meta"]["combo"], "价值确认 V1")
+            self.assertEqual(variant_curve["equity_curve_meta"]["variant_id"], "MAIN_OPTIMIZED")
+            self.assertEqual(variant_curve["equity_curve_meta"]["combo"], "主账户（优化版）")
             self.assertTrue(any(row["total_equity"] == 105.0 for row in variant_curve["equity_curve"]))
             with self.assertRaises(ValueError):
                 bot.equity_curve_window(account_scope="strategy_experiment", variant_id="bad-variant")
@@ -4274,7 +4265,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="VALUE_CONFIRM_V1",
+                strategy_experiments_variants="MAIN_OPTIMIZED",
                 stake_dollars=5.0,
             )
             store = TradeStore(settings.db_path, settings.initial_balance)
@@ -4306,19 +4297,18 @@ class TradingCoreTest(unittest.TestCase):
                     "updated_at_ms": int(now * 1000),
                 },
             }
-            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
-            variant_bot.price_basis_tracker._basis["okx"] = [9.900990099] * 5
-            variant_bot.value_confirm_guard.history.append((now*1000-25000,100.8))
-            price.update(okx=101.1,okx_updated_ms=now*1000)
-            bot.strategy_experiments.run_from_state(market, price, quotes)
-            variant_bot = bot.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+            variant_bot = bot.strategy_experiments._bots["MAIN_OPTIMIZED"]
+            variant_bot.store.upsert_round(market)
+            signal = Signal("BTC", "Up", .8, .35, 10, "pause propagation fixture")
+            variant_bot.store.place_trade(type("Intent", (), {"market": market, "signal": signal, "stake_dollars": 5.0})())
+            variant_bot = bot.strategy_experiments._bots["MAIN_OPTIMIZED"]
             self.assertEqual(variant_bot.store.open_trade_count("BTC"), 1)
 
             payload = bot.set_paper_trading_paused(True)
 
             self.assertTrue(payload["paper_trading"]["paused"])
             self.assertEqual(
-                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["VALUE_CONFIRM_V1"]["canceled_count"],
+                payload["paper_trading"]["strategy_experiments_cancel"]["variants"]["MAIN_OPTIMIZED"]["canceled_count"],
                 0,
             )
             self.assertTrue(variant_bot.paper_trading_runtime()["paused"])
@@ -4327,7 +4317,8 @@ class TradingCoreTest(unittest.TestCase):
             bot.strategy_experiments.run_from_state(market, price, quotes)
 
             self.assertEqual(variant_bot.store.active_paper_orders("BTC"), [])
-            self.assertEqual(variant_bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 1)
+            self.assertEqual(variant_bot.orders_page(status_filter="all")["recent_orders_meta"]["total"], 0)
+            self.assertEqual(variant_bot.store.open_trade_count("BTC"), 1)
             self.assertIn("PAPER_PAUSED", variant_bot.snapshot()["runtime"]["last_signal"]["reason"])
 
 
@@ -6932,12 +6923,16 @@ class TradingCoreTest(unittest.TestCase):
             self.assertGreater(store.metrics()["realized_pnl"], 0)
 
     def test_strategy_variants_cover_current_independent_accounts(self) -> None:
-        self.assertEqual([v.variant_id for v in STRATEGY_VARIANTS], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"])
-        self.assertEqual([v.combo for v in active_strategy_variants()], ["主账户止盈止损", "主账户（优化版）", "主账户自适应成长版", "价值确认 V1"])
+        self.assertEqual([v.variant_id for v in STRATEGY_VARIANTS], ["MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"])
+        self.assertEqual([v.combo for v in active_strategy_variants()], ["主账户（优化版）", "主账户自适应成长版", "主账户（优化极速赚钱版）", "主账户（优化进阶版）"])
 
+
+    def test_removed_strategies_in_old_launcher_settings_are_ignored(self) -> None:
+        self.assertEqual(selected_strategy_variants("MAIN_TP_SL,VALUE_CONFIRM_V1"), ())
+        self.assertEqual([v.variant_id for v in selected_strategy_variants("MAIN_TP_SL,MAIN_OPTIMIZED,VALUE_CONFIRM_V1")], ["MAIN_OPTIMIZED"])
 
     def test_selected_strategy_variants_reject_retired_accounts(self) -> None:
-        self.assertEqual([v.variant_id for v in selected_strategy_variants("")], ["MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"])
+        self.assertEqual([v.variant_id for v in selected_strategy_variants("")], ["MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"])
         for retired in ("SINGLE_FAK", "SINGLE_FAK_AGGRESSIVE_EDGE_DIAGNOSTIC", "PAIR_GTD"):
             with self.subTest(retired=retired), self.assertRaises(ValueError):
                 selected_strategy_variants(retired)
@@ -7398,16 +7393,16 @@ class TradingCoreTest(unittest.TestCase):
             self.assertIsNone(snapshot["decision_summary"]["recommended_variant_id"])
             self.assertIsNotNone(snapshot["decision_summary"]["current_leader_variant_id"])
             self.assertTrue(all(row["last_error"] is None for row in variants.values()))
-            self.assertEqual(set(variants), {"MAIN_TP_SL", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "VALUE_CONFIRM_V1"})
+            self.assertEqual(set(variants), {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"})
             adaptive = variants["MAIN_ADAPTIVE"]
             self.assertEqual(adaptive["adaptive_learning"]["seed_samples"], 0)
             self.assertEqual(adaptive["adaptive_learning"]["adaptive_samples"], 0)
             self.assertEqual(adaptive["metrics"]["cash_balance"], 100)
             self.assertNotEqual(bot.store.db_path, bot.strategy_experiments._bots["MAIN_ADAPTIVE"].store.db_path)
-            self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["open_trades"], 0)
-            self.assertEqual(variants["VALUE_CONFIRM_V1"]["last_signal"]["side"], "NO_TRADE")
-            self.assertEqual(variants["VALUE_CONFIRM_V1"]["metrics"]["cash_balance"], 100)
-            self.assertNotEqual(bot.store.db_path, bot.strategy_experiments._bots["VALUE_CONFIRM_V1"].store.db_path)
+            self.assertEqual(variants["MAIN_OPTIMIZED"]["metrics"]["open_trades"], 0)
+            self.assertEqual(variants["MAIN_OPTIMIZED"]["last_signal"]["side"], "NO_TRADE")
+            self.assertEqual(variants["MAIN_OPTIMIZED"]["metrics"]["cash_balance"], 100)
+            self.assertNotEqual(bot.store.db_path, bot.strategy_experiments._bots["MAIN_OPTIMIZED"].store.db_path)
 
 
     def test_strategy_experiment_low_fill_variant_is_disqualified(self) -> None:
@@ -7585,7 +7580,7 @@ class TradingCoreTest(unittest.TestCase):
                 db_path=Path(tmp) / "main.sqlite3",
                 strategy_experiments_enabled=True,
                 strategy_experiments_db_dir=Path(tmp) / "experiments",
-                strategy_experiments_variants="VALUE_CONFIRM_V1",
+                strategy_experiments_variants="MAIN_OPTIMIZED",
             )
             output = Path(tmp) / "docs" / "snapshot.html"
 
@@ -7600,7 +7595,7 @@ class TradingCoreTest(unittest.TestCase):
             self.assertTrue(output.exists())
             html = output.read_text(encoding="utf-8")
             self.assertIn("策略实验复盘报告", html)
-            self.assertIn("价值确认 V1", html)
+            self.assertIn("主账户（优化版）", html)
             self.assertIn("数据源", html)
 
 

@@ -64,7 +64,7 @@ class QuarantineTests(unittest.TestCase):
         self.assertIn("本市场存在隔离订单",self.manager.last_signal["MAIN"]["reason"])
         self.assertIn("本市场存在隔离订单",self.manager.last_signal["MAIN_OPTIMIZED"]["reason"])
         with self.assertRaisesRegex(ValueError,"隔离订单"):
-            self.store.prepare_order("another-id","VALUE_CONFIRM_V1",self.market,self.market.up_token,"Up","BUY",.5,cash=5)
+            self.store.prepare_order("another-id","MAIN_ADAPTIVE",self.market,self.market.up_token,"Up","BUY",.5,cash=5)
 
     def test_other_market_can_enter_within_existing_limits(self):
         old=self.pending();self.isolate(old);self.next_round();self.manager.tick()

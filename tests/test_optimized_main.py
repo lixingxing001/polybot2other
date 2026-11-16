@@ -190,7 +190,7 @@ class OptimizedTests(unittest.TestCase):
         with patch.object(client,"_get_event_by_slug",return_value={"resolutionSource":"spot"}):
             self.assertIsNone(client.read_market(self.market.started_at))
 
-    def test_existing_ledger_and_value_confirm_remain_separate(self):
+    def test_existing_ledger_and_adaptive_remain_separate(self):
         base=TradeStore(self.root/"main.sqlite3",100)
         self.addCleanup(base.conn.close)
         settings=Settings(db_path=base.db_path,strategy_experiments_enabled=True,
@@ -202,7 +202,7 @@ class OptimizedTests(unittest.TestCase):
         before=base.recent_trades(10)
         parent=PaperTradingBot(settings,base)
         optimized=parent.strategy_experiments._bots["MAIN_OPTIMIZED"]
-        value=parent.strategy_experiments._bots["VALUE_CONFIRM_V1"]
+        value=parent.strategy_experiments._bots["MAIN_ADAPTIVE"]
         self.addCleanup(optimized.store.conn.close);self.addCleanup(optimized.references.conn.close);self.addCleanup(value.store.conn.close)
         self.assertEqual(before,base.recent_trades(10))
         self.assertEqual(optimized.store.account()["initial_balance"],base.metrics()["total_equity"])

@@ -3223,7 +3223,6 @@ function renderStrategyExperiments(runtime = {}) {
   if (managedMode) {
     ids.strategyExperimentMeta.textContent = "4 个策略 · 实盘独立核算";
     ids.strategyExperimentSummary.textContent = "钱包余额共享 · 这里只展示当前程序确认的实盘记录";
-    document.getElementById("main-exit-panel").hidden = true;
     ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus);
     return;
   }
@@ -3235,10 +3234,9 @@ function renderStrategyExperiments(runtime = {}) {
   const rows = [main, ...variants];
   ids.strategyExperimentMeta.textContent = `${rows.length} 个 Paper 账户 · 模拟交易`;
   ids.strategyExperimentSummary.textContent = runtime.paper_execution?.enabled
-    ? "各账户独立 $100 模拟钱包 · 金额与风险设置跟随实盘 · 止盈止损账户独立成交"
-    : "各账户独立核算 · 止盈止损沿用主账户入场 · 原有策略与历史保留";
-  if (runtime.paper_execution?.enabled) document.getElementById("main-exit-panel").hidden = true;
-  else renderMainExitComparison(experiments);
+    ? "各账户独立 $100 模拟钱包 · 金额与风险设置跟随实盘"
+    : "三个账户独立核算 · 原有策略与历史保留";
+
   ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("");
 }
 
@@ -3271,35 +3269,6 @@ function renderPaperExecution(runtime = {}) {
   document.getElementById("paper-execution-events").innerHTML = events.length
     ? events.map(e => `<li><time>${new Date(e.at*1000).toLocaleTimeString("zh-CN")}</time> ${safe(e.name)} · ${safe(e.message)}</li>`).join("")
     : "<li>等待首次执行检查</li>";
-}
-
-function renderMainExitComparison(experiments = {}) {
-  const panel = document.getElementById("main-exit-panel");
-  if (!panel) return;
-  const variant = (experiments.variants || []).find(row => row.variant_id === "MAIN_TP_SL");
-  panel.hidden = !variant;
-  if (!variant) return;
-  const state = variant.independent_runtime || {};
-  const rule = state.policy || {};
-  const stats = state.comparison || {};
-  document.getElementById("main-exit-period").textContent = (state.started_at ? "开始：" + new Date(state.started_at * 1000).toLocaleString("zh-CN") : "等待主账户连接") + " · 初始模拟资金 " + fmtMoneyCell(state.initial_balance);
-  document.getElementById("main-exit-status").textContent = variant.last_error || (variant.paper_trading_paused ? "Paper 已暂停" : state.running ? "独立运行中" : "等待启动");
-  document.getElementById("main-exit-summary").innerHTML = [
-    experimentSummaryItem("跟随入场", stats.matched_entries || 0),
-    experimentSummaryItem("已结算配对", stats.paired_settled || 0),
-    experimentSummaryItem("同单收益差", stats.paired_settled ? signedMoney(stats.difference) : "等待结算"),
-    experimentSummaryItem("止盈 / 止损单", `${stats.take_profit_trades || 0} / ${stats.stop_loss_trades || 0}`),
-    experimentSummaryItem("挽回亏损 / 赢家变亏", `${stats.saved_losses || 0} / ${stats.winners_stopped_out || 0}`),
-    experimentSummaryItem("卖出费用", fmtMoneyCell(stats.exit_fees)),
-    experimentSummaryItem("未跟随", stats.skipped_entries || 0),
-  ].join("");
-  document.getElementById("main-exit-policy").textContent = `试验规则：净盈利 ${(Number(rule.take_profit || 0) * 100).toFixed(0)}% 止盈，净亏损 ${(Number(rule.stop_loss || 0) * 100).toFixed(0)}% 止损。卖出按买盘深度与费用核算，${Number(rule.latency_seconds || 0) * 1000} 毫秒模拟延迟。` + (variant.last_signal?.reason || "");
-  const pairs = stats.recent_pairs || [];
-  document.getElementById("main-exit-pairs").innerHTML = pairs.length ? pairs.map(row => {
-    const complete = row.difference != null;
-    const status = row.remaining_parts ? "持仓中" : complete ? "对照已完成" : "已退出，等待官方结果";
-    return `<tr><td>#${safe(row.parent_id)}</td><td>${safe(row.side)}</td><td>${fmtMoneyCell(row.original_stake)}</td><td>${safe(status)}</td><td>${row.hold_pnl == null ? "待官方结算" : fmtSignedMoneyCell(row.hold_pnl)}</td><td>${row.remaining_parts ? "尚未完全退出" : fmtSignedMoneyCell(row.exit_pnl)}</td><td>${complete ? fmtSignedMoneyCell(row.difference) : "待配对"}</td></tr>`;
-  }).join("") : '<tr><td colspan="7">等待启用后的主账户新成交；不会补录旧仓或导入历史收益。</td></tr>';
 }
 
 function experimentSummaryItem(label, value) {
@@ -3833,8 +3802,8 @@ function renderExperimentRow(row) {
     <td>${safe(row.role)}</td>
     <td>${fmtMoneyCell(metrics.total_equity)}</td>
     <td>${fmtSignedMoneyCell(metrics.realized_pnl)}</td>
-    <td>${fmtNumberCell(row.variant_id === "MAIN_TP_SL" ? metrics.settled_trades : summary.settled_count, 0)}</td>
-    <td>${fmtPctCell(row.variant_id === "MAIN_TP_SL" ? metrics.win_rate : summary.win_rate)}</td>
+    <td>${fmtNumberCell(summary.settled_count, 0)}</td>
+    <td>${fmtPctCell(summary.win_rate)}</td>
     <td>${fmtNumberCell(metrics.open_trades, 0)}</td>
     <td class="reason-cell">${safe(row.last_error || row.last_signal?.reason || "等待新行情")}</td>
     <td>${isMain ? '<button class="table-action" type="button" data-main-strategy>查看主账户</button>' :
@@ -3865,21 +3834,46 @@ function experimentDetailHtml(detail) {
   const orderSummary = variant.order_summary || {};
   const review = variant.review_score || {};
   const learning = variant.adaptive_learning || {};
+  const learningState = {
+    BASELINE_SHADOW: "基线运行 · 新校准验证中", VALIDATED: "新校准已参与评估", FALLBACK: "已退回基线 · 继续验证",
+    READY: "持续校准", WARMING: "基线评估 · 校准样本积累中",
+    BASELINE_FALLBACK: "样本不足，按基线评估", CALIBRATING: "近期样本校准",
+    ADAPTING: "近期样本校准", COST_REJECTED: "费用后优势不足", UNAVAILABLE: "学习模型不可用",
+  };
+  const validationState = learning.last_validation_state || learning.validation?.state;
+  const learningStatus = validationState || learning.last_adaptive_state || learning.state || "WARMING";
+  const learningErrors = Array.isArray(learning.source_errors) ? learning.source_errors : Object.entries(learning.source_errors || {}).map(([source, error]) => `${source}: ${error}`);
+  const adaptiveReason = learning.last_adaptive_reason || learning.last_reason || "每次评估都会继续检查最新行情与费用后优势。";
+  const validationReason = learning.last_validation_reason || learning.validation?.reason;
+  const scoreText = value => value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
   const learningPanel = variant.variant_id === "MAIN_ADAPTIVE"
-    ? `<div class="experiment-learning-panel">
-        <h3>自适应学习状态</h3>
+    ? (learning.v3 ? adaptiveV3Panel(learning) : `<div class="experiment-learning-panel">
+        <h3>${String(learning.model_version || "").endsWith("-v2") ? "自适应成长 V2 · 学习与纠正" : "自适应学习状态"}</h3>
         <div class="experiment-detail-metrics">
-          ${experimentMetric("模型状态", safe(learning.state || "WARMING"))}
-          ${experimentMetric("种子样本", fmtNumberCell(learning.seed_samples, 0))}
-          ${experimentMetric("新策略样本", fmtNumberCell(learning.adaptive_samples, 0))}
-          ${experimentMetric("总样本", fmtNumberCell(learning.total_samples, 0))}
-          ${experimentMetric("当前调整", learning.last_adjustment == null ? "基线" : `${Number(learning.last_adjustment) >= 0 ? "+" : ""}${(Number(learning.last_adjustment) * 100).toFixed(2)}%`)}
-          ${experimentMetric("当前状态", safe(learning.last_adaptive_state || "等待新信号"))}
-          ${experimentMetric("最小调整样本", fmtNumberCell(learning.min_adjustment_samples, 0))}
-          ${experimentMetric("单次最大调整", learning.max_adjustment == null ? "—" : `${(Number(learning.max_adjustment) * 100).toFixed(1)}%`)}
+          ${experimentMetric("学习状态", safe(learningState[learningStatus] || learningStatus))}
+          ${experimentMetric("已记录成交样本", fmtNumberCell(learning.total_samples, 0))}
+          ${experimentMetric("独立市场样本", fmtNumberCell(learning.unique_markets, 0))}
+          ${experimentMetric("近期有效权重", fmtNumberCell(learning.effective_samples, 1))}
+          ${experimentMetric("旧校准分数已隔离", fmtNumberCell(learning.excluded_legacy_samples, 0))}
+          ${experimentMetric("候选观察 / 已结算", `${fmtNumberCell(learning.shadow_observations, 0)} / ${fmtNumberCell(learning.shadow_resolved, 0)}`)}
+          ${experimentMetric("本次原始分数", scoreText(learning.last_base_score))}
+          ${experimentMetric("本次采用分数", scoreText(learning.last_adaptive_score))}
+          ${experimentMetric("候选校准分数", scoreText(learning.last_candidate_score))}
+          ${experimentMetric("前向验证市场", fmtNumberCell(learning.validation?.samples ?? learning.last_validation_samples, 0))}
+          ${experimentMetric("本次分数修正", learning.last_adjustment == null ? "—" : `${Number(learning.last_adjustment) >= 0 ? "+" : ""}${(Number(learning.last_adjustment) * 100).toFixed(2)} 个百分点`)}
+          ${experimentMetric("本次费用后优势", scoreText(learning.last_expected_edge))}
         </div>
-        <p class="experiment-detail-empty">历史样本只用于小幅校准评分，余额、持仓和交易记录仍保持独立。</p>
-      </div>`
+        <p class="experiment-detail-empty">当前评估：${safe(adaptiveReason)}</p>
+        ${validationReason ? `<p class="experiment-detail-empty">校准验证：${safe(validationReason)}</p>` : ""}
+        <p class="experiment-detail-empty">近期结果权重更高，同一市场最多计一票。新校准通过后续结算验证才参与评估，未通过或退化时按基线继续运行；候选观察不计作成交或收益。</p>
+        ${learningErrors.length ? `<p class="experiment-detail-empty negative">学习数据读取提示：${safe(learningErrors.join("；"))}</p>` : ""}
+      </div>`)
+    : "";
+  const fastPanel = variant.variant_id === "MAIN_OPTIMIZED_FAST"
+    ? fastPolicyPanel(variant.fast_policy, variant.last_signal)
+    : "";
+  const plusPanel = variant.variant_id === "MAIN_OPTIMIZED_PLUS"
+    ? plusPolicyPanel(variant.plus_policy, variant.last_signal)
     : "";
   return `
     <div class="experiment-detail">
@@ -3894,6 +3888,8 @@ function experimentDetailHtml(detail) {
       </div>
       <div class="experiment-score-reasons">${experimentScoreReasons(review)}</div>
       ${learningPanel}
+      ${fastPanel}
+      ${plusPanel}
       <div class="experiment-detail-grid">
         <div class="experiment-detail-section">
           <h3>最近交易</h3>
@@ -3906,6 +3902,189 @@ function experimentDetailHtml(detail) {
       </div>
     </div>
   `;
+}
+
+function adaptiveV3Panel(learning) {
+  const v3 = learning.v3 || {};
+  const validation = v3.validation || learning.validation || {};
+  const prediction = v3.last_prediction || {};
+  const execution = v3.execution || {};
+  const seed = v3.historical_seed || {};
+  const model = v3.model || {};
+  const counts = model.counts || {};
+  const features = v3.latest_features || {};
+  const assessmentAt = Number(v3.last_assessment_at);
+  const assessmentTime = v3.last_assessment_at != null && Number.isFinite(assessmentAt)
+    ? new Date(assessmentAt * 1000).toLocaleString("zh-CN", { hour12: false }) : "尚无完整评估";
+  const number = (value, digits = 2) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(digits);
+  const percent = value => value == null || !Number.isFinite(Number(value)) ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
+  const delta = value => value == null || !Number.isFinite(Number(value)) ? "—" : `${Number(value) >= 0 ? "+" : ""}${(Number(value) * 100).toFixed(2)} 个百分点`;
+  const bps = value => value == null || !Number.isFinite(Number(value)) ? "—" : `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(2)} bps`;
+  const active = validation.passed === true && v3.shadow_only === false;
+  const adjustedTrades = Number(execution.actual_adjusted_trades) || 0;
+  const status = active ? (adjustedTrades > 0 ? "候选修正已用于开仓" : "验证通过 · 修正可参与评估") : "基线继续开仓 · 候选对照中";
+  const healthErrors = Array.isArray(learning.source_errors) ? learning.source_errors : Object.entries(learning.source_errors || {}).map(([source, error]) => `${source}: ${error}`);
+  const reason = learning.last_entry_reason || learning.last_adaptive_reason || prediction.reason || "正在评估最新行情与含费成本。";
+  const coverage = v3.feature_coverage || {};
+  const selection = validation.selection || {};
+  const featureRows = [
+    ["10 秒动量", "v3_momentum_10_bps", bps],
+    ["30 秒动量", "v3_momentum_30_bps", bps],
+    ["60 秒动量", "v3_momentum_60_bps", bps],
+    ["历史波动", "v3_volatility_bps", value => value == null ? "—" : `${number(value)} bps`],
+    ["趋势偏离", "v3_trend_gap_bps", bps],
+    ["本方向买卖价差", "v3_spread", value => value == null ? "—" : `$${number(value, 3)}`],
+  ];
+  const featureMetrics = featureRows.map(([label, key, format]) => experimentMetric(label, format(features[key]))).join("");
+  const coverageValue = (key) => {
+    const value = coverage[key] ?? model.feature_counts?.[key];
+    return value && typeof value === "object" ? value.available ?? value.count ?? value.rows : value;
+  };
+  const featureCoverage = featureRows.map(([label, key]) => `${label} ${number(coverageValue(key), 0)}`).join(" · ");
+  return `<section class="experiment-learning-panel experiment-learning-v3" aria-label="自适应成长 V3 行情纠错">
+    <div class="adaptive-v3-heading"><h3>自适应成长 V3 · 行情纠错</h3><span class="adaptive-v3-status ${active ? "is-active" : "is-observing"}">${safe(status)}</span></div>
+    <p class="experiment-detail-empty">以原始预测为基础学习行情误差。候选分数与实际采用分数分别记录；采集正常或模型已就绪，不代表修正已经生效。</p>
+    <div class="experiment-detail-metrics">
+      ${experimentMetric("V3 已结成交", number(execution.v3_trades, 0))}
+      ${experimentMetric("已结中采用修正", number(execution.actual_adjusted_trades, 0))}
+      ${experimentMetric("已载入历史样本", number(seed.rows, 0))}
+      ${experimentMetric("本轮训练独立市场", number(counts.canonical_samples ?? counts.unique_markets ?? counts.training_samples ?? counts.samples, 0))}
+      ${experimentMetric("V3 前向验证市场", number(validation.samples, 0))}
+      ${experimentMetric("V3 验证观察时长", validation.observation_hours == null ? "—" : `${number(validation.observation_hours, 1)} 小时`)}
+      ${experimentMetric("本次原始分数", percent(learning.last_base_score))}
+      ${experimentMetric("本次采用分数", percent(learning.last_adaptive_score))}
+      ${experimentMetric("本次实际修正", delta(learning.last_adjustment))}
+      ${experimentMetric("本次候选分数", percent(learning.last_candidate_score))}
+      ${experimentMetric("本次费用后优势", percent(learning.last_expected_edge))}
+    </div>
+    <p class="experiment-detail-empty">当前评估：${safe(reason)}</p>
+    <p class="experiment-detail-empty">候选验证：${safe(validation.reason || "新版本正在记录同一机会的基线与候选判断；基线继续开仓。")}</p>
+    <div class="adaptive-v3-comparison">
+      <h4>同机会的前向对照</h4>
+      <div class="experiment-detail-metrics">
+        ${experimentMetric("基线预测误差", number(validation.raw_brier, 4))}
+        ${experimentMetric("候选预测误差", number(validation.candidate_brier, 4))}
+        ${experimentMetric("基线报价理论值 / 机会", number(validation.raw_quote_utility, 4))}
+        ${experimentMetric("候选报价理论值 / 机会", number(validation.candidate_quote_utility, 4))}
+        ${experimentMetric("基线理论回撤", number(validation.raw_drawdown, 3))}
+        ${experimentMetric("候选理论回撤", number(validation.candidate_drawdown, 3))}
+        ${experimentMetric("候选漏掉盈利机会", number(selection.missed_winners, 0))}
+        ${experimentMetric("候选避开亏损机会", number(selection.prevented_losers, 0))}
+        ${experimentMetric("候选新增盈利 / 亏损机会", `${number(selection.added_winners, 0)} / ${number(selection.added_losers, 0)}`)}
+      </div>
+      <p class="experiment-detail-empty">预测误差越低越好。报价理论值含费、按每机会 $1 预算计算，回撤采用同一预算口径；不等于实际成交收益，未重放深度、延迟和资金占用。</p>
+    </div>
+    <div class="adaptive-v3-features">
+      <h4>最近完整评估 · 可用行情特征</h4>
+      <p class="experiment-detail-empty">评估时间：${safe(assessmentTime)} · 当次基线 ${percent(prediction.base_score)} / 候选 ${percent(prediction.score)} · 候选修正 ${delta(prediction.delta)}。当前是否开仓以页面上方的本次评估为准。</p>
+      <div class="experiment-detail-metrics">${featureMetrics}</div>
+      <p class="experiment-detail-empty">可恢复历史特征市场数：${safe(featureCoverage)}。缺失显示 —，不补造历史行情或盘口。</p>
+    </div>
+    ${healthErrors.length ? `<p class="experiment-detail-empty negative">学习数据读取提示：${safe(healthErrors.join("；"))}</p>` : ""}
+  </section>`;
+}
+
+function fastPolicyPanel(snapshot, lastSignal) {
+  const policy = snapshot || {};
+  const params = policy.parameters || {};
+  const decision = policy.last_decision || {};
+  const number = (value, digits = 2) => value == null || !Number.isFinite(Number(value))
+    ? "—" : Number(value).toFixed(digits);
+  const percent = value => value == null || !Number.isFinite(Number(value))
+    ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
+  const price = value => value == null || !Number.isFinite(Number(value))
+    ? "—" : `$${Number(value).toFixed(3)}`;
+  const reason = decision.reason || lastSignal?.reason || "正在读取最新行情，按本策略条件评估。";
+  return `<section class="experiment-fast-panel" aria-label="优化极速版开仓条件">
+    <h3>优化极速版 · 开仓条件与当前评估</h3>
+    <p class="experiment-detail-empty">独立 Paper 对照 · ${safe(policy.policy_version || "正在读取策略版本")}</p>
+    <div class="experiment-detail-metrics">
+      ${experimentMetric("最高买入价", price(params.max_entry_price))}
+      ${experimentMetric("最低模型分数", percent(params.min_confidence))}
+      ${experimentMetric("最低费用后优势", percent(params.min_edge))}
+      ${experimentMetric("最低预期成本回报", percent(params.min_expected_roi))}
+      ${experimentMetric("入场剩余时间", `${number(params.min_time_left_seconds, 0)}–${number(params.max_time_left_seconds, 0)} 秒`)}
+      ${experimentMetric("最大买卖价差", price(params.max_spread))}
+      ${experimentMetric("最大追价幅度", price(params.max_entry_slippage))}
+      ${experimentMetric("最低可成交深度", `${number(params.min_depth_multiple, 1)} 倍单笔预算`)}
+      ${experimentMetric("同一期入场", params.one_entry_per_market === true ? "最多一次成交，不反手" : params.one_entry_per_market === false ? "按当前入场规则" : "—")}
+      ${experimentMetric("连续方向确认", `${number(params.confirmation_samples, 0)} 个源时间预测`)}
+      ${experimentMetric("确认跨度", `${number(params.confirmation_seconds, 0)} 秒`)}
+    </div>
+    <p class="experiment-detail-empty">当前评估：${safe(reason)}</p>
+    <div class="experiment-detail-metrics">
+      ${experimentMetric("本次模型分数", percent(decision.score))}
+      ${experimentMetric("本次买入价", price(decision.entry_price))}
+      ${experimentMetric("本次含费成本", price(decision.all_in_cost))}
+      ${experimentMetric("本次费用后优势", percent(decision.expected_edge))}
+      ${experimentMetric("本次预期成本回报", percent(decision.expected_roi))}
+      ${experimentMetric("本期剩余时间", decision.time_left_seconds == null ? "—" : `${number(Math.max(0, Number(decision.time_left_seconds)), 0)} 秒`)}
+    </div>
+    <p class="experiment-detail-empty">方向确认使用已有行情历史，不是等待重新收集训练样本。历史筛选用于形成研究规则，实际收益优势仍由后续 Paper 对照检验。模型分数和预期回报是估算，策略名称不代表收益保证。</p>
+  </section>`;
+}
+
+function plusPolicyPanel(snapshot, lastSignal) {
+  const policy = snapshot || {};
+  const params = policy.parameters || {};
+  const decision = policy.last_decision || {};
+  const comparison = policy.comparison || {};
+  const number = (value, digits = 2) => value == null || !Number.isFinite(Number(value))
+    ? "—" : Number(value).toFixed(digits);
+  const percent = value => value == null || !Number.isFinite(Number(value))
+    ? "—" : `${(Number(value) * 100).toFixed(2)}%`;
+  const price = value => value == null || !Number.isFinite(Number(value))
+    ? "—" : `$${Number(value).toFixed(3)}`;
+  const at = value => value == null || !Number.isFinite(Number(value))
+    ? "正在读取" : new Date(Number(value) * 1000).toLocaleString("zh-CN", { hour12: false });
+  const reason = decision.reason || lastSignal?.reason || "正在读取最新行情，按本策略条件评估。";
+  const baseline = comparison.baseline || {};
+  const variant = comparison.variant || {};
+  const moneyValue = value => value == null || !Number.isFinite(Number(value)) ? "—" : fmtSignedMoneyCell(value);
+  const rows = [
+    ["已结算笔数", "settled_trades", value => number(value, 0)],
+    ["胜率", "win_rate", value => value == null ? "—" : `${number(value)}%`],
+    ["实际净盈亏", "pnl", moneyValue],
+    ["每笔折算 $5 净盈亏", "normalized_5_pnl", moneyValue],
+    ["最大已实现回撤", "drawdown", value => value == null ? "—" : `$${number(value)}`],
+    ["尚未结算", "open_trades", value => number(value, 0)],
+  ];
+  const comparisonReady = comparison.available !== false && comparison.started_at != null;
+  return `<section class="experiment-plus-panel" aria-label="优化进阶版开仓条件与对照">
+    <h3>优化进阶版 · 独立策略对照</h3>
+    <p class="experiment-detail-empty">${safe(policy.policy_version || "正在读取策略版本")} · 沿用优化版方向判断与费用模型</p>
+    <div class="experiment-detail-metrics">
+      ${experimentMetric("同一期入场", params.one_entry_per_market === true ? "最多一次成交，不反手" : "—")}
+      ${experimentMetric("Up 动量过滤", `最近 ${number(params.up_momentum_window_seconds, 0)} 秒上涨超过 ${number(params.up_momentum_max_bps)} bps 时跳过`)}
+      ${experimentMetric("Down 动量过滤", "不增加此项过滤")}
+      ${experimentMetric("晚入场观察", params.late_entry_filter_enabled === false ? `本期已过 ${number(params.late_entry_after_seconds, 0)} 秒，仅记录、不拦截` : "按当前策略配置")}
+      ${experimentMetric("最低模型分数", percent(params.min_confidence))}
+      ${experimentMetric("最低费用后优势", percent(params.min_edge))}
+      ${experimentMetric("最高买入价", price(params.max_entry_price))}
+      ${experimentMetric("最大买卖价差", price(params.max_spread))}
+      ${experimentMetric("入场剩余时间", `${number(params.min_time_left_seconds, 0)}–${number(params.max_time_left_seconds, 0)} 秒`)}
+    </div>
+    <p class="experiment-detail-empty">当前评估：${safe(reason)}</p>
+    <div class="experiment-detail-metrics">
+      ${experimentMetric("本次候选方向", safe(decision.candidate_side || "—"))}
+      ${experimentMetric("本次模型分数", percent(decision.score))}
+      ${experimentMetric("本次买入价", price(decision.entry_price))}
+      ${experimentMetric("本次含费成本", price(decision.all_in_cost))}
+      ${experimentMetric("本次费用后优势", percent(decision.expected_edge))}
+      ${experimentMetric("最近 30 秒 BTC 动量", decision.momentum_30_bps == null ? "—" : `${number(decision.momentum_30_bps)} bps`)}
+      ${experimentMetric("本次是否晚入场", decision.late_entry == null ? "—" : decision.late_entry ? "是 · 仅观察" : "否")}
+    </div>
+    <p class="experiment-detail-empty">直接使用已有行情，不需要新增训练等待。新增过滤来自历史复盘，是否改善收益与胜率由以下前向对照检验。</p>
+    <div class="optimized-plus-comparison">
+      <h4>自新策略启动以来 / Paper</h4>
+      <p class="experiment-detail-empty">${comparisonReady ? `${safe(at(comparison.started_at))} 至 ${safe(at(comparison.asof))}` : "正在读取独立账本与共同统计起点。"}</p>
+      ${comparisonReady ? `<table class="optimized-plus-comparison-table">
+        <thead><tr><th scope="col">指标</th><th scope="col">原优化版</th><th scope="col">优化进阶版</th></tr></thead>
+        <tbody>${rows.map(([label, key, format]) => `<tr><th scope="row">${safe(label)}</th><td>${baseline.available === false ? "—" : format(baseline[key])}</td><td>${variant.available === false ? "—" : format(variant[key])}</td></tr>`).join("")}</tbody>
+      </table>` : ""}
+      <p class="experiment-detail-empty">${safe(comparison.note || "只比较共同起点之后新开的 Paper 交易。两者按各自条件实际执行，机会可能不同；不包含实盘，也不是同一机会的反事实回测。")}</p>
+    </div>
+  </section>`;
 }
 
 function experimentMetric(label, valueHtml) {
@@ -3991,7 +4170,7 @@ function renderMarket(data = latestStatus) {
   const runtime = data?.runtime || {};
   const aligned = Boolean(runtime.market_input_alignment?.enabled);
   const market = aligned ? runtime.current_market : activeMarket || runtime.current_market;
-  const signal = ["MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_TP_SL"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
+  const signal = ["MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"].includes(parseAccountScope(accountScope).variantId) ? (runtime.last_signal || {}) : selectedAccountSignal(data);
   const pair = runtime.pair_strategy || {};
   const lastPairEvent = pair.last_event || {};
   const up = aligned ? runtime.paper_quotes?.Up || {} : quotes.Up || runtime.latest_quotes?.Up || {};

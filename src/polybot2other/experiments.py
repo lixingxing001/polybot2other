@@ -64,6 +64,10 @@ class StrategyVariant:
             return "主账户止盈止损"
         if self.variant_id == "MAIN_OPTIMIZED":
             return "主账户（优化版）"
+        if self.variant_id == "MAIN_OPTIMIZED_FAST":
+            return "主账户（优化极速赚钱版）"
+        if self.variant_id == "MAIN_OPTIMIZED_PLUS":
+            return "主账户（优化进阶版）"
         if self.variant_id == "MAIN_ADAPTIVE":
             return "主账户自适应成长版"
         if self.variant_id == "VALUE_CONFIRM_V1":
@@ -122,23 +126,22 @@ VALUE_CONFIRM_VARIANT_ID = "VALUE_CONFIRM_V1"
 SIGNAL_FILTER_MODE_VALUE_CONFIRM = "VALUE_CONFIRM_V1"
 
 STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
-    StrategyVariant("MAIN_TP_SL", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
-                    "已实现", "待前向验证", "独立 Paper：沿用主账户入场，净收益 +20% / −40% 退出试验",
-                    signal_filter_mode="MAIN_TP_SL"),
     StrategyVariant("MAIN_OPTIMIZED", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
                     "已实现", "待前向验证", "独立 Paper：同源 TWAP、费用与波动约束",
                     signal_filter_mode="MAIN_OPTIMIZED"),
     StrategyVariant("MAIN_ADAPTIVE", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
                     "已实现", "待前向验证", "独立 Paper：以主账户（优化版）历史样本为种子，持续校准分数并成长",
                     signal_filter_mode=SIGNAL_FILTER_MODE_MAIN_ADAPTIVE),
-    StrategyVariant(VALUE_CONFIRM_VARIANT_ID, STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
-                    "已实现", "待前向验证", "独立 Paper：价值价带、方向确认、限额风控",
-                    single_entry_mode=SINGLE_ENTRY_MODE_STRICT,
-                    signal_filter_mode=SIGNAL_FILTER_MODE_VALUE_CONFIRM),
+    StrategyVariant("MAIN_OPTIMIZED_FAST", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
+                    "已实现", "待前向验证", "独立 Paper：优化版复盘后的费用与入场效率实验，不保证盈利速度",
+                    signal_filter_mode="MAIN_OPTIMIZED_FAST"),
+    StrategyVariant("MAIN_OPTIMIZED_PLUS", STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
+                    "已实现", "待前向验证", "独立 Paper：优化版同源信号，限制同一期反手与急涨追涨",
+                    signal_filter_mode="MAIN_OPTIMIZED_PLUS"),
 )
 
 # Retired implementations have no runnable registration and cannot create accounts.
-DEPRECATED_STRATEGY_VARIANT_IDS = frozenset()
+DEPRECATED_STRATEGY_VARIANT_IDS = frozenset({"MAIN_TP_SL", "VALUE_CONFIRM_V1"})
 
 
 def active_strategy_variants() -> tuple[StrategyVariant, ...]:

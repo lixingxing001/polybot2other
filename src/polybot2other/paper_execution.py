@@ -24,6 +24,8 @@ VERSION = "realistic-paper-v1"
 ACTIVE_PHASES = ("IN_FLIGHT", "CONFIRMING")
 NAMES = {"MAIN": "主账户", "MAIN_TP_SL": "主账户止盈止损",
          "MAIN_OPTIMIZED": "主账户（优化版）", "MAIN_ADAPTIVE": "主账户自适应成长版",
+         "MAIN_OPTIMIZED_FAST": "主账户（优化极速赚钱版）",
+         "MAIN_OPTIMIZED_PLUS": "主账户（优化进阶版）",
          "VALUE_CONFIRM_V1": "价值确认 V1"}
 
 
@@ -176,6 +178,7 @@ class PaperExecution:
             lambda: self.store.account()["cash_balance"],
             lambda: {},
             adaptive_model=getattr(bot, "adaptive_model", None),
+            execution_mode="paper",
         )
         self.recover()
 
@@ -202,6 +205,39 @@ class PaperExecution:
         now = self.clock()
         changed = (code, message) != (self.last_event["code"], self.last_event["message"])
         self.last_event = {"code": code, "message": message, "at": now}
+        if self.strategy_id == "MAIN_ADAPTIVE" and hasattr(self, "signals"):
+            if code in {"DATA_WAIT", "PAUSED"}:
+                self.signals.last_features = {"decision_at": now, "code": code, "reason": message,
+                                              "adaptive_allowed": False, "state": "waiting"}
+                self.signals.last_strategy_id = "MAIN_ADAPTIVE"
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            elif code in {"ENTRY_LIMIT", "EXECUTION_WAIT"}:
+                self.signals.last_features = {**self.signals.last_features, "reason": message,
+                                              "execution_state": code, "execution_reason": message}
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            self.signals.record_adaptive_state(message, code)
+        if self.strategy_id == "MAIN_OPTIMIZED_FAST" and hasattr(self, "signals"):
+            if code in {"DATA_WAIT", "PAUSED"}:
+                self.signals.last_features = {"decision_at": now, "code": code, "reason": message,
+                                              "fast_allowed": False, "state": "waiting"}
+                self.signals.last_strategy_id = "MAIN_OPTIMIZED_FAST"
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            elif code in {"ENTRY_LIMIT", "EXECUTION_WAIT"}:
+                self.signals.last_features = {**self.signals.last_features, "reason": message,
+                                              "execution_state": code, "execution_reason": message}
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            self.signals.record_fast_state(message, code)
+        if self.strategy_id == "MAIN_OPTIMIZED_PLUS" and hasattr(self, "signals"):
+            if code in {"DATA_WAIT", "PAUSED"}:
+                self.signals.last_features = {"decision_at": now, "code": code, "reason": message,
+                                              "plus_allowed": False, "state": "waiting"}
+                self.signals.last_strategy_id = "MAIN_OPTIMIZED_PLUS"
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            elif code in {"ENTRY_LIMIT", "EXECUTION_WAIT"}:
+                self.signals.last_features = {**self.signals.last_features, "reason": message,
+                                              "execution_state": code, "execution_reason": message}
+                self._record_signal(Signal("BTC", "NO_TRADE", 0, 0, 0, message))
+            self.signals.record_plus_state(message, code)
         if changed:
             with self.store._lock, self.store.conn:
                 self.store.conn.execute("INSERT INTO paper_sim_events(at,code,message) VALUES(?,?,?)", (now, code, message))
@@ -252,6 +288,12 @@ class PaperExecution:
             return "已有模拟订单传输或等待确认，预算保持占用"
         with self.store._lock:
             rows = self.store.conn.execute("SELECT side FROM trades WHERE round_id=?", (market.round_id,)).fetchall()
+        if self.strategy_id == "MAIN_ADAPTIVE" and rows:
+            return "成长版本期已有成交，禁止同一期反手或重复开仓"
+        if self.strategy_id == "MAIN_OPTIMIZED_FAST" and rows:
+            return "极速版本期已有成交，禁止同一期反手或重复开仓"
+        if self.strategy_id == "MAIN_OPTIMIZED_PLUS" and rows:
+            return "进阶版本期已有成交，禁止同一期反手或重复开仓"
         if any(self.strategy_id == "VALUE_CONFIRM_V1" or r[0] == side for r in rows):
             return "本期该方向已有成交，不重复开仓"
         risk = self.risk.risk_usage(self.strategy_id)
@@ -333,6 +375,10 @@ class PaperExecution:
             raise ValueError("提交前复查已不满足原策略入场条件")
         block = self._entry_block(market, signal.side, rule)
         if block: raise ValueError(block)
+        if self.strategy_id in {"MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"}:
+            # Bind the exact final score and raw provenance, not the earlier candidate.
+            signal = again
+            self._record_signal(signal)
         return self._queue(market, signal, "BUY", terms, revision,
                            max(self.policy.arrival_floor_seconds, self.clock()-started))
 
@@ -344,9 +390,27 @@ class PaperExecution:
                    "arrival_delay": delay, "revision": revision, "position_id": trade_id,
                    "exit_reason": exit_reason, "version": VERSION}
         amount = terms.get("amount", 0) if action == "BUY" else 0
+        if self.strategy_id == "MAIN_ADAPTIVE" and action == "BUY":
+            payload["adaptive_decision"] = self.signals.adaptive_snapshot(
+                market=market, limit=terms["limit"], info=terms["info"])
+        if self.strategy_id == "MAIN_OPTIMIZED_FAST" and action == "BUY":
+            payload["fast_decision"] = self.signals.fast_snapshot(
+                market=market, limit=terms["limit"], info=terms["info"])
+        if self.strategy_id == "MAIN_OPTIMIZED_PLUS" and action == "BUY":
+            payload["plus_decision"] = self.signals.plus_snapshot(
+                market=market, limit=terms["limit"], info=terms["info"])
         with self.store._lock, self.store.conn:
             if now >= market.ends_at: raise ValueError("市场已结束，取消本次提交")
             if self.pending(): raise ValueError("已有模拟订单等待确认")
+            if (self.strategy_id == "MAIN_ADAPTIVE" and action == "BUY"
+                    and self.store.conn.execute("SELECT 1 FROM trades WHERE round_id=? LIMIT 1", (market.round_id,)).fetchone()):
+                raise ValueError("成长版本期已有成交，禁止同一期反手或重复开仓")
+            if (self.strategy_id == "MAIN_OPTIMIZED_FAST" and action == "BUY"
+                    and self.store.conn.execute("SELECT 1 FROM trades WHERE round_id=? LIMIT 1", (market.round_id,)).fetchone()):
+                raise ValueError("极速版本期已有成交，禁止同一期反手或重复开仓")
+            if (self.strategy_id == "MAIN_OPTIMIZED_PLUS" and action == "BUY"
+                    and self.store.conn.execute("SELECT 1 FROM trades WHERE round_id=? LIMIT 1", (market.round_id,)).fetchone()):
+                raise ValueError("进阶版本期已有成交，禁止同一期反手或重复开仓")
             if amount > self.store.account()["cash_balance"]+.000001:
                 raise ValueError("模拟可用资金不足")
             if action == "SELL":

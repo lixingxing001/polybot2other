@@ -9,11 +9,14 @@ from unittest.mock import patch
 
 from polybot2other.bot import PaperTradingBot
 from polybot2other.config import Settings
-from polybot2other.experiments import selected_strategy_variants
+from polybot2other.experiments import selected_strategy_variants, StrategyVariant
 from polybot2other.models import MarketRound, Signal
 from polybot2other.storage import TradeStore
 from polybot2other.value_confirm import ValueConfirmGuard, stake_budget, reference_probability, POLICY_VERSION
 
+
+# Archived algorithm fixtures remain testable without a runnable registration.
+LEGACY_VALUE_VARIANT = StrategyVariant("VALUE_CONFIRM_V1", "SINGLE", "FAK", "archived", "archived", "historical fixture", single_entry_mode="STRICT", signal_filter_mode="VALUE_CONFIRM_V1")
 
 class ValueConfirmTests(unittest.TestCase):
     def setUp(self):
@@ -130,9 +133,10 @@ class ValueConfirmTests(unittest.TestCase):
                           live_trading_runtime_enabled=False)
         main_store=TradeStore(settings.db_path,100)
         self.addCleanup(main_store.conn.close)
-        main=PaperTradingBot(settings,main_store)
+        with patch("polybot2other.bot.selected_strategy_variants", return_value=(LEGACY_VALUE_VARIANT,)):
+            main=PaperTradingBot(settings,main_store)
         runner=main.strategy_experiments
-        self.assertEqual(list(runner._bots),['MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'])
+        self.assertEqual(list(runner._bots),['VALUE_CONFIRM_V1'])
         new=runner._bots['VALUE_CONFIRM_V1']
         self.addCleanup(new.store.conn.close)
         self.assertEqual(main.settings.stake_dollars,5)
@@ -179,7 +183,8 @@ class ValueConfirmTests(unittest.TestCase):
         settings=Settings(db_path=root/'main.sqlite3',strategy_experiments_enabled=True,
                           strategy_experiments_db_dir=root/'experiments',market_scout_enabled=False,
                           live_trading_runtime_enabled=False)
-        main=PaperTradingBot(settings,TradeStore(settings.db_path,100))
+        with patch("polybot2other.bot.selected_strategy_variants", return_value=(LEGACY_VALUE_VARIANT,)):
+            main=PaperTradingBot(settings,TradeStore(settings.db_path,100))
         self.addCleanup(main.store.conn.close)
         runner=main.strategy_experiments
         new=runner._bots['VALUE_CONFIRM_V1']
@@ -207,7 +212,7 @@ class ValueConfirmTests(unittest.TestCase):
     def test_new_strategy_skips_overlapping_tick(self):
         settings=Settings(db_path=self.store.db_path,market_scout_enabled=False,live_trading_runtime_enabled=False)
         bot=PaperTradingBot(settings,self.store)
-        bot.configure_strategy_experiment_variant(selected_strategy_variants('VALUE_CONFIRM_V1')[0])
+        bot.configure_strategy_experiment_variant(LEGACY_VALUE_VARIANT)
         entered, release = threading.Event(), threading.Event()
         def hold():
             entered.set()
@@ -224,7 +229,8 @@ class ValueConfirmTests(unittest.TestCase):
                 worker.join(3)
 
     def test_retired_accounts_cannot_be_selected(self):
-        self.assertEqual([x.variant_id for x in selected_strategy_variants('')],['MAIN_TP_SL','MAIN_OPTIMIZED','MAIN_ADAPTIVE','VALUE_CONFIRM_V1'])
+        self.assertEqual([x.variant_id for x in selected_strategy_variants('')],['MAIN_OPTIMIZED','MAIN_ADAPTIVE','MAIN_OPTIMIZED_FAST','MAIN_OPTIMIZED_PLUS'])
+        self.assertEqual(selected_strategy_variants('MAIN_TP_SL,VALUE_CONFIRM_V1'), ())
         with self.assertRaises(ValueError):
             selected_strategy_variants('SINGLE_FAK')
 

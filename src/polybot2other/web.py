@@ -557,6 +557,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
+        if self.path == "/api/managed-live/reset-loss-limit":
+            try:
+                runner = self._managed_live_runner(write=True)
+                payload = self._read_json_body()
+                if not isinstance(payload, dict) or set(payload) != {"strategy_id"}:
+                    raise ValueError("请指定需要重置亏损限额的实盘策略")
+                self._send_json(runner.reset_loss_limit(payload["strategy_id"]))
+            except PermissionError as exc:
+                self._send_error_json(HTTPStatus.FORBIDDEN, str(exc))
+            except ValueError as exc:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+            return
         if self.path == "/api/managed-live/sell":
             try:
                 runner = self._managed_live_runner(write=True)
