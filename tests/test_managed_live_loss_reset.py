@@ -24,7 +24,7 @@ class LossLimitResetTests(unittest.TestCase):
         self.store.save_market(market)
         order = self.store.prepare_order(f"reset-buy-{serial}", key, market, market.up_token,
                                         "Up", "BUY", .5, cash=5, now=at)
-        self.store.apply_confirmed_fill(order["id"], f"buy-{serial}", 10, .4, .1, "test", now=at)
+        self.store.apply_confirmed_fill(order["id"], f"buy-{serial}", 10, .4, .1, "test", now=at, notional=4)
         self.store.set_order_state(order["id"], "FILLED")
         return self.store.positions(key)[-1], market
 
@@ -74,7 +74,7 @@ class LossLimitResetTests(unittest.TestCase):
         position, market = self.position("MAIN_OPTIMIZED", now-100)
         sell = self.store.prepare_order("partial-exit", "MAIN_OPTIMIZED", market, market.up_token,
                                         "Up", "SELL", .2, shares=5, position_id=position["id"], now=now-50)
-        self.store.apply_confirmed_fill(sell["id"], "partial", 5, .2, .05, "test", now=now-50)
+        self.store.apply_confirmed_fill(sell["id"], "partial", 5, .2, .05, "test", now=now-50, notional=1)
         self.store.set_order_state(sell["id"], "FILLED")
         self.assertAlmostEqual(self.store.daily_pnl("MAIN_OPTIMIZED", now), -1.1)
         self.store.reset_loss_limit("MAIN_OPTIMIZED", now=now)

@@ -1,7 +1,8 @@
-"""Five independent live strategies sharing one real wallet and one order coordinator."""
+"""Independent live strategies sharing one real wallet and one order coordinator."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import json
 import math
 from pathlib import Path
 import threading
@@ -9,10 +10,13 @@ import time
 import secrets
 
 from .live import LiveProcessLock
+from . import first_strong_rules as first_strong
 from .models import MarketRound
-from .managed_live_store import ManagedLiveStore, STRATEGIES, STRATEGY_LABELS, ACTIVE_ORDER_STATES
+from .managed_live_store import (ManagedLiveStore, STRATEGIES, STRATEGY_LABELS, ACTIVE_ORDER_STATES,
+                                 BUDGET_ERROR, EXIT_SETTLE_LIVE, IncompleteFillReceipt)
 from .managed_live_client import ManagedExchange, OrderConfirmationPending, OrderSubmissionUncertain, fee_amount, maximum_fee_ratio
 from .managed_live_signals import LiveMarketFeed, LiveSignals
+from .strategy_league import _valid_book as valid_candidate_book, RETRY_SECONDS as CANDIDATE_RETRY_SECONDS
 from .managed_live_recovery import (no_activity_candidate, FINALIZE_AFTER_END_SECONDS, LATE_AUDIT_FAULT,
                                    wallet_only_audit_fault, direct_order_evidence)
 from .adaptive_v3_model import AdaptiveV3Model as AdaptiveModel
@@ -77,7 +81,7 @@ class ManagedLiveAccounts:
         for order in self.store.active_orders():
             if order["state"]=="PREPARED":self.store.set_order_state(order["id"],"CANCELED","服务重启前尚未提交")
         with self.store.lock:
-            if self.store.conn.execute("SELECT 1 FROM orders WHERE error='官方成交费用超出预算，需核对'").fetchone():
+            if self.store.conn.execute("SELECT 1 FROM orders WHERE error=? LIMIT 1", (BUDGET_ERROR,)).fetchone():
                 self._fault="存在官方成交费用超预算记录，暂停新开仓等待核对"
             if self.store.conn.execute("SELECT 1 FROM orders WHERE ack_id IS NOT NULL AND lower(ack_id)!=lower(external_id)").fetchone():
                 self._fault="官方订单编号与签名记录不一致，需要核对 SDK"
@@ -381,23 +385,41 @@ class ManagedLiveAccounts:
             return "极速版本期已有成交，禁止同一期反手或重复开仓"
         if key == "MAIN_OPTIMIZED_PLUS" and self.store.has_entry(key, market.round_id):
             return "进阶版本期已有成交，禁止同一期反手或重复开仓"
+        if key == EXIT_SETTLE_LIVE:
+            if self.store.has_entry(key, market.round_id):
+                return "拿到官方结算本局已经买过一次"
+            if self.store.recent_buy_attempt(key, since=time.time()-CANDIDATE_RETRY_SECONDS):
+                return "等待本策略两次下单之间的间隔"
+        if key == first_strong.KEY and self.store.has_entry(key, market.round_id):
+            return "首个强信号本局已有成交，等待官方结算"
         if self.store.has_entry(key,market.round_id,None if key=="VALUE_CONFIRM_V1" else side):return "本策略本期该方向已建仓，不重复开仓"
-        if any(o["state"]!="QUARANTINED" for o in self.store.active_orders(key)):return "本策略已有订单等待官方确认"
+        pending_round = market.round_id if key == first_strong.KEY else None
+        if any(o["state"]!="QUARANTINED" for o in self.store.active_orders(key, pending_round)):return "本策略已有订单等待官方确认"
         reason=self._entry_limits(key,rule)
         if reason:raise ValueError(reason)
         return None
 
     def _open(self,key,rule,market,signal,limit,info,revision):
+        if key == first_strong.KEY and not first_strong.qualified(signal):
+            return "本局方向评分未达到首个强信号门槛"
         reason=self._entry_restriction(key,rule,market,signal.side)
         if reason:return reason
         amount=rule["stake_dollars"]
         token=market.up_token if signal.side=="Up" else market.down_token
         book=self.exchange.rest_book(token)
+        if key == first_strong.KEY and not self._fresh_quote(book, token, time.time()):
+            return "本方向真实盘口过期或不匹配"
         if book.get("tick_size",info["tick_size"])!=info["tick_size"]:
             info=self.exchange.market_info(market,force=True)
             if book["tick_size"]!=info["tick_size"]:raise ValueError("市场价格精度正在更新，等待同步")
+        if key == EXIT_SETTLE_LIVE:
+            other = "Down" if signal.side == "Up" else "Up"
+            other_token = market.down_token if other == "Down" else market.up_token
+            book_rules = {signal.side:book, other:self.exchange.rest_book(other_token)}
         tick=float(info["tick_size"])
         limit=math.floor(min(limit,1-tick)/tick+1e-9)*tick
+        if key in (EXIT_SETTLE_LIVE, first_strong.KEY):
+            limit = round(limit,6)
         if limit<book["best_ask"]:raise ValueError("真实盘口已超过策略限价")
         ratio=maximum_fee_ratio(info["fee_rate"],info["fee_exponent"],tick,limit)
         budget=amount/(1+ratio)
@@ -416,9 +438,23 @@ class ManagedLiveAccounts:
             current_input=self.market_input_snapshot(advance_basis=True)
             current_market,ref,current_quotes,stamp=current_input.market,current_input.reference,current_input.quotes,current_input.observed_at
             if current_market is None or current_market.round_id!=market.round_id:return "市场已切换，等待新一期信号"
+            if key in (EXIT_SETTLE_LIVE, first_strong.KEY):
+                if (market.condition_id, market.up_token, market.down_token) != (
+                        current_market.condition_id, current_market.up_token, current_market.down_token):
+                    return "本局市场或代币已变动，等待重新核对"
+            if key == EXIT_SETTLE_LIVE:
+                if not all(valid_candidate_book(current_input,side,stamp,info,book_rules) for side in ("Up","Down")):
+                    return "两侧盘口、代币或官方最小成交份额尚未核对"
             fresh,new_limit=self.signals.evaluate(key,rule,current_market,ref,current_quotes,stamp,info,market_input=current_input)
+            if key == first_strong.KEY and not first_strong.qualified(fresh):
+                return "提交前复查未达到首个强信号门槛"
             if fresh.side!=signal.side or fresh.entry_price>limit or time.time()>=market.ends_at-self.settings.min_time_left_seconds:return "提交前复查已不满足入场条件，继续观察"
             if new_limit is None or limit>new_limit+.000001:return "提交前策略限价已变化，继续观察"
+            if key == EXIT_SETTLE_LIVE:
+                signal = fresh
+            if key == first_strong.KEY:
+                signal = replace(fresh, reason=f"首个强信号：初评 {signal.confidence:.6f}，"
+                    f"提交前方向评分 {fresh.confidence:.6f}，{fresh.reason}")
             adaptive_args = {}
             if key == "MAIN_ADAPTIVE":
                 signal = fresh
@@ -584,6 +620,24 @@ class ManagedLiveAccounts:
                 query_order={**order,"state":"EXPIRED_UNFILLED"} if reviewing_activity_fault else order
                 state=self.exchange.reconcile(query_order,market,info)
                 checked=dict(state.get("evidence",{"order":"checked"}))
+                groups = checked.get("receipt_groups", {})
+                previous = json.loads(order.get("trade_observations_json") or "{}")
+                observed = set(previous.get("matched_trade_ids", ()))
+                observed.update(checked.get("matched_trade_ids", ()))
+                accounted = set(checked.get("failed_trade_ids", ()))
+                if accounted.intersection(previous.get("confirmed_trade_ids", ())):
+                    self.store.record_verification(order["id"], checked)
+                    raise ValueError("此前官方已确认的成交又被列为失败，需核对")
+                for fill in state["fills"]:
+                    accounted.update(groups.get(fill["trade_id"], ()))
+                missing = observed - accounted
+                contradictory_empty = state["no_fill"] and (state["fills"] or order["confirmed_shares"] > 0)
+                unproven_terminal = state["terminal"] and not state["no_fill"] and not state["fills"] and not order["confirmed_shares"]
+                if missing or contradictory_empty or unproven_terminal or (state["terminal"] and checked.get("pending_trades")):
+                    checked["pending_trades"] = True
+                    checked["unresolved_trade_ids"] = sorted(missing)
+                    reason = state.get("pending_reason") or "本单已有的成交记录与最终凭证尚未核对齐全，继续核对"
+                    state = {**state, "terminal": False, "no_fill": False, "fills": [], "pending_reason": reason}
                 if state["fills"]:checked["confirmed_fills"]=state["fills"]
                 if self.store.recover_fak_no_match(order["id"],checked):
                     self._reconcile_retry_after.pop(order["id"],None)
@@ -606,7 +660,7 @@ class ManagedLiveAccounts:
                         continue
                 self.store.record_verification(order["id"],checked)
                 if order["state"]=="EXPIRED_UNFILLED":
-                    evidence=state.get("evidence",{})
+                    evidence=checked
                     if state["terminal"] and state["no_fill"]:
                         self.store.set_order_state(order["id"],"CANCELED","后续官方订单记录确认未成交")
                     elif state["fills"] or direct_order_evidence(evidence):
@@ -615,13 +669,12 @@ class ManagedLiveAccounts:
                         self.store.set_order_state(order["id"],"QUARANTINED","到期后发现钱包活动，尚未关联到该订单；仅隔离该订单核对")
                         self.store.event("reconcile_activity_isolated",f"{STRATEGY_LABELS.get(order['strategy_id'], order['strategy_id'])} 旧订单仅隔离核对，其他市场按剩余额度运行")
                     continue
-                for fill in state["fills"]:
-                    self.store.apply_confirmed_fill(order["id"],**fill)
-                if self.store.order(order["id"]).get("error")=="官方成交费用超出预算，需核对":
+                self.store.apply_reconciled_fills(order["id"],state["fills"],groups)
+                if self.store.order(order["id"]).get("error")==BUDGET_ERROR:
                     self._fault="存在官方成交费用超预算记录，暂停新开仓等待核对"
                 if state["terminal"]:
                     message=self.store.order(order["id"]).get("error")
-                    if message!="官方成交费用超出预算，需核对":message=None
+                    if message!=BUDGET_ERROR:message=None
                     self.store.set_order_state(order["id"],"CANCELED" if state["no_fill"] else "FILLED",message)
                     result="确认未成交" if state["no_fill"] else "确认成交"
                     self._reconcile_retry_after.pop(order["id"],None)
@@ -629,8 +682,8 @@ class ManagedLiveAccounts:
                                      f"{STRATEGY_LABELS.get(order['strategy_id'], order['strategy_id'])} {order['external_id']} 官方对账已完成：{result}")
                 elif state.get("pending_reason"):
                     self._wait_for_confirmation(order,state["pending_reason"])
-                if not state["terminal"]:self._try_finalize_missing(self.store.order(order["id"]),market,state.get("evidence",{}))
-            except OrderConfirmationPending as exc:
+                if not state["terminal"]:self._try_finalize_missing(self.store.order(order["id"]),market,checked)
+            except (OrderConfirmationPending, IncompleteFillReceipt) as exc:
                 if reviewing_activity_fault:continue
                 if order["state"]=="EXPIRED_UNFILLED":
                     self.store.record_verification(order["id"],{"order":"incomplete","message":str(exc)});continue
@@ -752,7 +805,7 @@ class ManagedLiveAccounts:
                     running=any(t.is_alive() for t in self._threads),error=self._fault or self.last_error,
                     entry_block_reason=block,market_paused=self._market_paused,
                     adaptive_model=adaptive_model,
-                    balance_scope="钱包余额和总资产由五个实盘策略共享；策略盈亏与持仓单独统计。",
+                    balance_scope="各实盘策略共享钱包余额和总资产，策略盈亏与持仓单独统计。",
                     off_policy="关闭开关只停止新开仓，已有实盘持仓继续管理退出。",
                     fee_note="策略盈亏依据官方已确认成交和官方市场费率计算；待领取收益不是现金余额。")
         return data

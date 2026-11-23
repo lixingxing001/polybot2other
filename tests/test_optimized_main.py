@@ -190,6 +190,28 @@ class OptimizedTests(unittest.TestCase):
         with patch.object(client,"_get_event_by_slug",return_value={"resolutionSource":"spot"}):
             self.assertIsNone(client.read_market(self.market.started_at))
 
+    def test_strict_resolution_identifies_the_closed_gamma_market(self):
+        slug = self.market.round_id
+        client = StrictTwapMarketClient(self.settings, self.bot.references)
+        market = {"slug": slug, "closed": True, "outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]'}
+        event = {
+            "slug": slug, "resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+            "eventMetadata": {"priceToBeat": 100.0, "finalPrice": 101.0}, "markets": [market],
+        }
+        with patch.object(client, "_get_event_by_slug", return_value=event):
+            self.assertEqual(client.get_resolution(slug), {
+                "market_slug": slug, "price_source": "Gamma:outcomePrices", "outcome": "Up",
+                "target_price": 100.0, "final_price": 101.0,
+            })
+        for label, response in (
+            ("different event", {**event, "slug": "old"}),
+            ("different market", {**event, "markets": [{**market, "slug": "old"}]}),
+            ("open market", {**event, "markets": [{**market, "closed": "false"}]}),
+            ("other contract", {**event, "resolutionSource": "spot"}),
+        ):
+            with self.subTest(label), patch.object(client, "_get_event_by_slug", return_value=response):
+                self.assertIsNone(client.get_resolution(slug))
+
     def test_existing_ledger_and_adaptive_remain_separate(self):
         base=TradeStore(self.root/"main.sqlite3",100)
         self.addCleanup(base.conn.close)

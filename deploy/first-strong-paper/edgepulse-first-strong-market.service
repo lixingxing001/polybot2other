@@ -1,0 +1,30 @@
+[Unit]
+Description=Public market data projection for the first strong signal Paper strategy
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/edgepulse/first-strong-paper
+ExecStart=/usr/bin/setpriv --reuid=10001 --regid=10001 --clear-groups --no-new-privs /usr/bin/python3 -B /opt/edgepulse/first-strong-paper/service/project_strong_signal_market.py --source /opt/edgepulse/data --output /opt/edgepulse/first-strong-paper/projected-market
+Restart=always
+RestartSec=3
+ProtectSystem=strict
+ProtectHome=yes
+PrivateNetwork=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/opt/edgepulse/first-strong-paper/projected-market
+InaccessiblePaths=-/opt/edgepulse/app -/opt/edgepulse/backups -/opt/edgepulse/paired-trials -/opt/edgepulse/data/strategy-experiments -/opt/edgepulse/data/live-accounts/accounts.sqlite3 -/opt/edgepulse/data/live-accounts/accounts.sqlite3-wal -/opt/edgepulse/data/live-accounts/accounts.sqlite3-shm
+InaccessiblePaths=-/opt/edgepulse/first-strong-paper/data
+TasksMax=8
+MemoryMax=80M
+CPUQuota=15%
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target

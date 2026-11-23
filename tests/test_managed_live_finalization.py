@@ -109,7 +109,7 @@ class FinalizationTests(unittest.TestCase):
         order=self.missing_expired();self.store.record_ack(order["id"],order["external_id"])
         self.probes();self.assertEqual(self.store.order(order["id"])["state"],"QUARANTINED")
         with self.store.conn:self.store.conn.execute("UPDATE orders SET ack_id=NULL WHERE id=?",(order["id"],))
-        self.store.apply_confirmed_fill(order["id"],"real-part",1,.4,.0168,"official_market_fee_schedule")
+        self.store.apply_confirmed_fill(order["id"],"real-part",1,.4,.0168,"official_market_fee_schedule",notional=.4)
         self.probes();self.assertEqual(self.store.order(order["id"])["state"],"QUARANTINED")
 
     def test_sell_requires_all_known_token_holdings_still_present(self):
@@ -121,7 +121,7 @@ class FinalizationTests(unittest.TestCase):
         self.healthy_clock(time.time()+301);self.exchange.reconcile.side_effect=TimeoutError
         self.manager.reconcile();self.assertEqual(self.store.order(order["id"])["state"],"EXPIRED_UNFILLED")
         self.healthy_clock(time.time()+301);self.exchange.reconcile.side_effect=None
-        fill={"trade_id":"late-proof","shares":2,"price":.4,"fee":.0336,"fee_source":"official_market_fee_schedule"}
+        fill={"trade_id":"late-proof","shares":2,"price":.4,"notional":.8,"fee":.0336,"fee_source":"official_market_fee_schedule"}
         self.exchange.reconcile.return_value={"fills":[fill],"terminal":True,"no_fill":False,"evidence":{"matching_trades":1}}
         self.manager.reconcile();reopened=self.store.order(order["id"])
         self.assertEqual(reopened["state"],"UNKNOWN");self.assertIn("出现新的",self.manager._fault)

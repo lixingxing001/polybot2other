@@ -11,31 +11,59 @@ import sqlite3
 import threading
 import time
 import uuid
+from . import first_strong_rules as first_strong
 from .managed_live_recovery import (FINALIZE_MIN_CHECKS, FINALIZE_MIN_SPAN_SECONDS, FINAL_AUDIT_INTERVAL_SECONDS,
                                    LATE_AUDIT_FAULT, wallet_only_audit_fault, fresh_absent_order, settled_activity_only,
                                    finalization_evidence, direct_order_evidence)
 
+EXIT_SETTLE_LIVE = "FORECAST_EXIT_SETTLE"
 STRATEGIES = {"MAIN": "主账户", "MAIN_OPTIMIZED": "主账户（优化版）",
               "MAIN_ADAPTIVE": "主账户自适应成长版", "MAIN_OPTIMIZED_FAST": "主账户（优化极速赚钱版）",
-              "MAIN_OPTIMIZED_PLUS": "主账户（优化进阶版）"}
+              "MAIN_OPTIMIZED_PLUS": "主账户（优化进阶版）", EXIT_SETTLE_LIVE: "拿到官方结算",
+              first_strong.KEY: first_strong.LABEL}
 RETIRED_STRATEGIES = {"VALUE_CONFIRM_V1": "价值确认 V1", "MAIN_TP_SL": "主账户止盈止损"}
 STRATEGY_LABELS = {**STRATEGIES, **RETIRED_STRATEGIES}
 ACTIVE_ORDER_STATES = ("PREPARED", "SUBMITTING", "PENDING", "UNKNOWN", "QUARANTINED")
+BUDGET_ERROR = "官方成交费用超出预算，需核对"
+BUDGET_TOLERANCE_MICROS = 10
+
+
+class IncompleteFillReceipt(RuntimeError):
+    """Keep the order reserved until the amounts and receipt identity can be verified."""
 
 
 def defaults():
-    return {"enabled": False, "manage_existing_when_off": True, "revision": 0,
+    config = {"enabled": False, "manage_existing_when_off": True, "revision": 0,
             "strategies": {key: {"enabled": False, "stake_dollars": 2.0 if key == "VALUE_CONFIRM_V1" else 5.0,
                                 "max_open_trades": 1 if key == "VALUE_CONFIRM_V1" else 2,
                                 "max_daily_loss": 6.0 if key == "VALUE_CONFIRM_V1" else 30.0 if key == "MAIN_OPTIMIZED_PLUS" else 21.0,
                                 "take_profit_pct": 20.0, "stop_loss_pct": 40.0}
                            for key in STRATEGIES}}
+    config["strategies"][EXIT_SETTLE_LIVE].update(max_open_trades=1, max_daily_loss=15.0)
+    config["strategies"][first_strong.KEY].update(stake_dollars=first_strong.BUDGET,
+        max_open_trades=first_strong.SLOTS, max_daily_loss=15.0)
+    return config
 
 
 def finite(value, low=0, high=1_000_000):
     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not low <= value <= high:
         raise ValueError(f"金额/参数须为 {low} 至 {high} 之间的有限数字")
     return float(value)
+
+
+def _settlement_curve_points(points, max_points=1200):
+    """Bound display size over the full account history, retaining endpoints and local extrema."""
+    if len(points) <= max_points:
+        return points
+    bucket_size = math.ceil((len(points)-2) / ((max_points-2)//2))
+    selected = [points[0]]
+    for start in range(1,len(points)-1,bucket_size):
+        indices = range(start,min(start+bucket_size,len(points)-1))
+        low = min(indices,key=lambda i:points[i]["realized_pnl"])
+        high = max(indices,key=lambda i:points[i]["realized_pnl"])
+        selected.extend(points[i] for i in sorted({low,high}))
+    selected.append(points[-1])
+    return selected
 
 
 class ManagedLiveStore:
@@ -75,6 +103,9 @@ class ManagedLiveStore:
             fill_key TEXT PRIMARY KEY,order_id TEXT NOT NULL REFERENCES orders(id),trade_id TEXT NOT NULL,
             shares REAL NOT NULL,price REAL NOT NULL,notional REAL NOT NULL,fee REAL NOT NULL,
             fee_source TEXT NOT NULL,confirmed_at REAL NOT NULL);
+          CREATE TABLE IF NOT EXISTS fill_receipt_trades(
+            order_id TEXT NOT NULL REFERENCES orders(id),trade_id TEXT NOT NULL,receipt_id TEXT NOT NULL,
+            PRIMARY KEY(order_id,trade_id));
           CREATE TABLE IF NOT EXISTS wallet_curve(id INTEGER PRIMARY KEY,at REAL NOT NULL,balance REAL,total_equity REAL);
           CREATE TABLE IF NOT EXISTS strategy_curve(id INTEGER PRIMARY KEY,at REAL NOT NULL,strategy_id TEXT NOT NULL,pnl REAL NOT NULL);
           CREATE TABLE IF NOT EXISTS valuation_books(token_id TEXT PRIMARY KEY,round_id TEXT NOT NULL,json TEXT NOT NULL);
@@ -84,11 +115,13 @@ class ManagedLiveStore:
           CREATE INDEX IF NOT EXISTS live_positions_strategy ON positions(strategy_id,status);
           CREATE INDEX IF NOT EXISTS live_orders_state ON orders(state);
           CREATE INDEX IF NOT EXISTS live_orders_strategy ON orders(strategy_id,created_at);
+          CREATE INDEX IF NOT EXISTS live_fills_order ON fills(order_id);
           CREATE INDEX IF NOT EXISTS live_wallet_curve_at ON wallet_curve(at,id);
         """)
         columns={r[1] for r in self.conn.execute("PRAGMA table_info(orders)")}
         for name,kind in {"ack_id":"TEXT","quarantined_at":"REAL","verification_at":"REAL",
-                          "verification_json":"TEXT","submission_json":"TEXT","closure_checks":"INTEGER NOT NULL DEFAULT 0",
+                          "verification_json":"TEXT","submission_json":"TEXT","trade_observations_json":"TEXT",
+                          "closure_checks":"INTEGER NOT NULL DEFAULT 0",
                           "closure_since":"REAL","closure_checked_at":"REAL","finalized_at":"REAL","finalization_json":"TEXT",
                           "audit_recovery_json":"TEXT","adaptive_decision_json":"TEXT","fast_decision_json":"TEXT","plus_decision_json":"TEXT"}.items():
             if name not in columns:self.conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {kind}")
@@ -175,7 +208,7 @@ class ManagedLiveStore:
                             raise ValueError("策略开关须为 true/false")
                         config["strategies"][key][field] = value
                     elif field == "max_open_trades":
-                        number = finite(value, 1, 10)
+                        number = finite(value, 1, first_strong.SLOTS if key == first_strong.KEY else 10)
                         if int(number) != number:
                             raise ValueError("最大持仓须为整数")
                         config["strategies"][key][field] = int(number)
@@ -235,6 +268,10 @@ class ManagedLiveStore:
                 raise ValueError("极速版本期已有成交，禁止同一期反手或重复开仓")
             if action == "BUY" and strategy_id == "MAIN_OPTIMIZED_PLUS" and self.has_entry(strategy_id, market.round_id):
                 raise ValueError("进阶版本期已有成交，禁止同一期反手或重复开仓")
+            if action == "BUY" and strategy_id == EXIT_SETTLE_LIVE and self.has_entry(strategy_id, market.round_id):
+                raise ValueError("拿到官方结算本局已经买过一次")
+            if action == "BUY" and strategy_id == first_strong.KEY and self.has_entry(strategy_id, market.round_id):
+                raise ValueError("首个强信号本局已有成交，等待官方结算")
             adaptive_json = None
             if adaptive_decision is not None:
                 if strategy_id != "MAIN_ADAPTIVE" or action != "BUY":
@@ -301,8 +338,9 @@ class ManagedLiveStore:
     def set_order_state(self, ident, state, error=None, now=None):
         with self.lock, self.conn:
             now = time.time() if now is None else now
-            self.conn.execute("UPDATE orders SET state=?,error=?,updated_at=?,submitted_at=CASE WHEN ?='SUBMITTING' THEN ? ELSE submitted_at END WHERE id=?",
-                              (state, error, now, state, now, ident))
+            self.conn.execute("""UPDATE orders SET state=?,error=CASE WHEN error=? THEN error ELSE ? END,
+                updated_at=?,submitted_at=CASE WHEN ?='SUBMITTING' THEN ? ELSE submitted_at END WHERE id=?""",
+                (state, BUDGET_ERROR, error, now, state, now, ident))
 
     def record_ack(self, ident, ack_id):
         with self.lock,self.conn:
@@ -317,6 +355,13 @@ class ManagedLiveStore:
 
     def record_verification(self,ident,evidence):
         with self.lock,self.conn:
+            if evidence.get("matched_trade_ids") or evidence.get("confirmed_trade_ids"):
+                order = self.order(ident)
+                observations = json.loads(order.get("trade_observations_json") or "{}")
+                for key in ("matched_trade_ids", "confirmed_trade_ids"):
+                    observations[key] = sorted(set(observations.get(key, ())) | set(evidence.get(key, ())))
+                self.conn.execute("UPDATE orders SET trade_observations_json=? WHERE id=?",
+                                  (json.dumps(observations), ident))
             self.conn.execute("UPDATE orders SET verification_json=?,verification_at=? WHERE id=?",
                               (json.dumps(evidence),time.time(),ident))
 
@@ -441,49 +486,116 @@ class ManagedLiveStore:
             if fault:self.conn.execute('DELETE FROM reconciliation_faults WHERE order_id=? AND message=?',(ident,LATE_AUDIT_FAULT))
             return target
 
-    def apply_confirmed_fill(self, ident, trade_id, shares, price, fee, fee_source, now=None):
-        """Only authenticated, confirmed fills enter financial accounting; idempotent."""
+    def apply_confirmed_fill(self, ident, trade_id, shares, price, fee, fee_source, now=None, *, notional):
+        fill = dict(trade_id=trade_id, shares=shares, price=price, fee=fee,
+                    fee_source=fee_source, notional=notional)
+        return bool(self.apply_reconciled_fills(ident, [fill], {}, now=now))
+
+    def apply_reconciled_fills(self, ident, fills, receipt_groups, now=None):
+        """Book the authenticated amounts together, including across the CLOB ID migration."""
+        if not fills:
+            return 0
         now = time.time() if now is None else now
-        shares = round(finite(shares, .000001, 1e12), 6)
-        price = finite(price, .000001, 1)
-        fee = round(finite(fee, 0, 1e9), 6)
-        notional = round(shares*price, 6)
         with self.lock, self.conn:
             order = self.order(ident)
             if order is None:
                 raise ValueError("未知本地订单，拒绝归属外部成交")
-            fill_key = order["external_id"]+":"+str(trade_id)
-            if self.conn.execute("SELECT 1 FROM fills WHERE fill_key=?", (fill_key,)).fetchone():
-                return False
-            if order["action"] == "BUY":
-                if order["confirmed_notional"]+order["confirmed_fee"]+notional+fee > order["requested_cash"]+.00001:
-                    # Preserve the real holding even when a broker report violates
-                    # the signed budget assumption; block further entries separately.
-                    self.conn.execute("UPDATE orders SET error=? WHERE id=?", ("官方成交费用超出预算，需核对",ident))
-                if order["position_id"] is None:
-                    cur = self.conn.execute("""INSERT INTO positions(strategy_id,round_id,token_id,outcome,
-                        entry_order,opened_at) VALUES(?,?,?,?,?,?)""", (order["strategy_id"], order["round_id"],
-                        order["token_id"], order["outcome"], ident, order["created_at"]))
-                    order["position_id"] = cur.lastrowid
-                    self.conn.execute("UPDATE orders SET position_id=? WHERE id=?", (order["position_id"], ident))
-                self.conn.execute("""UPDATE positions SET initial_shares=initial_shares+?,remaining_shares=remaining_shares+?,
-                    total_cost=round(total_cost+?,6),remaining_cost=round(remaining_cost+?,6),buy_fee=round(buy_fee+?,6)
-                    WHERE id=?""", (shares, shares, notional+fee, notional+fee, fee, order["position_id"]))
-            else:
-                position = self.position(order["position_id"])
-                if not position or shares > position["remaining_shares"]+.000001:
-                    raise ValueError("官方卖出份额超出本策略持仓，需要核对")
-                close_all = abs(shares-position["remaining_shares"]) < .000001
-                basis = position["remaining_cost"] if close_all else round(position["remaining_cost"]*shares/position["remaining_shares"],6)
-                remain = round(max(0,position["remaining_shares"]-shares),6)
-                self.conn.execute("""UPDATE positions SET remaining_shares=?,remaining_cost=round(remaining_cost-?,6),
-                    sell_fee=round(sell_fee+?,6),realized_pnl=round(realized_pnl+?,6),status=?,closed_at=?,exit_reason=? WHERE id=?""",
-                    (remain, basis, fee, notional-fee-basis, "CLOSED" if close_all else "OPEN",
-                     now if close_all else None, order["reason"], position["id"]))
-            self.conn.execute("INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?)", (fill_key,ident,str(trade_id),shares,price,notional,fee,fee_source,now))
-            self.conn.execute("""UPDATE orders SET confirmed_shares=round(confirmed_shares+?,6),confirmed_notional=round(confirmed_notional+?,6),
-                confirmed_fee=round(confirmed_fee+?,6),updated_at=? WHERE id=?""", (shares,notional,fee,now,ident))
-            return True
+            recorded = {row["trade_id"]: row for row in self.conn.execute(
+                "SELECT trade_id,shares,notional,fee FROM fills WHERE order_id=?", (ident,))}
+            aliases = {row["trade_id"]: row["receipt_id"] for row in self.conn.execute(
+                "SELECT trade_id,receipt_id FROM fill_receipt_trades WHERE order_id=?", (ident,))}
+            new_count = 0
+            polygon_batch = any(str(fill.get("trade_id", "")).startswith("polygon:") for fill in fills)
+            if polygon_batch:
+                current_ids = {fill.get("trade_id") for fill in fills}
+                if (not isinstance(receipt_groups, dict) or current_ids != set(receipt_groups)
+                        or any(not isinstance(key, str) or not key.startswith("polygon:") for key in current_ids)):
+                    raise IncompleteFillReceipt("部分链上成交缺少对应的官方交易编号，继续核对")
+                legacy_ids = set(recorded) - {key for key in recorded if key.startswith("polygon:")}
+                covered = set(aliases)
+                for ids in receipt_groups.values():
+                    if not isinstance(ids, list) or not ids or not all(
+                        isinstance(k, str) and k and not k.startswith("polygon:") for k in ids
+                    ):
+                        raise IncompleteFillReceipt("链上成交缺少对应的官方交易编号，继续核对")
+                    covered.update(ids)
+                if legacy_ids - covered:
+                    raise IncompleteFillReceipt("旧版已入账成交尚未与链上回执全部对应，继续核对")
+            for fill in fills:
+                trade_id = fill.get("trade_id")
+                if not isinstance(trade_id, str) or not trade_id:
+                    raise IncompleteFillReceipt("成交缺少官方编号，继续核对")
+                if trade_id in aliases:
+                    raise IncompleteFillReceipt("此成交已与链上回执关联，等待完整回执核对")
+                if any(fill.get(key) is None for key in ("shares", "price", "notional", "fee", "fee_source")):
+                    raise IncompleteFillReceipt("成交本金、份额或手续费的官方凭证尚未齐全，继续核对")
+                shares = finite(fill["shares"], .000001, 1e12)
+                price = finite(fill["price"], .000001, 1)
+                notional = finite(fill["notional"], .000001, shares)
+                fee = finite(fill["fee"], 0, 1e9)
+                amounts = (shares, notional, fee)
+                if any(round(amount, 6) != amount for amount in amounts):
+                    raise ValueError("官方成交金额或份额精度超出六位")
+                members = receipt_groups.get(trade_id, [])
+                if members:
+                    if len(set(members)) != len(members) or any(
+                        key in aliases and aliases[key] != trade_id for key in members
+                    ):
+                        raise ValueError("同一笔官方成交与多张链上回执关联，需核对")
+                    self.conn.executemany(
+                        "INSERT OR IGNORE INTO fill_receipt_trades VALUES(?,?,?)",
+                        [(ident, key, trade_id) for key in members])
+                    aliases.update(dict.fromkeys(members, trade_id))
+                existing_ids = {trade_id}
+                if members:
+                    existing_ids.update(key for key, receipt in aliases.items() if receipt == trade_id)
+                booked = [recorded[key] for key in existing_ids if key in recorded]
+                if booked:
+                    totals = tuple(round(sum(row[key] for row in booked), 6)
+                                   for key in ("shares", "notional", "fee"))
+                    if totals != amounts:
+                        raise ValueError("已入账的成交与官方回执份额、本金或手续费不一致，需核对")
+                    continue
+                self._write_confirmed_fill(self.order(ident), trade_id, shares, price, notional,
+                                           fee, fill["fee_source"], now)
+                recorded[trade_id] = dict(shares=shares, notional=notional, fee=fee)
+                new_count += 1
+            return new_count
+
+    def _write_confirmed_fill(self, order, trade_id, shares, price, notional, fee, fee_source, now):
+        ident = order["id"]
+        fill_key = order["external_id"] + ":" + trade_id
+        if order["action"] == "BUY":
+            spent_micros = sum(round(amount * 1_000_000) for amount in
+                               (order["confirmed_notional"], order["confirmed_fee"], notional, fee))
+            if spent_micros > round(order["requested_cash"] * 1_000_000) + BUDGET_TOLERANCE_MICROS:
+                # Preserve the real holding even when a broker report violates
+                # the signed budget assumption; block further entries separately.
+                self.conn.execute("UPDATE orders SET error=? WHERE id=?", (BUDGET_ERROR,ident))
+            if order["position_id"] is None:
+                cur = self.conn.execute("""INSERT INTO positions(strategy_id,round_id,token_id,outcome,
+                    entry_order,opened_at) VALUES(?,?,?,?,?,?)""", (order["strategy_id"], order["round_id"],
+                    order["token_id"], order["outcome"], ident, order["created_at"]))
+                order["position_id"] = cur.lastrowid
+                self.conn.execute("UPDATE orders SET position_id=? WHERE id=?", (order["position_id"], ident))
+            self.conn.execute("""UPDATE positions SET initial_shares=round(initial_shares+?,6),remaining_shares=round(remaining_shares+?,6),
+                total_cost=round(total_cost+?,6),remaining_cost=round(remaining_cost+?,6),buy_fee=round(buy_fee+?,6)
+                WHERE id=?""", (shares, shares, notional+fee, notional+fee, fee, order["position_id"]))
+        else:
+            position = self.position(order["position_id"])
+            available = round(position["remaining_shares"], 6) if position else 0
+            if shares > available:
+                raise ValueError("官方卖出份额超出本策略持仓，需要核对")
+            close_all = shares == available
+            basis = position["remaining_cost"] if close_all else round(position["remaining_cost"]*shares/available,6)
+            remain = round(available-shares,6)
+            self.conn.execute("""UPDATE positions SET remaining_shares=?,remaining_cost=round(remaining_cost-?,6),
+                sell_fee=round(sell_fee+?,6),realized_pnl=round(realized_pnl+?,6),status=?,closed_at=?,exit_reason=? WHERE id=?""",
+                (remain, basis, fee, notional-fee-basis, "CLOSED" if close_all else "OPEN",
+                 now if close_all else None, order["reason"], position["id"]))
+        self.conn.execute("INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?)", (fill_key,ident,str(trade_id),shares,price,notional,fee,fee_source,now))
+        self.conn.execute("""UPDATE orders SET confirmed_shares=round(confirmed_shares+?,6),confirmed_notional=round(confirmed_notional+?,6),
+            confirmed_fee=round(confirmed_fee+?,6),updated_at=? WHERE id=?""", (shares,notional,fee,now,ident))
 
     def positions(self, strategy_id=None, open_only=False):
         with self.lock:
@@ -510,7 +622,8 @@ class ManagedLiveStore:
     def reserved_cash(self, wallet_read_started_at=0):
         with self.lock:
             row = self.conn.execute("""SELECT coalesce(sum(CASE WHEN state IN ('PREPARED','SUBMITTING','PENDING','UNKNOWN','QUARANTINED')
-                THEN requested_cash WHEN updated_at>=? THEN confirmed_notional+confirmed_fee ELSE 0 END),0)
+                THEN max(requested_cash,round(confirmed_notional+confirmed_fee,6))
+                WHEN updated_at>=? THEN confirmed_notional+confirmed_fee ELSE 0 END),0)
                 FROM orders WHERE action='BUY'""", (wallet_read_started_at,)).fetchone()
             return round(row[0],6)
 
@@ -519,6 +632,11 @@ class ManagedLiveStore:
             sql="SELECT 1 FROM positions WHERE strategy_id=? AND round_id=?";args=[strategy_id,round_id]
             if side:sql+=" AND outcome=?";args.append(side)
             return self.conn.execute(sql,args).fetchone() is not None
+
+    def recent_buy_attempt(self, strategy_id, *, since):
+        with self.lock:
+            return self.conn.execute("""SELECT 1 FROM orders WHERE strategy_id=? AND action='BUY'
+                AND created_at>? LIMIT 1""", (strategy_id,since)).fetchone() is not None
 
     def reset_loss_limit(self, strategy_id, now=None):
         if not isinstance(strategy_id,str) or strategy_id not in STRATEGIES:
@@ -653,8 +771,13 @@ class ManagedLiveStore:
                            "as_of":oldest,"age_seconds":round(now-oldest,1) if oldest else None,
                            "missing_positions":len(open_rows)-len(observed_times),"pending_positions":pending_count}
                 peak=0.;drawdown=0.;cumulative=0.
+                settled_pnl_curve = []
+                if key in (EXIT_SETTLE_LIVE, first_strong.KEY) and closed:
+                    settled_pnl_curve.append({"created_at":positions[0]["opened_at"], "realized_pnl":0.0})
                 for p in sorted(closed,key=lambda x:(x["closed_at"],x["id"])):
                     cumulative+=p["realized_pnl"];peak=max(peak,cumulative);drawdown=max(drawdown,peak-cumulative)
+                    if settled_pnl_curve:
+                        settled_pnl_curve.append({"created_at":p["closed_at"], "realized_pnl":round(cumulative,6)})
                 orders=[dict(r) for r in self.conn.execute("SELECT * FROM orders WHERE strategy_id=? ORDER BY created_at DESC LIMIT 50",(key,))]
                 known={o["id"] for o in orders}
                 orders.extend(o for o in self.active_orders(key) if o["id"] not in known)
@@ -669,6 +792,8 @@ class ManagedLiveStore:
                     "max_drawdown":round(drawdown,6),"claim_due":round(sum(p["claim_due"] for p in positions),6),
                     "reserved_cash":round(sum(o["requested_cash"] for o in self.active_orders(key) if o["action"]=="BUY"),6)},
                     "open_trades":open_rows,"recent_trades":list(reversed(positions[-50:])),"orders":orders})
+                if key in (EXIT_SETTLE_LIVE, first_strong.KEY):
+                    variants[-1]["settled_pnl_curve"] = _settlement_curve_points(settled_pnl_curve)
             return {"enabled":config["enabled"],"settings":{k:v for k,v in config.items() if k!="retired_strategies"},"variants":variants,"wallet_curve":history['rows'],
                     "wallet_curve_meta":history['meta'],
                     "quarantined_orders":[o for o in self.active_orders() if o["state"]=="QUARANTINED"],

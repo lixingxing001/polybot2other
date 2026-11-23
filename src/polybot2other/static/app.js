@@ -164,6 +164,9 @@ const OKX_PING_MS = 20_000;
 const SNAPSHOT_POST_MS = 1_000;
 const STATUS_POLL_MS = 2_000;
 const STATUS_STREAM_STALE_MS = 4_000;
+const STATUS_REQUEST_TIMEOUT_MS = 15_000;
+const STATUS_STREAM_TIMEOUT_MS = 30_000;
+const STATUS_BACKLOG_MS = 15_000;
 const POLYMARKET_STATUS_REFRESH_MS = 30_000;
 const RECENT_PAGE_SIZE = 100;
 const ORDER_PAGE_SIZE = 20;
@@ -287,8 +290,17 @@ let lastSnapshotPostMs = 0;
 let snapshotInFlight = false;
 let latestStatus = null;
 let statusStream = null;
-let statusStreamConnected = false;
 let lastStatusStreamAt = 0;
+let lastStatusStreamSentAt = 0;
+let lastStatusBacklogRestartAt = 0;
+let lastStatusDeliveredAt = 0;
+let lastStatusServerAt = 0;
+let statusClockOffsetMs = null;
+let statusClockUncertaintyMs = 0;
+let statusStreamRevision = 0;
+let statusRequest = null;
+let statusReceived = false;
+let statusNeedsAuxiliary = true;
 let polymarketStatus = null;
 let polymarketStatusInFlight = false;
 let polymarketStatusLastFetchMs = 0;
@@ -309,6 +321,11 @@ let openDataScope = "main";
 let orderDataScope = "main";
 let recentDataScope = "main";
 let accountScope = "main";
+const EXIT_SETTLE_ID = "FORECAST_EXIT_SETTLE";
+let exitSettlePaper = null;
+let exitSettlePaperError = "";
+let exitSettlePaperRequest = false;
+let exitSettlePaperAttempt = 0;
 let accountScopeOptionsKey = "";
 let tableScopeOptionsKey = "";
 let strategyTables = null;
@@ -378,7 +395,6 @@ let marketSelectedCandidateSlug = "";
 const marketSettingsDirtyFields = new Set();
 let marketSettingsLoaded = false;
 let marketConfigOpen = false;
-let foregroundRefreshTimer = null;
 let equityCurveRows = [];
 let equityCurveMeta = {};
 let lastEquityCurveFetchMs = 0;
@@ -1918,6 +1934,16 @@ function sideClass(side) {
 }
 
 function setMetric(el, value, formatter = money, classResolver = cls) {
+  if (hasSeparatePaperLedger(accountScope) && toNumber(value) == null) {
+    const frame = metricAnimations.get(el)?.frame;
+    if (frame) cancelAnimationFrame(frame);
+    metricAnimations.delete(el);
+    delete el.dataset.metricReady;
+    delete el.dataset.metricValue;
+    el.textContent = "—";
+    el.className = "";
+    return;
+  }
   animateMetric(el, toNumber(value) || 0, formatter, classResolver);
 }
 
@@ -2160,6 +2186,7 @@ async function loadPolymarketStatus(force = false) {
   try {
     const params = force ? "?refresh=true" : "";
     const res = await fetch(`/api/polymarket-status${params}`);
+    syncStatusClock(res, now);
     const data = await res.json().catch(() => ({ ok: false, error: `polymarket status HTTP ${res.status}` }));
     if (!res.ok) throw new Error(data.error || `polymarket status HTTP ${res.status}`);
     polymarketStatus = data;
@@ -2512,7 +2539,9 @@ function renderAccountScope(data = latestStatus) {
   const current = accountScopeMeta(data);
   if (ids.accountScopeLabel) ids.accountScopeLabel.textContent = current.label;
   if (ids.accountScopeSource) ids.accountScopeSource.textContent = current.source;
-  if (ids.paperOnly) ids.paperOnly.textContent = window.ManagedLiveUI?.active(data) ? "真实钱包资产 · 所有实盘策略共享" : parseAccountScope(accountScope).scope === "live" ? `${current.label} · Live` : `${current.label} · Paper`;
+  if (ids.paperOnly) ids.paperOnly.textContent = window.ManagedLiveUI?.active(data)
+    ? hasSeparatePaperLedger(accountScope) ? current.label : "真实钱包资产 · 所有实盘策略共享"
+    : parseAccountScope(accountScope).scope === "live" ? `${current.label} · Live` : `${current.label} · Paper`;
   renderDataScopeOptions(data);
 }
 
@@ -2561,9 +2590,52 @@ function tableScopeOptions(data = latestStatus) {
 }
 
 function strategyExperimentVariants(data = latestStatus) {
-  const variants = data?.runtime?.strategy_experiments?.variants;
-  if (!Array.isArray(variants)) return [];
-  return variants.filter((variant) => variant && typeof variant === "object" && !isDeprecatedStrategyVariant(variant));
+  const rows = data?.runtime?.strategy_experiments?.variants;
+  const variants = (Array.isArray(rows) ? rows : [])
+    .filter(variant => variant && typeof variant === "object" && !isDeprecatedStrategyVariant(variant));
+  const paper = exitSettlePaper?.variant;
+  const liveSupports = data?.runtime?.managed_live?.settings?.strategies?.[EXIT_SETTLE_ID];
+  if (!variants.some(row => row.variant_id === EXIT_SETTLE_ID) && (paper || exitSettlePaper?.enabled || liveSupports)) variants.push({
+    variant_id: EXIT_SETTLE_ID, combo: "拿到官方结算", role: "按预测方向限价买入，持有到官方结算",
+    ...paper, last_error: exitSettlePaperError || exitSettlePaper?.reason || paper?.last_error,
+  });
+  const strong = window.FirstStrongPaper;
+  if (strong && !variants.some(row => row.variant_id === strong.id)) variants.push(strong.variant());
+  return variants;
+}
+
+function isFirstStrongScope(scope) {
+  return scope === "experiment:MAIN_FIRST_STRONG";
+}
+
+function hasSeparatePaperLedger(scope) {
+  return isExitSettleScope(scope) || isFirstStrongScope(scope);
+}
+
+function isExitSettleScope(scope) {
+  return scope === "experiment:" + EXIT_SETTLE_ID;
+}
+
+async function refreshExitSettlePaper() {
+  const now = Date.now();
+  if (document.hidden || activeAppPage !== "bot" || exitSettlePaperRequest || now - exitSettlePaperAttempt < 10_000) return;
+  exitSettlePaperRequest = true;
+  exitSettlePaperAttempt = now;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const response = await fetch("/api/exit-settle-paper", { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error("Paper 账本暂时未能更新");
+    const next = await response.json();
+    exitSettlePaper = next;
+    exitSettlePaperError = next.available === false && next.enabled ? (next.reason || "Paper 账本暂不可用") : "";
+  } catch {
+    exitSettlePaperError = exitSettlePaper?.available ? "正在重试，显示上次读取的 Paper 记录" : "正在连接 Paper 账本";
+  } finally {
+    clearTimeout(timer);
+    exitSettlePaperRequest = false;
+  }
+  renderAll(latestStatus, { force: true, forceChart: true });
 }
 
 function isDeprecatedStrategyVariant(variant) {
@@ -2628,10 +2700,15 @@ function selectedAccountMetrics(data = latestStatus) {
   return data?.metrics || {};
 }
 
+function isForecastPaperStrategy(id) {
+  return ["FORECAST_PAPER", "FORECAST_EARLY_PAPER", "FORECAST_LIMIT_060_PAPER", "FORECAST_LIMIT_CONTROL_PAPER"].includes(id);
+}
+
 function selectedAccountSignal(data = latestStatus) {
   if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.variant(data)?.last_signal || {};
   const variant = selectedAccountVariant(data);
   if (variant?.last_signal && typeof variant.last_signal === "object") return variant.last_signal;
+  if (isForecastPaperStrategy(parseAccountScope(accountScope).variantId) || hasSeparatePaperLedger(accountScope)) return {};
   return data?.runtime?.last_signal || {};
 }
 
@@ -2639,6 +2716,13 @@ function accountScopeMeta(data = latestStatus) {
   if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.meta(data);
   const variant = selectedAccountVariant(data);
   if (variant) {
+    if (isFirstStrongScope(accountScope)) return {
+      label: variant.combo, source: window.FirstStrongPaper.warning || "独立 Paper 账户 · 持仓按含费成本计，净值随官方结算更新",
+    };
+    if (variant.variant_id === EXIT_SETTLE_ID) return {
+      label: variant.combo,
+      source: exitSettlePaperError || exitSettlePaper?.reason || "Paper · 延续原候选账户的全部模拟记录",
+    };
     if (variant.account_scope === "live_paper" || parseAccountScope(accountScope).scope === "live_paper") {
       return {
         label: variant.combo || variant.variant_id,
@@ -2731,8 +2815,8 @@ function renderRuntime(runtime) {
     const market = live.market_data || {};
     const current = market.market && market.market.ends_at > Date.now() / 1000;
     const execution = window.ManagedLiveUI.execution(latestStatus);
-    ids.runtime.dataset.state = execution?.disconnected ? "blocked" : execution?.state || "loading";
-    ids.runtime.textContent = execution?.disconnected ? "实盘状态失联" : execution ? ({blocked:"实盘暂停开仓",waiting:"实盘等待入场",confirming:"实盘确认订单",ready:"实盘处理入场",off:"实盘新开仓关闭"}[execution.state] || execution.label) : "实盘状态读取中";
+    ids.runtime.dataset.state = execution?.state || "loading";
+    ids.runtime.textContent = execution?.disconnected ? execution.label : execution ? ({blocked:"实盘暂停开仓",waiting:"实盘等待入场",confirming:"实盘确认订单",ready:"实盘处理入场",off:"实盘新开仓关闭"}[execution.state] || execution.label) : "实盘状态读取中";
     ids.runtime.title = execution?.reason || live.error || "";
     ids.runtime.classList.toggle("error", execution?.state === "blocked");
     ids.runtime.classList.toggle("paused", execution?.state === "off");
@@ -2740,16 +2824,23 @@ function renderRuntime(runtime) {
     return;
   }
   const hasError = Boolean(runtime.last_error);
-  const displayedPrice = runtime.market_input_alignment?.enabled ? runtime.paper_price || {} : priceState;
-  const stalePrice = displayedPrice.chainlink_updated_ms ? Date.now() - displayedPrice.chainlink_updated_ms > 5_000 : true;
+  const shared = runtime.market_input_alignment?.enabled;
+  const displayedPrice = shared ? runtime.paper_price || {} : priceState;
+  const priceAgeMs = displayedPrice.chainlink > 0 && displayedPrice.chainlink_updated_ms > 0
+    ? Math.max(0, (shared ? statusServerNowMs() : Date.now()) - displayedPrice.chainlink_updated_ms) : null;
   const paperPaused = Boolean(runtime.paper_trading?.paused);
-  const runtimeError = hasError || (!paperPaused && stalePrice);
-  ids.runtime.dataset.state = runtimeError ? "blocked" : paperPaused ? "off" : "running";
-  ids.runtime.textContent = hasError ? "异常" : paperPaused ? "Paper已暂停" : stalePrice ? "等待实时价" : "实时运行";
-  ids.runtime.classList.toggle("error", runtimeError);
-  ids.runtime.classList.toggle("paused", paperPaused && !hasError);
-  ids.lastTick.textContent = runtime.last_error || (runtime.market_input_alignment?.enabled
-    ? runtime.market_input_alignment.error || "Paper / 实盘共用行情 · 参考价已校验"
+  const disconnected = statusDeliveryAgeMs() > 15_000;
+  const priceWaiting = priceAgeMs === null || priceAgeMs > 5_000;
+  ids.runtime.dataset.state = disconnected || hasError ? "blocked" : paperPaused || btcRuntimePaused ? "off" : priceWaiting ? "waiting" : "running";
+  ids.runtime.textContent = disconnected ? "页面正在重连" : hasError ? "运行异常" : paperPaused ? "Paper已暂停" : btcRuntimePaused ? "BTC 已暂停"
+    : priceAgeMs === null ? "暂无 BTC 报价" : priceWaiting ? "BTC 报价延迟" : "实时运行";
+  ids.runtime.title = disconnected ? "页面超过 15 秒未收到新的服务器状态，恢复连接后会自动更新。" : runtime.last_error
+    || (paperPaused ? "Paper 自动下单已暂停" : btcRuntimePaused ? "BTC 行情采集已暂停" : priceAgeMs === null ? "尚未收到有效的 Chainlink BTC 参考价"
+    : `最近的 Chainlink BTC 参考价来自 ${Math.floor(priceAgeMs / 1000)} 秒前`);
+  ids.runtime.classList.toggle("error", disconnected || hasError);
+  ids.runtime.classList.toggle("paused", ids.runtime.dataset.state === "off");
+  ids.lastTick.textContent = disconnected ? "等待服务器更新" : runtime.last_error || (shared
+    ? runtime.market_input_alignment.error || (runtime.market_input_alignment.ready ? "Paper / 实盘共用行情 · 参考价已校验" : "等待参考价校验")
     : `market ${marketWsStatus} · price ${priceWsStatus} · okx ${okxWsStatus} · binance ${binanceMarketWsStatus}`);
   if (ids.paperPauseToggle) {
     ids.paperPauseToggle.textContent = paperPaused ? "恢复 Paper" : "暂停 Paper";
@@ -3221,7 +3312,8 @@ function renderStrategyExperiments(runtime = {}) {
   const assetHeading = ids.strategyExperiments.closest("table")?.querySelectorAll("thead th")[2];
   if (assetHeading) assetHeading.textContent = managedMode ? "本策略持仓市值" : "账面资产";
   if (managedMode) {
-    ids.strategyExperimentMeta.textContent = "4 个策略 · 实盘独立核算";
+    const count = window.ManagedLiveUI.state(latestStatus).variants?.length ?? 0;
+    ids.strategyExperimentMeta.textContent = `${count} 个策略 · 实盘独立核算`;
     ids.strategyExperimentSummary.textContent = "钱包余额共享 · 这里只展示当前程序确认的实盘记录";
     ids.strategyExperiments.innerHTML = window.ManagedLiveUI.rows(latestStatus);
     return;
@@ -3229,13 +3321,14 @@ function renderStrategyExperiments(runtime = {}) {
   const experiments = runtime.strategy_experiments || {};
   const variants = strategyExperimentVariants(latestStatus);
   const main = { variant_id: "MAIN", combo: "主账户", role: "保留原策略与历史账本",
-    metrics: latestStatus?.metrics || {}, recent_trades_summary: latestStatus?.recent_trades_summary || {},
+    metrics: latestStatus?.metrics || {}, recent_trades_summary: {
+      settled_count: latestStatus?.metrics?.settled_trades, win_rate: latestStatus?.metrics?.win_rate },
     last_signal: runtime.last_signal || {}, last_error: runtime.last_error };
   const rows = [main, ...variants];
   ids.strategyExperimentMeta.textContent = `${rows.length} 个 Paper 账户 · 模拟交易`;
   ids.strategyExperimentSummary.textContent = runtime.paper_execution?.enabled
-    ? "各账户独立 $100 模拟钱包 · 金额与风险设置跟随实盘"
-    : "三个账户独立核算 · 原有策略与历史保留";
+    ? "各账户使用独立模拟钱包，金额和风控见「真实执行模拟」"
+    : "各账户独立核算";
 
   ids.strategyExperiments.innerHTML = rows.map(row => renderExperimentRow(row)).join("");
 }
@@ -3249,20 +3342,29 @@ function renderPaperExecution(runtime = {}) {
   const accounts = data.accounts || [], policy = accounts[0]?.policy || {};
   document.getElementById("paper-execution-version").textContent = "策略规则不变 · 模拟成交";
   document.getElementById("paper-execution-policy").textContent =
-    `金额与上方保存的设置同步；每个策略独立测试。提交后至少 ${policy.arrival_floor_seconds || 1} 秒按新盘口撮合，只使用 ${Math.round((policy.depth_fraction || .5) * 100)}% 可见深度；确认等待约 ${Number(policy.confirmation_seconds || 12).toFixed(1)} 秒。资金确认前不可复用。`;
+    `提交后至少 ${policy.arrival_floor_seconds || 1} 秒按新盘口撮合，使用 ${Math.round((policy.depth_fraction || .5) * 100)}% 可见深度。确认等待约 ${Number(policy.confirmation_seconds || 12).toFixed(1)} 秒，资金在确认后可复用。`;
+  const original = exitSettlePaper?.variant;
+  const counts = original?.order_counts || {};
+  const originalCard = original ? `<div class="managed-strategy-card paper-execution-account">
+    <div class="managed-strategy-title"><strong>${safe(original.combo)}</strong><span>Paper · 原候选账本</span></div>
+    <p>每笔 ${fmtMoneyCell(original.stake_dollars)} · 持有到官方结算</p>
+    <p class="paper-execution-reason">${safe(exitSettlePaperError || original.last_signal?.reason || "等待入场")}</p>
+    <small>已成交 ${Number(counts.FILLED || 0) + Number(counts.PARTIAL || 0)} 笔 · 未成交 ${Number(counts.CANCELLED || 0)} 笔 · 待确认 ${Number(counts.PENDING || 0)} 笔</small>
+    <small>持仓成本 ${fmtMoneyCell(original.metrics?.open_risk)} · 累计手续费 ${fmtMoneyCell(original.metrics?.fees)}</small>
+    <small>开始于 ${fmtDateTimeCell(original.start_at)}</small></div>` : "";
   document.getElementById("paper-execution-accounts").innerHTML = accounts.map(a => {
     const r = a.rules || {}, c = a.counts || {}, event = a.last_event || {};
     const pending = (a.pending || []).length;
     const state = pending ? "confirming" : /WAIT|LIMIT/.test(event.code || "") ? "waiting" : "ready";
     return `<div class="managed-strategy-card paper-execution-account" data-state="${state}">
-      <div class="managed-strategy-title"><strong>${safe(a.name)}</strong><span>Paper</span></div>
+      <div class="managed-strategy-title"><strong>${safe(a.name)}</strong><span>${isForecastPaperStrategy(a.strategy_id) ? "仅 Paper · 独立风控" : "Paper"}</span></div>
       <p>每笔 ${fmtMoneyCell(r.stake_dollars)} · 上限 ${safe(r.max_open_trades)} 笔 · 24h 亏损限额 ${Number(r.max_daily_loss) ? fmtMoneyCell(r.max_daily_loss) : "关闭"}</p>
       <p class="paper-execution-reason">${safe(pending ? "模拟订单传输 / 确认中，资金和份额保持占用" : event.message || "等待检查")}</p>
       <small>成交 ${Number(c.FILLED || 0) + Number(c.PARTIAL || 0)} 笔（部分 ${Number(c.PARTIAL || 0)}） · 未成交 ${Number(c.CANCELED || 0)} · 待确认 ${pending}</small>
       <small>已结算待领取 ${fmtMoneyCell(a.pending_settlement_cash || 0)}</small>
       <small>本轮开始 ${a.started_at ? new Date(a.started_at * 1000).toLocaleString("zh-CN") : "—"}</small>
     </div>`;
-  }).join("");
+  }).join("") + originalCard;
   document.getElementById("paper-execution-limitations").textContent =
     `确认等待参考 ${policy.confirmation_samples || 0} 笔历史实盘的第 90 百分位；样本不足时采用 12 秒估计。传输延迟参考当前只读请求耗时、至少 1 秒，不是实测下单延迟。官方结算后另模拟 ${policy.redemption_seconds || 60} 秒领取等待。${data.limitations || ""}`;
   const events = accounts.flatMap(a => (a.events || []).map(e => ({...e, name:a.name}))).sort((a,b) => b.at-a.at).slice(0,20);
@@ -3806,7 +3908,8 @@ function renderExperimentRow(row) {
     <td>${fmtPctCell(summary.win_rate)}</td>
     <td>${fmtNumberCell(metrics.open_trades, 0)}</td>
     <td class="reason-cell">${safe(row.last_error || row.last_signal?.reason || "等待新行情")}</td>
-    <td>${isMain ? '<button class="table-action" type="button" data-main-strategy>查看主账户</button>' :
+    <td>${row.variant_id === window.FirstStrongPaper?.id ? '<button class="table-action" type="button" data-first-strong-account>查看账户</button>' :
+      isMain ? '<button class="table-action" type="button" data-main-strategy>查看主账户</button>' :
       `<button class="table-action" type="button" data-experiment-id="${safe(row.variant_id)}">${detailOpen ? "收起" : "详情"}</button>`}</td>
     </tr>${!isMain && detailOpen ? renderExperimentDetailRow(row.variant_id, 9) : ""}`;
 }
@@ -3877,16 +3980,23 @@ function experimentDetailHtml(detail) {
     : "";
   return `
     <div class="experiment-detail">
+      ${variant.variant_id === EXIT_SETTLE_ID ? `<p>${safe(variant.role || "限价买入，通过官方结果结算。")}</p>
+        <button type="button" class="table-action" data-exit-settle-account>查看 Paper 账户与完整记录</button>` : ""}
       <div class="experiment-detail-metrics">
-        ${experimentMetric("评分", `<span class="${scoreClass(review.score)}">${fmtNumberCell(review.score, 2)}</span>`)}
-        ${experimentMetric("决策", safe(review.decision))}
+        ${variant.variant_id === EXIT_SETTLE_ID
+          ? experimentMetric("每笔模拟买入", fmtMoneyCell(variant.stake_dollars)) + experimentMetric("累计手续费", fmtMoneyCell(variant.metrics?.fees))
+          : experimentMetric("评分", `<span class="${scoreClass(review.score)}">${fmtNumberCell(review.score, 2)}</span>`) + experimentMetric("决策", safe(review.decision))}
         ${experimentMetric("净盈亏", fmtSignedMoneyCell(summary.total_pnl))}
         ${experimentMetric("ROI", fmtSignedPctCell(summary.roi_pct))}
-        ${experimentMetric("官方/兜底", `${fmtNumberCell(summary.official_count, 0)} / ${fmtNumberCell(summary.chainlink_count, 0)}`)}
-        ${experimentMetric("成交率", fmtPctCell(orderSummary.fill_rate))}
-        ${experimentMetric("订单", `${fmtNumberCell(orderSummary.total_count, 0)} 总 · ${fmtNumberCell(orderSummary.active_count, 0)} 活跃`)}
+        ${isForecastPaperStrategy(variant.variant_id)
+          ? experimentMetric("提前卖出 / 到期结算", `${fmtNumberCell(summary.early_exit_count, 0)} / ${fmtNumberCell(summary.official_count, 0)}`)
+          : experimentMetric("官方/兜底", `${fmtNumberCell(summary.official_count, 0)} / ${fmtNumberCell(summary.chainlink_count, 0)}`)}
+        ${variant.variant_id === EXIT_SETTLE_ID
+          ? experimentMetric("盘中最大回撤", fmtMoneyCell(variant.metrics?.max_drawdown)) + experimentMetric("较候选共同对照", fmtSignedMoneyCell(variant.excess_vs_control))
+          : experimentMetric("成交率", fmtPctCell(orderSummary.fill_rate)) + experimentMetric("订单", `${fmtNumberCell(orderSummary.total_count, 0)} 总 · ${fmtNumberCell(orderSummary.active_count, 0)} 活跃`)}
       </div>
-      <div class="experiment-score-reasons">${experimentScoreReasons(review)}</div>
+      ${isForecastPaperStrategy(variant.variant_id) ? `<button type="button" class="table-action" data-forecast-account="${safe(variant.variant_id)}">查看本局判断与开仓对照</button>` : ""}
+      ${variant.variant_id === EXIT_SETTLE_ID ? "" : `<div class="experiment-score-reasons">${experimentScoreReasons(review)}</div>`}
       ${learningPanel}
       ${fastPanel}
       ${plusPanel}
@@ -4248,7 +4358,7 @@ function paginateMeta(total, page) {
 }
 
 function renderOpenTrades(rows, scope = openDataScope, options = {}) {
-  if ((isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)) && strategyTablesLoading && !strategyTables) {
+  if (!hasSeparatePaperLedger(scope) && (isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)) && strategyTablesLoading && !strategyTables) {
     ids.openCount.textContent = "加载中";
     if (!options.force && isOpenInteractionActive()) {
       pendingOpenRender = true;
@@ -4275,7 +4385,8 @@ function renderOpenTrades(rows, scope = openDataScope, options = {}) {
   const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
   const fields = isMainScope(scope) ? openTradeFields : scopedOpenFields;
-  const selected = isMainScope(scope) ? selectedFields.open : experimentFieldKeys("open");
+  const selected = isFirstStrongScope(scope) ? ["combo","round_id","opened_at","side","entry_price","stake","position_state"]
+    : isMainScope(scope) ? selectedFields.open : experimentFieldKeys("open");
   renderTradeTable("open", rows, fields, ids.openTradesHead, ids.openTrades, selected);
   if (tableWrap) {
     tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
@@ -4293,6 +4404,11 @@ function renderRecentOrders(rows, options = {}) {
   const pageRows = rows.slice(pagination.start, pagination.end);
   ids.orderCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
   ids.orderPageInfo.textContent = `${scopeLabel(scope)} · 第 ${pagination.displayPage} / ${pagination.totalPages} 页 · 共 ${total} 条`;
+  if (isFirstStrongScope(scope)) {
+    ids.orderPageInfo.textContent += window.FirstStrongPaper.snapshot
+      ? ` · 最近 80 笔内筛选 / 累计提交 ${window.FirstStrongPaper.snapshot.account.submitted} 笔`
+      : " · 等待独立账本";
+  }
   ids.orderPrevPage.disabled = pagination.totalPages === 0 || pagination.currentPage <= 1;
   ids.orderNextPage.disabled = pagination.totalPages === 0 || pagination.currentPage >= pagination.totalPages;
   updateOrderActionButtons(rows);
@@ -4308,7 +4424,9 @@ function renderRecentOrders(rows, options = {}) {
   const scrollTop = tableWrap ? tableWrap.scrollTop : 0;
   const scrollLeft = tableWrap ? tableWrap.scrollLeft : 0;
   const fields = isMainScope(scope) ? recentOrderFields : scopedOrderFields;
-  const selected = isMainScope(scope) ? selectedFields.order : experimentFieldKeys("order");
+  const selected = isFirstStrongScope(scope) ? ["created_at","round_id","side","status","limit_price","cash_spent","fee"]
+    : isMainScope(scope) ? selectedFields.order : isExitSettleScope(scope)
+    ? ["detail_toggle", ...experimentFieldKeys("order")] : experimentFieldKeys("order");
   renderTradeTable("order", pageRows, fields, ids.recentOrdersHead, ids.recentOrders, selected);
   if (tableWrap) {
     tableWrap.scrollTop = Math.min(scrollTop, Math.max(0, tableWrap.scrollHeight - tableWrap.clientHeight));
@@ -4332,6 +4450,11 @@ function renderRecentTrades(rows, options = {}) {
   const filtered = recentFilterActive();
   ids.tradeCount.textContent = total > loaded ? `${loaded} / ${total}` : `${loaded}`;
   ids.recentPageInfo.textContent = `${scopeLabel(scope)} · ${filtered ? "范围" : "最近"} · 第 ${pagination.displayPage} / ${pagination.totalPages} 页 · 共 ${total} 条`;
+  if (isFirstStrongScope(scope)) {
+    ids.recentPageInfo.textContent += window.FirstStrongPaper.snapshot
+      ? ` · 最近 80 笔内筛选 / 累计结算 ${window.FirstStrongPaper.snapshot.account.settled} 笔`
+      : " · 等待独立账本";
+  }
   ids.recentPrevPage.disabled = pagination.totalPages === 0 || pagination.currentPage <= 1;
   ids.recentNextPage.disabled = pagination.totalPages === 0 || pagination.currentPage >= pagination.totalPages;
   renderRecentSummary(summary, scope);
@@ -4339,7 +4462,8 @@ function renderRecentTrades(rows, options = {}) {
   if (renderKey === lastRecentRenderKey) return;
   lastRecentRenderKey = renderKey;
   const fields = isMainScope(scope) ? recentTradeFields : scopedRecentFields;
-  const selected = isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent");
+  const selected = isFirstStrongScope(scope) ? ["opened_at","settled_at","round_id","side","status","stake","entry_price","payout","pnl","settlement_source_label"]
+    : isMainScope(scope) ? selectedFields.recent : experimentFieldKeys("recent");
   renderTradeTable("recent", pageRows, fields, ids.recentTradesHead, ids.recentTrades, selected);
   applyRecentContentTransition();
 }
@@ -4408,6 +4532,10 @@ function applyRecentContentTransition() {
 
 function renderRecentSummary(summary, scope = recentDataScope) {
   if (!ids.recentSummary) return;
+  if (isFirstStrongScope(scope) && !window.FirstStrongPaper.snapshot) {
+    ids.recentSummary.textContent = window.FirstStrongPaper.reason;
+    return;
+  }
   const data = summary || {};
   const sourceText = `官 ${Number(data.official_count || 0)} / 兜 ${Number(data.chainlink_count || 0)} / 平 ${Number(data.early_exit_count || 0)}`;
   const items = [
@@ -4489,7 +4617,7 @@ function openRenderKey(rows, scope = openDataScope) {
 }
 
 function orderRenderKey(rows, scope = orderDataScope, meta = orderMeta) {
-  const expandedFills = expandedOrderId ? orderFillCache.get(expandedOrderId) || [] : [];
+  const expandedFills = expandedOrderId ? orderFillCache.get(scope + ":" + expandedOrderId) || [] : [];
   const rowsKey = rows.map((row) => [
     row.variant_id || "main",
     row.id,
@@ -4795,7 +4923,7 @@ function orderCancelButton(row) {
 
 function renderOrderFillRow(row, colspan) {
   if (expandedOrderId !== row.id) return "";
-  const fills = orderFillCache.get(row.id) || [];
+  const fills = orderFillCache.get(orderDataScope + ":" + row.id) || [];
   const body = loadingOrderId === row.id
     ? `<div class="order-fill-empty">加载逐档成交...</div>`
     : orderFillsHtml(fills);
@@ -4828,12 +4956,14 @@ function renderTradeTable(kind, rows, fields, headEl, bodyEl, selectedOverride =
   const visibleFields = fields.filter((field) => selected.includes(field.key));
   headEl.innerHTML = `<tr>${visibleFields.map((field) => `<th>${safe(field.label)}</th>`).join("")}</tr>`;
   if (!rows.length) {
-    const emptyText = kind === "open" ? "暂无持仓" : kind === "order" ? "暂无订单" : "暂无交易";
-    bodyEl.innerHTML = `<tr><td class="empty" colspan="${Math.max(1, visibleFields.length)}">${emptyText}</td></tr>`;
+    const scope = kind === "open" ? openDataScope : kind === "order" ? orderDataScope : recentDataScope;
+    const emptyText = isFirstStrongScope(scope) && !window.FirstStrongPaper.snapshot ? window.FirstStrongPaper.reason
+      : kind === "open" ? "暂无持仓" : kind === "order" ? "暂无订单" : "暂无交易";
+    bodyEl.innerHTML = `<tr><td class="empty" colspan="${Math.max(1, visibleFields.length)}">${safe(emptyText)}</td></tr>`;
     return;
   }
   bodyEl.innerHTML = rows.map((row) => {
-    const experimentOrder = kind === "order" && row.account_scope === "strategy_experiment";
+    const experimentOrder = kind === "order" && row.account_scope === "strategy_experiment" && row.variant_id !== EXIT_SETTLE_ID;
     return `
     <tr${kind === "order" && !experimentOrder ? ` data-order-id="${safe(row.id)}"` : ""}>
       ${visibleFields.map((field) => `<td class="${field.cellClass || ""}">${field.render(row)}</td>`).join("")}
@@ -5032,6 +5162,11 @@ function drawChart(points) {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#181c20";
   ctx.fillRect(0, 0, width, height);
+  const settlementCurve = hasSeparatePaperLedger(accountScope);
+  if (settlementCurve && !points.length) {
+    ids.chartTooltip.hidden = true;
+    return;
+  }
   const initialBalance = chartInitialBalance();
   const rows = points.length ? points : [{
     cash_balance: initialBalance,
@@ -5045,7 +5180,8 @@ function drawChart(points) {
   const padRight = 14;
   const padTop = 2;
   const liveWalletChart = Boolean(window.ManagedLiveUI?.active(latestStatus));
-  const padBottom = liveWalletChart ? 25 : 2;
+  const datedAxis = liveWalletChart || settlementCurve;
+  const padBottom = datedAxis ? 25 : 2;
   const values = rows.map((p) => p.total_equity);
   const min = Math.min(...values, initialBalance);
   const max = Math.max(...values, initialBalance);
@@ -5090,7 +5226,8 @@ function drawChart(points) {
     ctx.beginPath();
     ctx.moveTo(chartPoints[0].x, height - padBottom);
     ctx.lineTo(chartPoints[0].x, chartPoints[0].y);
-    drawSmoothChartPath(ctx, chartPoints, false);
+    if (settlementCurve) drawSettlementPath(ctx, chartPoints);
+    else drawSmoothChartPath(ctx, chartPoints, false);
     const lastPoint = chartPoints[chartPoints.length - 1];
     ctx.lineTo(lastPoint.x, height - padBottom);
     ctx.closePath();
@@ -5102,7 +5239,10 @@ function drawChart(points) {
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.beginPath();
-  drawSmoothChartPath(ctx, chartPoints);
+  if (settlementCurve) {
+    ctx.moveTo(chartPoints[0].x, chartPoints[0].y);
+    drawSettlementPath(ctx, chartPoints);
+  } else drawSmoothChartPath(ctx, chartPoints);
   ctx.stroke();
 
   if (chartPoints.length === 1) {
@@ -5115,8 +5255,8 @@ function drawChart(points) {
   ctx.fillStyle = "#9aa7b1";
   ctx.font = "12px system-ui";
   ctx.fillText(money.format(max), padX, 13);
-  ctx.fillText(money.format(min), padX, liveWalletChart ? height - padBottom - 4 : height - 5);
-  if (liveWalletChart) {
+  ctx.fillText(money.format(min), padX, datedAxis ? height - padBottom - 4 : height - 5);
+  if (datedAxis) {
     const ticks = width >= 600 ? 4 : 2;
     for (let i = 0; i <= ticks; i += 1) {
       const stamp = minTs + (maxTs - minTs) * i / ticks;
@@ -5140,6 +5280,7 @@ function drawChart(points) {
 
 function chartInitialBalance() {
   if (window.ManagedLiveUI?.active(latestStatus)) {
+    if (hasSeparatePaperLedger(accountScope)) return 0;
     const rows = window.ManagedLiveUI.curve(latestStatus);
     return Number(rows[0]?.total_equity ?? window.ManagedLiveUI.state(latestStatus).wallet?.balance ?? 0);
   }
@@ -5155,7 +5296,10 @@ function buildChartRows(statusRows = []) {
     return window.ManagedLiveUI.curve(latestStatus).map(row => normalizeEquityPoint(row, chartInitialBalance())).filter(Boolean);
   }
   const initialBalance = chartInitialBalance();
-  const cutoff = Date.now() / 1000 - EQUITY_CURVE_DAYS * 24 * 60 * 60;
+  if (isFirstStrongScope(accountScope)) {
+    return downsampleEquityRows(window.FirstStrongPaper.curve.map(row => normalizeEquityPoint(row, initialBalance)), EQUITY_CURVE_MAX_POINTS);
+  }
+  const cutoff = isExitSettleScope(accountScope) ? 0 : Date.now() / 1000 - EQUITY_CURVE_DAYS * 24 * 60 * 60;
   const rowsByTime = new Map();
   for (const raw of equityCurveRows.concat(statusRows || [])) {
     const row = normalizeEquityPoint(raw, initialBalance);
@@ -5167,6 +5311,7 @@ function buildChartRows(statusRows = []) {
 }
 
 function selectedAccountCurrentPoint(data = latestStatus) {
+  if (hasSeparatePaperLedger(accountScope)) return null;
   if (window.ManagedLiveUI?.active(data)) return window.ManagedLiveUI.currentPoint(data);
   const metrics = selectedAccountMetrics(data);
   const totalEquity = toNumber(metrics?.total_equity);
@@ -5252,7 +5397,11 @@ function positionChartTooltip(point) {
   const pnlClass = cls(row.total_pnl);
   const pnlLabel = row.total_pnl > 0 ? "盈利" : row.total_pnl < 0 ? "亏损" : "持平";
   const liveWalletChart = Boolean(window.ManagedLiveUI?.active(latestStatus));
-  tooltip.innerHTML = liveWalletChart ? `
+  tooltip.innerHTML = hasSeparatePaperLedger(accountScope) ? `
+    <div class="chart-tooltip-time">${safe(formatChartTime(row.created_at))}</div>
+    ${liveWalletChart ? "" : `<div class="chart-tooltip-row"><span>模拟已结算净值</span><strong>${money.format(row.total_equity)}</strong></div>`}
+    <div class="chart-tooltip-row"><span>${liveWalletChart ? "实盘" : "模拟"}累计已结算盈亏</span><strong class="${pnlClass}">${signedMoney(row.realized_pnl)}</strong></div>
+  ` : liveWalletChart ? `
     <div class="chart-tooltip-time">${safe(formatChartTime(row.created_at))}</div>
     <div class="chart-tooltip-row"><span>钱包总资产</span><strong>${money.format(row.total_equity)}</strong></div>
     <div class="chart-tooltip-row"><span>较区间起点变化</span><strong class="${pnlClass}">${signedMoney(row.total_pnl)}</strong></div>
@@ -5289,6 +5438,13 @@ function formatChartTime(seconds) {
   });
 }
 
+function drawSettlementPath(ctx, points) {
+  for (let i = 1; i < points.length; i += 1) {
+    ctx.lineTo(points[i].x, points[i - 1].y);
+    ctx.lineTo(points[i].x, points[i].y);
+  }
+}
+
 function drawSmoothChartPath(ctx, points, moveToFirst = true) {
   if (!points.length) return;
   if (moveToFirst) ctx.moveTo(points[0].x, points[0].y);
@@ -5304,11 +5460,101 @@ function drawSmoothChartPath(ctx, points, moveToFirst = true) {
   ctx.lineTo(last.x, last.y);
 }
 
-async function loadStatus(manual = false) {
-  const res = await fetch(manual ? "/api/tick" : "/api/status", manual ? { method: "POST" } : {});
+function statusDeliveryAgeMs() {
+  return lastStatusDeliveredAt ? Math.max(0, Date.now() - lastStatusDeliveredAt) : Infinity;
+}
+
+function statusServerNowMs() {
+  return Date.now() - (statusClockOffsetMs || 0);
+}
+
+function syncStatusClock(response, startedAt) {
+  const serverAt = Date.parse(response.headers.get("Date"));
+  if (!Number.isFinite(serverAt)) return null;
+  const receivedAt = Date.now();
+  // HTTP Date has second resolution. The server wrote it between the request and response.
+  const minOffset = startedAt - serverAt - 999;
+  const maxOffset = receivedAt - serverAt;
+  const clocksAgree = minOffset <= 0 && maxOffset >= 0;
+  statusClockOffsetMs = clocksAgree ? 0 : (minOffset + maxOffset) / 2;
+  statusClockUncertaintyMs = clocksAgree ? 999 : (maxOffset - minOffset) / 2;
+  return serverAt;
+}
+
+function streamIsBacklogged() {
+  return statusStream && lastStatusStreamSentAt > 0
+    && statusServerNowMs() - lastStatusStreamSentAt > STATUS_BACKLOG_MS + statusClockUncertaintyMs;
+}
+
+function noteStatusDelivery(sentAt, precisionMs = 0) {
+  const now = Date.now();
+  let deliveredAt = now;
+  if (Number.isFinite(sentAt) && sentAt > 0) {
+    if (sentAt + precisionMs < lastStatusServerAt) return false;
+    lastStatusServerAt = Math.max(lastStatusServerAt, sentAt);
+    deliveredAt = Math.min(now, sentAt + (statusClockOffsetMs || 0));
+  }
+  lastStatusDeliveredAt = Math.max(lastStatusDeliveredAt, deliveredAt);
+  return true;
+}
+
+function acceptStatus(data, refreshAuxiliary) {
+  applyStatusPayload(data, { refreshAuxiliary: refreshAuxiliary || statusNeedsAuxiliary });
+  statusNeedsAuxiliary = false;
+  if (statusReceived) return;
+  statusReceived = true;
+  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
+  if (marketPageActive()) {
+    loadMarketLlmTerminal(true).catch(showError);
+    loadMarketScoutState(true).catch(showError);
+  }
+  if (!btcRuntimePaused) {
+    connectPriceSocket();
+    connectOkxSocket();
+    connectBinanceMarketSocket();
+  }
+}
+
+function loadStatus(manual = false) {
+  if (manual) return loadManualTickStatus();
+  if (statusRequest) return statusRequest.promise;
+  const controller = new AbortController();
+  const revision = statusStreamRevision;
+  const startedAt = Date.now();
+  const timeout = setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
+  const request = { controller };
+  statusRequest = request;
+  request.promise = (async () => {
+    try {
+      const res = await fetch("/api/status", { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const serverAt = syncStatusClock(res, startedAt);
+      const data = await res.json();
+      if (statusRequest !== request || !pageVisible) return;
+      if (statusStreamRevision !== revision && !(streamIsBacklogged() && serverAt > lastStatusServerAt + 1000)) return;
+      if (!noteStatusDelivery(serverAt, 999)) return;
+      acceptStatus(data, true);
+    } catch (error) {
+      if (statusRequest === request && statusStreamRevision === revision && pageVisible) throw error;
+    } finally {
+      clearTimeout(timeout);
+      if (statusRequest === request) statusRequest = null;
+    }
+  })();
+  return request.promise;
+}
+
+async function loadManualTickStatus() {
+  const revision = statusStreamRevision;
+  const startedAt = Date.now();
+  const res = await fetch("/api/tick", { method: "POST" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const serverAt = syncStatusClock(res, startedAt);
   const data = await res.json();
-  applyStatusPayload(data, { manual, refreshAuxiliary: true });
+  if (revision === statusStreamRevision && pageVisible) {
+    if (!noteStatusDelivery(serverAt, 999)) return;
+    applyStatusPayload(data, { manual: true, refreshAuxiliary: true });
+  }
 }
 
 async function runManualTick() {
@@ -5370,33 +5616,112 @@ function applyStatusPayload(data, options = {}) {
   }
 }
 
+function applyStatusChange(snapshot, path, value, remove) {
+  if (!Array.isArray(path) || !path.length) throw new Error("状态更新路径为空");
+  let node = snapshot;
+  for (const [index, key] of path.entries()) {
+    const validKey = Array.isArray(node)
+      ? Number.isSafeInteger(key) && key >= 0 && key < node.length
+      : node !== null && typeof node === "object" && typeof key === "string";
+    if (!validKey) throw new Error("状态更新路径无效");
+    const exists = Object.prototype.hasOwnProperty.call(node, key);
+    if (index < path.length - 1) {
+      if (!exists) throw new Error("状态更新路径缺失");
+      node = node[key];
+    } else if (remove) {
+      if (!exists || Array.isArray(node)) throw new Error("状态删除路径无效");
+      delete node[key];
+    } else {
+      Object.defineProperty(node, key, { value, configurable: true, enumerable: true, writable: true });
+    }
+  }
+}
+
+function closeStatusStream() {
+  if (statusStream) statusStream.close();
+  statusStream = null;
+  lastStatusStreamSentAt = 0;
+}
+
+function handleStatusConnectionError() {
+  if (!pageVisible) return;
+  if (latestStatus?.runtime) {
+    renderRuntime(latestStatus.runtime);
+    return;
+  }
+  ids.runtime.dataset.state = "blocked";
+  ids.runtime.textContent = "页面正在重连";
+  ids.runtime.classList.add("error");
+  ids.lastTick.textContent = "等待服务器返回状态，连接恢复后会自动更新";
+}
+
 function connectStatusStream() {
-  if (!window.EventSource || statusStream) return;
-  statusStream = new EventSource("/api/status-stream");
-  statusStream.onopen = () => {
-    statusStreamConnected = true;
+  if (!pageVisible || !window.EventSource || statusStream) return;
+  const stream = new EventSource("/api/status-stream?format=delta");
+  statusStream = stream;
+  lastStatusStreamAt = Date.now();
+  let snapshot = null;
+  let seq = 0;
+  const recover = () => {
+    if (stream !== statusStream) return;
+    closeStatusStream();
+    if (pageVisible) loadStatus().catch(handleStatusConnectionError);
   };
-  statusStream.onmessage = (event) => {
-    lastStatusStreamAt = Date.now();
-    if (!pageVisible) return;
+  stream.onerror = recover;
+  stream.onmessage = (event) => {
+    if (stream !== statusStream || !pageVisible) return;
+    let frame;
     try {
-      applyStatusPayload(JSON.parse(event.data), { refreshAuxiliary: false });
-    } catch (error) {
-      showError(error);
+      frame = JSON.parse(event.data);
+      if (frame.type === "ping") {
+        if (!snapshot || frame.seq !== seq) throw new Error("状态心跳序号无效");
+      } else {
+        if (frame.seq !== seq + 1) throw new Error("状态更新序号不连续");
+        if (frame.type === "full" && frame.data?.runtime) {
+          snapshot = frame.data;
+        } else if (frame.type === "delta" && snapshot && frame.base === seq) {
+          if (!Array.isArray(frame.set) || !Array.isArray(frame.remove)) throw new Error("状态更新格式无效");
+          for (const update of frame.set) {
+            if (!Array.isArray(update) || update.length !== 2) throw new Error("状态更新项无效");
+            applyStatusChange(snapshot, update[0], update[1], false);
+          }
+          for (const path of frame.remove) applyStatusChange(snapshot, path, undefined, true);
+        } else {
+          throw new Error("缺少完整状态");
+        }
+        seq = frame.seq;
+      }
+    } catch {
+      recover();
+      return;
     }
-  };
-  statusStream.onerror = () => {
-    statusStreamConnected = false;
-    if (statusStream) {
-      statusStream.close();
-      statusStream = null;
-    }
-    setTimeout(connectStatusStream, 2_000);
+    lastStatusStreamAt = Date.now();
+    lastStatusStreamSentAt = frame.sent_at_ms;
+    if (!noteStatusDelivery(frame.sent_at_ms)) return;
+    statusStreamRevision += 1;
+    // Table filters and renderers keep their own mutable copy of the wire snapshot.
+    if (frame.type !== "ping") acceptStatus(structuredClone(snapshot), false);
   };
 }
 
+function maintainStatusConnection() {
+  if (!pageVisible) return;
+  const now = Date.now();
+  const silence = now - lastStatusStreamAt;
+  const wasStalled = statusStream && silence >= STATUS_STREAM_STALE_MS;
+  const backlogged = streamIsBacklogged();
+  if (backlogged && statusClockOffsetMs !== null && now - lastStatusBacklogRestartAt >= STATUS_BACKLOG_MS) {
+    lastStatusBacklogRestartAt = now;
+    closeStatusStream();
+  } else if (silence >= STATUS_STREAM_TIMEOUT_MS) {
+    closeStatusStream();
+  }
+  connectStatusStream();
+  if (!statusStream || wasStalled || backlogged) loadStatus().catch(handleStatusConnectionError);
+}
+
 async function loadEquityCurve(force = false) {
-  if (window.ManagedLiveUI?.active(latestStatus)) return;
+  if (window.ManagedLiveUI?.active(latestStatus) || isFirstStrongScope(accountScope)) return;
   const now = Date.now();
   if (equityCurveInFlight) {
     if (force) equityCurvePendingForce = true;
@@ -5414,6 +5739,7 @@ async function loadEquityCurve(force = false) {
     if (selection.scope === "experiment") {
       params.set("account_scope", "strategy_experiment");
       params.set("variant_id", selection.variantId);
+      if (isExitSettleScope(requestScope)) params.set("full_history", "1");
     } else if (selection.scope === "live") {
       params.set("account_scope", "live");
       params.set("variant_id", selection.variantId);
@@ -5499,7 +5825,7 @@ function applyOrderPage(rows = [], meta = {}, options = {}) {
 
 function strategyExperimentViewActive() {
   return [openDataScope, orderDataScope, recentDataScope].some((scope) => (
-    isExperimentAggregateScope(scope) || isExperimentVariantScope(scope)
+    !hasSeparatePaperLedger(scope) && (isExperimentAggregateScope(scope) || isExperimentVariantScope(scope))
   ));
 }
 
@@ -5531,6 +5857,13 @@ async function loadStrategyExperimentTables(options = {}) {
 }
 
 async function loadOrders(force = false) {
+  if (isFirstStrongScope(orderDataScope)) {
+    const rows = window.FirstStrongPaper.orderPage(orderStatusFilter);
+    orderRows = rows;
+    orderMeta = {total:rows.length, loaded:rows.length, has_more:false, status_filter:orderStatusFilter};
+    renderRecentOrders(rows, {force});
+    return;
+  }
   if (isExperimentAggregateScope(orderDataScope)) {
     await loadStrategyExperimentTables({ force, orderLimit: strategyOrderLimit });
     return;
@@ -5592,18 +5925,20 @@ async function toggleOrderFills(orderId) {
     return;
   }
   expandedOrderId = orderId;
-  if (!orderFillCache.has(orderId)) {
+  const scope = orderDataScope;
+  const cacheKey = scope + ":" + orderId;
+  if (!orderFillCache.has(cacheKey)) {
     loadingOrderId = orderId;
     renderRecentOrders(orderRows, { force: true });
     try {
       const params = new URLSearchParams({ order_id: String(orderId) });
-      appendScopeParams(params, orderDataScope);
+      appendScopeParams(params, scope);
       const res = await fetch(`/api/order-fills?${params.toString()}`);
       if (!res.ok) throw new Error(`order fills HTTP ${res.status}`);
       const payload = await res.json();
-      orderFillCache.set(orderId, Array.isArray(payload.fills) ? payload.fills : []);
+      orderFillCache.set(cacheKey, Array.isArray(payload.fills) ? payload.fills : []);
     } finally {
-      loadingOrderId = null;
+      if (orderDataScope === scope && loadingOrderId === orderId) loadingOrderId = null;
     }
   }
   renderRecentOrders(orderRows, { force: true });
@@ -5749,7 +6084,7 @@ function handleDataScopeChange(kind, value) {
     else recentLoading = true;
   }
   renderAll(latestStatus, { force: true, forceOrder: true });
-  if (isExperimentAggregateScope(normalized) || isExperimentVariantScope(normalized)) {
+  if (!hasSeparatePaperLedger(normalized) && (isExperimentAggregateScope(normalized) || isExperimentVariantScope(normalized))) {
     if (kind === "order") strategyOrderLimit = ORDER_PAGE_SIZE;
     if (kind === "recent") strategyTradeLimit = RECENT_PAGE_SIZE;
     loadStrategyExperimentTables({ force: true }).catch(showError);
@@ -5804,6 +6139,15 @@ function recentTradeQueryParams(offset, scope = recentDataScope) {
 }
 
 async function loadRecentTradesPage(replace = false, options = {}) {
+  if (isFirstStrongScope(recentDataScope)) {
+    const page = window.FirstStrongPaper.tradePage(recentFilters);
+    recentRows = page.rows;
+    recentMeta = {total:recentRows.length, loaded:recentRows.length, has_more:false, ...recentFilters};
+    recentSummary = page.summary;
+    recentLoading = false;
+    renderRecentTrades(recentRows);
+    return;
+  }
   const requestScope = recentDataScope;
   const requestFilterKey = recentFilterKey();
   if (isExperimentAggregateScope(requestScope)) {
@@ -6293,7 +6637,21 @@ function renderAll(data = latestStatus, options = {}) {
 
 function renderAllNow(data = latestStatus, options = {}) {
   if (!data) return;
+  refreshExitSettlePaper();
+  if (activeAppPage === "bot") window.FirstStrongPaper?.refresh();
   window.ManagedLiveUI?.render(data);
+  const growthScope = parseAccountScope(accountScope);
+  const forecastId = growthScope.scope === "experiment" && isForecastPaperStrategy(growthScope.variantId)
+    ? growthScope.variantId : null;
+  window.ForecastObservationsUI?.sync(forecastId, selectedAccountVariant(data)?.combo);
+  window.PaperGrowthUI?.sync({
+    paper: !window.ManagedLiveUI?.active(data) && growthScope.scope !== "live" && !isFirstStrongScope(accountScope),
+    strategyId: growthScope.variantId || "MAIN",
+  });
+  for (const [menu, scope] of [[ids.openFieldOptions, openDataScope], [ids.orderFieldOptions, orderDataScope], [ids.recentFieldOptions, recentDataScope]]) {
+    const details = menu?.closest("details");
+    if (details) details.hidden = isFirstStrongScope(scope);
+  }
   renderRuntime(data.runtime);
   renderPaperExecution(data.runtime);
   renderLivePanel(data);
@@ -6341,6 +6699,8 @@ function renderAllNow(data = latestStatus, options = {}) {
 }
 
 function scopedOpenRows(scope, data = latestStatus) {
+  if (isFirstStrongScope(scope)) return window.FirstStrongPaper.openTrades;
+  if (isExitSettleScope(scope)) return exitSettlePaper?.variant?.open_trades || [];
   if (isLiveScope(scope)) {
     const parsed = parseAccountScope(scope);
     const active = normalizeLiveRealStrategyId(data?.runtime?.live_trading?.variant_id || data?.runtime?.live_trading?.variant?.variant_id);
@@ -6802,30 +7162,24 @@ function showError(error) {
   ids.lastTick.textContent = error.message;
 }
 
-async function refreshMarketBoundary() {
-  if (btcRuntimePaused) return;
-  if (!pageVisible) return;
-  if (activeMarket && Date.now() / 1000 < activeMarket.end_ts - 1) return;
-  await loadStatus();
-}
-
 function handleVisibilityChange() {
   pageVisible = document.visibilityState !== "hidden";
-  if (!pageVisible) return;
-  connectStatusStream();
-  if (!btcRuntimePaused) {
+  if (!pageVisible) {
+    closeStatusStream();
+    if (statusRequest) statusRequest.controller.abort();
+    statusRequest = null;
+    return;
+  }
+  statusNeedsAuxiliary = true;
+  maintainStatusConnection();
+  if (latestStatus && !btcRuntimePaused) {
     connectPriceSocket();
     connectOkxSocket();
     connectBinanceMarketSocket();
     if (activeMarket?.up_token && activeMarket?.down_token) connectMarketSocket();
   }
-  if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer);
   renderAll(latestStatus, { force: true, forceChart: true });
-  loadEquityCurve(false).catch(showError);
-  foregroundRefreshTimer = setTimeout(() => {
-    loadStatus().catch(showError);
-    loadPolymarketStatus(statusPageActive()).catch(handlePolymarketStatusError);
-  }, 150);
+  loadPolymarketStatus(statusPageActive()).catch(handlePolymarketStatusError);
 }
 
 function handleChartMove(event) {
@@ -6841,7 +7195,18 @@ function handleChartLeave() {
 }
 
 function handleAccountScopeChange() {
+  const previousAccount = accountScope;
   accountScope = ids.accountScopeSelect?.value || "main";
+  const syncScope = (kind, select, current) => {
+    if ((hasSeparatePaperLedger(accountScope) || (hasSeparatePaperLedger(previousAccount) && current === previousAccount))
+        && current !== accountScope) {
+      select.value = accountScope;
+      handleDataScopeChange(kind, accountScope);
+    }
+  };
+  syncScope("open", ids.openDataScope, openDataScope);
+  syncScope("order", ids.orderDataScope, orderDataScope);
+  syncScope("recent", ids.recentDataScope, recentDataScope);
   equityCurveRows = [];
   equityCurveMeta = {};
   lastEquityCurveFetchMs = 0;
@@ -6872,6 +7237,11 @@ ids.polymarketStatusRefresh?.addEventListener("click", () => {
 bindLiveSettingsDirtyTracking();
 bindLiveStopWinEstimate();
 window.addEventListener("popstate", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
+window.addEventListener("first-strong-paper-update", () => {
+  if (isFirstStrongScope(orderDataScope)) loadOrders(true).catch(showError);
+  if (isFirstStrongScope(recentDataScope)) loadRecentTradesPage(true).catch(showError);
+  renderAll(latestStatus, {forceChart:isFirstStrongScope(accountScope)});
+});
 window.addEventListener("hashchange", () => setActiveAppPage(locationAppPage(), { syncHash: false }));
 setActiveAppPage(locationAppPage(), { syncHash: false });
 
@@ -6918,7 +7288,26 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && marketConfigOpen) setMarketConfigOpen(false);
 });
 ids.accountScopeSelect.addEventListener("change", handleAccountScopeChange);
+document.addEventListener("click", event => {
+  const button = event.target.closest("[data-exit-settle-account], [data-first-strong-account]");
+  if (!button) return;
+  const scope = button.hasAttribute("data-first-strong-account") ? "experiment:MAIN_FIRST_STRONG" : "experiment:" + EXIT_SETTLE_ID;
+  if (!accountScopeOptions().some(option => option.value === scope)) return;
+  ids.accountScopeSelect.value = scope;
+  const view = document.getElementById("managed-data-view");
+  view.value = "paper";
+  view.dispatchEvent(new Event("change", {bubbles:true}));
+  ids.accountScopeSelect.dispatchEvent(new Event("change"));
+  ids.accountScopeSelect.scrollIntoView({block:"center"});
+});
 ids.strategyExperiments.addEventListener("click", (event) => {
+  const forecastId = event.target.closest("[data-forecast-account]")?.dataset.forecastAccount;
+  if (isForecastPaperStrategy(forecastId)) {
+    ids.accountScopeSelect.value = `experiment:${forecastId}`;
+    ids.accountScopeSelect.dispatchEvent(new Event("change"));
+    requestAnimationFrame(() => document.getElementById("forecast-paper-panel")?.scrollIntoView({block: "start"}));
+    return;
+  }
   if (event.target.closest("[data-main-strategy]")) {
     ids.accountScopeSelect.value = "main";
     ids.accountScopeSelect.dispatchEvent(new Event("change"));
@@ -6994,25 +7383,9 @@ document.addEventListener("pointerup", scheduleProtectedLiveCopyFlush);
 
 initFieldOptions();
 setRecentLoading(true);
-loadPolymarketStatus(false).catch(handlePolymarketStatusError);
-loadStatus().then(() => {
-  if (samplePageActive()) loadSampleCandidates({ renderLoading: true }).catch(showError);
-  if (marketPageActive()) {
-    loadMarketLlmTerminal(true).catch(showError);
-    loadMarketScoutState(true).catch(showError);
-  }
-  connectStatusStream();
-  if (!btcRuntimePaused) {
-    connectPriceSocket();
-    connectOkxSocket();
-    connectBinanceMarketSocket();
-  }
-}).catch(showError);
-setInterval(() => {
-  if (!pageVisible) return;
-  if (statusStreamConnected && Date.now() - lastStatusStreamAt < STATUS_STREAM_STALE_MS) return;
-  loadStatus().catch(showError);
-}, STATUS_POLL_MS);
+maintainStatusConnection();
+if (pageVisible) loadPolymarketStatus(false).catch(handlePolymarketStatusError);
+setInterval(maintainStatusConnection, STATUS_POLL_MS);
 setInterval(() => {
   if (!pageVisible) return;
   loadPolymarketStatus(false).catch(handlePolymarketStatusError);
@@ -7025,7 +7398,6 @@ setInterval(() => {
   if (!pageVisible || !marketPageActive()) return;
   loadMarketScoutState(false).catch(showError);
 }, MARKET_SCOUT_STATE_POLL_MS);
-setInterval(() => refreshMarketBoundary().catch(showError), 1_000);
 document.addEventListener("visibilitychange", handleVisibilityChange);
 window.addEventListener("resize", () => renderAll(latestStatus, { force: true, forceChart: true }));
 window.addEventListener("beforeunload", releaseSnapshotLeadership);

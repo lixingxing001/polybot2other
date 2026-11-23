@@ -53,6 +53,57 @@ The default mode still runs Paper trading continuously. Live trading is opt-in a
 - Trades, settlements, and equity curve are stored in SQLite.
 - Recent trades include a trade-level settlement source. `polymarket_official` means the market winner came from Polymarket Gamma resolved prices; `chainlink_fallback` means the bot used the local Chainlink price against the target because the official winner was not available yet; `early_exit` means the position was closed before market settlement. The bot periodically rechecks fallback settlements and upgrades or corrects them when the official outcome appears. When Polymarket exposes `finalPrice` / `priceToBeat` in event metadata, the bot records those official settlement prices for final price and final distance display; if metadata is missing, it falls back to a one-time Polymarket page payload parse after settlement.
 
+## Linux 服务器 Docker 部署（独立 Paper）
+
+`compose.yaml` 运行五个独立 Paper 账户，使用全新的持久化数据目录。它固定关闭进程级实盘开关，不读取完整的本机 `.env.live`，不加载钱包私钥或签名地址。行情仍使用与本机相同的统一采集和真实执行模拟逻辑；新账户需要重新积累行情和自适应样本，不继承本机收益或训练记录。
+
+镜像使用 Python 3.12，并固定当前本机使用的 `py_clob_client_v2==1.0.1`。构建上下文只包含源码和构建文件，排除 `work/ecs.txt`、环境文件、账本、备份、日志和虚拟环境。服务以 UID/GID `10001:10001` 运行，数据写入 `/app/data`，容器日志自动轮转。
+
+统一行情源即使运行 Paper 也要求现有的 CLOB API 认证。单独在服务器 `/opt/edgepulse/secrets/market-data.env` 配置以下三项，不要复制整个 `.env.live`：
+
+```dotenv
+POLYBOT2OTHER_LIVE_API_KEY=<existing API key>
+POLYBOT2OTHER_LIVE_API_SECRET=<existing API secret>
+POLYBOT2OTHER_LIVE_API_PASSPHRASE=<existing API passphrase>
+```
+
+这些是 CLOB API 凭据，部署仅将它们用于行情认证，不代表凭据本身具有交易所提供的只读权限。文件通过 Compose secret 只读挂载，不进入镜像或 Compose 环境变量。缺少认证时，HTTP 服务可以健康，但策略会等待行情，不能视为已正常运行模拟盘。
+
+将 `Dockerfile`、`.dockerignore`、`compose.yaml`、`pyproject.toml`、`src/` 放入服务器 `/opt/edgepulse/app/`，配置好上述认证文件后，在服务器执行：
+
+```bash
+cd /opt/edgepulse/app
+install -d -m 0750 -o 10001 -g 10001 /opt/edgepulse/data
+chmod 0700 /opt/edgepulse/secrets
+chown 10001:10001 /opt/edgepulse/secrets/market-data.env
+chmod 0400 /opt/edgepulse/secrets/market-data.env
+printf 'EDGEPULSE_DATA_DIR=/opt/edgepulse/data\nEDGEPULSE_MARKET_ENV_FILE=/opt/edgepulse/secrets/market-data.env\n' > .env
+docker compose up -d --build --wait --wait-timeout 180
+docker compose ps
+docker compose logs --tail=100 dashboard
+```
+
+该 Compose 使用 Linux host 网络，应用仅监听 `127.0.0.1:8791`，保留现有管理接口的回环地址和同源校验。无需新增公网端口或修改宝塔站点。Docker Desktop 需要额外开启 host networking，不要直接在已有 `8791` 服务的本机运行这份配置。
+
+在本机另开终端建立 SSH 隧道，再访问 `http://127.0.0.1:18791`。本机端口 `18791` 与现有 Mac 服务的 `8791` 分开：
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
+  -L 127.0.0.1:18791:127.0.0.1:8791 root@154.36.164.138
+```
+
+日常管理在服务器 `/opt/edgepulse/app` 目录执行：
+
+```bash
+docker compose ps                         # 查看服务和健康状态
+docker compose logs -f --tail=100 dashboard # 查看日志
+docker compose restart dashboard          # 重启，保留 Paper 数据
+docker compose stop dashboard             # 停止，保留 Paper 数据
+docker compose up -d --build --wait        # 更新源码后重建并启动
+```
+
+容器退出后自动重启，并随 Docker 服务开机启动；主动执行 `stop` 后保持停止。健康检查验证 HTTP/API 可用性，行情是否新鲜、策略是否满足入场条件需另看页面。备份运行中的 SQLite 应使用 SQLite backup API，或先停止此容器再备份整个 `/opt/edgepulse/data`；不要只复制正在写入的主数据库文件而遗漏 WAL。
+
 ## Run
 
 ```bash

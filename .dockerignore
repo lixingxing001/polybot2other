@@ -1,0 +1,17 @@
+# Only application source and build metadata enter the image build context.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!src/
+!src/**
+
+# Exclude generated files even when they are inside src/.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.egg-info/
+**/.DS_Store
+**/.env*
+**/*.sqlite3*
+**/*.db

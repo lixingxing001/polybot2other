@@ -105,7 +105,7 @@ class ManagedLiveTests(unittest.TestCase):
         return self.store.positions(key)[0]
 
     def confirm(self, order, shares, price, trade_id="trade-1", terminal=True):
-        self.exchange.responses[order["external_id"]]={"fills":[{"trade_id":trade_id,"shares":shares,"price":price,
+        self.exchange.responses[order["external_id"]]={"fills":[{"trade_id":trade_id,"shares":shares,"price":price,"notional":round(shares*price,6),
             "fee":fee_amount(shares,price,.07,1),"fee_source":"official_market_fee_schedule"}],
             "terminal":terminal,"no_fill":False,"status":"MATCHED"}
         self.manager.reconcile()
@@ -125,7 +125,7 @@ class ManagedLiveTests(unittest.TestCase):
         with self.store.conn:
             self.store.conn.execute("UPDATE live_config SET json=? WHERE id=1", (json.dumps(saved),))
         self.store._migrate_config()
-        self.assertEqual(set(self.store.config()["strategies"]), {"MAIN", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"})
+        self.assertEqual(set(self.store.config()["strategies"]), {"MAIN", "MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS", "FORECAST_EXIT_SETTLE", "MAIN_FIRST_STRONG"})
         self.assertEqual(self.store.exit_rules("MAIN_TP_SL")["take_profit_pct"], 31.0)
         self.assertFalse(self.store.exit_rules("MAIN_TP_SL")["enabled"])
         self.assertNotIn("retired_strategies", self.manager.snapshot()["settings"])
@@ -220,7 +220,7 @@ class ManagedLiveTests(unittest.TestCase):
         p=self.buy()
         self.assertAlmostEqual(p["total_cost"],4.168)
         order=self.store.order(p["entry_order"])
-        self.assertFalse(self.store.apply_confirmed_fill(order["id"],"trade-1",10,.4,.168,"official_market_fee_schedule"))
+        self.assertFalse(self.store.apply_confirmed_fill(order["id"],"trade-1",10,.4,.168,"official_market_fee_schedule",notional=4))
         self.assertEqual(self.store.position(p["id"])["initial_shares"],10)
         self.assertEqual(self.manager.wallet["balance"],100)  # Ledger arithmetic never invents wallet cash.
 
@@ -230,11 +230,143 @@ class ManagedLiveTests(unittest.TestCase):
         self.assertEqual(len(self.store.positions()),1);self.assertEqual(self.store.positions()[0]["initial_shares"],4)
         self.manager.tick();self.assertEqual(len(self.exchange.submitted),1)
         self.exchange.responses[order["external_id"]]={"fills":[
-            {"trade_id":"trade-1","shares":4,"price":.4,"fee":.0672,"fee_source":"official_market_fee_schedule"},
-            {"trade_id":"trade-2","shares":6,"price":.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],
+            {"trade_id":"trade-1","shares":4,"price":.4,"notional":1.6,"fee":.0672,"fee_source":"official_market_fee_schedule"},
+            {"trade_id":"trade-2","shares":6,"price":.4,"notional":2.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],
             "terminal":True,"no_fill":False,"status":"MATCHED"}
         self.manager.reconcile();self.assertEqual(len(self.store.positions()),1)
         self.assertEqual(self.store.positions()[0]["initial_shares"],10)
+
+    @staticmethod
+    def receipt(tx, shares, price, notional, fee):
+        return {"trade_id": "polygon:"+tx, "shares": shares, "price": price,
+                "notional": notional, "fee": fee, "fee_source": "polygon_order_filled_v2"}
+
+    def report_receipts(self, order, fills, groups, terminal=True):
+        self.exchange.responses[order["external_id"]] = {
+            "fills": fills, "terminal": terminal, "no_fill": False,
+            "pending_reason": None if terminal else "等待其余成交",
+            "evidence": {"receipt_groups": groups, "matched_trade_ids": sorted(
+                {item for ids in groups.values() for item in ids})}}
+        self.manager.reconcile()
+
+    def test_receipt_amounts_flow_into_buy_partial_sell_and_resolution(self):
+        self.enable(); self.manager.tick()
+        buy = self.store.active_orders()[0]
+        receipt = self.receipt("buy", 9.9, .50, 4.947121, .052879)
+        self.report_receipts(buy, [receipt], {"polygon:buy": ["a"]})
+        self.assertIsNone(self.manager._fault)
+        self.assertEqual(self.store.order(buy["id"])["confirmed_notional"], 4.947121)
+        position = self.store.positions()[0]
+        self.assertEqual((position["total_cost"], position["buy_fee"]), (5, .052879))
+        self.assertEqual(self.store.reserved_cash(0), 5)
+        sell = self.store.prepare_order("sell", "MAIN", self.market, "up", "Up", "SELL",
+                                        .49, shares=3.96, position_id=position["id"])
+        self.store.set_order_state(sell["id"], "PENDING")
+        self.report_receipts(sell, [self.receipt("sell", 3.96, .51, 2.013021, .011)],
+                             {"polygon:sell": ["s"]})
+        partial = self.store.position(position["id"])
+        self.assertEqual((partial["remaining_cost"], partial["remaining_shares"], partial["realized_pnl"]),
+                         (3, 5.94, .002021))
+        self.store.resolve(self.market.round_id, "Up")
+        self.assertEqual(self.store.position(position["id"])["realized_pnl"], 2.942021)
+        self.assertEqual(self.store.daily_pnl("MAIN"), 2.942021)
+        self.assertEqual(self.manager.wallet["balance"], 100)
+
+    def test_budget_tolerance_includes_ten_micro_dollars(self):
+        self.enable(); self.manager.tick()
+        order = self.store.active_orders()[0]
+        self.report_receipts(order, [self.receipt("buy", 10, .49, 4.950010, .05)],
+                             {"polygon:buy": ["a"]})
+        self.assertEqual(self.store.reserved_cash(0), 5.000010)
+        self.assertIsNone(self.manager._fault)
+        other = ManagedLiveAccounts(self.settings, exchange=self.exchange, feed=self.feed, store=self.store)
+        self.assertIsNone(other._fault)
+
+    def test_eleven_micro_dollar_actual_overrun_survives_pending_and_restart(self):
+        self.enable(); self.manager.tick()
+        order = self.store.active_orders()[0]
+        self.report_receipts(order, [self.receipt("buy", 10, .49, 4.950011, .05)],
+                             {"polygon:buy": ["a"]}, terminal=False)
+        self.assertEqual(self.store.order(order["id"])["state"], "UNKNOWN")
+        self.assertEqual(self.store.reserved_cash(0), 5.000011)
+        self.assertIn("超预算", self.manager._fault)
+        other = ManagedLiveAccounts(self.settings, exchange=self.exchange, feed=self.feed, store=self.store)
+        self.assertIn("超预算", other._fault)
+
+    def test_partial_sell_leaves_one_micro_share_until_final_receipt(self):
+        position = self.buy()
+        sell = self.store.prepare_order("micro-sell", "MAIN", self.market, "up", "Up", "SELL", .4,
+                                        shares=10, position_id=position["id"])
+        self.store.apply_confirmed_fill(sell["id"], "partial", 9.999999, .4, 0, "test", notional=3.999999)
+        partial = self.store.position(position["id"])
+        self.assertEqual((partial["remaining_shares"], partial["status"]), (.000001, "OPEN"))
+        with self.assertRaisesRegex(ValueError, "超出本策略持仓"):
+            self.store.apply_confirmed_fill(sell["id"], "over", .000002, .5, 0, "test", notional=.000001)
+        self.store.apply_confirmed_fill(sell["id"], "last", .000001, 1, 0, "test", notional=.000001)
+        self.assertEqual(self.store.position(position["id"])["status"], "CLOSED")
+
+    def test_missing_amount_is_atomic_and_subsequent_empty_report_retains_reservation(self):
+        self.enable(); self.manager.tick()
+        order = self.store.active_orders()[0]
+        first = self.receipt("first", 4, .4, 1.6, .04)
+        other = self.receipt("other", 6, .4, 2.4, .06)
+        groups = {"polygon:first": ["a"], "polygon:other": ["b"]}
+        self.report_receipts(order, [first, {k:v for k,v in other.items() if k!="notional"}], groups)
+        self.assertEqual(self.store.positions(), [])
+        self.assertIsNone(self.manager._fault)
+        self.exchange.responses[order["external_id"]] = {"fills": [], "terminal": True, "no_fill": True}
+        self.manager.reconcile()
+        self.assertEqual(self.store.order(order["id"])["state"], "UNKNOWN")
+        self.assertEqual(self.manager.available_cash(), 95)
+        self.report_receipts(order, [first, other], groups)
+        self.assertEqual(self.store.positions()[0]["total_cost"], 4.1)
+        self.assertEqual(self.store.order(order["id"])["state"], "FILLED")
+
+    def test_legacy_trade_and_transaction_replays_do_not_duplicate_cost(self):
+        self.enable(); self.manager.tick()
+        order = self.store.active_orders()[0]
+        self.store.apply_confirmed_fill(order["id"], "legacy", 4, .4, .04, "old", notional=1.6)
+        receipt = self.receipt("old", 4, .4, 1.6, .04)
+        fresh = self.receipt("new", 6, .4, 2.4, .06)
+        groups = {"polygon:old": ["legacy"], "polygon:new": ["new"]}
+        self.report_receipts(order, [receipt, fresh], groups, terminal=False)
+        self.report_receipts(order, [receipt, fresh], groups)
+        self.assertEqual(self.store.order(order["id"])["confirmed_shares"], 10)
+        self.assertEqual(self.store.positions()[0]["total_cost"], 4.1)
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM fills").fetchone()[0], 2)
+
+    def test_legacy_amount_conflict_rolls_back_new_receipt_and_requests_review(self):
+        self.enable(); self.manager.tick()
+        order = self.store.active_orders()[0]
+        self.store.apply_confirmed_fill(order["id"], "legacy", 4, .4, .04, "old", notional=1.6)
+        self.report_receipts(order, [self.receipt("new", 6, .4, 2.4, .06),
+                                     self.receipt("old", 4, .4, 1.599999, .04)],
+                             {"polygon:new": ["new"], "polygon:old": ["legacy"]})
+        self.assertIn("已入账", self.manager._fault)
+        self.assertEqual(self.store.order(order["id"])["confirmed_shares"], 4)
+        self.assertEqual(self.store.positions()[0]["total_cost"], 1.64)
+        self.assertEqual(self.store.conn.execute("SELECT count(*) FROM fill_receipt_trades").fetchone()[0], 0)
+
+    def test_pending_trade_can_fail_but_a_previously_confirmed_trade_cannot_disappear(self):
+        self.enable(); self.manager.tick()
+        first = self.store.active_orders()[0]
+        second = self.store.prepare_order("second", "MAIN_OPTIMIZED", self.market, "up", "Up", "BUY", .5, cash=5)
+        self.store.set_order_state(second["id"], "PENDING")
+        for order, confirmed in ((first, []), (second, ["a"])):
+            self.exchange.responses[order["external_id"]] = {
+                "fills": [], "terminal": False, "no_fill": False,
+                "evidence": {"matched_trade_ids": ["a"], "confirmed_trade_ids": confirmed, "pending_trades": True}}
+        self.manager.reconcile()
+        other = ManagedLiveAccounts(self.settings, exchange=self.exchange, feed=self.feed, store=self.store)
+        for order in (first, second):
+            self.exchange.responses[order["external_id"]] = {
+                "fills": [], "terminal": True, "no_fill": True,
+                "evidence": {"matched_trade_ids": ["a"], "failed_trade_ids": ["a"]}}
+        other.reconcile()
+        self.assertEqual(self.store.order(first["id"])["state"], "CANCELED")
+        self.assertEqual(self.store.order(second["id"])["state"], "UNKNOWN")
+        self.assertIn("又被列为失败", other._fault)
+        self.assertEqual(len(self.exchange.submitted), 1)
 
     def test_unknown_post_is_not_retried_and_reserves_budget(self):
         self.exchange.fail_post=True;self.enable();self.manager.tick()
@@ -559,15 +691,22 @@ class ManagedLiveTests(unittest.TestCase):
         fake.get_order.return_value={"id":ident,"status":"MATCHED","size_matched":"10"}
         trade={"id":"receipt","taker_order_id":ident,"asset_id":"up","status":"MATCHED","size":"10","price":"0.4"}
         fake.get_trades.return_value=[trade]
-        with patch.object(exchange,"client",return_value=(sdk,fake)):
+        verified={"trade_id":"polygon:test", "shares":10,"notional":4,"price":.4,
+                  "fee":.15,"fee_source":"polygon_order_filled_v2"}
+        with patch.object(exchange,"client",return_value=(sdk,fake)), patch(
+            "polybot2other.managed_live_client.confirmed_receipt_fills",
+            return_value=([verified],{verified["trade_id"]:["receipt"]},{}),
+        ) as read_receipt:
             pending=exchange.reconcile(order,self.market,exchange_info())
             self.assertFalse(pending["terminal"]);self.assertEqual(pending["fills"],[])
+            read_receipt.assert_not_called()
             trade["status"]="CONFIRMED"
             confirmed=exchange.reconcile(order,self.market,exchange_info())
-            self.assertTrue(confirmed["terminal"]);self.assertAlmostEqual(confirmed["fills"][0]["fee"],.168)
+            self.assertTrue(confirmed["terminal"]);self.assertEqual(confirmed["fills"],[verified])
             trade["status"]="FAILED"
             failed=exchange.reconcile(order,self.market,exchange_info())
             self.assertTrue(failed["terminal"]);self.assertTrue(failed["no_fill"]);self.assertEqual(failed["fills"],[])
+            read_receipt.assert_called_once()
 
     def test_official_fee_curve_is_applied_to_optimized_signal(self):
         from polybot2other.managed_live_signals import LiveSignals
@@ -611,7 +750,7 @@ class ManagedLiveTests(unittest.TestCase):
         self.assertEqual(self.store.order(order["id"])["state"],"UNKNOWN")
         other_store=ManagedLiveStore(self.store.path);self.addCleanup(other_store.conn.close)
         other=ManagedLiveAccounts(self.settings,exchange=self.exchange,feed=self.feed,store=other_store)
-        self.exchange.responses[order["external_id"]]={"fills":[{"trade_id":"confirmed-after-restart","shares":10,"price":.4,"fee":.168,"fee_source":"official_market_fee_schedule"}],"terminal":True,"no_fill":False}
+        self.exchange.responses[order["external_id"]]={"fills":[{"trade_id":"confirmed-after-restart","shares":10,"price":.4,"notional":4,"fee":.168,"fee_source":"official_market_fee_schedule"}],"terminal":True,"no_fill":False}
         other.reconcile()
         self.assertEqual(other_store.order(order["id"])["state"],"FILLED")
         self.assertIsNone(other._fault);self.assertEqual(len(self.exchange.submitted),1)
@@ -625,7 +764,7 @@ class ManagedLiveTests(unittest.TestCase):
         self.confirm(first,4,.4,terminal=False)
         self.assertEqual(self.store.order(first["id"])["state"],"UNKNOWN")
         self.assertIsNotNone(self.manager._access_block(require_wallet=True))
-        self.exchange.responses[first["external_id"]]={"fills":[{"trade_id":"trade-1","shares":4,"price":.4,"fee":.0672,"fee_source":"official_market_fee_schedule"},{"trade_id":"trade-2","shares":6,"price":.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],"terminal":True,"no_fill":False}
+        self.exchange.responses[first["external_id"]]={"fills":[{"trade_id":"trade-1","shares":4,"price":.4,"notional":1.6,"fee":.0672,"fee_source":"official_market_fee_schedule"},{"trade_id":"trade-2","shares":6,"price":.4,"notional":2.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],"terminal":True,"no_fill":False}
         self.manager.reconcile()
         self.assertIsNotNone(self.manager._access_block(require_wallet=True))
         self.confirm(second,10,.4,"second-order")

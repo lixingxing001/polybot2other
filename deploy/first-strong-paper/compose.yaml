@@ -1,0 +1,49 @@
+name: edgepulse-first-strong
+services:
+  candidate:
+    image: ${STRONG_PAPER_IMAGE:?set the verified new strategy image}
+    container_name: edgepulse-first-strong-paper
+    command:
+      - python
+      - -m
+      - polybot2other.strong_signal_paper
+      - --source-dir
+      - /source
+      - --state-dir
+      - /state
+      - --config
+      - /config/main.json
+      - --port
+      - "8793"
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 300m
+    cpus: 0.42
+    pids_limit: 110
+    stop_grace_period: 55s
+    environment:
+      POLYBOT2OTHER_ENV_FILE: /dev/null
+      POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED: "false"
+      POLYBOT2OTHER_MANAGED_LIVE_ENABLED: "false"
+    volumes:
+      - ./projected-market:/source:ro
+      - ./config/main.json:/config/main.json:ro
+      - ./data:/state:rw
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8793/healthz', timeout=5).status == 200"]
+      interval: 15s
+      timeout: 7s
+      start_period: 35s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 4m
+        max-file: "2"

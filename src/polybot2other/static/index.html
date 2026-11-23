@@ -6,6 +6,7 @@
     <title>EdgePulse</title>
     <link rel="icon" type="image/svg+xml" href="/static/edgepulse.svg">
     <link rel="stylesheet" href="/static/styles.css?v=20261113-five-live-strategies">
+    <link rel="stylesheet" href="/static/paper-growth.css?v=20261119-league">
   </head>
   <body>
     <main class="app-shell">
@@ -45,9 +46,9 @@
       <div class="page-stack">
       <section id="bot-page" class="app-page is-active" data-page="bot" aria-labelledby="nav-bot">
       <section id="managed-wallet-panel" class="panel managed-wallet-panel" hidden>
-        <div class="managed-wallet-head"><div><div class="eyebrow">真实钱包 · 五个策略共享</div><div id="managed-wallet-address" class="subtle">正在连接</div></div><label class="managed-master"><span id="managed-mode-label">Paper 模式</span><input id="managed-master-enabled" type="checkbox" aria-label="实盘总开关"><span class="managed-switch-track"></span><b>实盘总开关</b></label></div>
+        <div class="managed-wallet-head"><div><div class="eyebrow">真实钱包 · 各实盘策略共享</div><div id="managed-wallet-address" class="subtle">正在连接</div></div><label class="managed-master"><span id="managed-mode-label">Paper 模式</span><input id="managed-master-enabled" type="checkbox" aria-label="实盘总开关"><span class="managed-switch-track"></span><b>实盘总开关</b></label></div>
         <div class="managed-wallet-stats"><div><span>真实钱包余额</span><strong id="managed-wallet-balance">—</strong></div><div><span>钱包持仓估值</span><strong id="managed-wallet-positions">—</strong></div><div><span>真实钱包总资产</span><strong id="managed-wallet-total">—</strong></div><div><span>连接状态</span><strong id="managed-wallet-health">读取中</strong><small id="managed-wallet-updated"></small></div></div>
-        <p class="managed-wallet-note">保存的每笔金额、持仓上限和亏损限额供 Paper 与实盘共用。实盘总开关和策略开关只控制真实资金新开仓；关闭后继续管理已有实盘持仓。Paper 由顶部“暂停 Paper”单独控制。</p>
+        <p class="managed-wallet-note">每张卡片标明金额和风控适用的账户。实盘开关控制真实资金新开仓，关闭后继续管理已有实盘持仓。顶部“暂停 Paper”控制主服务的模拟交易。“每局首个强信号”由独立模拟服务运行。</p>
         <div id="managed-strategy-controls" class="managed-strategy-controls"></div>
         <div id="managed-data-health" class="managed-data-health" hidden></div>
         <div id="managed-quarantine-status" class="managed-quarantine-status" role="status" hidden></div>
@@ -226,6 +227,105 @@
             <p id="managed-chart-range" class="managed-wallet-note" hidden></p>
           </div>
         </div>
+      </section>
+
+      <section id="strategy-league" class="panel paper-growth-panel" aria-labelledby="league-heading" hidden>
+        <div class="panel-header"><h2 id="league-heading">Paper · 候选策略对比</h2><span id="league-start" class="subtle"></span></div>
+        <p id="league-status" class="paper-growth-summary" role="status"></p>
+        <div id="league-body" hidden>
+          <div class="league-controls"><label>策略家族 <select id="league-filter" aria-label="选择策略家族"><option value="">全部家族</option></select></label><button type="button" id="league-rules-button" aria-expanded="false" aria-controls="league-rules">筛选规则</button></div>
+          <div id="league-rules" class="paper-growth-summary" hidden>
+            <p>候选与同期对照各从 $100 开始，每笔模拟买入预算 $5。亏损、回撤或现金降到零后仍按策略信号继续采样，余额可以为负。多个策略买到同一局时，各自记账。</p>
+            <p>筛选从统一规则生效后的首个完整市场起算。满 7 天且各自结清至少 100 局后，取满整天的边界。若该段内发起的交易尚未结清，顺延到本策略与对照都结清的五分钟边界。初筛要求扣费后盈利、每份另扣 $0.02 后仍盈利、跑赢同期对照，且行情覆盖至少 90%。每个家族优先复验最先通过的策略，同时通过时选额外损耗后收益最高者，再同分按固定策略编号选取。</p>
+            <p>入围后只评估随后新开的局，再满 7 天和 100 个结清局后复验。除初筛条件外，该段前后半段均需盈利。最大回撤保留作复盘参考，所有候选持续模拟买卖。</p>
+          </div>
+          <div id="league-families"></div>
+        </div>
+      </section>
+      <section id="forecast-paper-panel" class="panel paper-growth-panel" hidden aria-label="本局方向预测">
+        <div class="panel-head"><h2 id="forecast-paper-title">本局方向预测 · Paper</h2><strong id="forecast-paper-direction">等待行情</strong></div>
+        <p id="forecast-paper-decision" class="paper-growth-summary" role="status"></p>
+        <p id="forecast-paper-tie" class="paper-growth-summary" hidden></p>
+        <div id="forecast-paper-time-study">
+        <h3 class="forecast-section-title">提前一分钟开仓，效果怎么样？</h3>
+        <p id="forecast-paper-comparison-notice" class="paper-growth-summary" role="status">正在读取同期记录…</p>
+        <div id="forecast-paper-comparison-body" hidden>
+          <div class="table-wrap" tabindex="0" aria-label="两种入场时间的同期实际模拟成交">
+            <table class="paper-growth-table"><thead><tr><th>入场时段</th><th>开仓 / 同期局数</th><th>开仓率</th><th>扣费后已实现盈亏</th></tr></thead><tbody id="forecast-paper-comparison-rows"></tbody></table>
+          </div>
+          <p id="forecast-paper-comparison-result" class="paper-growth-summary"></p>
+          <p id="forecast-paper-comparison-coverage" class="paper-growth-summary"></p>
+          <p class="paper-growth-summary">两个账户独立模拟成交。原版沿用已有余额和近 24 小时风控记录，资金余量和实际成交时机也会影响同期收益差。</p>
+        </div>
+        </div>
+        <section id="forecast-paper-forward" hidden aria-labelledby="forecast-paper-forward-heading">
+          <h3 id="forecast-paper-forward-heading" class="forecast-section-title">限价 60 美分，扣费后是否赚得更多？</h3>
+          <p id="forecast-paper-forward-status" class="paper-growth-summary" role="status"></p>
+          <div id="forecast-paper-forward-body" hidden>
+            <div class="table-wrap" tabindex="0" aria-label="限价版与同期对照的模拟成交和收益">
+              <table class="paper-growth-table"><thead><tr><th>账户</th><th>观察局数</th><th>委托数</th><th>成交 / 已结清局</th><th>结清净收益</th><th>前 50 局</th><th>后 50 局</th><th>额外损耗后收益</th><th>盘中最大回撤</th></tr></thead><tbody id="forecast-paper-forward-rows"></tbody></table>
+            </div>
+            <p id="forecast-paper-forward-coverage" class="paper-growth-summary"></p>
+            <p class="paper-growth-summary">每组从 $100 开始，每局最多 $5，回撤预算 $10。限价版仅在原买入限价不超过 $0.60 时尝试买入，对照组沿用原版买价。额外损耗按每份再扣 $0.02 估算。</p>
+          </div>
+        </section>
+        <p id="forecast-paper-entry-reasons" class="paper-growth-summary"></p>
+        <details id="forecast-paper-trace" hidden open><summary>进入开仓时段后，第一次看清方向时是什么价？</summary>
+          <p id="forecast-paper-trace-summary" class="paper-growth-summary"></p>
+          <div class="table-wrap" tabindex="0" aria-label="所选账户近期逐局入场记录">
+            <table class="paper-growth-table"><thead><tr><th>本局收盘（北京）</th><th>首次看清方向</th><th>当时卖一含费价</th><th>首次满足买入条件</th><th>买单进展</th></tr></thead><tbody id="forecast-paper-trace-rows"></tbody></table>
+          </div>
+          <p class="paper-growth-summary">每份含费成本 1 美分对应 1 分。余量是模型方向评分减去含费成本；买入要求按限价计算仍有至少 4 分余量。实际盈亏以成交和结算为准。</p>
+        </details>
+        <details open><summary>提前多久看得准</summary>
+          <div class="table-wrap" tabindex="0" aria-label="各倒计时点的预测与当时盘口成绩">
+            <table class="paper-growth-table"><thead><tr><th>距收盘</th><th>有方向 / 观察局数</th><th>命中 / 已判分</th><th>同场比较 · 策略</th><th>同场比较 · 盘口</th></tr></thead><tbody id="forecast-paper-checkpoints"></tbody></table>
+          </div>
+          <p class="paper-growth-summary">只用倒计时点之前 5 秒内的记录。两边都有方向且官方已结算的局，才进入同场比较。</p>
+          <p id="forecast-paper-exits" class="paper-growth-summary"></p>
+        </details>
+      </section>
+      <section id="paper-growth-panel" class="panel paper-growth-panel" hidden aria-label="各策略今日增长状态">
+        <div class="panel-head">
+          <div><h2>Paper · 各策略今日增长状态</h2><span class="paper-growth-scope">每个策略单独判断 · 北京时间</span></div>
+          <button id="paper-growth-refresh" type="button">刷新</button>
+        </div>
+        <p id="paper-growth-notice" class="paper-growth-summary" role="status">正在读取各策略的交易结果…</p>
+        <div id="paper-growth-body" hidden>
+          <div class="table-wrap paper-growth-overview-wrap" tabindex="0" aria-label="每个策略各自的今日增长状态">
+            <table class="paper-growth-table paper-growth-overview"><thead><tr><th>策略</th><th>最近表现</th><th>今日赚亏</th><th>近 1 小时</th><th>近 3 小时</th><th>近 6 小时</th><th>详情</th></tr></thead><tbody id="paper-growth-strategies"></tbody></table>
+          </div>
+          <details id="paper-growth-detail" class="paper-growth-details">
+            <summary><span id="paper-growth-detail-name">单个策略</span> · 详细数据</summary>
+            <div class="paper-growth-detail-content">
+              <div class="paper-growth-heading"><h3 id="paper-growth-detail-title"></h3><span id="paper-growth-state" class="paper-growth-badge">读取中</span></div>
+              <p id="paper-growth-summary" class="paper-growth-detail-summary"></p>
+              <div id="paper-growth-detail-body" hidden>
+                <div class="paper-growth-metrics">
+                  <div><span>这个策略今日赚亏</span><strong id="paper-growth-today">—</strong><small>北京时间 00:00 起</small></div>
+                  <div><span>最近 1 小时赚亏</span><strong id="paper-growth-hour">—</strong><small>已扣除交易手续费</small></div>
+                  <div><span>今天最多赚到过</span><strong id="paper-growth-peak">—</strong><small id="paper-growth-peak-note"></small></div>
+                  <div><span>比今天最高盈利少了</span><strong id="paper-growth-drawdown">—</strong><small id="paper-growth-drawdown-note"></small></div>
+                </div>
+                <div class="table-wrap" tabindex="0" aria-label="所选策略各时间段的表现，可横向滚动"><table class="paper-growth-table"><thead><tr><th>时间段</th><th>赚亏金额</th><th>平均每小时</th><th>交易胜率</th><th>不同市场 / 交易笔数</th></tr></thead><tbody id="paper-growth-windows"></tbody></table></div>
+                <ul id="paper-growth-reasons" class="paper-growth-reasons"></ul>
+                <p id="paper-growth-positions" class="paper-growth-note"></p>
+              </div>
+            </div>
+          </details>
+          <details class="paper-growth-details paper-growth-rules-details"><summary>这些状态怎么看？</summary>
+            <ul class="paper-growth-rules">
+              <li><b>最近开始盈利：</b>前面还在亏，最近一小时开始赚钱了。</li>
+              <li><b>最近赚得更快了：</b>最近一小时比上一小时赚得更多，每投入一美元赚到的比例也更高。</li>
+              <li><b>最近持续盈利：</b>最近一、三、六小时合计都在赚钱。</li>
+              <li><b>最近一小时亏损：</b>最近一小时亏钱，先看后面几笔是否继续亏损。</li>
+              <li><b>最近持续亏损：</b>相邻两小时、近三小时合计都亏钱，而且已在至少三个不同市场亏损。</li>
+              <li><b>交易太少，暂不好判断：</b>这个策略至少需要三小时记录和五个不同市场的结果；近期盈利判断还需要近一小时至少三个市场的结果。</li>
+            </ul>
+            <p class="paper-growth-rules">每个策略只看自己的记录，同一个市场重复开仓只算一个结果。这里只说明已经发生的表现，不代表接下来一定赚钱或亏钱。</p>
+          </details>
+        </div>
+        <div class="paper-growth-footer"><span>仅统计各策略已结算的 Paper 收益，已扣手续费；时间段有重叠，不能相加。状态提示不参与自动下单。</span><span id="paper-growth-updated">等待更新</span></div>
       </section>
 
       <section class="panel experiment-panel">
@@ -677,7 +777,11 @@
       </div>
     </main>
 
-    <script src="/static/managed-live.js?v=20261113-five-live-strategies"></script>
-    <script src="/static/app.js?v=20261111-four-strategies-v2"></script>
+    <script src="/static/first-strong-account.js?v=20261122-overview"></script>
+    <script src="/static/managed-live.js?v=20261122-strong-overview"></script>
+    <script src="/static/strategy-league.js?v=20261122-settle"></script>
+    <script src="/static/forecast-observations.js?v=20261119-forward"></script>
+    <script src="/static/paper-growth.js?v=20261122-settle"></script>
+    <script src="/static/app.js?v=20261122-strong-overview"></script>
   </body>
 </html>

@@ -52,6 +52,7 @@ from .execution import (
 from .evidence import MarketEvidenceScout
 from .shared_market_inputs import MarketInputs
 from .experiments import (
+    FORECAST_PAPER_NAMES,
     ANTI_BOT_GUARD_MODE_NONE,
     MARKET_DATA_MODE_BASE,
     MARKET_DATA_MODE_MULTI_CONFIRM,
@@ -7003,6 +7004,13 @@ class StrategyExperimentRunner:
                 store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 variant_settings = replace(variant_settings, initial_balance=store.account()["initial_balance"])
                 bot = PlusMainBot(variant_settings, store)
+            elif variant.variant_id in FORECAST_PAPER_NAMES:
+                from .optimized_main import ForecastPaperBot, OptimizedTradeStore
+                store = OptimizedTradeStore(variant_settings.db_path, variant_settings.initial_balance)
+                bot = ForecastPaperBot(
+                    variant_settings, store, baseline_store.get_round if baseline_store else None,
+                    strategy_label=variant.combo,
+                )
             else:
                 store = TradeStore(variant_settings.db_path, variant_settings.initial_balance)
                 bot = PaperTradingBot(variant_settings, store)
@@ -7044,6 +7052,14 @@ class StrategyExperimentRunner:
             if variant.strategy_family in {STRATEGY_FAMILY_PAIR, STRATEGY_FAMILY_LLM_SUPER_AGENT}
             else settings.max_open_trades
         )
+        if variant.variant_id in FORECAST_PAPER_NAMES:
+            return replace(
+                settings, db_path=db_path, initial_balance=100.0, stake_dollars=5.0,
+                max_open_trades=1, max_daily_loss=15.0, paper_entry_order_type=variant.order_type,
+                strategy_experiments_enabled=False, strategy_experiments_variants="",
+                live_trading_runtime_enabled=False, managed_live_enabled=False,
+                market_scout_enabled=False, llm_super_agent_enabled=False,
+            )
         if variant.variant_id in {"MAIN_OPTIMIZED", "MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS", "MAIN_TP_SL"}:
             initial_balance = 100.0 if variant.variant_id in {"MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"} else (
                 self.baseline_store.metrics()["total_equity"] if self.baseline_store is not None else settings.initial_balance

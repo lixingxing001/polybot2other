@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .execution import ORDER_TYPE_FAK
 
@@ -39,6 +39,17 @@ PRICE_SOURCE_MODE_CHAINLINK_ONLY = "CHAINLINK_ONLY"
 PRICE_SOURCE_MODE_FALLBACK_ONLY = "FALLBACK_ONLY"
 ANTI_BOT_GUARD_MODE_NONE = "NONE"
 ANTI_BOT_GUARD_MODE_ENABLED = "ANTI_BOT_GUARD"
+FORECAST_PAPER_ID = "FORECAST_PAPER"
+FORECAST_PAPER_NAME = "本局方向预测"
+FORECAST_EARLY_PAPER_ID = "FORECAST_EARLY_PAPER"
+FORECAST_LIMIT_060_PAPER_ID = "FORECAST_LIMIT_060_PAPER"
+FORECAST_LIMIT_CONTROL_PAPER_ID = "FORECAST_LIMIT_CONTROL_PAPER"
+FORECAST_PAPER_NAMES = {
+    FORECAST_PAPER_ID: FORECAST_PAPER_NAME,
+    FORECAST_EARLY_PAPER_ID: "本局方向预测（提前1分钟对照）",
+    FORECAST_LIMIT_060_PAPER_ID: "本局方向预测（60美分限价版）",
+    FORECAST_LIMIT_CONTROL_PAPER_ID: "本局方向预测（60美分实验对照组）",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +71,8 @@ class StrategyVariant:
 
     @property
     def combo(self) -> str:
+        if self.variant_id in FORECAST_PAPER_NAMES:
+            return FORECAST_PAPER_NAMES[self.variant_id]
         if self.variant_id == "MAIN_TP_SL":
             return "主账户止盈止损"
         if self.variant_id == "MAIN_OPTIMIZED":
@@ -143,6 +156,28 @@ STRATEGY_VARIANTS: tuple[StrategyVariant, ...] = (
 # Retired implementations have no runnable registration and cannot create accounts.
 DEPRECATED_STRATEGY_VARIANT_IDS = frozenset({"MAIN_TP_SL", "VALUE_CONFIRM_V1"})
 
+# Enabled explicitly by the Paper deployment. A blank selector preserves existing accounts.
+FORECAST_PAPER_VARIANT = StrategyVariant(
+    FORECAST_PAPER_ID, STRATEGY_FAMILY_SINGLE, ORDER_TYPE_FAK,
+    "已实现", "待前向验证", "仅 Paper · 按本局方向和成交成本买入，持续判断持有或提前卖出",
+    signal_filter_mode=FORECAST_PAPER_ID,
+)
+FORECAST_EARLY_PAPER_VARIANT = replace(
+    FORECAST_PAPER_VARIANT, variant_id=FORECAST_EARLY_PAPER_ID,
+    signal_filter_mode=FORECAST_EARLY_PAPER_ID,
+    role="仅 Paper · 最早从剩 4 分钟开始买入，独立核算提前入场的扣费收益",
+)
+FORECAST_LIMIT_060_PAPER_VARIANT = replace(
+    FORECAST_PAPER_VARIANT, variant_id=FORECAST_LIMIT_060_PAPER_ID,
+    signal_filter_mode=FORECAST_LIMIT_060_PAPER_ID,
+    role="仅 Paper · 原买入限价最多 60 美分，从已实现净值高点起共用 10 美元回撤预算",
+)
+FORECAST_LIMIT_CONTROL_PAPER_VARIANT = replace(
+    FORECAST_PAPER_VARIANT, variant_id=FORECAST_LIMIT_CONTROL_PAPER_ID,
+    signal_filter_mode=FORECAST_LIMIT_CONTROL_PAPER_ID,
+    role="仅 Paper · 沿用原版买价，与 60 美分限价版同期开始，采用相同仓位与回撤预算",
+)
+
 
 def active_strategy_variants() -> tuple[StrategyVariant, ...]:
     """独立 Paper 策略；原主账户由原运行器管理。"""
@@ -163,9 +198,11 @@ def selected_strategy_variants(raw_variant_ids: str | None) -> tuple[StrategyVar
     wanted = wanted.difference(DEPRECATED_STRATEGY_VARIANT_IDS)
     if not wanted:
         return tuple()
-    by_id = {variant.variant_id: variant for variant in STRATEGY_VARIANTS}
+    available = (*STRATEGY_VARIANTS, FORECAST_PAPER_VARIANT, FORECAST_EARLY_PAPER_VARIANT,
+                 FORECAST_LIMIT_060_PAPER_VARIANT, FORECAST_LIMIT_CONTROL_PAPER_VARIANT)
+    by_id = {variant.variant_id: variant for variant in available}
     unknown = sorted(wanted.difference(by_id))
     if unknown:
         allowed = ", ".join(sorted(by_id))
         raise ValueError(f"unknown strategy experiment variants: {', '.join(unknown)}; allowed: {allowed}")
-    return tuple(variant for variant in STRATEGY_VARIANTS if variant.variant_id in wanted)
+    return tuple(variant for variant in available if variant.variant_id in wanted)

@@ -1,6 +1,7 @@
 /* Real wallet and live execution controls; credentials never enter this UI. */
 (() => {
-  const names={MAIN:"主账户",MAIN_OPTIMIZED:"主账户（优化版）",MAIN_ADAPTIVE:"主账户自适应成长版",MAIN_OPTIMIZED_FAST:"主账户（优化极速赚钱版）",MAIN_OPTIMIZED_PLUS:"主账户（优化进阶版）"};
+  const FIRST_STRONG_ID="MAIN_FIRST_STRONG";
+  const names={MAIN:"主账户",MAIN_OPTIMIZED:"主账户（优化版）",MAIN_ADAPTIVE:"主账户自适应成长版",MAIN_OPTIMIZED_FAST:"主账户（优化极速赚钱版）",MAIN_OPTIMIZED_PLUS:"主账户（优化进阶版）",FORECAST_EXIT_SETTLE:"拿到官方结算",[FIRST_STRONG_ID]:"主账户·每局首个强信号"};
   let previousMode=null,busy=false,token="",latest=null,acknowledged=null;
   let dataView="auto",runtimeMessage="";
   const el=id=>document.getElementById(id);
@@ -24,7 +25,10 @@
     })};
   };
   const key=()=>accountScope==="main"?"MAIN":parseAccountScope(accountScope).variantId||"MAIN";
-  const active=data=>dataView==="live"||(dataView==="auto"&&state(data).enabled===true&&state(data).settings?.strategies?.[key()]?.enabled===true);
+  const firstStrongSelected=()=>key()===FIRST_STRONG_ID;
+  const separatePaperWallet=id=>id===EXIT_SETTLE_ID||id===FIRST_STRONG_ID;
+  const paperOnly=data=>isForecastPaperStrategy(key())||(firstStrongSelected()&&!state(data).settings?.strategies?.[FIRST_STRONG_ID]);
+  const active=data=>!paperOnly(data)&&(dataView==="live"||(dataView==="auto"&&state(data).enabled===true&&state(data).settings?.strategies?.[key()]?.enabled===true));
   const variant=data=>(state(data).variants||[]).find(r=>r.variant_id===key())||null;
   const walletCurve=data=>{
     const root=state(data),now=Date.now()/1000,cutoff=now-7*86400;
@@ -34,12 +38,36 @@
       rows.push({created_at:w.checked_at,cash_balance:w.balance,total_equity:w.total_equity});
     return rows;
   };
-  const executionFor=(data,selected)=>{const r=state(data),s=selected?.execution,observed=r.market_data?.observed_at;
-    return observed&&Date.now()/1000-observed>15?{...s,state:"blocked",label:"运行状态未知",reason:"界面超过 15 秒未收到服务状态，无法确认实盘运行情况；正在重连。",since:observed+15,checked_at:observed,recovery:"auto",disconnected:true}:s;};
+  function selectedCurve(data){
+    if(!separatePaperWallet(key()))return walletCurve(data);
+    return (variant(data)?.settled_pnl_curve||[]).filter(point=>
+      Number.isFinite(point.created_at)&&Number.isFinite(point.realized_pnl)).map(point=>({
+      created_at:point.created_at,total_equity:point.realized_pnl,total_pnl:point.realized_pnl,realized_pnl:point.realized_pnl}));
+  }
+  function executionFor(data,selected){
+    const root=state(data),status=selected?.execution;
+    const age=statusDeliveryAgeMs();
+    if(age<=15_000){
+      if(root.runtime_enabled===false&&status?.state==="off"){
+        return {...status,label:"实盘已关闭",reason:"服务器的实盘执行开关已关闭。"};
+      }
+      return status;
+    }
+    const lastUpdate=Number.isFinite(age)?(statusServerNowMs()-age)/1000:null;
+    if(root.runtime_enabled===false){
+      return {...status,state:"off",label:"上次确认：实盘已关闭",
+        reason:"页面正在重连。上次收到服务器状态时，实盘执行已关闭。",
+        checked_at:lastUpdate,retry_at:null,disconnected:true};
+    }
+    return {...status,state:"blocked",label:"实盘状态待核实",
+      reason:"页面超过 15 秒未收到新的服务器状态，暂时无法确认实盘是否在运行。",
+      since:lastUpdate?lastUpdate+15:null,checked_at:lastUpdate,retry_at:null,disconnected:true};
+  }
   const execution=data=>executionFor(data,variant(data));
   const executionTargets=data=>{
     const root=state(data),enabled=(root.variants||[]).filter(v=>root.settings?.strategies?.[v.variant_id]?.enabled===true);
-    return enabled.length?enabled:[variant(data)||{variant_id:key(),combo:names[key()]}];
+    if(enabled.length||(firstStrongSelected()&&!variant(data)))return enabled;
+    return [variant(data)||{variant_id:key(),combo:names[key()]}];
   };
   const stateLabel=v=>({PREPARED:"准备提交",SUBMITTING:"正在提交",PENDING:"待官方确认",UNKNOWN:"提交结果待核对",QUARANTINED:"隔离核对中",EXPIRED_UNFILLED:"到期核对无成交",FILLED:"已确认成交",CANCELED:"未成交",REJECTED:"已拒绝",FAILED:"链上成交失败",OPEN:"持仓中",CLOSED:"已卖出",SETTLED:"已结算",REDEEMABLE:"已结算 · 待领取"}[v]||v);
   function valuationNote(v){
@@ -77,20 +105,44 @@
   }
   function controls(data){
     const container=el("managed-strategy-controls");
-    if(!container.children.length)container.innerHTML=Object.entries(names).map(([id,name])=>`<div class="managed-strategy-card" data-live-card="${id}">
-      <div class="managed-strategy-title"><strong>${esc(name)}</strong><label class="managed-small-switch"><input type="checkbox" data-live-toggle="${id}" aria-label="${esc(name)}实盘开关"><span>允许实盘开仓</span></label></div>
-      <div class="managed-inputs"><label>每笔金额（Paper / 实盘共用，含费）<div><span>$</span><input type="number" min="0.1" step="0.1" data-setting="stake_dollars" aria-label="${esc(name)}每笔金额"></div></label><button type="button" data-live-save="${id}">保存</button></div>
-      <details><summary>风险设置（Paper / 实盘共用）</summary><label>最多持仓（含待确认）<input type="number" min="1" max="10" step="1" data-setting="max_open_trades" aria-label="${esc(name)}最多持仓"></label><label>24 小时亏损限额（$）<input type="number" min="0" step="1" data-setting="max_daily_loss" aria-label="${esc(name)}每日亏损限额"></label>
-      <button type="button" data-live-reset-loss="${id}" aria-label="${esc(name)}重置亏损限额" title="按已保存的限额，从现在重新统计本策略实盘亏损；历史盈亏和持仓保留。">重置亏损限额</button><small class="managed-loss-reset-note" data-live-loss-reset-note></small>
-      </details><small class="managed-card-state"></small></div>`).join("");
     const root=state(data);
+    const strategies=Object.entries(names).filter(([id])=>root.settings?.strategies?.[id]);
+    const paper=window.FirstStrongPaper;
+    const strongLive=Boolean(root.settings?.strategies?.[FIRST_STRONG_ID]);
+    const strategyKey=[...strategies.map(([id])=>id),paper?"strong-paper":""].join("|");
+    if(container.dataset.strategies!==strategyKey){
+      container.dataset.strategies=strategyKey;
+      const paperDetails=paper?`<small data-paper-budget></small><small class="managed-card-state" data-paper-balance></small>
+        <small class="managed-card-state" data-paper-reason></small>`:"";
+      const accountButtons=`<div class="managed-inputs">${paper?'<button type="button" data-first-strong-account>查看模拟账户</button>':""}
+        ${strongLive?`<button type="button" data-live-select="${FIRST_STRONG_ID}">查看实盘</button>`:""}</div>`;
+      container.innerHTML=strategies.map(([id,name])=>`<div class="managed-strategy-card" data-live-card="${id}" ${id===FIRST_STRONG_ID?"data-first-strong-card":""}>
+      <div class="managed-strategy-title"><strong>${esc(name)}</strong><label class="managed-small-switch"><input type="checkbox" data-live-toggle="${id}" aria-label="${esc(name)}实盘开关"><span>允许实盘开仓</span></label></div>
+      <div class="managed-inputs"><label>每笔金额（${separatePaperWallet(id)?"仅实盘":"Paper / 实盘共用"}，含费）<div><span>$</span><input type="number" min="0.1" step="0.1" data-setting="stake_dollars" aria-label="${esc(name)}每笔金额"></div></label><button type="button" data-live-save="${id}">保存</button></div>
+      <details><summary>风险设置（${separatePaperWallet(id)?"仅实盘":"Paper / 实盘共用"}）</summary><label>最多持仓（含待确认）<input type="number" min="1" max="${id===FIRST_STRONG_ID?2:10}" step="1" data-setting="max_open_trades" aria-label="${esc(name)}最多持仓"></label><label>24 小时亏损限额（$）<input type="number" min="0" step="1" data-setting="max_daily_loss" aria-label="${esc(name)}每日亏损限额"></label>
+      <button type="button" data-live-reset-loss="${id}" aria-label="${esc(name)}重置亏损限额" title="按已保存的限额，从现在重新统计本策略实盘亏损；历史盈亏和持仓保留。">重置亏损限额</button><small class="managed-loss-reset-note" data-live-loss-reset-note></small>
+      </details>${id===EXIT_SETTLE_ID?'<small>Paper 沿用候选账户，每笔 $5。实盘按此处设置开仓。</small>':""}<small class="managed-card-state" data-live-card-state></small>${id===FIRST_STRONG_ID?paperDetails+accountButtons:""}</div>`).join("")+(paper&&!strongLive?`
+      <div class="managed-strategy-card" data-first-strong-card>
+        <div class="managed-strategy-title"><strong>${esc(paper.label)}</strong><label class="managed-small-switch"><input type="checkbox" disabled aria-label="${esc(paper.label)}实盘开关"><span>等待服务器提供实盘控制</span></label></div>
+        ${paperDetails}${accountButtons}
+      </div>`:"");
+    }
+    if(paper){
+      const card=container.querySelector("[data-first-strong-card]");
+      const snapshot=paper.snapshot;
+      const wallet=snapshot?.account;
+      card.querySelector("[data-paper-balance]").textContent=`模拟可用资金 ${amount(wallet?.cash)}`;
+      card.querySelector("[data-paper-budget]").textContent=snapshot?.rule
+        ?`独立 Paper · 每笔 ${amount(snapshot.rule.stake_dollars)}（含费） · ${wallet?.open_positions??"—"} 笔持仓`:"";
+      card.querySelector("[data-paper-reason]").textContent=`模拟状态 · ${paper.reason}`;
+    }
     for(const [id,c] of Object.entries(root.settings?.strategies||{})){const card=container.querySelector(`[data-live-card="${id}"]`);if(!card)continue;
       const toggle=card.querySelector("input[data-live-toggle]");toggle.checked=c.enabled;toggle.disabled=busy;card.classList.toggle("is-live",root.enabled&&c.enabled);
       card.querySelectorAll("input[data-setting]").forEach(input=>{if(document.activeElement!==input&&!input.dataset.dirty)input.value=c[input.dataset.setting];});card.querySelectorAll("button").forEach(button=>{button.disabled=busy;});
       const reset=(root.variants||[]).find(r=>r.variant_id===id)?.loss_limit;
       const resetButton=card.querySelector("[data-live-reset-loss]");resetButton.disabled=busy||!reset;
       card.querySelector("[data-live-loss-reset-note]").textContent=!reset?"等待服务支持重置":reset.reset_at?`上次重置：${at(reset.reset_at)} · 仅本策略实盘`:"从点击时重新统计实盘亏损，保留历史盈亏及持仓风险。";
-      const execution=(root.variants||[]).find(r=>r.variant_id===id)?.execution,caption=card.querySelector(".managed-card-state");
+      const execution=(root.variants||[]).find(r=>r.variant_id===id)?.execution,caption=card.querySelector("[data-live-card-state]");
       caption.textContent=execution?`${execution.label} · ${execution.reason}`:root.enabled&&c.enabled?"正在读取开仓状态":c.enabled?"等待实盘总开关开启":"新开仓关闭";caption.dataset.state=execution?.state||"off";}
   }
   function renderExecution(data){
@@ -114,7 +166,7 @@
     const s=executionFor(data,r)||{state:"connecting",label:"正在连接",reason:"正在读取实盘开仓状态…"};
     const seconds=Math.max(0,Math.floor(Date.now()/1000-(s.since||Date.now()/1000))),duration=seconds<60?`${seconds} 秒`:`${Math.floor(seconds/60)} 分 ${seconds%60} 秒`;
     const tone={blocked:"red",waiting:"amber",confirming:"amber",connecting:"amber",ready:"green",holding:"green",off:"neutral"}[s.state]||"neutral";
-    const recovery=s.disconnected?"正在重连，恢复后自动更新":s.state==="off"?"已有持仓继续管理":s.state==="holding"?"释放名额后自动检查入场":s.state==="blocked"?(s.recovery==="manual"?"需要人工处理后恢复":"自动复查，条件恢复后继续开仓"):s.state==="confirming"?"正在核对官方成交结果":s.state==="connecting"?"等待服务连接":s.state==="ready"?"正在处理入场请求":"持续检查入场条件";
+    const recovery=s.disconnected?"正在重连，恢复后自动更新":s.state==="off"?(state(data).runtime_enabled===false?"":"已有持仓继续管理"):s.state==="holding"?"释放名额后自动检查入场":s.state==="blocked"?(s.recovery==="manual"?"需要人工处理后恢复":"自动复查，条件恢复后继续开仓"):s.state==="confirming"?"正在核对官方成交结果":s.state==="connecting"?"等待服务连接":s.state==="ready"?"正在处理入场请求":"持续检查入场条件";
     // Keep lamp nodes stable across the one-second status refresh; rebuilding
     // them would restart the animation and make the lights flicker.
     if(!box.querySelector(".execution-signal-shell"))box.innerHTML=`
@@ -163,19 +215,48 @@
   }
   function render(data){
     latest=data;const root=state(data),panel=el("managed-wallet-panel");if(!panel)return;panel.hidden=!root.available;
-    el("managed-view-control").hidden=!root.available;el("managed-data-view").value=dataView;
+    el("managed-view-control").hidden=!root.available||paperOnly(data);
+    el("managed-data-view").value=firstStrongSelected()&&paperOnly(data)?"paper":dataView;
     const live=active(data),w=root.wallet||{};
-    if(previousMode!==live){if(typeof metricAnimations!=="undefined"){metricAnimations.forEach(x=>{if(x.frame)cancelAnimationFrame(x.frame);});metricAnimations.clear();document.querySelectorAll("[data-metric-ready]").forEach(n=>{delete n.dataset.metricReady;delete n.dataset.metricValue;});}
-      if(typeof equityCurveRows!=="undefined")equityCurveRows=[];if(typeof equityCurveMeta!=="undefined")equityCurveMeta={};if(typeof lastChartRenderMs!=="undefined")lastChartRenderMs=0;if(typeof lastEquityCurveFetchMs!=="undefined")lastEquityCurveFetchMs=0;previousMode=live;}
+    if(previousMode!==live){
+      if(typeof metricAnimations!=="undefined"){metricAnimations.forEach(x=>{if(x.frame)cancelAnimationFrame(x.frame);});metricAnimations.clear();document.querySelectorAll("[data-metric-ready]").forEach(n=>{delete n.dataset.metricReady;delete n.dataset.metricValue;});}
+      if(live){
+        equityCurveRows=[];equityCurveMeta={};lastEquityCurveFetchMs=0;
+      }else if(previousMode===true){
+        // The selected Paper account can finish loading before this animation frame.
+        // Reuse that response, or start a read after an automatic view change.
+        loadEquityCurve(false).catch(showError);
+      }
+      lastChartRenderMs=0;
+      previousMode=live;
+    }
     document.body.classList.toggle("managed-mode-live",live);el("paper-table-stack").hidden=live;el("managed-live-tables").hidden=!live;
     document.querySelectorAll("[data-live-valuation-note]").forEach(n=>{n.hidden=!live;});
     const brand=document.querySelector(".brand-lockup .eyebrow");if(brand)brand.textContent=live?"LIVE · 真实资金":"Paper · 策略对照";
-    el("equity-chart-title").textContent=live?"真实钱包总资产曲线 · 近7天":"资金曲线";el("market-panel-title").textContent=live?"实时市场 · 实盘行情":"实时市场 · 原主账户";
-    const curve=walletCurve(data),range=el("managed-chart-range");range.hidden=!live;
-    if(live){const format=t=>new Date(t*1000).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
+    const settlement=key()===EXIT_SETTLE_ID,firstStrong=firstStrongSelected();
+    const chartTitle=el("equity-chart-title");
+    if(firstStrong||settlement)chartTitle.textContent=live?"本策略实盘 · 累计已结算盈亏":"Paper · 已结算净值";
+    else chartTitle.textContent=live?"真实钱包总资产曲线 · 近7天":"资金曲线";
+    el("market-panel-title").textContent=live?"实时市场 · 实盘行情":(settlement||firstStrong||isForecastPaperStrategy(key()))?`实时市场 · ${accountScopeMeta(data).label}`:"实时市场 · 原主账户";
+    const curve=live?selectedCurve(data):[],range=el("managed-chart-range");range.hidden=!live&&!settlement&&!firstStrong;
+    if(live&&!settlement&&!firstStrong){const format=t=>new Date(t*1000).toLocaleString("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false});
       range.textContent=curve.length?`实际记录：${format(curve[0].created_at)} — ${format(curve[curve.length-1].created_at)}${root.wallet_curve_meta?.first_recorded_at>Date.now()/1000-7*86400?" · 实盘记录尚不足7天":""}`:"近7天暂无真实钱包资产记录";}
-    el("managed-chart-empty").hidden=!live||curve.length>0;el("equity-chart").hidden=!el("managed-chart-empty").hidden;
+    const empty=el("managed-chart-empty");
+    if(firstStrong&&!live){
+      const paper=window.FirstStrongPaper,points=paper?.snapshot?.equity_curve?.length||0;
+      range.textContent=points===1?"当前只有初始资金记录，首次官方结算后更新净值。":"按独立模拟账户的初始资金和逐笔结算净收益计算。";
+      empty.textContent=paper?.reason||"正在读取模拟账户记录…";
+      empty.hidden=points>0;
+    }else if(settlement||firstStrong){
+      range.textContent=live?"从本策略首次真实开仓起累计。每次平仓或官方结算后更新，已扣成交费用。":"按原模拟本金和逐笔已结算净收益重建，包含候选阶段记录，未计入持仓浮盈。";
+      empty.textContent=live?"此策略暂无已结算的实盘交易。":lastEquityCurveFetchMs?"所选期间暂无 Paper 结算记录。":"正在读取 Paper 结算记录…";
+      empty.hidden=live?curve.length>0:equityCurveRows.length>0;
+    }else{
+      empty.textContent="等待真实资产估值";empty.hidden=!live||curve.length>0;
+    }
+    el("equity-chart").hidden=!empty.hidden;
     const labels=live?["钱包总资产（共享）","策略净盈亏","策略未实现盈亏","钱包可用资金（共享）","全钱包预留额度","本策略持仓成本","本策略胜率","已结算序列回撤"]:["总资产","总盈亏","未实现盈亏","可用资金","挂单预留","持仓风险","胜率","最大回撤"];
+    if(firstStrong&&!live){labels[0]="账面资产（按成本）";labels[1]="已实现盈亏";labels[7]="已结算最大回撤";}
     document.querySelectorAll(".metric-grid > .metric > span").forEach((n,i)=>{if(labels[i])n.textContent=labels[i];});
     if(panel.hidden)return;
     el("managed-mode-label").textContent=root.enabled?"允许策略实盘开仓":"实盘新开仓关闭";el("managed-master-enabled").checked=Boolean(root.enabled);el("managed-master-enabled").disabled=busy;
@@ -228,7 +309,7 @@
     return sale+settlement||'<span class="managed-money--muted">—</span>';
   }
   function renderTables(data){
-    const r=variant(data);if(!r)return;const positions=r.open_trades||[],orders=r.orders||[],history=r.recent_trades||[];
+    const r=variant(data)||{combo:names[key()]};const positions=r.open_trades||[],orders=r.orders||[],history=r.recent_trades||[];
     el("managed-position-account").textContent=r.combo;el("managed-position-count").textContent=positions.length+" 笔";
     renderScrollRows("managed-positions",positions.length?positions.map(p=>{const pending=orders.some(o=>o.position_id===p.id&&["PREPARED","SUBMITTING","PENDING","UNKNOWN","QUARANTINED"].includes(o.state));const expired=Number(p.round_id.split("-").pop())+300<=Date.now()/1000;
       const note=valuationNote(p.valuation);
@@ -247,19 +328,24 @@
 
   document.addEventListener("input",e=>{if(e.target.matches("#managed-strategy-controls input[data-setting]"))e.target.dataset.dirty="true";});
   document.addEventListener("change",e=>{
-    if(e.target.id==="managed-data-view"){dataView=e.target.value;renderAll(latestStatus,{force:true,forceChart:true});return;}
+    if(e.target.id==="managed-data-view"){dataView=e.target.value;renderAll(latestStatus,{force:true,forceChart:true});
+      if(!active(latestStatus))requestAnimationFrame(()=>loadEquityCurve(true).catch(showError));return;}
     if(e.target.id==="managed-master-enabled"){try{const strategies={};if(e.target.checked)for(const[id,c]of Object.entries(state(latest).settings?.strategies||{}))if(c.enabled)strategies[id]=cardValues(id);update({enabled:e.target.checked,strategies});}catch(error){el("managed-live-message").textContent=error.message;render(latest);}}
     const id=e.target.dataset.liveToggle;if(id){try{update({strategies:{[id]:e.target.checked?{...cardValues(id),enabled:true}:{enabled:false}}});}catch(error){el("managed-live-message").textContent=error.message;render(latest);}}
   });
   document.addEventListener("click",async e=>{
     const save=e.target.closest("[data-live-save]");if(save){try{update({strategies:{[save.dataset.liveSave]:cardValues(save.dataset.liveSave)}});}catch(error){el("managed-live-message").textContent=error.message;}}
     const reset=e.target.closest("[data-live-reset-loss]");if(reset){await resetLossLimit(reset.dataset.liveResetLoss);return;}
-    const select=e.target.closest("[data-live-select]");if(select){ids.accountScopeSelect.value=select.dataset.liveSelect==="MAIN"?"main":"experiment:"+select.dataset.liveSelect;ids.accountScopeSelect.dispatchEvent(new Event("change",{bubbles:true}));}
+    const select=e.target.closest("[data-live-select]");if(select){dataView="live";ids.accountScopeSelect.value=select.dataset.liveSelect==="MAIN"?"main":"experiment:"+select.dataset.liveSelect;ids.accountScopeSelect.dispatchEvent(new Event("change",{bubbles:true}));}
     const sell=e.target.closest("[data-live-sell]");if(sell){sell.disabled=true;try{await post("/api/managed-live/sell",{strategy_id:sell.dataset.liveOwner,position_id:Number(sell.dataset.liveSell)});el("managed-live-message").textContent="卖出请求已处理，请以官方确认后的成交为准。";}catch(error){el("managed-live-message").textContent=error.message;}finally{sell.disabled=false;}}
   });
-  setInterval(()=>{if(!latest||!state(latest).available)return;renderDataHealth(latest);renderExecution(latest);if(active(latest)&&typeof renderRuntime==="function")renderRuntime(latest.runtime);},1000);
+  setInterval(()=>{
+    if(!latest||document.hidden)return;
+    if(state(latest).available){renderDataHealth(latest);renderExecution(latest);}
+    if(typeof renderRuntime==="function")renderRuntime(latest.runtime);
+  },1000);
   window.ManagedLiveUI={active,state,variant,execution,metrics,render,renderMetrics,rows,market,
     meta:d=>({label:(variant(d)?.combo||names[key()])+" · 实盘",source:"钱包余额与总资产共享；盈亏、持仓及胜率按当前策略统计"}),
-    curve:walletCurve,
-    currentPoint:d=>{const w=state(d).wallet||{};return w.total_equity==null?null:{created_at:w.checked_at,cash_balance:w.balance,total_equity:w.total_equity};}};
+    curve:selectedCurve,
+    currentPoint:d=>{if(separatePaperWallet(key()))return null;const w=state(d).wallet||{};return w.total_equity==null?null:{created_at:w.checked_at,cash_balance:w.balance,total_equity:w.total_equity};}};
 })();

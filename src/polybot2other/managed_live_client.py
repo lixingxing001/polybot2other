@@ -17,6 +17,7 @@ from py_clob_client_v2.exceptions import PolyApiException
 from .live import PolymarketLiveClient
 from .managed_live_recovery import (normalize_error, FINALIZE_AFTER_END_SECONDS,
                                     is_fak_no_match,response_acceptance_evidence,saved_fak_no_match)
+from .managed_live_receipts import ReceiptPending, confirmed_receipt_fills
 
 
 class OrderConfirmationPending(RuntimeError):
@@ -196,7 +197,14 @@ class ManagedExchange:
         key = market.round_id
         if not force and key in self._market_info:
             return self._market_info[key]
-        _, client = self.client()
+        if self.settings.live_trading_runtime_enabled:
+            _, client = self.client()
+        else:
+            # Paper needs public fee/tick metadata, never a wallet signer.
+            client = ManagedClobClient(
+                self.http, host=self.settings.clob_url,
+                chain_id=self.settings.live_trading_chain_id,
+            )
         raw = client.get_clob_market_info(market.condition_id)
         tokens = {str(t["t"]) for t in raw.get("t", []) if isinstance(t,dict) and t.get("t")}
         if not {market.up_token, market.down_token} <= tokens:
@@ -350,6 +358,8 @@ class ManagedExchange:
     def reconcile(self, order, market, info):
         sdk, client = self.client()
         remote_id=order.get("ack_id") or order["external_id"]
+        if remote_id.lower() != order["external_id"].lower():
+            raise ValueError("官方订单编号与本地签名订单不一致")
         evidence={"order":"unavailable","trades":"unavailable","open_orders":"not_needed","token_balance":None,"checks_started_at":time.time()}
         raw=None
         try:
@@ -365,36 +375,57 @@ class ManagedExchange:
             found=client.get_trades(params,only_first_page=False)
             if isinstance(found,list):trades=found;evidence["trades"]="checked"
         except Exception as exc:evidence["trades_error"]=type(exc).__name__
-        confirmed=[];seen=set();finished=set();pending=False;failed_shares=0.
+        acknowledgement=json.loads(order.get("submission_json") or "{}")
+        matched_ack=(acknowledgement.get("accepted") is True
+                     and str(acknowledgement.get("status","")).upper()=="MATCHED")
+        expected=set(acknowledgement.get("trade_ids") or []) if matched_ack else set()
+        confirmed_rows=[];seen={};failed_ids=set();pending=False;failed_shares=0.
         for trade in trades:
             if not isinstance(trade,dict):raise ValueError("官方成交记录格式无效")
             if str(trade.get("taker_order_id","")).lower()!=remote_id.lower():
                 continue
-            if str(trade.get("asset_id",order["token_id"]))!=order["token_id"]:
+            if str(trade.get("asset_id",""))!=order["token_id"]:
                 raise ValueError("成交的资产与本地订单不一致")
-            ident=str(trade.get("id") or "")
+            if trade.get("side") and str(trade["side"]).upper()!=order["action"]:
+                raise ValueError("成交的方向与本地订单不一致")
+            ident=trade.get("id")
             if not ident:pending=True;continue
-            if ident in seen:continue
-            seen.add(ident)
+            if not isinstance(ident,str):raise ValueError("官方成交编号格式无效")
             status=str(trade.get("status","")).upper()
+            fingerprint=(status,trade.get("transaction_hash"),number(trade["size"]))
+            if ident in seen:
+                if fingerprint!=seen[ident]:pending=True
+                continue
+            seen[ident]=fingerprint
             if status=="FAILED":
                 failed_shares+=number(trade["size"])
-                finished.add(ident)
+                failed_ids.add(ident)
                 continue
             if status!="CONFIRMED":
                 pending=True
                 continue
-            quantity=number(trade["size"]);price=number(trade["price"])
-            finished.add(ident)
-            fee=fee_amount(quantity,price,info["fee_rate"],info["fee_exponent"])
-            confirmed.append({"trade_id":ident,"shares":quantity,"price":price,"fee":fee,
-                              "fee_source":"official_market_fee_schedule"})
+            confirmed_rows.append(trade)
+        if expected and expected!=set(seen):pending=True
+        confirmed=[];receipt_reason=None
+        if confirmed_rows and not pending:
+            try:
+                confirmed,groups,details=confirmed_receipt_fills(
+                    self.http,order,info,confirmed_rows,chain_id=self.settings.live_trading_chain_id,
+                    funder=os.environ.get("POLYBOT2OTHER_LIVE_FUNDER_ADDRESS","").strip(),
+                )
+                evidence.update(receipt_groups=groups,receipt_details=details)
+            except ReceiptPending as exc:
+                pending=True;receipt_reason=str(exc)
         status=str(raw.get("status","")).upper() if complete else "UNAVAILABLE"
         terminal=status in {"MATCHED","FILLED","CANCELED","CANCELLED","EXPIRED","UNMATCHED"}
         actual=sum(t["shares"] for t in confirmed)
         reconciled=bool(complete and terminal and evidence["trades"]=="checked" and not pending
-                        and abs(actual+failed_shares-number(raw["size_matched"]))<.000001)
-        evidence.update(matching_trades=len(seen),confirmed_shares=actual,pending_trades=pending)
+                        and (seen or (status not in {"MATCHED","FILLED"} and not matched_ack))
+                        and (abs(actual+failed_shares-number(raw["size_matched"]))<.000001
+                             or (failed_ids and abs(actual-number(raw["size_matched"]))<.000001)))
+        evidence.update(matching_trades=len(seen),matched_trade_ids=sorted(seen),
+                        confirmed_trade_ids=sorted(row["id"] for row in confirmed_rows),
+                        failed_trade_ids=sorted(failed_ids),confirmed_shares=actual,pending_trades=pending)
         if confirmed:evidence["confirmed_fills"]=confirmed
         if not complete or order.get("state")=="QUARANTINED":
             evidence["open_orders"]="unavailable"
@@ -406,10 +437,7 @@ class ManagedExchange:
             except Exception as exc:evidence["token_balance_error"]=type(exc).__name__
             # Missing lookup alone is never proof of a no-fill. A saved successful
             # FAK acknowledgement plus all its final receipts is independent proof.
-            acknowledgement=json.loads(order.get("submission_json") or "{}")
-            expected=set(acknowledgement.get("trade_ids") or [])
-            if (not complete and acknowledgement.get("accepted") is True and acknowledgement.get("status","").upper()=="MATCHED"
-                    and expected and expected==seen==finished and not pending and evidence["trades"]=="checked"
+            if (not complete and matched_ack and expected and expected==set(seen) and not pending and evidence["trades"]=="checked"
                     and evidence["open_orders"]=="checked" and evidence["matching_open_order"] is False):
                 reconciled=True;status="CONFIRMED_RECEIPTS"
         if (order.get("state") in ("QUARANTINED","EXPIRED_UNFILLED") and not reconciled
@@ -421,7 +449,7 @@ class ManagedExchange:
                 "官方成交查询暂不可用，继续核对" if evidence["trades"]!="checked" else "官方成交尚未全部确认")
         evidence["checks_completed_at"]=time.time()
         return {"fills":confirmed,"terminal":reconciled,"no_fill":reconciled and actual==0,"status":status,
-                "pending_reason":None if reconciled else reason,"evidence":evidence}
+                "pending_reason":None if reconciled else receipt_reason or reason,"evidence":evidence}
 
     def wallet_activity_evidence(self,order,market):
         """Independent Data API history; require complete pagination and matching wallet/market."""

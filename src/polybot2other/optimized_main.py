@@ -9,9 +9,10 @@ import threading
 import time
 
 from .bot import PaperTradingBot
+from .experiments import FORECAST_PAPER_NAME
 from .clob_ws import ClobMarketOrderBook, CLOB_MARKET_WS_URL, _StdlibWebSocket
 from .models import MarketRound, Signal
-from .polymarket import PolymarketClient, _first_event_market, _jsonish_list, _target_from_market
+from .polymarket import PolymarketClient, _first_event_market, _jsonish_list, _target_from_market, _truthy
 from .storage import TradeStore
 from .optimized_reference import ReferenceCache, PolyBoltReferenceFeed, SPOT, TWAP
 
@@ -112,10 +113,10 @@ class StrictTwapMarketClient(PolymarketClient):
 
     def get_resolution(self, slug):
         event = self._get_event_by_slug(slug)
-        if not event or not self.twap_contract(event):
+        if not event or event.get("slug") != slug or not self.twap_contract(event):
             return None
         raw = _first_event_market(event)
-        if not raw or not raw.get("closed"):
+        if not raw or raw.get("slug") != slug or not _truthy(raw.get("closed")):
             return None
         outcomes = _jsonish_list(raw.get("outcomes"))
         prices = _jsonish_list(raw.get("outcomePrices"))
@@ -126,7 +127,13 @@ class StrictTwapMarketClient(PolymarketClient):
         target = positive_price(metadata.get("priceToBeat"))
         if len(winners)!=1 or winners[0] not in ("Up","Down") or target is None:
             return None
-        return {"outcome":winners[0], "target_price":target, "final_price":metadata.get("finalPrice")}
+        return {
+            "market_slug": raw["slug"],
+            "price_source": "Gamma:outcomePrices",
+            "outcome": winners[0],
+            "target_price": target,
+            "final_price": metadata.get("finalPrice"),
+        }
 
 
 def forecast_twap(references, market, current):
@@ -534,3 +541,37 @@ class OptimizedMainBot(PaperTradingBot):
                 self._book_ws=None
             if not self._stop.is_set():
                 self._stop.wait(backoff);backoff=min(10,backoff*2)
+
+
+class ForecastPaperBot(OptimizedMainBot):
+    """Use the independent worker and official settlement, with realistic Paper fills only."""
+
+    strategy_label = FORECAST_PAPER_NAME
+    policy_version = "forecast-paper-v1"
+
+    def __init__(self, settings, store, shared_round=None, *, strategy_label=FORECAST_PAPER_NAME):
+        from .forecast_settlement import ForecastSettlements
+        super().__init__(settings, store)
+        self.last_signal = {"side": "NO_TRADE", "reason": "等待本局方向预测和模拟盘口"}
+        self.strategy_label = strategy_label
+        self.forecast_settlements = ForecastSettlements(store, shared_round)
+
+    def start(self):
+        if self.paper_execution is None or not self._shared_inputs_required:
+            self._signal("PAPER_WAIT", "等待共享行情和真实盘口模拟撮合")
+            return
+        super().start()
+
+    def optimized_tick(self):
+        if self.paper_execution is not None and self._shared_inputs_required:
+            super().optimized_tick()
+
+    def _resolve(self, now):
+        self.forecast_settlements.check(now, self.polymarket.get_resolution)
+
+    def stop(self):
+        super().stop()
+        self.forecast_settlements.join()
+
+    def diagnostics(self):
+        return {**super().diagnostics(), "settlement_error": self.forecast_settlements.last_error}

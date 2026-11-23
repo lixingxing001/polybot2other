@@ -60,6 +60,7 @@ class Settings:
     paper_entry_order_type: str = "FAK"
     paper_taker_fee_rate: float = 0.07
     paper_realistic_execution: bool = False
+    strategy_league_enabled: bool = False
     paper_gtd_seconds: float = 90.0
     strategy_experiments_enabled: bool = False
     strategy_experiments_db_dir: Path = Path("data/strategy-experiments")
@@ -304,6 +305,7 @@ def load_settings() -> Settings:
         paper_entry_order_type=os.environ.get("POLYBOT2OTHER_PAPER_ENTRY_ORDER_TYPE", "FAK"),
         paper_taker_fee_rate=_float_env("POLYBOT2OTHER_PAPER_TAKER_FEE_RATE", 0.07, 0.0),
         paper_realistic_execution=_bool_env("POLYBOT2OTHER_PAPER_REALISTIC_EXECUTION", False),
+        strategy_league_enabled=_bool_env("POLYBOT2OTHER_STRATEGY_LEAGUE_ENABLED", False),
         paper_gtd_seconds=_float_env("POLYBOT2OTHER_PAPER_GTD_SECONDS", 90.0, 1.0),
         strategy_experiments_enabled=_bool_env("POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED", True),
         strategy_experiments_db_dir=Path(

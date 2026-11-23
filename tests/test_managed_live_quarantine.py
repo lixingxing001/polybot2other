@@ -136,8 +136,8 @@ class QuarantineTests(unittest.TestCase):
         self.assertAlmostEqual(risk["unconfirmed_budget"],3.3328)
         self.isolate(order)
         self.exchange.responses[order["external_id"]]={"fills":[
-            {"trade_id":"trade-1","shares":4,"price":.4,"fee":.0672,"fee_source":"official_market_fee_schedule"},
-            {"trade_id":"trade-2","shares":6,"price":.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],
+            {"trade_id":"trade-1","shares":4,"price":.4,"notional":1.6,"fee":.0672,"fee_source":"official_market_fee_schedule"},
+            {"trade_id":"trade-2","shares":6,"price":.4,"notional":2.4,"fee":.1008,"fee_source":"official_market_fee_schedule"}],
             "terminal":True,"no_fill":False}
         self.manager.reconcile();self.manager.reconcile()
         self.assertEqual(self.store.order(order["id"])["state"],"FILLED")
@@ -221,7 +221,10 @@ class QuarantineTests(unittest.TestCase):
     def test_missing_lookup_accounts_confirmed_fills_but_waits_without_ack(self):
         e,sdk,c=self.adapter();order={"external_id":"0x"+"d"*64,"token_id":"up","created_at":time.time()}
         c.get_trades.return_value=[{"id":"receipt","taker_order_id":order["external_id"],"asset_id":"up","status":"CONFIRMED","size":"10","price":".4"}]
-        with patch.object(e,"client",return_value=(sdk,c)):
+        with patch.object(e,"client",return_value=(sdk,c)), patch(
+            "polybot2other.managed_live_client.confirmed_receipt_fills",
+            return_value=([{"trade_id":"polygon:test","shares":10}],{"polygon:test":["receipt"]},{}),
+        ):
             result=e.reconcile(order,self.market,exchange_info())
         self.assertEqual(result["fills"][0]["shares"],10)
         self.assertFalse(result["terminal"])
@@ -230,7 +233,10 @@ class QuarantineTests(unittest.TestCase):
         e,sdk,c=self.adapter();order={"external_id":"0x"+"e"*64,"token_id":"up","created_at":time.time(),
                                      "submission_json":json.dumps({"accepted":True,"status":"matched","trade_ids":["one","two"]})}
         receipt=lambda ident,status:{"id":ident,"taker_order_id":order["external_id"],"asset_id":"up","status":status,"size":"5","price":".4"}
-        with patch.object(e,"client",return_value=(sdk,c)):
+        with patch.object(e,"client",return_value=(sdk,c)), patch(
+            "polybot2other.managed_live_client.confirmed_receipt_fills",
+            return_value=([{"trade_id":"polygon:test","shares":10}],{"polygon:test":["one","two"]},{}),
+        ):
             c.get_trades.return_value=[receipt("one","CONFIRMED"),receipt("two","MINED")]
             self.assertFalse(e.reconcile(order,self.market,exchange_info())["terminal"])
             c.get_trades.return_value=[receipt("one","CONFIRMED"),receipt("two","CONFIRMED")]

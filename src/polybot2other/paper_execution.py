@@ -16,6 +16,7 @@ import threading
 import time
 
 from .managed_live_client import fee_amount, maximum_fee_ratio
+from .experiments import FORECAST_LIMIT_060_PAPER_ID, FORECAST_LIMIT_CONTROL_PAPER_ID, FORECAST_PAPER_NAMES
 from .models import MarketRound, Signal
 from .shared_market_inputs import quote_error
 
@@ -26,7 +27,7 @@ NAMES = {"MAIN": "主账户", "MAIN_TP_SL": "主账户止盈止损",
          "MAIN_OPTIMIZED": "主账户（优化版）", "MAIN_ADAPTIVE": "主账户自适应成长版",
          "MAIN_OPTIMIZED_FAST": "主账户（优化极速赚钱版）",
          "MAIN_OPTIMIZED_PLUS": "主账户（优化进阶版）",
-         "VALUE_CONFIRM_V1": "价值确认 V1"}
+         "VALUE_CONFIRM_V1": "价值确认 V1", **FORECAST_PAPER_NAMES}
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,23 @@ class ExecutionPolicy:
 def floor_to(value, places):
     factor = 10 ** places
     return math.floor(value*factor+1e-8)/factor
+
+
+def minimum_sell_price(target_net, info):
+    """Lowest legal price tick yielding the required net proceeds per share."""
+    tick = float(info["tick_size"])
+    lo, hi = tick, 1-tick
+    def net(price):
+        return price-fee_amount(1, price, info["fee_rate"], info["fee_exponent"])
+    if net(hi) < target_net:
+        raise ValueError("价格精度无法满足卖出所需净回款")
+    for _ in range(40):
+        mid = (lo+hi)/2
+        if net(mid) < target_net:
+            lo = mid
+        else:
+            hi = mid
+    return round(math.ceil(hi/tick-1e-9)*tick, 6)
 
 
 def checked_info(info):
@@ -169,18 +187,26 @@ class PaperExecution:
         self.rules = {}
         self._create_schema()
         self.store.paper_execution_ledger = self
-        from .managed_live_signals import LiveSignals
         self.risk = PaperRiskView(self)
+        self._init_signals(base_settings, feed)
+        self.recover()
+
+    def _init_signals(self, base_settings, feed):
+        from .managed_live_signals import LiveSignals
         self.signals = LiveSignals(
             base_settings,
             self.risk,
             feed,
             lambda: self.store.account()["cash_balance"],
             lambda: {},
-            adaptive_model=getattr(bot, "adaptive_model", None),
+            adaptive_model=getattr(self.bot, "adaptive_model", None),
             execution_mode="paper",
         )
-        self.recover()
+
+    def _entry_recheck(self, rule, fresh, info):
+        signal, limit = self.signals.evaluate(self.strategy_id, rule, fresh.market, fresh.reference,
+            fresh.quotes, fresh.observed_at, info, market_input=fresh)
+        return signal, limit, self.signals.settings.min_time_left_seconds
 
     def _create_schema(self):
         with self.store._lock, self.store.conn:
@@ -350,11 +376,16 @@ class PaperExecution:
                 self.event("EXECUTION_WAIT", message)
             return frame
 
-    def enqueue_buy(self, market, signal, ceiling, rule, revision, info):
+    def enqueue_buy(self, market, signal, ceiling, rule, revision, info, *, evidence=None):
         started = self.clock()
         token = market.up_token if signal.side == "Up" else market.down_token
         book = self.book_reader(token)
-        error = quote_error(market, {signal.side: book}, signal.side, self.clock())
+        book_checked_at = self.clock()
+        if evidence is not None:
+            evidence["submission_book"] = book
+            evidence["book_checked_at"] = book_checked_at
+            evidence["book_token_matches"] = str(book.get("token_id")) == token
+        error = quote_error(market, {signal.side: book}, signal.side, book_checked_at)
         if error: raise ValueError(error)
         if str(book.get("tick_size")) != str(info["tick_size"]):
             info = checked_info(self.info_reader(market, force=True))
@@ -368,14 +399,17 @@ class PaperExecution:
         fresh = self.frame_reader()
         if fresh.error or not fresh.market or fresh.market.round_id != market.round_id:
             raise ValueError(fresh.error or "市场已切换")
-        again, new_limit = self.signals.evaluate(self.strategy_id, rule, fresh.market, fresh.reference,
-            fresh.quotes, fresh.observed_at, info, market_input=fresh)
+        if evidence is not None:
+            evidence["recheck_frame"] = fresh
+        again, new_limit, minimum_seconds = self._entry_recheck(rule, fresh, info)
+        if evidence is not None:
+            evidence["recheck_complete"] = True
         if (again.side != signal.side or again.entry_price > terms["limit"] or new_limit is None
-                or terms["limit"] > new_limit+.000001 or self.clock() >= market.ends_at-self.signals.settings.min_time_left_seconds):
+                or terms["limit"] > new_limit+.000001 or self.clock() >= market.ends_at-minimum_seconds):
             raise ValueError("提交前复查已不满足原策略入场条件")
         block = self._entry_block(market, signal.side, rule)
         if block: raise ValueError(block)
-        if self.strategy_id in {"MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"}:
+        if self.strategy_id in FORECAST_PAPER_NAMES or self.strategy_id in {"MAIN_ADAPTIVE", "MAIN_OPTIMIZED_FAST", "MAIN_OPTIMIZED_PLUS"}:
             # Bind the exact final score and raw provenance, not the earlier candidate.
             signal = again
             self._record_signal(signal)
@@ -402,6 +436,9 @@ class PaperExecution:
         with self.store._lock, self.store.conn:
             if now >= market.ends_at: raise ValueError("市场已结束，取消本次提交")
             if self.pending(): raise ValueError("已有模拟订单等待确认")
+            if (self.strategy_id in FORECAST_PAPER_NAMES and action == "BUY"
+                    and self.store.conn.execute("SELECT 1 FROM trades WHERE round_id=? LIMIT 1", (market.round_id,)).fetchone()):
+                raise ValueError("本局已经买过一次，等待下一局")
             if (self.strategy_id == "MAIN_ADAPTIVE" and action == "BUY"
                     and self.store.conn.execute("SELECT 1 FROM trades WHERE round_id=? LIMIT 1", (market.round_id,)).fetchone()):
                 raise ValueError("成长版本期已有成交，禁止同一期反手或重复开仓")
@@ -476,21 +513,30 @@ class PaperExecution:
             fraction=self.policy.depth_fraction, consumed=consumed)
         if fill["shares"] <= 0:
             self._finish_empty(order, "FAK 到达时限价内没有可用深度，未成交部分取消")
+            if action == "BUY":
+                self._observe_buy_arrival(order, now, book, consumed, fill)
             return
         if action == "BUY" and fill["cash"] > order["amount"]+.000001:
             raise ValueError("模拟费用超过已预留预算")
+        # Keep the pre-match consumption available to arrival observers.
+        consumed_after = dict(consumed)
         for level in fill["levels"]:
             key = str(level["price"])
-            consumed[key] = consumed.get(key, 0)+level["shares"]
+            consumed_after[key] = consumed_after.get(key, 0)+level["shares"]
         payload = {**order, "fill": fill, "matched_at": now,
                    "arrival_book": {k: book.get(k) for k in ("source_ms", "received_ms", "best_bid", "best_ask", "bids", "asks")}}
         due = max(now+.1, order["submitted_at"]+self.policy.confirmation_seconds)
         with self.store._lock, self.store.conn:
             self.store.conn.execute("UPDATE paper_sim_orders SET phase='CONFIRMING',due_at=?,payload=? WHERE order_id=? AND phase='IN_FLIGHT'", (due, json.dumps(payload), order["order_id"]))
-            self.store.conn.execute("INSERT OR REPLACE INTO paper_sim_consumed VALUES(?,?,?,?)", (order["token"], action, fingerprint, json.dumps(consumed)))
+            self.store.conn.execute("INSERT OR REPLACE INTO paper_sim_consumed VALUES(?,?,?,?)", (order["token"], action, fingerprint, json.dumps(consumed_after)))
             self.store.conn.execute("UPDATE paper_orders SET external_status='SIM_MATCHED_AWAITING_CONFIRMATION',reason=reason||?,updated_at=? WHERE id=?",
                 (f" | 已模拟撮合 {fill['shares']:.6f} 份，等待确认；余额尚未释放", now, order["order_id"]))
         self.event("CONFIRMING", f"已模拟撮合，约 {max(0,due-now):.1f} 秒后确认；资金/份额保持占用")
+        if action == "BUY":
+            self._observe_buy_arrival(order, now, book, consumed, fill)
+
+    def _observe_buy_arrival(self, order, now, book, consumed, fill):
+        pass
 
     def _finish_empty(self, order, reason):
         now = self.clock()
@@ -580,7 +626,7 @@ class PaperExecution:
                 self.enqueue_sell(row, frame.market, reason)
                 break
 
-    def enqueue_sell(self, position, market, reason="手动卖出"):
+    def enqueue_sell(self, position, market, reason="手动卖出", *, recheck=None):
         with self.lock:
             if self.pending(): raise ValueError("已有模拟订单等待确认")
             started = self.clock()
@@ -599,6 +645,8 @@ class PaperExecution:
             quantity = floor_to(position["shares"], 2)  # V2 market SELL precision.
             estimate = sweep_book(book, "SELL", limit, info, shares=quantity)
             if estimate["shares"] <= 0 or estimate["cash"] <= 0: raise ValueError("卖出限价内没有可用买盘")
+            if recheck is not None:
+                limit, reason = recheck(book, info, quantity, limit)
             config = self.config_reader()
             rule = config["strategies"][self.strategy_id]
             basis = position["stake"]*estimate["shares"]/position["shares"]
@@ -606,13 +654,7 @@ class PaperExecution:
             if reason == "止盈":
                 if roi < rule["take_profit_pct"]: raise ValueError("最新盘口已不满足止盈")
                 target = position["stake"]/position["shares"]*(1+rule["take_profit_pct"]/100)
-                lo, hi = tick, 1-tick
-                if hi-fee_amount(1, hi, info["fee_rate"], info["fee_exponent"]) < target: raise ValueError("价格精度无法满足止盈净回款")
-                for _ in range(40):
-                    mid = (lo+hi)/2
-                    if mid-fee_amount(1, mid, info["fee_rate"], info["fee_exponent"]) < target: lo = mid
-                    else: hi = mid
-                limit = max(limit, math.ceil(hi/tick-1e-9)*tick)
+                limit = max(limit, minimum_sell_price(target, info))
                 if limit > book["best_bid"]+.000001: raise ValueError("止盈限价暂无可成交买盘")
             elif reason == "止损" and roi > -rule["stop_loss_pct"]:
                 raise ValueError("最新盘口已恢复，未触发止损")
@@ -665,13 +707,21 @@ class PaperExecutionService:
         self.owner = owner
         self.stop_event = threading.Event()
         self.thread = None
+        self.league = None
+        if getattr(owner.settings, "strategy_league_enabled", False):
+            from .strategy_league_runtime import StrategyLeagueRunner
+            self.league = StrategyLeagueRunner(owner, manager)
         policy = ExecutionPolicy.from_history(manager.store.path)
         bots = {"MAIN": owner, **(owner.strategy_experiments._bots if owner.strategy_experiments else {})}
+        trial_bots = [bots[key] for key in (FORECAST_LIMIT_060_PAPER_ID, FORECAST_LIMIT_CONTROL_PAPER_ID) if key in bots]
+        if trial_bots:
+            self._share_trial_start(trial_bots)
         self.engines = {}
         for key, bot in bots.items():
             if key not in NAMES: continue
             def config_reader(strategy_id=key, strategy_bot=bot):
-                config = manager.store.config()
+                # The forecast experiment has no managed-live strategy or editable live rule.
+                config = {"revision": 1, "strategies": {}} if strategy_id in FORECAST_PAPER_NAMES else manager.store.config()
                 if strategy_id in config.get("strategies", {}):
                     return config
                 # Keep isolated Paper settings available even when a strategy
@@ -687,17 +737,38 @@ class PaperExecutionService:
                     "stop_loss_pct": 40.0,
                 }
                 return {**config, "strategies": strategies}
-            engine = PaperExecution(bot, key, owner.settings, frame_reader=manager.market_input_snapshot,
+            engine_type = PaperExecution
+            if key in FORECAST_PAPER_NAMES:
+                from .forecast_execution import ForecastPaperExecution
+                engine_type = ForecastPaperExecution
+            engine = engine_type(bot, key, owner.settings, frame_reader=manager.market_input_snapshot,
                 info_reader=manager.exchange.market_info, book_reader=manager.exchange.rest_book,
                 config_reader=config_reader, feed=manager.feed, policy=policy)
             bot.paper_execution = engine
             self.engines[key] = engine
+
+    @staticmethod
+    def _share_trial_start(bots):
+        # Use one complete market boundary even if initializing the engines spans two markets.
+        boundary = math.ceil(time.time() / 300) * 300
+        for bot in bots:
+            with bot.store._lock:
+                conn = bot.store.conn
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_limit_run'").fetchone():
+                    run = conn.execute("SELECT starts_at FROM forecast_limit_run WHERE id=1").fetchone()
+                    if run:
+                        boundary = run[0]
+                        break
+        for bot in bots:
+            bot.forecast_trial_boundary = boundary
 
     def start(self):
         if self.thread and self.thread.is_alive(): return
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._run, daemon=True, name="paper-execution-confirmations")
         self.thread.start()
+        if self.league:
+            self.league.start()
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -717,6 +788,8 @@ class PaperExecutionService:
     def stop(self):
         self.stop_event.set()
         if self.thread and self.thread is not threading.current_thread(): self.thread.join(timeout=8)
+        if self.league:
+            self.league.stop()
 
     def snapshot(self):
         return {"enabled": True, "version": VERSION, "accounts": [x.snapshot() for x in self.engines.values()],

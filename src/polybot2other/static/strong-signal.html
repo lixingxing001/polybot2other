@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>主账户 · 每局首个强信号</title>
+  <style>
+    :root{color-scheme:dark;font:15px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#ecf1f4;background:#101315;--muted:#a7b3bd;--border:#333b42;--panel:#1a1f23;--green:#71d5aa;--red:#ff9193;--gold:#efca7b;font-variant-numeric:tabular-nums}
+    *{box-sizing:border-box}body{margin:0}main{max-width:1420px;margin:auto;padding:34px 28px 48px}h1,h2,p,dl,dd{margin:0}h1{font-size:clamp(1.6rem,3vw,2.15rem);line-height:1.3;letter-spacing:-.03em}h2{font-size:1.12rem}.muted,dt,.sub{color:var(--muted)}.sub{font-size:.87rem}.heading,.panel-title,.caption,.wallet{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.heading{margin-bottom:17px}.heading .sub{margin-top:7px}.label{font-size:.85rem;font-weight:650;color:var(--green);margin-bottom:6px}.status{display:inline-flex;align-items:center;gap:.55rem;color:var(--gold);border:1px solid currentColor;border-radius:22px;padding:4px 12px;font-size:.85rem}.status:before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}.status[data-kind="ok"],.positive{color:var(--green)}.status[data-kind="error"],.negative{color:var(--red)}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-top:14px}.panel-title,.wallet{padding:14px 19px;border-bottom:1px solid var(--border)}.wallet{margin:0;border:0;background:linear-gradient(105deg,#203028 0%,#1a2222 43%,#1a1f23 92%)}.wallet .amount{font-size:clamp(1.8rem,3vw,2.35rem);font-weight:650;letter-spacing:-.035em}.wallet .sub{margin-top:2px}.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));border-top:1px solid var(--border)}.metrics>div{padding:13px 17px;border-right:1px solid var(--border)}.metrics>div:last-child{border-right:0}dt{font-size:.84rem}dd{font-size:1.18rem;font-weight:630;margin-top:3px}.pair{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(265px,.8fr);gap:14px}.pair .panel{min-width:0}
+    .chart{position:relative;margin:13px 16px 12px;height:185px}canvas{width:100%;height:100%;display:block}.empty{padding:16px 19px;color:var(--muted);font-size:.9rem}.chart-empty{position:absolute;inset:0;display:grid;place-content:center;text-align:center;color:var(--muted);font-size:.92rem}.chart-foot{padding:0 18px 12px;color:var(--muted);font-size:.82rem}.observations{display:grid;grid-template-columns:max-content minmax(0,1fr);align-content:start;align-items:baseline;gap:10px 17px;padding:15px 19px 16px}.observations dd{font-size:.9rem;margin:0;font-weight:500;overflow-wrap:anywhere}.wide{overflow-x:auto}table{width:100%;border-collapse:collapse;text-align:left;font-size:.91rem}th{color:var(--muted);font-weight:500;font-size:.82rem}th,td{padding:9px 16px;border-bottom:1px solid var(--border);white-space:nowrap}tbody tr:last-child td{border-bottom:0}td:first-child,th:first-child{padding-left:19px}.stat-note{margin:0;color:var(--muted);font-size:.85rem}.time-info{color:var(--muted);font-size:.82rem;text-align:right}.live-info{color:var(--gold);font-size:.89rem;padding:6px 0 0}[hidden]{display:none!important}
+    @media(max-width:900px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.metrics>div:nth-child(-n+3){border-bottom:1px solid var(--border)}.metrics>div:nth-child(3n){border-right:0}.pair{grid-template-columns:1fr}}@media(max-width:560px){main{padding:20px 10px}.metrics>div{padding:10px 12px}dd{font-size:1.05rem}.heading{gap:9px}.wallet,.panel-title{padding:12px 14px}.observations{padding:13px}.time-info{text-align:left}.chart{margin:8px;height:160px}th,td{padding:9px 12px}.heading .sub{font-size:.8rem}}
+  </style>
+  <script src="/strong-signal.js" defer></script>
+</head>
+<body>
+<main>
+  <header class="heading">
+    <div><p class="label">BTC 5 分钟 · 独立 Paper</p><h1>主账户 · 每局首个强信号</h1><p class="sub" id="rules">读取策略规则中…</p></div>
+    <div><span class="status" id="state" role="status">连接中</span></div>
+  </header>
+  <p id="warning" class="live-info" role="status" hidden></p>
+  <section class="panel" aria-label="模拟钱包">
+    <div class="wallet"><div><span class="muted">已结算净值</span><p class="amount" id="equity">—</p><p class="sub">初始模拟资金 <span id="initial">—</span> · 持仓按买入成本计</p></div>
+      <div class="time-info">北京时间<br>启动 <time id="start">—</time><br>采集 <time id="heartbeat">—</time></div></div>
+    <dl class="metrics">
+      <div><dt>已实现净盈亏</dt><dd id="pnl">—</dd></div><div><dt>可用现金</dt><dd id="cash">—</dd></div>
+      <div><dt>挂单预留</dt><dd id="reserved">—</dd></div><div><dt>持仓成本</dt><dd id="open-cost">—</dd></div>
+      <div><dt>胜率</dt><dd id="win-rate">—</dd></div><div><dt>累计成交费</dt><dd id="fees">—</dd></div>
+    </dl>
+  </section>
+  <div class="pair">
+    <section class="panel"><div class="panel-title"><h2>结算资金曲线</h2><p class="stat-note" id="closed">—</p></div>
+      <div class="chart"><canvas id="curve" aria-label="已结算模拟净值走势" role="img"></canvas><p id="chart-empty" class="chart-empty">正在读取资金曲线…</p></div>
+      <p class="chart-foot" id="chart-caption">每局按官方结果结算后更新。</p></section>
+    <section class="panel"><div class="panel-title"><h2>当前判断</h2></div>
+      <dl class="observations"><dt>当前市场</dt><dd id="round">—</dd><dt>参考价</dt><dd id="reference">—</dd><dt>有效盘口</dt><dd id="quotes">—</dd><dt>策略记录</dt><dd id="event">—</dd><dt>记录时间</dt><dd id="event-time">—</dd></dl></section>
+  </div>
+  <section class="panel"><div class="panel-title"><h2>当前持仓</h2><p class="stat-note" id="positions-count">—</p></div><div class="wide" id="positions"></div></section>
+  <section class="panel"><div class="panel-title"><h2>最近结算</h2><p class="stat-note" id="settled-count">—</p></div><div class="wide" id="trades"></div></section>
+  <section class="panel"><div class="panel-title"><h2>最近委托</h2><p class="stat-note" id="orders-count">—</p></div><div class="wide" id="orders"></div></section>
+  <noscript><p class="live-info">打开 JavaScript 可查看实时面板。<a href="/api/status">查看账本数据</a></p></noscript>
+</main>
+</body>
+</html>

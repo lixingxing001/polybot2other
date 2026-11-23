@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import httpx
 
 from .models import Signal
+from . import first_strong_rules as first_strong
 from .adaptive_main import AdaptiveDecisionJournal, compact_adaptive_decision
 from .adaptive_features import current_reference_features
 from .storage import TradeStore
@@ -20,9 +21,14 @@ from .optimized_plus import PlusMainBot, PlusDecisionJournal, compact_plus_decis
 from .optimized_reference import SPOT
 from .value_confirm import ValueConfirmGuard, entry_limit
 from .managed_live_client import fee_amount
+from .managed_live_store import EXIT_SETTLE_LIVE
+from .forecast_paper import ForecastPaperPolicy
+from .strategy_league_policies import POLICIES, entry_decision, sample_frame
 from .buffered_ws import BufferedWebSocket
 from .managed_live_book import ReliableLiveBooks
 from .shared_market_inputs import SharedMarketInputs
+
+SETTLEMENT_POLICY = next(policy for policy in POLICIES if policy.key == "exit_settle")
 
 
 class LiveMarketFeed(OptimizedMainBot):
@@ -253,6 +259,17 @@ class LiveSignals:
         frame=market_input or self.market_inputs.build(market,reference,quotes,now)
         if frame.error:return blocked(frame.error)
         market,reference,quotes,now=frame.market,frame.reference,frame.quotes,frame.observed_at
+        if strategy_id == EXIT_SETTLE_LIVE:
+            forecast = ForecastPaperPolicy(self.feed.references).evaluate(frame, info)
+            sample = sample_frame(frame, forecast, info)
+            entry = entry_decision(SETTLEMENT_POLICY, sample, ())
+            if entry.action != "BUY":
+                return blocked(forecast.reason if forecast.up_score is None else entry.reason)
+            book = sample.book(entry.side)
+            score = sample.score(entry.side)
+            reason = (f"拿到官方结算：方向评分 {score:.3f}，限价 {entry.limit:.4f}，"
+                      f"扣费后余量 {score-book.cost:.4f}，距收盘 {sample.left:.1f} 秒")
+            return Signal("BTC",entry.side,score,book.ask,forecast.move_bps,reason), entry.limit
         seed.update(round_id=market.round_id, decision_at=now, observed_at=now,
                     time_left_seconds=market.ends_at-now, market_ends_at=market.ends_at, started_at=market.started_at,
                     target_price=market.target_price, snapshot_id=getattr(frame,"snapshot_id",None))
@@ -348,6 +365,8 @@ class LiveSignals:
         if signal.side in ("Up","Down"):
             error=frame.quote_error(signal.side)
             if error:return blocked(error)
+            if strategy_id == first_strong.KEY and not first_strong.qualified(signal):
+                return blocked(f"方向评分 {signal.confidence:.4f}，等待评分达到 {first_strong.SCORE_FLOOR:.2f}")
         if strategy_id=="VALUE_CONFIRM_V1":
             self.value_settings=config
             candidate_limit=min(.65,signal.entry_price+.01)

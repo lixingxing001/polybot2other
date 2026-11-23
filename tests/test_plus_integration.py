@@ -177,7 +177,7 @@ class PlusIntegrationTests(unittest.TestCase):
 
     def test_live_filled_round_forbids_reversal_only_for_plus(self):
         order=self.live.prepare_order("fill",PLUS,self.market,"up","Up","BUY",.41,cash=5,plus_decision=self.features())
-        self.live.apply_confirmed_fill(order["id"],"trade",10,.4,.1,"official")
+        self.live.apply_confirmed_fill(order["id"],"trade",10,.4,.1,"official",notional=4)
         self.live.set_order_state(order["id"],"FILLED")
         with self.assertRaisesRegex(ValueError,"反手"):
             self.live.prepare_order("reverse",PLUS,self.market,"down","Down","BUY",.41,cash=5,plus_decision=self.features(side="Down"))

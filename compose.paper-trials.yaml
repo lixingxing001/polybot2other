@@ -1,0 +1,35 @@
+name: edgepulse-trials
+services:
+  trials:
+    image: edgepulse:paired-trials-v1
+    container_name: edgepulse-paired-trials
+    command: ["python", "-m", "polybot2other.paired_trials"]
+    network_mode: host
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.60
+    mem_limit: 350m
+    pids_limit: 120
+    stop_grace_period: 55s
+    environment:
+      POLYBOT2OTHER_ENV_FILE: /dev/null
+      POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED: "false"
+      POLYBOT2OTHER_MIN_PRICE_DISTANCE_BPS: "3.5"
+    volumes:
+      - /opt/edgepulse/data:/source:ro
+      - /opt/edgepulse/paired-trials/data:/trial-data:rw
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8792/health', timeout=6).close()"]
+      interval: 15s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import gzip
+import hashlib
 import html
 import hmac
+from http.client import HTTPConnection, HTTPException
 import ipaddress
 import json
 import mimetypes
@@ -13,6 +16,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,11 +25,23 @@ from typing import Any
 
 from .bot import LiveOnceBlockedError, PaperTradingBot
 from .config import Settings, load_settings
+from .dashboard_transport import StatusStream, accepts_gzip, json_bytes
 from .live_doctor import build_live_doctor_from_bot
+from .forecast_comparison import forecast_comparison
+from .forecast_forward import forecast_forward_status
+from .forecast_observations import forecast_snapshot
+from .paper_growth import PaperGrowthMonitor
+from .exit_settle_paper import ExitSettlePaper, VARIANT_ID as EXIT_SETTLE_ID, is_exit_settle_scope
+from .first_strong_rules import KEY as FIRST_STRONG_ID
+from .strategy_league_report import StrategyLeagueReport
 from .storage import PAPER_ORDER_STATUS_FILTERS, TradeStore
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+COMPRESSIBLE_READ_ENDPOINTS = {
+    "/api/status", "/api/exit-settle-paper", "/api/strategy-league", "/api/paper-growth", "/api/forecast-paper", "/api/forecast-comparison",
+    "/api/strategy-experiments", "/api/orders", "/api/equity-curve", "/api/first-strong-paper",
+}
 STATUS_STREAM_INTERVAL_SECONDS = 1.0
 STATUS_SNAPSHOT_CACHE_SECONDS = 0.5
 LIVE_SNAPSHOT_CACHE_SECONDS = 0.5
@@ -39,10 +56,23 @@ POLYMARKET_STATUS_HEADERS = {
 }
 
 
+@lru_cache(maxsize=32)
+def _static_representation(path: Path, mtime_ns: int, size: int, compressed: bool) -> tuple[bytes, str]:
+    # File metadata is part of the cache key so a deployment replaces the cached bytes.
+    data = path.read_bytes()
+    etag = 'W/"' + hashlib.sha256(data).hexdigest() + '"'
+    if compressed:
+        data = gzip.compress(data, compresslevel=4, mtime=0)
+    return data, etag
+
+
 class DashboardServer(ThreadingHTTPServer):
     def __init__(self, server_address, handler_class, bot: PaperTradingBot) -> None:
         super().__init__(server_address, handler_class)
         self.bot = bot
+        self.paper_growth = PaperGrowthMonitor(bot)
+        self.strategy_league_report = StrategyLeagueReport(bot)
+        self.exit_settle_paper = ExitSettlePaper(bot)
         self._status_snapshot_cache: dict[str, Any] | None = None
         self._status_snapshot_cache_at = 0.0
         self._status_snapshot_lock = threading.Lock()
@@ -189,8 +219,33 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
 
+    def _paper_reader(self, scope, variant_id):
+        return self.server.exit_settle_paper if is_exit_settle_scope(scope, variant_id) else self.server.bot
+
+    def _first_strong_snapshot(self, include_body=True):
+        # The Paper runner owns its database. Only fetch its public, read-only account view.
+        conn = HTTPConnection("127.0.0.1", 8793, timeout=2.5)
+        try:
+            conn.request("GET", "/api/status")
+            response = conn.getresponse()
+            if response.status != 200:
+                raise ValueError("Paper runner unavailable")
+            payload = json.load(response)
+            if not isinstance(payload, dict) or payload.get("key") != FIRST_STRONG_ID or payload.get("mode") != "paper":
+                raise ValueError("unexpected Paper account")
+        except (OSError, HTTPException, ValueError):
+            self._send_error_json(HTTPStatus.SERVICE_UNAVAILABLE, "首个强信号的独立模拟账本暂不可用", include_body)
+            return
+        finally:
+            conn.close()
+        self._send_json(payload, include_body)
+
     def do_HEAD(self) -> None:  # noqa: N802 - stdlib handler API
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+        if path == "/api/first-strong-paper":
+            return self._first_strong_snapshot(include_body=False)
         if path == "/strategy-review.html":
             self._send_static("strategy-review.html", include_body=False)
             return
@@ -199,6 +254,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.status_snapshot(), include_body=False)
+            return
+        if path == "/api/forecast-paper":
+            strategy_id = _query_str_optional(query, "strategy_id") or "FORECAST_PAPER"
+            self._send_json(forecast_snapshot(self.server.bot, strategy_id), include_body=False)
+            return
+        if path == "/api/forecast-comparison":
+            self._send_json(forecast_comparison(self.server.bot), include_body=False)
+            return
+        if path == "/api/forecast-forward":
+            self._send_json(forecast_forward_status(self.server.bot), include_body=False)
+            return
+        if path == "/api/exit-settle-paper":
+            self._send_json(self.server.exit_settle_paper.snapshot(), include_body=False)
+            return
+        if path == "/api/strategy-league":
+            self._send_json(self.server.strategy_league_report.snapshot(), include_body=False)
+            return
+        if path == "/api/paper-growth":
+            self._send_json(self.server.paper_growth.snapshot(), include_body=False)
             return
         if path == "/api/polymarket-status":
             self._send_json(self.server.polymarket_status(force=False), include_body=False)
@@ -273,6 +347,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if path == "/api/first-strong-paper":
+            return self._first_strong_snapshot()
         if path == "/api/managed-live":
             try:
                 runner = self._managed_live_runner()
@@ -290,6 +366,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/status":
             self._send_json(self.server.status_snapshot())
+            return
+        if path == "/api/forecast-paper":
+            strategy_id = _query_str_optional(query, "strategy_id") or "FORECAST_PAPER"
+            self._send_json(forecast_snapshot(self.server.bot, strategy_id))
+            return
+        if path == "/api/forecast-comparison":
+            self._send_json(forecast_comparison(self.server.bot))
+            return
+        if path == "/api/forecast-forward":
+            self._send_json(forecast_forward_status(self.server.bot))
+            return
+        if path == "/api/exit-settle-paper":
+            self._send_json(self.server.exit_settle_paper.snapshot())
+            return
+        if path == "/api/strategy-league":
+            self._send_json(self.server.strategy_league_report.snapshot())
+            return
+        if path == "/api/paper-growth":
+            self._send_json(self.server.paper_growth.snapshot())
             return
         if path == "/api/polymarket-status":
             try:
@@ -328,7 +423,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(self.server.bot.market_scout_settings())
             return
         if path == "/api/status-stream":
-            self._send_status_stream()
+            self._send_status_stream(delta=query.get("format") == ["delta"])
             return
         if path == "/api/actor-analysis":
             try:
@@ -353,7 +448,7 @@ class Handler(BaseHTTPRequestHandler):
                 account_scope = _query_str_optional(query, "account_scope") or "main"
                 variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
                 self._send_json(
-                    self.server.bot.recent_trades_page(
+                    self._paper_reader(account_scope, variant_id).recent_trades_page(
                         limit,
                         offset,
                         start_at,
@@ -373,7 +468,7 @@ class Handler(BaseHTTPRequestHandler):
                 account_scope = _query_str_optional(query, "account_scope") or "main"
                 variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
                 self._send_json(
-                    self.server.bot.orders_page(
+                    self._paper_reader(account_scope, variant_id).orders_page(
                         limit,
                         offset,
                         status_filter,
@@ -389,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
                 order_id = _query_int(query, "order_id", 0, 1, 1_000_000_000)
                 account_scope = _query_str_optional(query, "account_scope") or "main"
                 variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
-                self._send_json(self.server.bot.order_fills(order_id, account_scope, variant_id))
+                self._send_json(self._paper_reader(account_scope, variant_id).order_fills(order_id, account_scope=account_scope, variant_id=variant_id))
             except ValueError as exc:
                 self._send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
             return
@@ -399,6 +494,10 @@ class Handler(BaseHTTPRequestHandler):
                 max_points = _query_int(query, "max_points", 1200, 2, 5000)
                 account_scope = _query_str_optional(query, "account_scope") or "main"
                 variant_id = _query_str_optional(query, "variant_id") or _query_str_optional(query, "variant")
+                if is_exit_settle_scope(account_scope, variant_id):
+                    self._send_json(self.server.exit_settle_paper.equity_curve_window(
+                        days, max_points, full_history=_query_bool_optional(query, "full_history", False)))
+                    return
                 self._send_json(
                     self.server.bot.equity_curve_window(
                         days,
@@ -416,7 +515,10 @@ class Handler(BaseHTTPRequestHandler):
                 if variant_id:
                     trade_limit = _query_int(query, "trade_limit", 50, 1, 200)
                     order_limit = _query_int(query, "order_limit", 50, 1, 200)
-                    self._send_json(self.server.bot.strategy_experiment_detail(variant_id, trade_limit, order_limit))
+                    if variant_id == EXIT_SETTLE_ID:
+                        self._send_json(self.server.exit_settle_paper.snapshot(trade_limit, order_limit))
+                    else:
+                        self._send_json(self.server.bot.strategy_experiment_detail(variant_id, trade_limit, order_limit))
                 else:
                     self._send_json(self.server.bot.strategy_experiments_snapshot())
             except ValueError as exc:
@@ -716,32 +818,63 @@ class Handler(BaseHTTPRequestHandler):
         return payload if isinstance(payload, dict) else {}
 
     def _send_json(self, payload: dict[str, Any], include_body: bool = True) -> None:
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        data = json_bytes(payload)
+        path = urllib.parse.urlsplit(self.path).path
+        compressible = (
+            self.command in {"GET", "HEAD"}
+            and path in COMPRESSIBLE_READ_ENDPOINTS
+            and b'"control_token":' not in data
+        )
+        compressed = compressible and len(data) >= 512 and accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        if compressed:
+            data = gzip.compress(data, compresslevel=4, mtime=0)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        if compressible:
+            self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if include_body:
             try:
                 self.wfile.write(data)
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 return
 
-    def _send_status_stream(self) -> None:
+    def _send_status_stream(self, *, delta: bool = False) -> None:
+        current = json_bytes(self.server.status_snapshot())
+        compress = accepts_gzip(self.headers.get("Accept-Encoding", "")) and b'"control_token":' not in current
+        encoder = zlib.compressobj(level=4, wbits=16 + zlib.MAX_WBITS) if compress else None
+        stream = StatusStream() if delta else None
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if compress:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Connection", "keep-alive")
         self.end_headers()
-        while True:
-            try:
-                payload = json.dumps(self.server.status_snapshot(), ensure_ascii=False, separators=(",", ":"))
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        first = True
+        try:
+            while True:
+                if encoder and b'"control_token":' in current:
+                    # Reconnect and renegotiate before sending a sensitive snapshot.
+                    self.close_connection = True
+                    return
+                frame = stream.frame(current) if stream else b"data: " + current + b"\n\n"
+                if stream and first:
+                    frame = b"retry: 2000\n" + frame
+                if encoder:
+                    frame = encoder.compress(frame) + encoder.flush(zlib.Z_SYNC_FLUSH)
+                self.wfile.write(frame)
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
-            time.sleep(STATUS_STREAM_INTERVAL_SECONDS)
+                first = False
+                time.sleep(STATUS_STREAM_INTERVAL_SECONDS)
+                current = json_bytes(self.server.status_snapshot())
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            return
 
     def _send_json_status(self, status: HTTPStatus, payload: dict[str, Any], include_body: bool = True) -> None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -788,21 +921,34 @@ class Handler(BaseHTTPRequestHandler):
         if not str(path).startswith(str(STATIC_DIR.resolve())) or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
-        data = path.read_bytes()
+        stat = path.stat()
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if path.suffix == ".js":
             content_type = "application/javascript; charset=utf-8"
         elif path.suffix in {".html", ".css"}:
             content_type = f"{content_type}; charset=utf-8"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(data)))
+        compressible = path.suffix in {".js", ".css", ".html", ".svg", ".json"} and stat.st_size >= 512
+        compressed = compressible and accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        data, etag = _static_representation(path, stat.st_mtime_ns, stat.st_size, compressed)
+        cacheable = path.suffix != ".html"
+        validators = {v.strip().removeprefix("W/") for v in self.headers.get("If-None-Match", "").split(",")}
+        unchanged = cacheable and ("*" in validators or etag.removeprefix("W/") in validators)
+        self.send_response(HTTPStatus.NOT_MODIFIED if unchanged else HTTPStatus.OK)
+        self.send_header("Cache-Control", "private, no-cache" if cacheable else "no-store")
+        if cacheable:
+            self.send_header("ETag", etag)
+        if compressible:
+            self.send_header("Vary", "Accept-Encoding")
+        if not unchanged:
+            self.send_header("Content-Type", content_type)
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        if include_body:
+        if include_body and not unchanged:
             try:
                 self.wfile.write(data)
-            except BrokenPipeError:
+            except (BrokenPipeError, ConnectionResetError):
                 return
 
 
