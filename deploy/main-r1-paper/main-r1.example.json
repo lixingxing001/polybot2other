@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "mode": "PAPER_ONLY",
+  "strategy_id": "MAIN_R1_ADAPTIVE_PAPER_V1",
+  "base_main": {
+    "price_source_mode": "MIXED",
+    "market_data_mode": "BASE",
+    "anti_bot_guard_mode": "NONE",
+    "min_confidence": 0.62,
+    "min_edge": 0.02,
+    "min_price_distance_bps": 3.5,
+    "max_entry_price": 0.72,
+    "max_spread": 0.08,
+    "min_ask_size": 1.0,
+    "min_time_left_seconds": 20,
+    "max_time_left_seconds": 285,
+    "max_quote_age_ms": 3000
+  },
+  "provenance": {
+    "source_commit": "e8acd7f7514b09a9f012c19342f1de2790ae656e",
+    "captured_at": "2026-11-23T00:00:00+00:00",
+    "source_note": "SOURCE DEFAULTS EXAMPLE, NOT A VERIFIED RUNTIME SNAPSHOT. Replace all values and provenance with an explicit allowlisted snapshot of active MAIN before the experiment. No credentials."
+  }
+}

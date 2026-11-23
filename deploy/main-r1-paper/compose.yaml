@@ -1,0 +1,80 @@
+name: edgepulse-main-r1
+services:
+  main-r1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: edgepulse:main-r1-paper-v1
+    container_name: edgepulse-main-r1-paper
+    command: ["python", "-m", "polybot2other.main_r1_paper", "--config", "/config/main-r1.json", "--source", "/source", "--data-dir", "/r1-data", "--host", "127.0.0.1", "--port", "8794"]
+    network_mode: host
+    user: "10001:10001"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.60
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 55s
+    environment:
+      POLYBOT2OTHER_ENV_FILE: /dev/null
+      POLYBOT2OTHER_LIVE_TRADING_RUNTIME_ENABLED: "false"
+      POLYBOT2OTHER_MANAGED_LIVE_ENABLED: "false"
+      POLYBOT2OTHER_STRATEGY_EXPERIMENTS_ENABLED: "false"
+      POLYBOT2OTHER_LLM_SUPER_AGENT_ENABLED: "false"
+      POLYBOT2OTHER_MARKET_SCOUT_ENABLED: "false"
+    volumes:
+      - type: bind
+        source: ${MAIN_R1_CONFIG_PATH:-./main-r1.json}
+        target: /config/main-r1.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${MAIN_R1_DATA_DIR:-/opt/edgepulse/main-r1/data}
+        target: /r1-data
+        bind: {create_host_path: false}
+      # Only market data files are exposed; accounts.sqlite3 and .env are not mounted.
+      # WAL sidecars must already exist for the running source collector.
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/polybot2other-real-btc.sqlite3
+        target: /source/polybot2other-real-btc.sqlite3
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/polybot2other-real-btc.sqlite3-wal
+        target: /source/polybot2other-real-btc.sqlite3-wal
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/polybot2other-real-btc.sqlite3-shm
+        target: /source/polybot2other-real-btc.sqlite3-shm
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/live-accounts/market.references.sqlite3
+        target: /source/live-accounts/market.references.sqlite3
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/live-accounts/market.references.sqlite3-wal
+        target: /source/live-accounts/market.references.sqlite3-wal
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${EDGEPULSE_SOURCE_DATA_DIR:-/opt/edgepulse/data}/live-accounts/market.references.sqlite3-shm
+        target: /source/live-accounts/market.references.sqlite3-shm
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8794/health',timeout=6); d=json.load(r); assert d['ok'] and d['mode']=='PAPER_ONLY' and d['strategy_id']=='MAIN_R1_ADAPTIVE_PAPER_V1'"]
+      interval: 20s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
