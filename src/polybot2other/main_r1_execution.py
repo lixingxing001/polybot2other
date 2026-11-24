@@ -15,6 +15,7 @@ import threading
 import time
 
 from .main_r1_risk import MainR1Risk
+from .managed_live_client import fee_amount
 from .models import Signal
 from .paper_execution import PaperExecution, VERSION, buy_terms, checked_info, sweep_book
 from .shared_market_inputs import quote_error
@@ -46,6 +47,34 @@ def fixed_plan(candidate, frame):
     return {"candidate_key": candidate, **CANDIDATES[candidate],
             "selection_id": f"shadow:{candidate}:{getattr(frame.market, 'round_id', 'none')}",
             "regime": "control", "reason": "固定候选独立模拟对照"}
+
+
+def _fee_safe_ceiling(confidence, min_edge, ceiling, info):
+    """Highest legal MAIN price tick whose fee-inclusive cost preserves edge.
+
+    The supported fee curves (rate <= 1, exponent >= 1) have a monotone
+    price-plus-fee cost. Search integer ticks so rounding can never raise the
+    submitted price above either the original ceiling or the net-edge cap.
+    Actual budget-sized, per-level fee rounding is checked again after quoting.
+    """
+    if (not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                and math.isfinite(x) for x in (confidence, min_edge, ceiling))
+            or not 0 <= confidence <= 1 or not 0 <= min_edge <= 1):
+        raise ValueError("MAIN 净优势参数无效")
+    info = checked_info(info)
+    tick = float(info["tick_size"])
+    rate, exponent = float(info["fee_rate"]), float(info["fee_exponent"])
+    target = confidence - min_edge
+    low, high = 1, math.floor(min(ceiling, 1-tick)/tick+1e-9)
+    best = None
+    while low <= high:
+        middle = (low+high)//2
+        price = round(middle*tick, 6)
+        if price + fee_amount(1., price, rate, exponent) <= target+1e-12:
+            best, low = price, middle+1
+        else:
+            high = middle-1
+    return best
 
 
 class MainR1Execution(PaperExecution):
@@ -375,6 +404,17 @@ class MainR1Execution(PaperExecution):
         if error:
             raise ValueError(error)
         book = frame.quotes[signal.side]
+        net_edge = None
+        if plan["signal_family"] == "MAIN":
+            safe_ceiling = _fee_safe_ceiling(signal.confidence, self.base_settings.min_edge, ceiling, info)
+            net_edge = {"score": signal.confidence, "min_edge": self.base_settings.min_edge,
+                        "original_ceiling": ceiling, "fee_safe_ceiling": safe_ceiling}
+            if safe_ceiling is None or book["best_ask"] > safe_ceiling+1e-8:
+                self._audit(frame, "EDGE_WAIT", signal=asdict(signal), plan=plan, risk=risk,
+                            book=book, info=info, net_edge=net_edge)
+                self.event("EDGE_WAIT", "手续费后优势不足，跳过本帧并继续等待")
+                return None
+            ceiling = safe_ceiling
         terms = buy_terms(risk["budget"], ceiling, info, book)
         quote = sweep_book(book, "BUY", terms["limit"], info, notional_budget=terms["notional_budget"])
         if quote["shares"] <= 0 or not quote["full"]:
@@ -383,7 +423,18 @@ class MainR1Execution(PaperExecution):
             raise ValueError("提交前复查已离开 MAIN 入场时窗")
         details = {"signal": asdict(signal), "plan": plan, "risk": risk, "quote": quote,
                    "book": book, "info": info, "limit": terms["limit"],
+                   "net_edge": net_edge,
                    "features": deepcopy(getattr(self.signals, "last_features", {}))}
+        if net_edge is not None:
+            all_in_price = quote["cash"]/quote["shares"]
+            net_edge.update(quote_all_in_price=all_in_price,
+                            quote_net_edge=signal.confidence-all_in_price)
+            # quote.cash already includes rounded per-level fees. Do not round
+            # away a real shortfall in the budget-sized per-share net edge.
+            if net_edge["quote_net_edge"]+1e-12 < net_edge["min_edge"]:
+                self._audit(frame, "EDGE_WAIT", **details)
+                self.event("EDGE_WAIT", "逐档报价后的净优势不足，跳过本帧并继续等待")
+                return None
         if plan["price_floor"] is not None and quote["cash"] < round(plan["price_floor"]*quote["shares"], 6):
             self._audit(frame, "FLOOR_WAIT", **details)
             self.event("FLOOR_WAIT", "预计含费均价低于 0.60，跳过本帧并继续等待")
@@ -410,6 +461,8 @@ class MainR1Execution(PaperExecution):
                    "token": market.up_token if signal.side == "Up" else market.down_token,
                    "side": signal.side, "signal": asdict(signal), "submitted_at": now,
                    "arrival_delay": delay, "revision": revision, "position_id": None,
+                   "arrival_at": now+delay,
+                   "arrival_deadline": now+delay+self.policy.max_poll_lateness_seconds,
                    "exit_reason": None, "version": VERSION, "strategy_key": self.strategy_id,
                    "signal_snapshot_id": terms["r1_frame"]}
         self.store.upsert_round(market)
@@ -451,6 +504,13 @@ class MainR1Execution(PaperExecution):
         floor = plan.get("price_floor")
         if floor is not None and fill["cash"] < round(floor*fill["shares"], 6):
             self.guard.halt("floor_drift", now=self.clock())
+        net_edge = order.get("r1_decision", {}).get("net_edge")
+        if net_edge is not None:
+            actual_edge = net_edge["score"]-fill["cash"]/fill["shares"]
+            if actual_edge+1e-12 < net_edge["min_edge"]:
+                # Keep a partial fill and its real rounded costs in the ledger.
+                # A decision threshold must never delete a losing observation.
+                self.guard.halt("net_edge_drift", now=self.clock())
 
     def _arrive(self, order):
         """Only a validated arrival book can prove a terminal zero fill.
@@ -459,8 +519,26 @@ class MainR1Execution(PaperExecution):
         reservation and stop new risk instead of retrying the same opportunity.
         A saved positive match follows the base delayed-confirmation accounting.
         """
-        frame = self._frame(self.frame_reader())
-        market, now = frame.market, self.clock()
+        now = self.clock()
+        arrival_at = order["submitted_at"]+order["arrival_delay"]
+        deadline_at = arrival_at+self.policy.max_poll_lateness_seconds
+        if now < arrival_at:
+            return
+        if now > deadline_at:
+            self._finish_empty(order, "处理已超过固定到达窗口，保持未知订单占位")
+            return
+        # WS depth has no tick/minimum metadata. Reuse only fresh, token-bound
+        # public rules compatible with the metadata frozen into this order.
+        try:
+            frame = self._frame(self.frame_reader(), order["info"])
+        except (ValueError, TypeError, KeyError, OverflowError):
+            self._finish_empty(order, "到达盘口或市场规则无法核实，保持未知订单占位")
+            return
+        now = self.clock()
+        if now > deadline_at:
+            self._finish_empty(order, "读取盘口后已超过固定到达窗口，保持未知订单占位")
+            return
+        market = frame.market
         if frame.error or not market or market.round_id != order["round_id"] or now >= market.ends_at:
             self._finish_empty(order, "缺少本轮到达时盘口，保持未知订单占位")
             return
@@ -469,8 +547,17 @@ class MainR1Execution(PaperExecution):
         if error or str(book.get("token_id")) != str(order["token"]):
             self._finish_empty(order, "到达盘口过期或代币不匹配，保持未知订单占位")
             return
-        if min(book.get("source_ms", 0), book.get("received_ms", 0)) < order["submitted_at"]*1000:
-            self._finish_empty(order, "未观察到提交后的到达盘口，保持未知订单占位")
+        if min(book["source_ms"], book["received_ms"]) < arrival_at*1000:
+            if now >= deadline_at:
+                self._finish_empty(order, "固定到达窗口结束仍无到达后的盘口，保持未知订单占位")
+                return
+            # Leave due_at fixed. Waiting may not extend the opportunity window,
+            # release the reservation, or turn missing evidence into zero fills.
+            self._audit(frame, "ARRIVAL_WAIT", order_id=order["order_id"],
+                        arrival={"arrival_at": arrival_at, "deadline_at": deadline_at,
+                                 "source_ms": book["source_ms"], "received_ms": book["received_ms"],
+                                 "observed_at": now})
+            self.event("ARRIVAL_WAIT", "盘口早于预计到达时刻，固定窗口内等待新盘口；预算保持占用")
             return
         if str(book.get("tick_size")) != str(order["info"]["tick_size"]):
             self._finish_empty(order, "到达时价格精度无法核实，保持未知订单占位")
@@ -554,7 +641,9 @@ class MainR1Execution(PaperExecution):
                       updated_at=excluded.updated_at,reason=excluded.reason
                 """, (order["round_id"], order["order_id"], self.clock(), reason))
             self.guard.halt("unknown_order", now=self.clock())
-            self._audit(None, "UNKNOWN", order_id=order["order_id"], round_id=order["round_id"], reason=reason)
+            self._audit(None, "UNKNOWN", order_id=order["order_id"], round_id=order["round_id"], reason=reason,
+                        arrival_at=order["submitted_at"]+order["arrival_delay"],
+                        arrival_deadline=order["submitted_at"]+order["arrival_delay"]+self.policy.max_poll_lateness_seconds)
             self.event("UNKNOWN", reason)
             return
         super()._finish_empty(order, reason)

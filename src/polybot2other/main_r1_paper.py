@@ -365,10 +365,15 @@ def common_inputs_ready(frame, now):
     return True
 
 
+def r1_trial_feed(source, exchange):
+    """Opt in to socket receipt timestamps without changing other trial feeds."""
+    return TrialFeed(source, exchange, strict_received_time=True)
+
+
 class MainR1Runner:
     """One prospective portfolio and four independent, comparable shadow wallets."""
     def __init__(self, source, data_dir, config, *, clock=time.time,
-                 feed_factory=TrialFeed, exchange_factory=PublicExchange,
+                 feed_factory=r1_trial_feed, exchange_factory=PublicExchange,
                  engine_factory=None, selector_factory=None, cohort_factory=None):
         from .main_r1_execution import MainR1Execution
         from .main_r1_selector import MainR1Selector, SELECTOR_CONFIG

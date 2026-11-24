@@ -86,8 +86,9 @@ class LiveDepthBook:
 
 
 class ReliableLiveBooks:
-    def __init__(self,current,publish,quotes,rest_reader,connector=BufferedWebSocket.connect):
+    def __init__(self,current,publish,quotes,rest_reader,connector=BufferedWebSocket.connect,*,strict_received_time=False):
         self.current=current;self.publish=publish;self.quotes=quotes;self.rest_reader=rest_reader;self.connector=connector
+        self.strict_received_time=strict_received_time
         self.lock=threading.Lock();self.ws=None;self.resync=threading.Event();self.retry={};self.failures={}
         self.observer=None
         self._listeners={};self._listener_lock=threading.Lock()
@@ -184,11 +185,25 @@ class ReliableLiveBooks:
                         text=self.ws.read_text(.25)
                         if text and text not in ("PING","PONG"):
                             data=json.loads(text)
+                            received_at_socket=None
+                            if self.strict_received_time:
+                                # Arrival-sensitive research must retain the wire receipt
+                                # time of this message, including time spent buffered.
+                                received_at_socket=getattr(self.ws,"last_received_ms",None)
+                                try:
+                                    valid=(isinstance(received_at_socket,(int,float))
+                                           and not isinstance(received_at_socket,bool)
+                                           and math.isfinite(received_at_socket)
+                                           and 0<received_at_socket<=time.time()*1000)
+                                except OverflowError:
+                                    valid=False
+                                if not valid:raise ValueError("BOOK_RECEIVED_TIMESTAMP_INVALID")
                             for message in data if isinstance(data,list) else [data]:
                                 if isinstance(message,dict):
-                                    self._observe('BOOK',message,getattr(self.ws,'last_received_ms',None) or time.time()*1000,raw_text=text)
+                                    self._observe('BOOK',message,received_at_socket if self.strict_received_time else
+                                                  (getattr(self.ws,'last_received_ms',None) or time.time()*1000),raw_text=text)
                                 if not isinstance(message,dict) or message.get("event_type") not in ("book","price_change"):continue
-                                source=float(message.get("timestamp",0));received=time.time()*1000
+                                source=float(message.get("timestamp",0));received=received_at_socket if self.strict_received_time else time.time()*1000
                                 if not math.isfinite(source) or source<=0 or source>received+1000:raise ValueError("BOOK_TIMESTAMP_INVALID")
                                 changed=book.apply(message,source,received)
                                 if not changed:continue

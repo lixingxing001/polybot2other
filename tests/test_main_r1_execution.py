@@ -57,7 +57,7 @@ class MainR1ExecutionTests(TestCase):
         self.plan_reader = None
         self.make_engine()
 
-    def make_engine(self, *, plan_reader=None, settings=None):
+    def make_engine(self, *, plan_reader=None, settings=None, strategy_id=KEY):
         self.store = TradeStore(self.path, 1000.)
         self.addCleanup(self.store.conn.close)
         self.store.upsert_round(self.market)
@@ -69,7 +69,7 @@ class MainR1ExecutionTests(TestCase):
             kwargs["entry_plan_reader"] = plan_reader
         self.plan_reader = plan_reader
         self.engine = MainR1Execution(
-            self.bot, KEY, settings or self.settings, frame_reader=self.frame,
+            self.bot, strategy_id, settings or self.settings, frame_reader=self.frame,
             info_reader=self.info_reader, book_reader=self.book_reader,
             config_reader=lambda: self.config, feed=SimpleNamespace(references=None),
             policy=self.policy, clock=lambda: self.now, **kwargs,
@@ -84,7 +84,7 @@ class MainR1ExecutionTests(TestCase):
     def book(self, token="up"):
         return {"token_id": token, "source_ms": self.now * 1000 - self.book_age_ms,
                 "received_ms": self.now * 1000 - self.book_age_ms,
-                "tick_size": "0.01", "min_order_size": self.minimum,
+                "tick_size": self.info["tick_size"], "min_order_size": self.minimum,
                 "best_ask": self.asks[0]["price"], "best_bid": self.bids[0]["price"],
                 "asks": deepcopy(self.asks), "bids": deepcopy(self.bids)}
 
@@ -134,6 +134,215 @@ class MainR1ExecutionTests(TestCase):
         return {"candidate_key": candidate, "signal_family": family, "price_floor": floor,
                 "selection_id": "selection-before-submit", "regime": "test-regime",
                 "reason": "deterministic test selection"}
+
+    def fee_case(self, candidate="MAIN", *, strategy_id=KEY, tick="0.01", rate=.05,
+                 exponent=1, min_edge=.02):
+        """A fresh isolated wallet for each fee/tick/account subcase."""
+        self.store.conn.close()
+        self.fee_case_count = getattr(self, "fee_case_count", 0) + 1
+        self.path = self.path.parent / f"fee-case-{self.fee_case_count}.sqlite3"
+        self.settings = replace(self.settings, db_path=self.path, min_edge=min_edge)
+        self.config = {"enabled": False, "revision": 1,
+                       "strategies": {strategy_id: dict(self.rule)}}
+        self.info = {"fee_rate": rate, "fee_exponent": exponent, "tick_size": tick}
+        self.asks = [{"price": .60, "size": 1000.}]
+        self.bids = [{"price": .58, "size": 1000.}]
+        self.final_score, self.final_limit = .64, .62
+        family = {"FAST": "MAIN_OPTIMIZED_FAST", "PLUS": "MAIN_OPTIMIZED_PLUS"}.get(candidate, "MAIN")
+        floor = .60 if candidate == "MAIN_FLOOR_060" else None
+        return self.make_engine(strategy_id=strategy_id,
+                                plan_reader=lambda frame: self.plan(candidate, family, floor))
+
+    def test_main_fee_rejection_is_valid_no_trade_for_portfolio_and_both_shadows(self):
+        for candidate in ("MAIN", "MAIN_FLOOR_060"):
+            for account in ("portfolio", "shadow"):
+                with self.subTest(candidate=candidate, account=account):
+                    strategy_id = KEY if account == "portfolio" else f"MAIN_R1_SHADOW_{candidate}_PAPER_V1"
+                    self.fee_case(candidate, strategy_id=strategy_id)
+                    self.asks = [{"price": .61, "size": 1000.}]
+                    self.assertGreater(self.final_score - .61, self.settings.min_edge)
+                    self.engine.decide()
+                    self.assertEqual(self.store.paper_order_count(), 0)
+                    self.assertEqual(self.store.account()["cash_balance"], 1000.)
+                    self.assertEqual(self.store.reserved_cash(), 0.)
+                    # The cohort collector must see an observed no-trade, not a
+                    # technical failure that silently excludes this market.
+                    self.assertTrue(self.engine.last_observation_valid)
+                    codes = [row[0] for row in self.store.conn.execute(
+                        "SELECT code FROM main_r1_decisions ORDER BY id")]
+                    self.assertIn("EDGE_WAIT", codes)
+                    self.assertNotIn("REJECTED", codes)
+                    self.now += .1
+                    self.asks = [{"price": .60, "size": 1000.}]
+                    self.engine.decide()
+                    self.assertEqual(self.store.paper_order_count(), 1)
+                    self.assertTrue(self.engine.last_observation_valid)
+        self.fee_case()
+        self.final_score = self.settings.min_edge  # No positive price tick can fit.
+        self.engine.decide()
+        self.assertEqual(self.store.paper_order_count(), 0)
+        self.assertEqual(self.store.reserved_cash(), 0.)
+        self.assertTrue(self.engine.last_observation_valid)
+        code, payload = self.store.conn.execute(
+            "SELECT code,detail_json FROM main_r1_decisions ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(code, "EDGE_WAIT")
+        self.assertIsNone(json.loads(payload)["net_edge"]["fee_safe_ceiling"])
+
+    def test_main_fee_safe_limit_and_same_frame_evidence_cover_portfolio_and_shadows(self):
+        for candidate in ("MAIN", "MAIN_FLOOR_060"):
+            for account in ("portfolio", "shadow"):
+                with self.subTest(candidate=candidate, account=account):
+                    strategy_id = KEY if account == "portfolio" else f"MAIN_R1_SHADOW_{candidate}_PAPER_V1"
+                    self.fee_case(candidate, strategy_id=strategy_id)
+                    self.assertIsNotNone(self.queue())
+                    order, = self.engine.pending()
+                    self.assertEqual(order["limit"], .60)
+                    self.assertEqual(order["amount"], 5.)
+                    self.assertEqual(self.store.reserved_cash(), 5.)
+                    details = order["r1_decision"]
+                    edge = details["net_edge"]
+                    quote = details["quote"]
+                    self.assertEqual(edge["score"], .64)
+                    self.assertEqual(edge["min_edge"], .02)
+                    self.assertEqual(edge["original_ceiling"], .62)
+                    self.assertEqual(edge["fee_safe_ceiling"], .60)
+                    self.assertEqual(details["book"]["asks"], self.asks)
+                    self.assertEqual(details["info"], order["info"])
+                    self.assertEqual(order["info"], self.info)
+                    self.assertAlmostEqual(edge["quote_all_in_price"], quote["cash"] / quote["shares"])
+                    self.assertAlmostEqual(edge["quote_net_edge"], .64 - quote["cash"] / quote["shares"])
+                    self.assertGreaterEqual(edge["quote_net_edge"] + 1e-9, .02)
+
+    def test_main_fee_limit_handles_zero_fees_ticks_and_fee_exponents(self):
+        cases = (
+            (0., "0.01", 1, .62),
+            (.05, "0.1", 1, .60),
+            (.05, "0.001", 1, .608),
+            (.05, "0.0001", 1, .608),
+            (.05, "0.01", 2, .61),
+            (.05, "0.01", 4, .61),
+        )
+        for rate, tick, exponent, expected in cases:
+            with self.subTest(rate=rate, tick=tick, exponent=exponent):
+                self.fee_case(rate=rate, tick=tick, exponent=exponent)
+                self.assertIsNotNone(self.queue())
+                order, = self.engine.pending()
+                self.assertEqual(order["limit"], expected)
+                self.assertLessEqual(order["limit"], self.final_limit)
+                self.assertAlmostEqual(order["limit"] / float(tick), round(order["limit"] / float(tick)))
+                cost = expected + round(rate * (expected * (1 - expected)) ** exponent, 6)
+                self.assertLessEqual(cost, self.final_score - self.settings.min_edge + 1e-9)
+                if expected + float(tick) <= self.final_limit + 1e-9:
+                    next_tick = round(expected + float(tick), 6)
+                    next_cost = next_tick + round(rate * (next_tick * (1 - next_tick)) ** exponent, 6)
+                    self.assertGreater(next_cost, self.final_score - self.settings.min_edge)
+
+    def test_main_fee_limit_uses_frozen_minimum_edge_not_a_hardcoded_two_cents(self):
+        self.fee_case(min_edge=.03)
+        self.asks = [{"price": .59, "size": 1000.}]
+        self.bids = [{"price": .57, "size": 1000.}]
+        self.assertIsNotNone(self.queue())
+        order, = self.engine.pending()
+        self.assertEqual(order["limit"], .59)
+        self.assertEqual(order["r1_decision"]["net_edge"]["min_edge"], .03)
+
+    def test_main_fee_gate_rechecks_the_final_frame_after_metadata_refresh(self):
+        self.fee_case(rate=0.)
+        def refreshed(*args, **kwargs):
+            self.info["fee_rate"] = .05
+            self.asks = [{"price": .61, "size": 1000.}]
+            return dict(self.info)
+        self.info_reader.side_effect = refreshed
+        self.engine.decide()
+        self.assertEqual(self.frames_evaluated[-1][1].quotes["Up"]["best_ask"], .61)
+        self.assertEqual(self.store.paper_order_count(), 0)
+        self.assertEqual(self.store.reserved_cash(), 0.)
+        self.assertTrue(self.engine.last_observation_valid)
+        code, = self.store.conn.execute("SELECT code FROM main_r1_decisions ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(code, "EDGE_WAIT")
+
+    def test_main_fee_gate_checks_actual_sweep_cost_at_rounding_boundary(self):
+        self.fee_case()
+        self.asks = [{"price": .61, "size": 1000.}]
+        # Unit-price fee arithmetic gives exactly two cents. Six-decimal
+        # quantities/cash make this particular full-budget quote slightly dearer.
+        self.final_score, self.final_limit = .641895, .61
+        self.engine.decide()
+        self.assertEqual(self.store.paper_order_count(), 0)
+        self.assertEqual(self.store.reserved_cash(), 0.)
+        self.assertTrue(self.engine.last_observation_valid)
+        code, payload = self.store.conn.execute(
+            "SELECT code,detail_json FROM main_r1_decisions ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(code, "EDGE_WAIT")
+        edge = json.loads(payload)["net_edge"]
+        self.assertEqual(edge["fee_safe_ceiling"], .61)
+        self.assertLess(edge["quote_net_edge"], .02 - 1e-9)
+
+    def test_main_fee_gate_does_not_charge_swept_fees_twice(self):
+        self.fee_case()
+        self.final_score, self.final_limit = .66, .64
+        self.asks = [{"price": .60, "size": 4.}, {"price": .62, "size": 1000.}]
+        self.assertIsNotNone(self.queue())
+        self.confirm()
+        trade, = self.store.open_trades()
+        order, = self.store.recent_paper_orders(1)
+        fills = list(self.store.conn.execute("SELECT price,shares,notional,fee FROM paper_fills ORDER BY id"))
+        self.assertEqual(len(fills), 2)
+        expected_fee = round(sum(round(shares * .05 * price * (1 - price), 6)
+                                 for price, shares, _, _ in fills), 6)
+        self.assertGreater(expected_fee, 0.)
+        self.assertAlmostEqual(order["fee"], expected_fee, places=6)
+        self.assertAlmostEqual(trade["stake"], order["notional"] + expected_fee, places=6)
+        self.assertAlmostEqual(order["cash_spent"], trade["stake"], places=6)
+        self.assertAlmostEqual(self.store.account()["cash_balance"], 1000. - trade["stake"], places=6)
+        self.store.settle_round_outcome(self.market.round_id, "Up", self.now)
+        self.assertAlmostEqual(self.store.account()["realized_pnl"], trade["shares"] - trade["stake"], places=6)
+
+    def test_fast_and_plus_keep_their_own_accepted_fee_limits(self):
+        for candidate in ("FAST", "PLUS"):
+            with self.subTest(candidate=candidate):
+                self.fee_case(candidate)
+                self.asks = [{"price": .61, "size": 1000.}]
+                # This fixture represents an already-approved family evaluator.
+                # R1 must not impose the new MAIN-only gate on its returned limit.
+                self.assertIsNotNone(self.queue())
+                order, = self.engine.pending()
+                self.assertEqual(order["limit"], .62)
+                self.assertEqual(order["r1_plan"]["candidate_key"], candidate)
+                self.assertEqual(self.frames_evaluated[-1][0], f"MAIN_OPTIMIZED_{candidate}")
+
+    def test_partial_fee_rounding_drift_keeps_the_fill_and_confirms_while_paused(self):
+        self.fee_case()
+        self.assertIsNotNone(self.queue())
+        # Half of this real-shaped arrival level fills 0.000048 shares. Its
+        # rounded notional is $0.000029 and fee is $0.000001: $0.625/share,
+        # exceeding the $0.62 all-in bound despite the legal $0.60 limit.
+        self.asks = [{"price": .60, "size": .000096}]
+        self.advance(1.1)
+        order, = self.engine.pending()
+        self.assertEqual(order["phase"], "CONFIRMING")
+        self.assertAlmostEqual(order["fill"]["shares"], .000048, places=9)
+        self.assertAlmostEqual(order["fill"]["cash"], .000030, places=9)
+        self.assertGreater(order["fill"]["cash"] / order["fill"]["shares"], .62)
+        self.assertIn("net_edge_drift", self.engine.snapshot()["risk_state"]["persistent_halts"])
+        self.assertEqual(self.store.reserved_cash(), 5.)
+        self.advance(11.)
+        # The shared display helper hides sub-cent stakes; inspect the ledger
+        # itself, as the R1 risk/settlement paths also do for every positive fill.
+        trade, = self.store.conn.execute("SELECT * FROM trades")
+        self.assertEqual(trade["status"], "OPEN")
+        self.assertAlmostEqual(trade["shares"], .000048, places=9)
+        self.assertAlmostEqual(trade["stake"], .000030, places=9)
+        self.assertEqual(self.store.recent_paper_orders(1)[0]["status"], "PARTIAL")
+        self.assertEqual(self.store.paper_order_count(), 1)
+        self.assertEqual(self.store.reserved_cash(), 0.)
+        self.assertAlmostEqual(self.store.account()["cash_balance"], 1000. - trade["stake"], places=6)
+        self.assertIn("net_edge_drift", self.engine.snapshot()["risk_state"]["persistent_halts"])
+        state, = self.store.conn.execute("SELECT state FROM main_r1_round_locks").fetchone()
+        self.assertEqual(state, "CONSUMED")
+        self.engine.manage_exits()
+        self.blocked()
+        self.assertEqual(self.store.paper_order_count(), 1)
 
     def test_constructor_rejects_live_capability_flags(self):
         for field in ("live_trading_runtime_enabled", "managed_live_enabled"):

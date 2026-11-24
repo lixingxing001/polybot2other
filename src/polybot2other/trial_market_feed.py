@@ -50,7 +50,7 @@ class TrialReferences:
 
 
 class TrialFeed:
-    def __init__(self, source, exchange):
+    def __init__(self, source, exchange, *, strict_received_time=False):
         self.source = Path(source)
         self.references = TrialReferences(self.source / "live-accounts/market.references.sqlite3")
         self.exchange = exchange
@@ -59,7 +59,8 @@ class TrialFeed:
         self.rules, self.info = {}, {}
         self.rules_checked_at = 0.
         self.stop = threading.Event()
-        self.books = ReliableLiveBooks(self.current, self.publish, self.get_quotes, exchange.rest_book)
+        self.books = ReliableLiveBooks(self.current, self.publish, self.get_quotes, exchange.rest_book,
+                                       strict_received_time=strict_received_time)
         self.inputs = SharedMarketInputs(self, lambda: {})
         self.threads = []
         self.last_error = None

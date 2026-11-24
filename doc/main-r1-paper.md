@@ -47,6 +47,13 @@ NAV 使用一致会计检查点：自由现金、仍拥有的预留现金、已�
 
 模拟继续采用 `realistic-paper-v1`：至少 1 秒到达延迟，到达时使用可见深度的 50%，12 秒确认、60 秒兑付延迟，最多 2 秒轮询迟到。它们是模拟假设，不是交易所承诺。FAK 的买入限价只能约束上限；更优价格或部分成交仍可能使实际含费成本低于 0.60。此时保留成交、锁定轮次并暂停新风险，不自动反向卖出。
 
+### 本次成交边界修复
+
+- R1 的 `MAIN`、`MAIN_FLOOR_060` 候选先把买入上限收紧到满足已配置最小净优势的合法价格档位，再按最终同帧盘口、实际预算和逐档舍入费用复核 `信号分数 − 含费报价均价`。不足时记录 `EDGE_WAIT`，不预留资金。FAST、PLUS 保留各自的入场限价逻辑，原有策略默认入口与参数不变。
+- 费用已包含在扫档结果的 `cash`、成交成本与净收益中，只入账一次。到达时若极小部分成交因费用舍入低于净优势门槛，保留全部正成交与真实模拟成本，锁定整轮，并以 `net_edge_drift` 暂停新风险；已有成交继续确认及官方结算，不删除不利样本。
+- 预计到达时刻固定为 `submitted_at + arrival_delay`，截止时刻为该时刻加冻结的最大轮询迟到量，当前为 2 秒。盘口源时间和接收时间均不得早于预计到达时刻；窗口内只有较早的有效盘口时记录 `ARRIVAL_WAIT`，不修改 `due_at` 或顺延截止时刻。超时或无法核实的到达证据进入 `UNKNOWN` 并保留预算，只有已核实到达盘口的限价内零成交才释放预留。
+- 仅 R1 显式开启严格 WS 接收时间：保留底层 socket 读取时记录的 `received_ms`，不以稍后的解析或发布时刻刷新盘口；无效接收时间拒绝发布。WS 缺少的价格精度和最小份数只从新鲜、代币与价格精度匹配的公共规则补齐。其他 `TrialFeed` 和盘口采集器默认行为保持不变。
+
 ## 准备配置
 
 复制 `deploy/main-r1-paper/main-r1.example.json` 为同目录的 `main-r1.json`，逐项核对当前 MAIN 的白名单入场参数，并更新 `provenance` 的采集时间、源码版本和来源说明。不得把 `.env`、钱包、API 凭据或整个运行配置复制到这里。JSON 不接受未知字段或任何开启实盘的开关。
@@ -88,6 +95,28 @@ docker compose -f deploy/main-r1-paper/compose.yaml up -d --no-deps main-r1
 运行中的 WAL 数据库需要对应 sidecar 文件已存在且 UID 10001 可读。数据库或 sidecar 被源服务替换 inode 后，应停止并重建**这个新服务**的文件挂载以连接新文件；不能改成 `immutable` 或复制旧文件来掩盖问题。源采集器或已验证参考价停止后，新系统会等待输入，已有记录保留。
 
 仓库内旧部署文件没有被修改。以上命令是供审核后显式启动的模板，本次代码交付不会执行这些命令或替用户启动服务器。
+
+## 升级已有 MAIN-R1 实验
+
+本次修复会改变运行代码指纹，**必须新建实验目录**；旧 `campaign.json`、组合与四个影子账本保留为旧版本证据，不复制进新目录。以下操作由部署者在自己的主机执行。
+
+1. 先保留旧配置、旧代码和依赖环境；Docker 部署还应保留实际运行的旧镜像，不能假定重新构建同一 Git 提交就会得到相同依赖。使用旧版本处理已有确认、官方结算和延迟兑付。检查 `http://127.0.0.1:8794/api/status` 的 `portfolio` 及全部 `shadows`：`execution.counts` 中 `IN_FLIGHT`、`CONFIRMING`、`UNKNOWN` 均为零，`open_cost` 与 `execution.pending_settlement_cash` 均为零，并核对没有孤立未决订单或其他对账异常。
+2. 旧版没有停止新入场但继续结算的维护命令，网页也是只读的；停止进程会同时停止确认和结算。完成上述检查后正常停止旧 MAIN-R1；Docker 在原配置及原路径环境下执行 `docker compose -f deploy/main-r1-paper/compose.yaml stop main-r1`，本机前台进程使用 Ctrl-C。停止后只读复核旧账本。若停止期间仍留下未决，使用保留的旧运行环境继续处理；缺少到达证据的订单重启后可能进入持久 `UNKNOWN`，需要保留证据单独复核，不能用重启、手改数据库或清空暂停把它当作已解决。不要停止提供市场数据的原采集服务。
+3. 更新到本次修复后的 `dev` 提交，核对独立 `main-r1.json`，为新实验选择从未使用的空目录。Docker 使用下面的路径示例；先把路径改为本机实际值，来源数据库及其 WAL/SHM 仍须满足上一节的只读挂载条件。
+
+```bash
+export MAIN_R1_CONFIG_PATH="$PWD/deploy/main-r1-paper/main-r1.json"
+export EDGEPULSE_SOURCE_DATA_DIR=/opt/edgepulse/data
+export MAIN_R1_DATA_DIR=/opt/edgepulse/main-r1/runs/upgrade-20261124-01
+sudo install -d -m 0700 -o 10001 -g 10001 "$MAIN_R1_DATA_DIR"
+docker compose -f deploy/main-r1-paper/compose.yaml config
+docker compose -f deploy/main-r1-paper/compose.yaml build main-r1
+docker compose -f deploy/main-r1-paper/compose.yaml up -d --no-deps --force-recreate main-r1
+```
+
+4. 检查 `http://127.0.0.1:8794/health` 与 `/api/status`：`mode` 为 `PAPER_ONLY`，`live_enabled` 为 `false`，新 `config_id`、`runtime`、`start_at` 与新目录的 `campaign.json` 一致。组合与影子均从各自 1,000 虚拟资金开始，新的共同样本重新积累；`waiting_start`、`waiting_data` 或证据不足而空仓不等于启动失败。旧实验收益与新实验收益分开报告。
+
+本机 Python 启动同样使用新 `--data-dir`，其余参数仍按“本机运行”一节，监听地址和端口保持 `127.0.0.1:8794`。同一实验的正常重启才复用原目录、原配置和完全相同的运行指纹；切换版本后不要把旧目录作为重试目标。
 
 ## 验证与当前边界
 
