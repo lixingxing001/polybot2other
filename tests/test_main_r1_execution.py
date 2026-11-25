@@ -14,7 +14,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from polybot2other.config import Settings
-from polybot2other.main_r1_execution import KEY, MainR1Execution
+from polybot2other.main_r1_execution import ARRIVAL_MODEL, EXECUTION_BASIS, KEY, MainR1Execution
 from polybot2other.models import MarketRound, Signal
 from polybot2other.paper_execution import ExecutionPolicy
 from polybot2other.shared_market_inputs import MarketInputs
@@ -463,6 +463,10 @@ class MainR1ExecutionTests(TestCase):
         self.assertIsNotNone(self.queue())
         self.advance(4.1)
         self.assertEqual(self.engine.snapshot()["counts"].get("UNKNOWN"), 1)
+        unknown, = self.engine.snapshot()["unknown_orders"]
+        self.assertEqual(unknown["failure_code"], "ARRIVAL_POLL_LATE")
+        self.assertEqual(unknown["model"], ARRIVAL_MODEL)
+        self.assertIsNone(unknown["evidence_at"])
         self.assertEqual(self.store.account()["cash_balance"], 995.)
         self.assertEqual(self.store.reserved_cash(), 5.)
         self.assertEqual(self.store.recent_paper_orders(1)[0]["status"], "PENDING")
@@ -646,6 +650,10 @@ class MainR1ExecutionTests(TestCase):
         self.assertEqual(after["risk_state"], before["risk_state"])
         self.assertEqual(after["mode"], "PAPER_ONLY")
         self.assertFalse(after["live_enabled"])
+        self.assertEqual(after["arrival_model"], ARRIVAL_MODEL)
+        self.assertEqual(after["execution_basis"], EXECUTION_BASIS)
+        self.assertEqual(after["unknown_order_count"], 0)
+        self.assertEqual(after["unknown_orders"], [])
 
     def test_idle_poll_risk_sampling_is_one_hertz_but_entry_still_rechecks(self):
         self.engine.risk_checkpoint = Mock(wraps=self.engine.risk_checkpoint)

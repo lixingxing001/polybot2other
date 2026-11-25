@@ -219,15 +219,20 @@ class ManagedExchange:
         self._market_info[key] = info
         return info
 
-    def rest_book(self, token_id):
-        return self._read_book(token_id,display_only=False)
+    def rest_book(self, token_id, *, strict_received_time=False):
+        return self._read_book(token_id,display_only=False,strict_received_time=strict_received_time)
 
     def valuation_book(self, token_id):
         """Read-only display refresh. This result must never be used to place orders."""
         return self._read_book(token_id,display_only=True)
 
-    def _read_book(self, token_id, *, display_only):
+    def _read_book(self, token_id, *, display_only, strict_received_time=False):
         response = self.http.get(self.settings.clob_url.rstrip("/")+"/book", params={"token_id": token_id})
+        # HTTPX's non-streaming get has received the response body at return.
+        # R1 opts in: parsing a buffered response must not make an old receipt
+        # appear to arrive after a simulated order. Other consumers retain their
+        # existing timestamp policy.
+        received_at = time.time() if strict_received_time else None
         response.raise_for_status()
         raw = response.json()
         if raw.get("version") not in (None,"","ctf","v1"):
@@ -245,7 +250,8 @@ class ManagedExchange:
         if not bids or (not asks and not display_only) or (asks and bids[0]["price"] >= asks[0]["price"]):
             raise ValueError("官方盘口缺失或交叉")
         return {"token_id":str(token_id),"bids":bids,"asks":asks,"best_bid":bids[0]["price"],
-                "best_ask":asks[0]["price"] if asks else None,"source_ms":stamp,"received_ms":now*1000,
+                "best_ask":asks[0]["price"] if asks else None,"source_ms":stamp,
+                "received_ms":(received_at if strict_received_time else now)*1000,
                 "updated_at_ms":stamp,"min_order_size":number(raw.get("min_order_size",0)),
                 "tick_size":str(raw.get("tick_size","0.01")),"neg_risk":bool(raw.get("neg_risk",False))}
 

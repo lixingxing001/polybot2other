@@ -264,6 +264,42 @@ def test_entry_window_and_unready_feed_wait_without_freezing_the_round_choice(fo
     assert instance.selector.status()["last_decision"]["regime"] is not None
 
 
+def test_real_unknown_orders_surface_learning_halt_and_status_reads_leave_ledgers_unchanged(forward_case):
+    case = forward_case
+    instance = case.build(traded=True)
+    case.clock.now = case.base+17.
+    instance._drive_once()
+    assert all(engine.store.paper_order_count() == 1 for engine in instance.shadows.values())
+    case.clock.now += 3.1  # No arrival evidence was captured inside the fixed window.
+    for engine in instance.shadows.values():
+        engine.poll()
+    before = {name: (engine.store.conn.total_changes, engine.store.account(),
+                     engine.store.recent_paper_orders(10)) for name, engine in instance.engines.items()}
+    instance._account_snapshot = Mock(wraps=instance._account_snapshot)
+    status = instance.snapshot()
+    assert status["state"] == "learning_blocked"
+    assert status["feed"]["ready"] is True  # Fresh data does not clear historical UNKNOWN evidence.
+    assert status["learning"]["state"] == "blocked"
+    assert status["execution_halted"] is False
+    assert status["blocking"]["blocked_shadow_count"] == 4
+    assert status["blocking"]["unknown_order_count"] == 4
+    assert status["portfolio"]["trade_count"] == 0
+    assert status["router"]["cohorts"] == 0
+    assert instance._account_snapshot.call_count == 5
+    for account in status["shadows"]:
+        unknown, = account["execution"]["unknown_orders"]
+        assert unknown["phase"] == "UNKNOWN"
+        assert unknown["model"] == "r1-local-observation-v2"
+        assert unknown["reason"]
+        assert unknown["deadline_at"] == unknown["arrival_at"]+2.
+        assert account["execution"]["unknown_order_count"] == 1
+        assert account["risk"]["state"]["persistent_halts"] == ["unknown_order"]
+    instance.snapshot()
+    after = {name: (engine.store.conn.total_changes, engine.store.account(),
+                    engine.store.recent_paper_orders(10)) for name, engine in instance.engines.items()}
+    assert before == after  # GET/status does not retry, refund, settle, sample NAV or clear risk state.
+
+
 def test_long_feed_readiness_gap_excludes_the_missed_common_window(forward_case):
     case = forward_case
     instance = case.build()

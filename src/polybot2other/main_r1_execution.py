@@ -23,6 +23,9 @@ from .shared_market_inputs import quote_error
 
 KEY = "MAIN_R1_ADAPTIVE_PAPER_V1"
 LABEL = "MAIN-R1"
+ARRIVAL_MODEL = "r1-local-observation-v2"
+EXECUTION_BASIS = "local_observation"
+LEGACY_ARRIVAL_MODEL = "legacy-dual-clock-v1"
 FLOOR = .60
 CANDIDATES = {
     "MAIN": {"signal_family": "MAIN", "price_floor": None},
@@ -40,6 +43,22 @@ def _json(value):
 
 def _digest(value):
     return hashlib.sha256(_json(value).encode()).hexdigest()
+
+
+def _arrival_contract(order):
+    # Untagged persisted orders retain the policy under which they were submitted.
+    if "arrival_model" not in order:
+        return LEGACY_ARRIVAL_MODEL, "dual_clock"
+    return order.get("arrival_model"), order.get("execution_basis")
+
+
+def _finite_time(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
 
 
 def fixed_plan(candidate, frame):
@@ -179,9 +198,15 @@ class MainR1Execution(PaperExecution):
                        "quotes": {s: {k: q.get(k) for k in ("token_id", "best_bid", "best_ask",
                            "source_ms", "received_ms", "ask_size", "bid_size", "tick_size", "min_order_size")}
                                   for s, q in frame.quotes.items()}}
-        payload = {"config_hash": self.config_hash, "strategy_id": self.strategy_id,
-                   "frame": summary, **details}
         with self.store._lock, self.store.conn:
+            model, basis = ARRIVAL_MODEL, EXECUTION_BASIS
+            if order_id is not None:
+                saved = self.store.conn.execute("SELECT payload FROM paper_sim_orders WHERE order_id=?", (order_id,)).fetchone()
+                if saved:
+                    model, basis = _arrival_contract(json.loads(saved[0]))
+            payload = {"config_hash": self.config_hash, "strategy_id": self.strategy_id,
+                       "arrival_model": model, "execution_basis": basis,
+                       "frame": summary, **details}
             self.store.conn.execute("INSERT INTO main_r1_decisions(observed_at,round_id,snapshot_id,code,order_id,detail_json) VALUES(?,?,?,?,?,?)",
                 (self.clock(), getattr(getattr(frame, "market", None), "round_id", None) or details.get("round_id"),
                  getattr(frame, "snapshot_id", None), code, order_id, _json(payload)))
@@ -461,6 +486,7 @@ class MainR1Execution(PaperExecution):
                    "token": market.up_token if signal.side == "Up" else market.down_token,
                    "side": signal.side, "signal": asdict(signal), "submitted_at": now,
                    "arrival_delay": delay, "revision": revision, "position_id": None,
+                   "arrival_model": ARRIVAL_MODEL, "execution_basis": EXECUTION_BASIS,
                    "arrival_at": now+delay,
                    "arrival_deadline": now+delay+self.policy.max_poll_lateness_seconds,
                    "exit_reason": None, "version": VERSION, "strategy_key": self.strategy_id,
@@ -513,11 +539,11 @@ class MainR1Execution(PaperExecution):
                 self.guard.halt("net_edge_drift", now=self.clock())
 
     def _arrive(self, order):
-        """Only a validated arrival book can prove a terminal zero fill.
+        """Match the first eligible observation processed in the fixed window.
 
-        Missing arrival evidence is uncertainty, even in Paper. Preserve the
-        reservation and stop new risk instead of retrying the same opportunity.
-        A saved positive match follows the base delayed-confirmation accounting.
+        Exchange source time remains freshness evidence, not a required update
+        after the hypothetical arrival. Untagged legacy orders keep both clock
+        lower bounds. Missing evidence never proves a terminal zero fill.
         """
         now = self.clock()
         arrival_at = order["submitted_at"]+order["arrival_delay"]
@@ -527,47 +553,67 @@ class MainR1Execution(PaperExecution):
         if now > deadline_at:
             self._finish_empty(order, "处理已超过固定到达窗口，保持未知订单占位")
             return
+        model, basis = _arrival_contract(order)
+        if (model, basis) not in ((ARRIVAL_MODEL, EXECUTION_BASIS), (LEGACY_ARRIVAL_MODEL, "dual_clock")):
+            self._finish_empty(order, "到达观察模型无法核实，保持未知订单占位",
+                               failure_code="ARRIVAL_MODEL_UNSUPPORTED")
+            return
         # WS depth has no tick/minimum metadata. Reuse only fresh, token-bound
         # public rules compatible with the metadata frozen into this order.
+        raw_frame = None
         try:
-            frame = self._frame(self.frame_reader(), order["info"])
+            raw_frame = self.frame_reader()
+            frame = self._frame(raw_frame, order["info"])
         except (ValueError, TypeError, KeyError, OverflowError):
-            self._finish_empty(order, "到达盘口或市场规则无法核实，保持未知订单占位")
+            self._finish_empty(order, "到达盘口或市场规则无法核实，保持未知订单占位",
+                               failure_code="ARRIVAL_BOOK_INVALID",
+                               arrival_evidence=self._arrival_evidence(order, raw_frame))
             return
         now = self.clock()
+        evidence = self._arrival_evidence(order, frame, now)
         if now > deadline_at:
-            self._finish_empty(order, "读取盘口后已超过固定到达窗口，保持未知订单占位")
+            self._finish_empty(order, "读取盘口后已超过固定到达窗口，保持未知订单占位",
+                               failure_code="ARRIVAL_CAPTURE_LATE", arrival_evidence=evidence)
             return
         market = frame.market
         if frame.error or not market or market.round_id != order["round_id"] or now >= market.ends_at:
-            self._finish_empty(order, "缺少本轮到达时盘口，保持未知订单占位")
+            self._finish_empty(order, "缺少本轮到达时盘口，保持未知订单占位",
+                               failure_code="ARRIVAL_MARKET_UNAVAILABLE", arrival_evidence=evidence)
+            return
+        book = frame.quotes.get(order["side"], {})
+        if any(_finite_time(book.get(key)) is None for key in ("source_ms", "received_ms")):
+            self._finish_empty(order, "到达盘口时间无法核实，保持未知订单占位",
+                               failure_code="ARRIVAL_BOOK_INVALID", arrival_evidence=evidence)
             return
         error = frame.quote_error(order["side"], now)
-        book = frame.quotes.get(order["side"], {})
         if error or str(book.get("token_id")) != str(order["token"]):
-            self._finish_empty(order, "到达盘口过期或代币不匹配，保持未知订单占位")
+            self._finish_empty(order, "到达盘口过期或代币不匹配，保持未知订单占位",
+                               failure_code="ARRIVAL_BOOK_STALE_OR_MISMATCH", arrival_evidence=evidence)
             return
-        if min(book["source_ms"], book["received_ms"]) < arrival_at*1000:
+        before_arrival = book["received_ms"] < arrival_at*1000
+        if model == LEGACY_ARRIVAL_MODEL:
+            before_arrival = before_arrival or book["source_ms"] < arrival_at*1000
+        if before_arrival:
             if now >= deadline_at:
-                self._finish_empty(order, "固定到达窗口结束仍无到达后的盘口，保持未知订单占位")
+                self._finish_empty(order, "固定到达窗口结束仍无合格到达收据，保持未知订单占位",
+                                   failure_code="ARRIVAL_WINDOW_EXHAUSTED", arrival_evidence=evidence)
                 return
             # Leave due_at fixed. Waiting may not extend the opportunity window,
             # release the reservation, or turn missing evidence into zero fills.
             self._audit(frame, "ARRIVAL_WAIT", order_id=order["order_id"],
-                        arrival={"arrival_at": arrival_at, "deadline_at": deadline_at,
-                                 "source_ms": book["source_ms"], "received_ms": book["received_ms"],
-                                 "observed_at": now})
-            self.event("ARRIVAL_WAIT", "盘口早于预计到达时刻，固定窗口内等待新盘口；预算保持占用")
+                        arrival=evidence,
+                        required_clock="source_and_received" if model == LEGACY_ARRIVAL_MODEL else "received")
+            self.event("ARRIVAL_WAIT", "缺少符合本单观察模型的到达收据，固定窗口内继续等待；预算保持占用")
             return
         if str(book.get("tick_size")) != str(order["info"]["tick_size"]):
-            self._finish_empty(order, "到达时价格精度无法核实，保持未知订单占位")
+            self._finish_empty(order, "到达时价格精度无法核实，保持未知订单占位", arrival_evidence=evidence)
             return
         if order["action"] != "BUY":
-            self._finish_empty(order, "研究订单类型无法核实，保持未知订单占位")
+            self._finish_empty(order, "研究订单类型无法核实，保持未知订单占位", arrival_evidence=evidence)
             return
         raw = book.get("asks")
         if not isinstance(raw, (list, tuple)) or not raw:
-            self._finish_empty(order, "到达盘口缺少逐档深度，保持未知订单占位")
+            self._finish_empty(order, "到达盘口缺少逐档深度，保持未知订单占位", arrival_evidence=evidence)
             return
         try:
             fingerprint = hashlib.sha256(_json(raw).encode()).hexdigest()
@@ -582,20 +628,20 @@ class MainR1Execution(PaperExecution):
                               notional_budget=order["notional_budget"],
                               fraction=self.policy.depth_fraction, consumed=consumed)
         except (ValueError, TypeError, KeyError, OverflowError):
-            self._finish_empty(order, "到达盘口档位无法核实，保持未知订单占位")
+            self._finish_empty(order, "到达盘口档位无法核实，保持未知订单占位", arrival_evidence=evidence)
             return
         if fill["shares"] <= 0:
             self._finish_empty(order, "已核实 FAK 到达时限价内零成交", verified_zero_fill=True)
             self._observe_buy_arrival(order, now, book, consumed, fill)
             return
         if fill["cash"] > order["amount"]+.000001:
-            self._finish_empty(order, "撮合费用超出预留预算，保持未知订单占位")
+            self._finish_empty(order, "撮合费用超出预留预算，保持未知订单占位", arrival_evidence=evidence)
             return
         consumed_after = dict(consumed)
         for level in fill["levels"]:
             key = str(level["price"])
             consumed_after[key] = consumed_after.get(key, 0)+level["shares"]
-        payload = {**order, "fill": fill, "matched_at": now,
+        payload = {**order, "fill": fill, "matched_at": now, "arrival_evidence": evidence,
                    "arrival_book": {k: book.get(k) for k in
                                     ("source_ms", "received_ms", "best_bid", "best_ask", "bids", "asks")}}
         due = max(now+.1, order["submitted_at"]+self.policy.confirmation_seconds)
@@ -617,14 +663,46 @@ class MainR1Execution(PaperExecution):
         self._consume(order, fill)
         self._audit(None, "MATCHED" if fill["shares"] > 0 else "ZERO_FILL", order_id=order["order_id"],
                     round_id=order["round_id"], fill=fill, book=book, consumed_before=consumed,
+                    arrival=self._arrival_evidence(order, now=now, book=book),
                     plan=order.get("r1_plan"), signal_snapshot_id=order.get("r1_frame"))
 
-    def _finish_empty(self, order, reason, *, verified_zero_fill=False):
+    def _arrival_evidence(self, order, frame=None, now=None, *, book=None):
+        at = self.clock() if now is None else now
+        if book is None:
+            quotes = getattr(frame, "quotes", {})
+            book = quotes.get(order["side"], {}) if isinstance(quotes, dict) else {}
+        book = book if isinstance(book, dict) else {}
+        source, received = (_finite_time(book.get(key)) for key in ("source_ms", "received_ms"))
+        arrival = order["submitted_at"]+order["arrival_delay"]
+        return {"arrival_at": arrival, "deadline_at": arrival+self.policy.max_poll_lateness_seconds,
+                "source_ms": source, "received_ms": received, "observed_at": at,
+                "source_age_ms": _finite_time(at*1000-source) if source is not None else None,
+                "receipt_age_ms": _finite_time(at*1000-received) if received is not None else None,
+                "transport_lag_ms": _finite_time(received-source) if source is not None and received is not None else None}
+
+    def _last_arrival_wait(self, order_id):
+        with self.store._lock:
+            row = self.store.conn.execute("""SELECT detail_json FROM main_r1_decisions
+                WHERE order_id=? AND code='ARRIVAL_WAIT' ORDER BY id DESC LIMIT 1""", (order_id,)).fetchone()
+        return json.loads(row[0]).get("arrival") if row else None
+
+    def _finish_empty(self, order, reason, *, verified_zero_fill=False,
+                      failure_code=None, arrival_evidence=None):
         with self.store._lock:
             row = self.store.conn.execute("SELECT * FROM paper_sim_orders WHERE order_id=?", (order["order_id"],)).fetchone()
             if not row or row["phase"] != "IN_FLIGHT" or json.loads(row["payload"]).get("fill", {}).get("shares", 0) > 0:
                 return
         if not verified_zero_fill:
+            now = self.clock()
+            arrival = order["submitted_at"]+order["arrival_delay"]
+            deadline = arrival+self.policy.max_poll_lateness_seconds
+            last_wait = self._last_arrival_wait(order["order_id"])
+            if failure_code is None and now > deadline:
+                failure_code = "ARRIVAL_WINDOW_EXHAUSTED" if last_wait else "ARRIVAL_POLL_LATE"
+                reason = ("固定到达窗口内持续等待但未取得合格收据，保持未知订单占位" if last_wait else
+                          "首次到达处理已超过固定观察窗口，保持未知订单占位")
+            failure_code = failure_code or "ARRIVAL_UNVERIFIED"
+            arrival_evidence = arrival_evidence or last_wait
             with self.store._lock, self.store.conn:
                 cursor = self.store.conn.execute(
                     "UPDATE paper_sim_orders SET phase='UNKNOWN' WHERE order_id=? AND phase='IN_FLIGHT'",
@@ -642,8 +720,8 @@ class MainR1Execution(PaperExecution):
                 """, (order["round_id"], order["order_id"], self.clock(), reason))
             self.guard.halt("unknown_order", now=self.clock())
             self._audit(None, "UNKNOWN", order_id=order["order_id"], round_id=order["round_id"], reason=reason,
-                        arrival_at=order["submitted_at"]+order["arrival_delay"],
-                        arrival_deadline=order["submitted_at"]+order["arrival_delay"]+self.policy.max_poll_lateness_seconds)
+                        failure_code=failure_code, arrival=arrival_evidence,
+                        arrival_at=arrival, arrival_deadline=deadline)
             self.event("UNKNOWN", reason)
             return
         super()._finish_empty(order, reason)
@@ -715,7 +793,32 @@ class MainR1Execution(PaperExecution):
             db = self.store.conn
             counts = dict(db.execute("SELECT phase,count(*) FROM paper_sim_orders GROUP BY phase").fetchall())
             decisions = [dict(r) for r in db.execute("SELECT id,observed_at,round_id,snapshot_id,code,order_id FROM main_r1_decisions ORDER BY id DESC LIMIT 20")]
+            unknown = []
+            for row in db.execute("""SELECT s.order_id,s.phase,s.payload,o.round_id,o.reason,
+                    l.reason AS lock_reason FROM paper_sim_orders s JOIN paper_orders o ON o.id=s.order_id
+                    LEFT JOIN main_r1_round_locks l ON l.order_id=s.order_id
+                    WHERE s.phase='UNKNOWN' ORDER BY s.order_id DESC LIMIT 10""").fetchall():
+                order = json.loads(row["payload"])
+                model, basis = _arrival_contract(order)
+                audit = db.execute("""SELECT detail_json FROM main_r1_decisions
+                    WHERE order_id=? AND code='UNKNOWN' ORDER BY id ASC LIMIT 1""", (row["order_id"],)).fetchone()
+                detail = json.loads(audit[0]) if audit else {}
+                evidence = detail.get("arrival") or self._last_arrival_wait(row["order_id"]) or {}
+                observed = _finite_time(evidence.get("observed_at"))
+                source, received = (_finite_time(evidence.get(key)) for key in ("source_ms", "received_ms"))
+                arrival = order["submitted_at"]+order["arrival_delay"]
+                unknown.append({"order_id": row["order_id"], "round_id": row["round_id"], "phase": row["phase"],
+                    "model": model, "execution_basis": basis, "submitted_at": order["submitted_at"],
+                    "arrival_at": arrival, "deadline_at": arrival+self.policy.max_poll_lateness_seconds,
+                    "reason": detail.get("reason") or row["lock_reason"] or row["reason"],
+                    "failure_code": detail.get("failure_code"), "evidence_at": observed,
+                    "source_ms": source, "received_ms": received,
+                    "source_age_ms": _finite_time(observed*1000-source) if observed is not None and source is not None else None,
+                    "receipt_age_ms": _finite_time(observed*1000-received) if observed is not None and received is not None else None,
+                    "transport_lag_ms": _finite_time(received-source) if source is not None and received is not None else None})
             return {"strategy_id": self.strategy_id, "name": LABEL, "mode": "PAPER_ONLY", "live_enabled": False,
+                    "arrival_model": ARRIVAL_MODEL, "execution_basis": EXECUTION_BASIS,
+                    "unknown_order_count": counts.get("UNKNOWN", 0), "unknown_orders": unknown,
                     "config_hash": self.config_hash, "policy": asdict(self.policy), "account": self.store.account(),
                     "risk": deepcopy(self.last_risk), "risk_state": self.guard.snapshot(),
                     "counts": counts, "last_event": dict(self.last_event), "decisions": decisions,

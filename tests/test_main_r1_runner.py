@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 from polybot2other import main_r1_paper as runner
-from polybot2other.main_r1_web import serve
+from polybot2other.main_r1_web import page, serve
 from polybot2other.models import MarketRound, Signal
 from polybot2other.optimized_reference import SPOT, TWAP
 from polybot2other.shared_market_inputs import MarketInputs
@@ -91,6 +91,7 @@ def test_campaign_is_frozen_private_and_restart_does_not_reset_start(config, tmp
         assert first["start_at"] == 600
         assert first["risk_template"]["initial_balance"] == 1000
         assert first["policy"]["depth_fraction"] == .5
+        assert first["execution_model"] == {"arrival_model": "r1-local-observation-v2", "execution_basis": "local_observation"}
         assert set(first["candidates"]) == {"MAIN", "MAIN_FLOOR_060", "FAST", "PLUS"}
         assert (root / "campaign.json").stat().st_mode & 0o777 == 0o600
         assert runner.campaign(root, copy.deepcopy(config), now=99999) == first
@@ -146,7 +147,7 @@ def test_public_exchange_exposes_no_wallet_signing_or_order_api(config, tmp_path
     public.rest_book("token")
     public.close()
     transport.market_info.assert_called_once_with(market, force=True)
-    transport.rest_book.assert_called_once_with("token")
+    transport.rest_book.assert_called_once_with("token", strict_received_time=True)
     transport.http.close.assert_called_once()
     for name in ("client", "identity", "read_wallet", "prepare", "submit", "reconcile", "token_balance"):
         assert not hasattr(public, name)
@@ -284,10 +285,20 @@ def test_status_http_is_readonly_loopback_and_distinguishes_feed_pause():
         assert response.status == 200
         assert json.loads(response.read()) == {"ok": True, "mode": "PAPER_ONLY", "strategy_id": runner.KEY,
                                                "state": "waiting_data", "feed_ready": False}
+        snapshot.return_value["state"] = "learning_blocked"
+        client.request("GET", "/health")
+        response = client.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["ok"] is True  # A persistent halt must not trigger restart loops.
         called = snapshot.call_count
         client.request("POST", "/api/status", body='{"resume":true}')
         response = client.getresponse()
         assert response.status == 405
+        response.read()
+        assert snapshot.call_count == called
+        client.request("GET", "/resume")
+        response = client.getresponse()
+        assert response.status == 404
         response.read()
         assert snapshot.call_count == called
         client.request("GET", "/api/status", headers={"Host": "attacker.invalid"})
@@ -405,6 +416,105 @@ def isolated_runner(config, source, tmp_path):
         yield obj, clock, exchange
     finally:
         obj.close()
+
+
+def test_snapshot_uses_clock_after_capture_without_clamping_genuinely_future_frames(isolated_runner):
+    obj, clock, _ = isolated_runner
+    clock[0] = 615.
+    capture = obj.feed.capture
+
+    def elapsed_capture():
+        clock[0] += .025  # The production capture observes time after snapshot() begins.
+        return capture()
+
+    obj.feed.capture = elapsed_capture
+    status = obj.snapshot()
+    assert status["as_of"] == 615.025
+    assert status["feed"]["ready"] is True
+    assert status["state"] == "running"
+    assert status["learning"]["state"] == "collecting"
+
+    def future_capture():
+        return replace(capture(), observed_at=clock[0]+.25)
+
+    obj.feed.capture = future_capture
+    status = obj.snapshot()
+    assert status["as_of"] == 615.025  # Do not hide clock errors by moving now to the frame time.
+    assert status["feed"]["ready"] is False
+    assert status["state"] == "waiting_data"
+
+
+def test_unknown_shadow_blocks_learning_and_is_visible_without_reading_risk_twice(isolated_runner):
+    obj, clock, _ = isolated_runner
+    clock[0] = 615.
+    engine = obj.shadows["FAST"]
+    engine.snapshot = Mock(return_value={
+        "counts": {"FILLED": 3, "UNKNOWN": 1}, "unknown_order_count": 1,
+        "arrival_model": "r1-local-observation-v2", "execution_basis": "local_observation",
+        "risk": {"allowed": False, "valuation_status": "unavailable"},
+        "risk_state": {"persistent_halts": ["unknown_order"]},
+        "last_event": {"code": "RISK_WAIT", "message": "订单状态未知", "at": 615.},
+        "unknown_orders": [{"order_id": 5, "round_id": "btc-updown-5m-600", "phase": "UNKNOWN",
+                            "model": "legacy-dual-clock-v1", "execution_basis": "dual_clock",
+                            "submitted_at": 610., "arrival_at": 611., "deadline_at": 613.,
+                            "reason": "固定窗口无合格证据 <unsafe>", "evidence_at": 612.,
+                            "source_ms": 610900., "received_ms": 611020.,
+                            "source_age_ms": 1100., "receipt_age_ms": 980., "transport_lag_ms": 120.}]
+    })
+    engine.guard.snapshot = Mock(side_effect=AssertionError("Use the already captured risk state"))
+    obj._account_snapshot = Mock(wraps=obj._account_snapshot)
+    status = obj.snapshot()
+    assert obj._account_snapshot.call_count == 5
+    assert [call.args[0] for call in obj._account_snapshot.call_args_list] == ["portfolio", *runner.CANDIDATES]
+    engine.snapshot.assert_called_once_with()
+    engine.guard.snapshot.assert_not_called()
+    assert status["state"] == "learning_blocked"
+    assert status["learning_blocked"] is True and status["execution_halted"] is False
+    assert status["learning"]["state"] == "blocked"
+    assert status["blocking"]["blocked_shadow_count"] == 1
+    assert status["blocking"]["unknown_order_count"] == 1
+    assert status["blocking"]["shadows"][0]["key"] == "FAST"
+    assert status["blocking"]["shadows"][0]["reasons"]
+    html = page(status)
+    for evidence in ("learning_blocked", "UNKNOWN 1", "RISK_WAIT", "订单 #5", "legacy-dual-clock-v1",
+                     "r1-local-observation-v2", "预计到达", "截止", "120.0 ms", "cohorts", "errors"):
+        assert evidence in html
+    assert "&lt;unsafe&gt;" in html and "<unsafe>" not in html
+    assert "影子账户继续采样。" not in html
+
+
+@pytest.mark.parametrize("account_name,unknown,halts,expected", [
+    ("portfolio", 1, [], "execution_halted"),
+    ("portfolio", 0, ["peak_drawdown"], "execution_halted"),
+    ("MAIN", 1, [], "learning_blocked"),
+    ("MAIN", 0, ["net_edge_drift"], "learning_blocked"),
+])
+def test_persistent_or_unknown_blockers_do_not_require_each_other(isolated_runner, account_name, unknown, halts, expected):
+    obj, clock, _ = isolated_runner
+    clock[0] = 615.
+    obj.engines[account_name].snapshot = Mock(return_value={
+        "counts": {"UNKNOWN": unknown}, "risk_state": {"persistent_halts": halts}})
+    status = obj.snapshot()
+    assert status["state"] == expected
+    assert status["blocking"]["unknown_order_count"] == unknown
+    assert status["execution_halted"] is (account_name == "portfolio")
+    assert status["learning_blocked"] is (account_name != "portfolio")
+
+
+def test_process_priority_preserves_blocker_diagnostics(isolated_runner):
+    obj, clock, _ = isolated_runner
+    obj.shadows["MAIN"].snapshot = Mock(return_value={"counts": {"UNKNOWN": 1}})
+    assert obj.snapshot()["state"] == "waiting_start"
+    clock[0] = 615.
+    obj.errors["decision:MAIN"] = "ValueError"
+    status = obj.snapshot()
+    assert status["state"] == "degraded" and status["learning_blocked"] is True
+    obj._closed = True
+    try:
+        status = obj.snapshot()
+        assert status["state"] == "stopped" and status["learning_blocked"] is True
+    finally:
+        obj._closed = False
 
 
 def test_runner_has_one_portfolio_four_shadow_ledgers_and_no_implicit_choice(isolated_runner):

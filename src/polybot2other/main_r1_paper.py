@@ -167,10 +167,13 @@ def build_settings(config, data_dir):
 
 def campaign(data_dir, config, *, now=None, selector_config=None):
     """Create once under the caller's writer lock; restarts cannot change the run."""
+    from .main_r1_execution import ARRIVAL_MODEL, EXECUTION_BASIS
+
     config = validate_config(config)
     root = Path(data_dir)
     path = root / "campaign.json"
     frozen = {"config": config, "policy": POLICY, "risk_template": RISK_TEMPLATE,
+              "execution_model": {"arrival_model": ARRIVAL_MODEL, "execution_basis": EXECUTION_BASIS},
               "runtime": runtime_fingerprint(),
               "selector_config": json.loads(json.dumps(selector_config or {}, allow_nan=False)),
               "candidates": {k: {"signal_family": v[0], "price_floor": v[1]} for k, v in CANDIDATES.items()}}
@@ -270,7 +273,7 @@ class PublicExchange:
             return deepcopy(info)
 
     def rest_book(self, token_id):
-        return self._reader.rest_book(token_id)
+        return self._reader.rest_book(token_id, strict_received_time=True)
 
     def close(self):
         self._reader.http.close()
@@ -413,6 +416,7 @@ class MainR1Runner:
                 wallet = self.wallets[name]
                 cfg = {"revision": 1, "mode": "PAPER_ONLY", "live_enabled": False,
                        "config_id": self.run["config_id"], "base_main": self.run["config"]["base_main"],
+                       "execution_model": deepcopy(self.run["execution_model"]),
                        "strategies": {key: {"enabled": True, "stake_dollars": 5,
                             "max_open_trades": 2, "max_daily_loss": 0, **MODES}}}
                 plan_reader = self._portfolio_plan if name == "portfolio" else (
@@ -548,6 +552,9 @@ class MainR1Runner:
     def _account_snapshot(self, name):
         engine = self.engines[name]
         execution = engine.snapshot()  # Cached risk state; never evaluates or submits on GET.
+        risk_state = execution.get("risk_state")
+        if risk_state is None:
+            risk_state = engine.guard.snapshot()
         with engine.store._lock:
             account = engine.store.account()
             counts = engine.store.conn.execute("""SELECT count(*) trade_count,
@@ -561,28 +568,64 @@ class MainR1Runner:
                 "cash_balance": account["cash_balance"], "realized_pnl": account["realized_pnl"],
                 "open_cost": counts["open_cost"], "trade_count": counts["trade_count"],
                 "settled_rounds": settled, "execution": execution,
-                "risk": {"checkpoint": execution.get("risk"), "state": engine.guard.snapshot()}}
+                "risk": {"checkpoint": execution.get("risk"), "state": risk_state}}
 
     def snapshot(self):
-        now = self.clock()
         frame = self.feed.capture()
+        # Capture itself takes time. Comparing its timestamp with a clock read
+        # taken before capture would falsely classify a fresh frame as future data.
+        now = self.clock()
         ready = common_inputs_ready(frame, now)
         feed = {"ready": ready, "round_id": frame.market.round_id if frame.market else None,
                 "reference_ready": bool(frame.reference.get("ready") and frame.reference.get("protocol_verified")),
                 "quote_sides": list(frame.valid_quotes(now)), "error": frame.error,
                 "last_market_error": self.feed.last_error,
                 "ws_state": self.feed.books.health().get("ws_state")}
+        accounts = [self._account_snapshot(name) for name in ("portfolio", *CANDIDATES)]
+        blockers = []
+        for account in accounts:
+            execution = account["execution"]
+            unknown = max(execution.get("unknown_order_count", 0), execution.get("counts", {}).get("UNKNOWN", 0))
+            halts = list(account["risk"]["state"].get("persistent_halts", []))
+            if unknown or halts:
+                reasons = ([f"{unknown} 笔 UNKNOWN 订单保留预算，等待证据核对"] if unknown else [])
+                reasons.extend(f"持久停止：{reason}" for reason in halts)
+                blockers.append({"key": account["key"], "unknown_order_count": unknown,
+                                 "persistent_halts": halts, "reasons": reasons})
+        portfolio_blocker = next((item for item in blockers if item["key"] == "portfolio"), None)
+        shadow_blockers = [item for item in blockers if item["key"] != "portfolio"]
+        execution_halted, learning_blocked = bool(portfolio_blocker), bool(shadow_blockers)
+        router = self.selector.status()
+        cohorts = self.cohorts.snapshot()
         state = "stopped" if self._closed else "waiting_start" if now < self.run["start_at"] else (
             "degraded" if self.errors or (self._started and (self.last_step is None or now-self.last_step > 20))
+            else "execution_halted" if execution_halted else "learning_blocked" if learning_blocked
             else "waiting_entry_window" if ready and now < frame.market.ends_at-self.settings.max_time_left_seconds
             else "running" if ready else "waiting_data")
+        if learning_blocked:
+            learning_state, learning_reason = "blocked", "影子账户存在未知订单或持久停止，无法继续形成完整共同学习样本；等待审计处理。"
+        elif state in ("stopped", "waiting_start", "degraded", "waiting_entry_window", "waiting_data"):
+            learning_state = state
+            learning_reason = {"stopped": "实验已停止。", "waiting_start": "等待实验开始。",
+                               "degraded": "运行异常，先检查错误与循环状态。", "waiting_entry_window": "等待本轮共同入场窗口。",
+                               "waiting_data": "等待合格行情；缺失数据不能计为正常空仓样本。"}[state]
+        elif (router.get("last_decision") or {}).get("candidate_key"):
+            learning_state, learning_reason = "candidate_selected", "本轮已选出候选；完整共同机会仍需确认与官方结算。"
+        else:
+            learning_state, learning_reason = "collecting", "冷启动或选择条件尚未满足；影子账户继续积累并检验合格共同样本。"
         return {"strategy_id": KEY, "name": LABEL, "mode": "PAPER_ONLY", "live_enabled": False,
                 "state": state, "as_of": now, "start_at": self.run["start_at"], "last_step": self.last_step,
                 "config_id": self.run["config_id"], "provenance": self.run["config"]["provenance"],
-                "runtime": self.run["runtime"],
-                "feed": feed, "errors": dict(self.errors), "portfolio": self._account_snapshot("portfolio"),
-                "shadows": [self._account_snapshot(name) for name in CANDIDATES],
-                "router": self.selector.status(), "cohorts": self.cohorts.snapshot()}
+                "runtime": self.run["runtime"], "execution_model": self.run["execution_model"],
+                "execution_halted": execution_halted, "learning_blocked": learning_blocked,
+                "blocking": {"portfolio": portfolio_blocker, "shadows": shadow_blockers,
+                             "blocked_shadow_count": len(shadow_blockers),
+                             "unknown_order_count": sum(item["unknown_order_count"] for item in blockers)},
+                "learning": {"state": learning_state, "reason": learning_reason,
+                             "learned_cohorts": router.get("cohorts", 0),
+                             "selector_reason": (router.get("last_decision") or {}).get("reason")},
+                "feed": feed, "errors": dict(self.errors), "portfolio": accounts[0], "shadows": accounts[1:],
+                "router": router, "cohorts": cohorts}
 
     def close(self):
         if self._closed:
